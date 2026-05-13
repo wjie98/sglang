@@ -137,10 +137,8 @@ class DecodeVerifyRollbackWorker:
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-        spec_info, draft_cache_locs = self.draft(batch)
-        logits_output, verify_output, can_run_cuda_graph = self.verify(
-            batch, spec_info, draft_cache_locs
-        )
+        spec_info = self.draft(batch)
+        logits_output, verify_output, can_run_cuda_graph = self.verify(batch, spec_info)
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=verify_output.verified_id,
@@ -175,7 +173,7 @@ class DecodeVerifyRollbackWorker:
         )
         return logits_output, next_token_ids, batch_result.can_run_cuda_graph
 
-    def _draft_preprocess_decode(self, batch: ScheduleBatch) -> torch.Tensor:
+    def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
         for req in batch.reqs:
             req.decode_batch_idx += 1
@@ -218,7 +216,6 @@ class DecodeVerifyRollbackWorker:
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
-        return out_cache_loc
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
@@ -229,19 +226,16 @@ class DecodeVerifyRollbackWorker:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-    def draft(self, batch: ScheduleBatch) -> Tuple[EagleVerifyInput, torch.Tensor]:
+    def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
-            return (
-                EagleVerifyInput.create_idle_input(
-                    self.topk,
-                    self.speculative_num_steps,
-                    self.speculative_num_draft_tokens,
-                ),
-                torch.empty(0, dtype=torch.int64, device=self.device),
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
             )
 
-        draft_cache_locs = self._draft_preprocess_decode(batch)
+        self._draft_preprocess_decode(batch)
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
@@ -276,24 +270,21 @@ class DecodeVerifyRollbackWorker:
         )
         draft_tokens = draft_tokens.to(torch.long)
 
-        return (
-            EagleVerifyInput(
-                draft_token=draft_tokens,
-                custom_mask=tree_mask,
-                positions=positions,
-                retrive_index=retrive_index,
-                retrive_next_token=retrive_next_token,
-                retrive_next_sibling=retrive_next_sibling,
-                retrive_cum_len=None,
-                spec_steps=self.speculative_num_steps,
-                topk=self.topk,
-                draft_token_num=self.speculative_num_draft_tokens,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                seq_lens_sum=forward_batch.seq_lens_sum,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-                draft_probs=draft_probs,
-            ),
-            draft_cache_locs,
+        return EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=positions,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.topk,
+            draft_token_num=self.speculative_num_draft_tokens,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            draft_probs=draft_probs,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -398,7 +389,6 @@ class DecodeVerifyRollbackWorker:
         self,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
-        draft_cache_locs: torch.Tensor,
     ) -> Tuple[LogitsProcessorOutput, EagleVerifyOutput, bool]:
         # DVR reuses the cache locations populated by self-decode draft. This
         # matches the reference branch and avoids reallocating a second verify
@@ -446,6 +436,12 @@ class DecodeVerifyRollbackWorker:
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
 
+        self.postprocess_for_verify(batch, verify_output)
+        return logits_output, verify_output, can_run_cuda_graph
+
+    def postprocess_for_verify(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
@@ -465,5 +461,3 @@ class DecodeVerifyRollbackWorker:
             batch.spec_info.verified_id = batch.spec_info.verified_id[accept_end]
             batch.spec_info.topk_p = batch.spec_info.topk_p[accept_end]
             batch.spec_info.topk_index = batch.spec_info.topk_index[accept_end]
-
-        return logits_output, verify_output, can_run_cuda_graph
