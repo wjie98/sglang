@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
@@ -38,6 +39,30 @@ if is_cuda():
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def dvr_causal_verify_cuda_graph_metadata(model_runner, attn_backend, forward_mode):
+    """Use ordinary causal attention for DVR target-verify cuda graphs.
+
+    The EAGLE verify metadata contains a custom tree mask. In DVR chain mode the
+    logical mask is causal, but keeping it as a custom mask can still select a
+    different backend path from ordinary extend/prefill and breaks strict
+    logprob equality. The cuda graph runner owns capture/replay timing, so it
+    enters this DVR-owned context immediately around metadata initialization.
+    """
+
+    yield
+    if (
+        model_runner.spec_algorithm.is_decode_verify_rollback()
+        and forward_mode.is_target_verify()
+    ):
+        metadata = getattr(attn_backend, "forward_metadata", None)
+        if metadata is not None:
+            if hasattr(metadata, "custom_mask"):
+                metadata.custom_mask = None
+            if hasattr(metadata, "mask_indptr"):
+                metadata.mask_indptr = None
 
 
 class DecodeVerifyRollbackWorker:
@@ -267,7 +292,6 @@ class DecodeVerifyRollbackWorker:
                 seq_lens_sum=forward_batch.seq_lens_sum,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 draft_probs=draft_probs,
-                causal_target_verify_attention=True,
             ),
             draft_cache_locs,
         )

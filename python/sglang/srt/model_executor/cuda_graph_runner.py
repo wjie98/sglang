@@ -977,15 +977,22 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
-        attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
+        from sglang.srt.speculative.dvr_worker import (
+            dvr_causal_verify_cuda_graph_metadata,
         )
+
+        with dvr_causal_verify_cuda_graph_metadata(
+            self.model_runner, attn_backend, forward_batch.forward_mode
+        ):
+            attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
 
         # Run and capture
         def run_once():
@@ -1118,16 +1125,23 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        from sglang.srt.speculative.dvr_worker import (
+            dvr_causal_verify_cuda_graph_metadata,
         )
+
+        with dvr_causal_verify_cuda_graph_metadata(
+            self.model_runner, attn_backend, self.capture_forward_mode
+        ):
+            attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                buffers.req_pool_indices[:bs],
+                buffers.seq_lens[:bs],
+                forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            )
 
         # Store fields
         self.raw_bs = raw_bs
@@ -1208,9 +1222,6 @@ class CudaGraphRunner:
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
-                    causal_target_verify_attention=(
-                        self.model_runner.spec_algorithm.is_decode_verify_rollback()
-                    ),
                 )
 
         elif self.model_runner.spec_algorithm.is_ngram():

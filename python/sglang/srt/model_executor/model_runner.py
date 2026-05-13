@@ -2372,9 +2372,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         capture_hidden_mode=CaptureHiddenMode.FULL,
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
-                        causal_target_verify_attention=(
-                            self.spec_algorithm.is_decode_verify_rollback()
-                        ),
                     )
 
             elif self.spec_algorithm.is_ngram():
