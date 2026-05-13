@@ -2221,11 +2221,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
-            or self.spec_algorithm.is_ngram()
-        ):
+        if self.spec_algorithm.uses_target_verify_forward():
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -2352,7 +2348,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+                or self.spec_algorithm.is_decode_verify_rollback()
+            ):
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:
@@ -2372,6 +2372,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         capture_hidden_mode=CaptureHiddenMode.FULL,
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
+                        causal_target_verify_attention=(
+                            self.spec_algorithm.is_decode_verify_rollback()
+                        ),
                     )
 
             elif self.spec_algorithm.is_ngram():

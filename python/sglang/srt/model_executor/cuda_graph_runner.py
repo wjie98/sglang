@@ -547,11 +547,7 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if (
-            model_runner.spec_algorithm.is_eagle()
-            or model_runner.spec_algorithm.is_standalone()
-            or model_runner.spec_algorithm.is_ngram()
-        ):
+        if model_runner.spec_algorithm.uses_target_verify_forward():
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -666,6 +662,9 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode != self.capture_forward_mode:
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -1188,6 +1187,7 @@ class CudaGraphRunner:
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_decode_verify_rollback()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -1208,6 +1208,9 @@ class CudaGraphRunner:
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
+                    causal_target_verify_attention=(
+                        self.model_runner.spec_algorithm.is_decode_verify_rollback()
+                    ),
                 )
 
         elif self.model_runner.spec_algorithm.is_ngram():

@@ -69,6 +69,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
     draft_probs: Optional[torch.Tensor] = None
+    causal_target_verify_attention: bool = False
 
     # Shape info for padding
     num_tokens_per_req: int = -1
@@ -78,6 +79,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
+
+    def use_causal_target_verify_attention(self) -> bool:
+        return self.causal_target_verify_attention
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):

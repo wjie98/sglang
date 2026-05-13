@@ -267,6 +267,7 @@ class DecodeVerifyRollbackWorker:
                 seq_lens_sum=forward_batch.seq_lens_sum,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 draft_probs=draft_probs,
+                causal_target_verify_attention=True,
             ),
             draft_cache_locs,
         )
