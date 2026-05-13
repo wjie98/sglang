@@ -4,6 +4,7 @@ import logging
 from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
@@ -31,7 +32,10 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     select_top_k_tokens,
 )
-from sglang.srt.utils import next_power_of_2
+from sglang.srt.utils import is_cuda, next_power_of_2
+
+if is_cuda():
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +159,7 @@ class DecodeVerifyRollbackWorker:
 
         out_cache_loc = alloc_token_slots(
             batch.tree_cache,
-            num_seqs * self.speculative_num_steps * self.topk,
+            num_seqs * self.speculative_num_draft_tokens * self.topk,
         )
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
@@ -170,10 +174,10 @@ class DecodeVerifyRollbackWorker:
             0,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
-            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
             self.page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps + self.page_size),
+            next_power_of_2(self.speculative_num_draft_tokens + self.page_size),
         )
 
         batch.out_cache_loc = out_cache_loc
@@ -214,7 +218,9 @@ class DecodeVerifyRollbackWorker:
 
         model_worker_batch = batch.get_model_worker_batch()
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
+        parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
+            forward_batch
+        )
 
         (
             tree_mask,
@@ -251,6 +257,7 @@ class DecodeVerifyRollbackWorker:
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 seq_lens_sum=forward_batch.seq_lens_sum,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                draft_probs=draft_probs,
             ),
             draft_cache_locs,
         )
@@ -260,15 +267,16 @@ class DecodeVerifyRollbackWorker:
         assert isinstance(spec_info, EagleDraftInput)
 
         out_cache_loc = forward_batch.out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
+            forward_batch.batch_size, self.topk, self.speculative_num_draft_tokens
         )
         out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
+            self.speculative_num_draft_tokens, -1
         )
 
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+        draft_probs_list: List[torch.Tensor] = []
         scores = None
         topk_p = None
         topk_index = spec_info.verified_id
@@ -308,6 +316,10 @@ class DecodeVerifyRollbackWorker:
             logits_output = self.model_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"dvr draft step {i}")
 
+            if not forward_batch.sampling_info.is_all_greedy:
+                draft_probs_list.append(
+                    self.get_draft_probs(forward_batch, logits_output.next_token_logits)
+                )
             next_token_ids = self.model_runner.sample(logits_output, forward_batch)
             topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
             topk_p = torch.ones(
@@ -320,12 +332,26 @@ class DecodeVerifyRollbackWorker:
         forward_batch.seq_lens_cpu = origin_seq_lens_cpu
         forward_batch.spec_info = origin_spec_info
 
-        return organize_draft_results(
+        parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list,
             token_list,
             parents_list,
             self.speculative_num_draft_tokens,
         )
+        draft_probs = (
+            torch.stack(draft_probs_list, dim=1) if draft_probs_list else None
+        )
+        return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def get_draft_probs(
+        self, forward_batch: ForwardBatch, logits: torch.Tensor
+    ) -> torch.Tensor:
+        sampling_info = forward_batch.sampling_info
+        probs = F.softmax(logits / sampling_info.temperatures, dim=-1)
+        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+        if sampling_info.need_top_p_sampling:
+            probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+        return probs
 
     def verify(
         self,
@@ -333,10 +359,11 @@ class DecodeVerifyRollbackWorker:
         spec_info: EagleVerifyInput,
         draft_cache_locs: torch.Tensor,
     ) -> Tuple[LogitsProcessorOutput, EagleVerifyOutput, bool]:
-        if draft_cache_locs.numel() > 0:
-            self.token_to_kv_pool_allocator.free(draft_cache_locs)
-
-        spec_info.prepare_for_verify(batch, self.page_size)
+        # DVR reuses the cache locations populated by self-decode draft. This
+        # matches the reference branch and avoids reallocating a second verify
+        # window over the same tokens.
+        if not batch.forward_mode.is_idle():
+            batch.input_ids = spec_info.draft_token
         spec_info.num_tokens_per_req = self.speculative_num_draft_tokens
         batch.return_hidden_states = False
         batch.forward_mode = (

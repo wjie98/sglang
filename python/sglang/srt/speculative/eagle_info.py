@@ -25,6 +25,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
+from sglang.srt.speculative.chain_rejection import chain_speculative_sampling
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
@@ -67,6 +68,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+    draft_probs: Optional[torch.Tensor] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1
@@ -348,9 +350,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
-            draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device=batch.device
-            )
+            draft_probs = self.draft_probs
+            if draft_probs is None:
+                draft_probs = torch.zeros(
+                    target_probs.shape, dtype=torch.float32, device=batch.device
+                )
 
             # coins for rejection sampling
             coins = torch.rand_like(
@@ -360,7 +364,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device=batch.device
             )
-            tree_speculative_sampling_target_only(
+            sampling_fn = (
+                chain_speculative_sampling
+                if self.draft_probs is not None
+                else tree_speculative_sampling_target_only
+            )
+            sampling_fn(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
