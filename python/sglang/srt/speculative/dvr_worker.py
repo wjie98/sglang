@@ -128,13 +128,22 @@ class DecodeVerifyRollbackWorker:
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, bool]:
         model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
         )
+        topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
         batch.spec_info = EagleDraftInput(
+            hidden_states=logits_output.hidden_states,
             verified_id=next_token_ids,
+            topk_p=torch.ones(
+                (next_token_ids.shape[0], self.topk),
+                dtype=torch.float32,
+                device=next_token_ids.device,
+            ),
+            topk_index=topk_index,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -416,9 +425,20 @@ class DecodeVerifyRollbackWorker:
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = verify_output.draft_input
+        if batch.spec_info.topk_p is None and batch.spec_info.verified_id.numel() > 0:
+            batch.spec_info.topk_p = torch.ones(
+                (batch.spec_info.verified_id.shape[0], self.topk),
+                dtype=torch.float32,
+                device=batch.spec_info.verified_id.device,
+            )
+            batch.spec_info.topk_index = batch.spec_info.verified_id.to(
+                torch.long
+            ).unsqueeze(-1)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
         if not batch.forward_mode.is_idle():
             accept_end = torch.cumsum(batch.spec_info.accept_length + 1, dim=0) - 1
             batch.spec_info.verified_id = batch.spec_info.verified_id[accept_end]
+            batch.spec_info.topk_p = batch.spec_info.topk_p[accept_end]
+            batch.spec_info.topk_index = batch.spec_info.topk_index[accept_end]
 
         return logits_output, verify_output, can_run_cuda_graph
