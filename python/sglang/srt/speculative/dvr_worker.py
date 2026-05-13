@@ -286,7 +286,10 @@ class DecodeVerifyRollbackWorker:
 
         origin_seq_lens = forward_batch.seq_lens.clone()
         origin_seq_lens_cpu = forward_batch.seq_lens_cpu.clone()
+        origin_seq_lens_sum = forward_batch.seq_lens_sum
         origin_spec_info = forward_batch.spec_info
+        origin_positions = forward_batch.positions
+        origin_out_cache_loc = forward_batch.out_cache_loc
         forward_batch.spec_info = None
 
         for i in range(self.speculative_num_steps + 1):
@@ -313,6 +316,7 @@ class DecodeVerifyRollbackWorker:
             forward_batch.out_cache_loc = out_cache_loc[i].contiguous()
             forward_batch.seq_lens = origin_seq_lens + i + 1
             forward_batch.seq_lens_cpu = origin_seq_lens_cpu + i + 1
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens.sum().item())
             logits_output = self.model_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"dvr draft step {i}")
 
@@ -330,7 +334,10 @@ class DecodeVerifyRollbackWorker:
 
         forward_batch.seq_lens = origin_seq_lens
         forward_batch.seq_lens_cpu = origin_seq_lens_cpu
+        forward_batch.seq_lens_sum = origin_seq_lens_sum
         forward_batch.spec_info = origin_spec_info
+        forward_batch.positions = origin_positions
+        forward_batch.out_cache_loc = origin_out_cache_loc
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list,
