@@ -345,13 +345,20 @@ class TritonAttnBackend(AttentionBackend):
                     self.token_to_kv_pool_allocator,
                 )
 
-            custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
-            )
-            mask_indptr = self.mask_indptr
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-            mask_indptr = mask_indptr[: bs + 1]
+            if forward_batch.spec_algorithm.is_decode_verify_rollback():
+                # DVR verifies a single linear self-draft chain. Use the same
+                # causal masking as ordinary extend/prefill instead of EAGLE's
+                # tree mask so target-verify attention matches full prefill.
+                custom_mask = None
+                mask_indptr = None
+            else:
+                custom_mask = spec_info.custom_mask
+                seq_mask_len = self.num_draft_tokens * (
+                    forward_batch.seq_lens + self.num_draft_tokens
+                )
+                mask_indptr = self.mask_indptr
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
             num_kv_splits = None
             attn_logits = None
