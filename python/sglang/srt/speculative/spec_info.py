@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    DECODE_VERIFY_ROLLBACK = auto()
     NONE = auto()
 
     @classmethod
@@ -45,6 +46,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_decode_verify_rollback(self) -> bool:
+        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -101,6 +105,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_decode_verify_rollback():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
+
+            return DecodeVerifyRollbackWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 

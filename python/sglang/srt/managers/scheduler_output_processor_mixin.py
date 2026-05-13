@@ -428,7 +428,12 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
+        is_regular_decode = (
+            batch.spec_algorithm.is_none()
+            or batch.spec_algorithm.is_decode_verify_rollback()
+        )
+
+        if is_regular_decode or batch.is_spec_v2:
             if batch.is_spec_v2:
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
             else:
@@ -465,7 +470,7 @@ class SchedulerOutputProcessorMixin:
                 cum_num_tokens += accept_length + 1
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        if not is_regular_decode:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -488,7 +493,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            if is_regular_decode:
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
@@ -529,9 +534,7 @@ class SchedulerOutputProcessorMixin:
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
-            if req.return_logprob and (
-                batch.spec_algorithm.is_none() or batch.is_spec_v2
-            ):
+            if req.return_logprob and (is_regular_decode or batch.is_spec_v2):
                 # Spec v1 handles logprobs inside its own worker.
                 # Normalize: non-spec has 1 token, spec v2 has multiple.
                 if batch.is_spec_v2:
@@ -571,7 +574,7 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    if batch.spec_algorithm.is_none():
+                    if is_regular_decode:
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
                     elif batch.is_spec_v2:
@@ -613,7 +616,10 @@ class SchedulerOutputProcessorMixin:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
             mamba_track_interval = get_global_server_args().mamba_track_interval
-            if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
+            if (
+                batch.spec_algorithm.is_none()
+                or batch.spec_algorithm.is_decode_verify_rollback()
+            ) and seq_len % mamba_track_interval == 0:
                 # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
                 req.mamba_next_track_idx = (
                     batch.req_to_token_pool.get_mamba_ping_pong_other_idx(

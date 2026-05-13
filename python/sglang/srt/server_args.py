@@ -3018,6 +3018,43 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK":
+            if not self.device.startswith("cuda"):
+                raise ValueError("DVR currently only supports CUDA device.")
+            if self.enable_dp_attention:
+                raise ValueError("DVR currently does not support DP attention.")
+            if self.speculative_draft_model_path is not None:
+                raise ValueError("DVR self draft does not use a draft model path.")
+            if self.page_size != 1:
+                raise ValueError("DVR currently requires --page-size 1.")
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = 16
+                logger.warning(
+                    "speculative_num_draft_tokens is set to 16 by default for DVR. "
+                    "You can override this by explicitly setting --speculative-num-draft-tokens."
+                )
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = self.speculative_num_draft_tokens - 1
+            elif self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
+                logger.warning(
+                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 for DVR chain mode."
+                )
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            elif self.speculative_eagle_topk != 1:
+                raise ValueError("DVR currently supports only chain mode with topk == 1.")
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for DVR. You can override this by explicitly setting --max-running-requests."
+                )
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            logger.warning(
+                "Overlap scheduler and mixed chunked prefill are disabled for DVR."
+            )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -4807,7 +4844,14 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=[
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+                "DECODE_VERIFY_ROLLBACK",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
