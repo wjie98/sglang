@@ -22,9 +22,15 @@ from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
+    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
+    from sglang.srt.layers.attention.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule,
+    )
+else:
+    FLA_CHUNK_SIZE = 64
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -237,6 +243,112 @@ class GDNKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
+
+    def recurrent_state_from_qkvg_beta(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        initial_state: torch.Tensor,
+        token_count: Optional[Union[int, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        if is_cpu():
+            raise NotImplementedError("DVR GDN recurrent post-verify is GPU-only.")
+
+        if token_count is None:
+            _, final_state = fused_recurrent_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return final_state.to(initial_state.dtype, copy=False)
+
+        if isinstance(token_count, int):
+            token_count = torch.full(
+                (q.shape[0],), token_count, dtype=torch.long, device=q.device
+            )
+        token_count = token_count.to(device=q.device, dtype=torch.long)
+        if torch.all(token_count == token_count[0]):
+            end = int(token_count[0].item())
+            if end == 0:
+                return initial_state
+            _, final_state = fused_recurrent_gated_delta_rule(
+                q=q[:, :end],
+                k=k[:, :end],
+                v=v[:, :end],
+                g=g[:, :end],
+                beta=beta[:, :end],
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return final_state.to(initial_state.dtype, copy=False)
+
+        states = []
+        for i, end in enumerate(token_count.tolist()):
+            if end == 0:
+                states.append(initial_state[i : i + 1])
+                continue
+            _, final_state = fused_recurrent_gated_delta_rule(
+                q=q[i : i + 1, :end],
+                k=k[i : i + 1, :end],
+                v=v[i : i + 1, :end],
+                g=g[i : i + 1, :end],
+                beta=beta[i : i + 1, :end],
+                initial_state=initial_state[i : i + 1],
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            states.append(final_state)
+        return torch.cat(states, dim=0).to(initial_state.dtype, copy=False)
+
+    def chunkwise_boundary_state_from_qkvg_beta(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        boundary_token_count: int = FLA_CHUNK_SIZE,
+    ) -> torch.Tensor:
+        if is_cpu():
+            raise NotImplementedError("DVR GDN chunkwise post-verify is GPU-only.")
+        if boundary_token_count % FLA_CHUNK_SIZE != 0:
+            raise ValueError(
+                f"boundary_token_count must align to {FLA_CHUNK_SIZE}, "
+                f"got {boundary_token_count}."
+            )
+        if boundary_token_count == 0:
+            return state_pool[state_indices]
+        if boundary_token_count > q.shape[1]:
+            raise ValueError(
+                f"boundary_token_count={boundary_token_count} exceeds saved "
+                f"qkvg beta length {q.shape[1]}."
+            )
+
+        _, _, h = chunk_gated_delta_rule(
+            q=q[:, :boundary_token_count],
+            k=k[:, :boundary_token_count],
+            v=v[:, :boundary_token_count],
+            g=g[:, :boundary_token_count],
+            beta=beta[:, :boundary_token_count],
+            initial_state=state_pool,
+            initial_state_indices=state_indices,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return h[:, -1].to(state_pool.dtype, copy=False)
 
 
 class GDNAttnBackend(MambaAttnBackendBase):

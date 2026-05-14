@@ -217,6 +217,12 @@ class MambaPool:
             )
 
     @dataclass(frozen=True, kw_only=True)
+    class StateBackup:
+        conv: List[torch.Tensor]
+        temporal: torch.Tensor
+        indices: torch.Tensor
+
+    @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
@@ -393,6 +399,27 @@ class MambaPool:
 
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
+
+    def backup_state(self, indices: torch.Tensor) -> StateBackup:
+        indices = indices.to(device=self.device, dtype=torch.long)
+        return self.StateBackup(
+            conv=[conv[:, indices].clone() for conv in self.mamba_cache.conv],
+            temporal=self.mamba_cache.temporal[:, indices].clone(),
+            indices=indices.clone(),
+        )
+
+    def restore_state(
+        self,
+        backup: StateBackup,
+        indices: Optional[torch.Tensor] = None,
+    ):
+        dst_indices = backup.indices if indices is None else indices
+        dst_indices = dst_indices.to(device=self.device, dtype=torch.long)
+        for conv, saved_conv in zip(self.mamba_cache.conv, backup.conv):
+            conv[:, dst_indices] = saved_conv.to(conv.dtype, copy=False)
+        self.mamba_cache.temporal[:, dst_indices] = backup.temporal.to(
+            self.mamba_cache.temporal.dtype, copy=False
+        )
 
     def available_size(self):
         return len(self.free_slots)
@@ -657,6 +684,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
+
+    def backup_mamba_state(self, req_indices: torch.Tensor) -> MambaPool.StateBackup:
+        return self.mamba_pool.backup_state(self.get_mamba_indices(req_indices))
+
+    def restore_mamba_state(
+        self,
+        backup: MambaPool.StateBackup,
+        req_indices: Optional[torch.Tensor] = None,
+    ):
+        mamba_indices = None if req_indices is None else self.get_mamba_indices(req_indices)
+        self.mamba_pool.restore_state(backup, mamba_indices)
 
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map

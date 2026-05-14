@@ -93,3 +93,26 @@ Status:
    run chunkwise scan for that chunk, commit boundary state, and slide the
    q/k/v/g/beta window.
 6. Add batch tests with different accepted lengths.
+
+## Phase 2: State Backup And Post-Verify Helpers
+
+Scope:
+
+- Add a small Mamba state backup/restore API for conv and temporal states. DVR
+  will use this before draft decode and target verify so live recursive decode
+  state can be rolled back to the aligned boundary state.
+- Add two GDN post-verify helper paths that consume saved q/k/v/g/beta:
+  - recurrent helper: compute the state at an accepted tail token, including
+    per-request accepted lengths;
+  - chunkwise helper: run the prefill-like chunkwise path and return the state
+    at the last `FLA_CHUNK_SIZE` boundary.
+
+Status:
+
+- Implemented backup/restore on `MambaPool` plus request-index wrappers on
+  `HybridReqToTokenPool`.
+- Implemented GDN helper methods in `GDNKernelDispatcher`. They are not yet
+  wired into DVR scheduling/state commit, so current generation behavior is
+  unchanged.
+- Static checks passed, and a direct CUDA tensor smoke test verified both helper
+  output shapes and chunkwise state-pool update semantics.
