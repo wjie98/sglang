@@ -429,6 +429,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None:
+                dvr_indices = intermediate_state_indices[:batch_size].to(torch.long)
+                mamba_cache_params.dvr_q_state_cache[dvr_indices] = query.reshape(
+                    batch_size, draft_token_num, layer.num_q_heads, layer.head_q_dim
+                )
+                mamba_cache_params.dvr_k_state_cache[dvr_indices] = key.reshape(
+                    batch_size, draft_token_num, layer.num_k_heads, layer.head_k_dim
+                )
+                mamba_cache_params.dvr_v_state_cache[dvr_indices] = value.reshape(
+                    batch_size, draft_token_num, layer.num_v_heads, layer.head_v_dim
+                )
+                mamba_cache_params.dvr_g_state_cache[dvr_indices] = g.reshape(
+                    batch_size, draft_token_num, layer.num_v_heads
+                )
+                mamba_cache_params.dvr_beta_state_cache[dvr_indices] = beta.reshape(
+                    batch_size, draft_token_num, layer.num_v_heads
+                )
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,

@@ -199,6 +199,9 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
+                if v is None:
+                    kwargs[name] = None
+                    continue
                 if name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
                 else:
@@ -210,12 +213,18 @@ class MambaPool:
             return sum(
                 get_tensor_size_bytes(getattr(self, f.name))
                 for f in dataclasses.fields(self)
+                if getattr(self, f.name) is not None
             )
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
+        dvr_q_state_cache: Optional[torch.Tensor] = None
+        dvr_k_state_cache: Optional[torch.Tensor] = None
+        dvr_v_state_cache: Optional[torch.Tensor] = None
+        dvr_g_state_cache: Optional[torch.Tensor] = None
+        dvr_beta_state_cache: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -227,6 +236,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        enable_dvr_qkvg_beta_cache: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -301,11 +311,57 @@ class MambaPool:
                     )
                     for conv_shape in conv_state_shape
                 ]
+                if enable_dvr_qkvg_beta_cache:
+                    dvr_q_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                        ),
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    dvr_k_state_cache = torch.zeros_like(dvr_q_state_cache)
+                    dvr_v_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    dvr_g_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    dvr_beta_state_cache = torch.zeros_like(dvr_g_state_cache)
+                else:
+                    dvr_q_state_cache = None
+                    dvr_k_state_cache = None
+                    dvr_v_state_cache = None
+                    dvr_g_state_cache = None
+                    dvr_beta_state_cache = None
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
+                    dvr_q_state_cache=dvr_q_state_cache,
+                    dvr_k_state_cache=dvr_k_state_cache,
+                    dvr_v_state_cache=dvr_v_state_cache,
+                    dvr_g_state_cache=dvr_g_state_cache,
+                    dvr_beta_state_cache=dvr_beta_state_cache,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -314,6 +370,7 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    f"dvr_qkvg_beta_cache size: {sum(get_tensor_size_bytes(t) for t in (dvr_q_state_cache, dvr_k_state_cache, dvr_v_state_cache, dvr_g_state_cache, dvr_beta_state_cache) if t is not None) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -398,9 +455,19 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             # Skip intermediate buffers used only for speculative decoding
             # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "dvr_q_state_cache",
+                "dvr_k_state_cache",
+                "dvr_v_state_cache",
+                "dvr_g_state_cache",
+                "dvr_beta_state_cache",
+            ):
                 continue
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -429,7 +496,17 @@ class MambaPool:
         """
         state_tensors = []
         for field in vars(self.mamba_cache):
+            if field in (
+                "dvr_q_state_cache",
+                "dvr_k_state_cache",
+                "dvr_v_state_cache",
+                "dvr_g_state_cache",
+                "dvr_beta_state_cache",
+            ):
+                continue
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -463,6 +540,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
+        enable_dvr_qkvg_beta_cache: bool = False,
     ):
         super().__init__(
             size=size,
@@ -484,6 +562,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            enable_dvr_qkvg_beta_cache=enable_dvr_qkvg_beta_cache,
         )
 
     def _init_mamba_pool(
@@ -495,6 +574,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        enable_dvr_qkvg_beta_cache: bool = False,
     ):
         self.mamba_pool = MambaPool(
             size=size,
@@ -504,6 +584,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            enable_dvr_qkvg_beta_cache=enable_dvr_qkvg_beta_cache,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 

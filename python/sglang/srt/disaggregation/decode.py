@@ -184,6 +184,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         enable_overlap_schedule: bool,
         mamba_size: int = None,
         start_layer: int = None,
+        enable_dvr_qkvg_beta_cache: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -219,6 +220,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            enable_dvr_qkvg_beta_cache=enable_dvr_qkvg_beta_cache,
         )
 
     def clear(self):
