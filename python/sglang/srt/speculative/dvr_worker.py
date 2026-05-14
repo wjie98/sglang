@@ -136,6 +136,7 @@ class DecodeVerifyRollbackWorker:
         self._gdn_boundary_seqlen = {}
         self._gdn_boundary_track_idx = {}
         self._gdn_boundary_backup = None
+        self._gdn_live_backup = None
 
         logger.info(
             "Initialized DVR self-decode worker: num_steps=%s, num_draft_tokens=%s",
@@ -516,14 +517,26 @@ class DecodeVerifyRollbackWorker:
             batch.req_to_token_pool.mamba_pool.restore_state(
                 self._gdn_boundary_backup, live_indices
             )
+            if self._gdn_live_backup is not None:
+                mamba_cache = (
+                    batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+                )
+                for conv, saved_conv in zip(
+                    mamba_cache.conv, self._gdn_live_backup.conv
+                ):
+                    conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)
         else:
             batch.req_to_token_pool.mamba_pool.copy_from(boundary_indices, live_indices)
 
     def _backup_gdn_boundary_state(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
             self._gdn_boundary_backup = None
+            self._gdn_live_backup = None
             return
-        _, boundary_indices = self._mamba_indices_for_batch(batch)
+        live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
+        self._gdn_live_backup = batch.req_to_token_pool.mamba_pool.backup_state(
+            live_indices
+        )
         self._gdn_boundary_backup = batch.req_to_token_pool.mamba_pool.backup_state(
             boundary_indices
         )
@@ -535,10 +548,8 @@ class DecodeVerifyRollbackWorker:
             return
 
         live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
-        accepted_tokens = torch.tensor(
-            [x + 1 for x in verify_output.accept_length_per_req_cpu],
-            dtype=torch.long,
-            device=live_indices.device,
+        accepted_tokens, _, accepted_steps = self._accepted_token_metadata(
+            batch, verify_output, live_indices.device
         )
         if accepted_tokens.numel() == 0:
             return
@@ -570,12 +581,11 @@ class DecodeVerifyRollbackWorker:
             )
             mamba_cache.temporal[layer_idx, live_indices] = tail_state
 
-        step_live = accepted_tokens - 1
         fused_mamba_state_scatter_with_mask(
             mamba_cache.conv[0],
             mamba_cache.intermediate_conv_window[0],
             live_indices,
-            step_live,
+            accepted_steps,
         )
 
         if crossing.any():
@@ -627,6 +637,84 @@ class DecodeVerifyRollbackWorker:
 
         mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = pos_after.to(torch.int32)
 
+    def _accepted_token_metadata(
+        self,
+        batch: ScheduleBatch,
+        verify_output: EagleVerifyOutput,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        accepted_tokens = torch.tensor(
+            [x + 1 for x in verify_output.accept_length_per_req_cpu],
+            dtype=torch.long,
+            device=device,
+        )
+        if accepted_tokens.numel() == 0:
+            return accepted_tokens, accepted_tokens, accepted_tokens
+
+        accepted_starts = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=device),
+                torch.cumsum(accepted_tokens, dim=0)[:-1],
+            ]
+        )
+        accepted_indices_offset = torch.arange(
+            0,
+            len(batch.seq_lens) * batch.spec_info.draft_token_num,
+            step=batch.spec_info.draft_token_num,
+            dtype=torch.long,
+            device=device,
+        )
+
+        if (
+            batch.spec_info.topk > 1
+            and verify_output.accepted_indices.shape[0] > 0
+        ):
+            accepted_steps = (
+                verify_output.accepted_indices[
+                    accepted_starts + accepted_tokens - 1
+                ].to(device=device, dtype=torch.long)
+                - accepted_indices_offset
+            )
+        else:
+            accepted_steps = accepted_tokens - 1
+        return accepted_tokens, accepted_starts, accepted_steps
+
+    def _select_accepted_verify_outputs(
+        self,
+        logits_output: LogitsProcessorOutput,
+        verify_output: EagleVerifyOutput,
+    ):
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            verify_output.accepted_indices
+        ]
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states[
+                verify_output.accepted_indices
+            ]
+
+    def _prepare_next_draft_after_verify(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ):
+        batch.forward_mode = (
+            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        )
+        batch.spec_info = verify_output.draft_input
+        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+        if batch.forward_mode.is_idle():
+            return
+
+        accept_end = torch.cumsum(batch.spec_info.accept_length + 1, dim=0) - 1
+        batch.spec_info.verified_id = batch.spec_info.verified_id[accept_end]
+        # Keep the next-draft inputs in the same compatibility shape as EAGLE.
+        batch.spec_info.topk_index = batch.spec_info.verified_id.to(torch.long).unsqueeze(
+            -1
+        )
+        batch.spec_info.topk_p = torch.zeros(
+            (batch.spec_info.verified_id.shape[0], self.topk),
+            dtype=torch.float32,
+            device=batch.spec_info.verified_id.device,
+        )
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -668,40 +756,14 @@ class DecodeVerifyRollbackWorker:
             vocab_mask=None,
         )
 
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            verify_output.accepted_indices
-        ]
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[
-                verify_output.accepted_indices
-            ]
-
+        self._select_accepted_verify_outputs(logits_output, verify_output)
+        self._commit_gdn_state_after_verify(batch, verify_output)
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
-
-        self._commit_gdn_state_after_verify(batch, verify_output)
         self.postprocess_for_verify(batch, verify_output)
         return logits_output, verify_output, can_run_cuda_graph
 
     def postprocess_for_verify(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        batch.forward_mode = (
-            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
-        )
-        batch.spec_info = verify_output.draft_input
-        if batch.spec_info.topk_p is None and batch.spec_info.verified_id.numel() > 0:
-            batch.spec_info.topk_p = torch.ones(
-                (batch.spec_info.verified_id.shape[0], self.topk),
-                dtype=torch.float32,
-                device=batch.spec_info.verified_id.device,
-            )
-            batch.spec_info.topk_index = batch.spec_info.verified_id.to(
-                torch.long
-            ).unsqueeze(-1)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-        if not batch.forward_mode.is_idle():
-            accept_end = torch.cumsum(batch.spec_info.accept_length + 1, dim=0) - 1
-            batch.spec_info.verified_id = batch.spec_info.verified_id[accept_end]
-            batch.spec_info.topk_p = batch.spec_info.topk_p[accept_end]
-            batch.spec_info.topk_index = batch.spec_info.topk_index[accept_end]
+        self._prepare_next_draft_after_verify(batch, verify_output)
