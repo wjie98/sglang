@@ -782,17 +782,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mamba_cache_params.dvr_beta_state_cache[rows, cols] = beta.reshape(
                     batch_size, draft_token_num, layer.num_v_heads
                 )
+                real_token_lens = getattr(
+                    forward_batch.spec_info, "dvr_real_token_lens", None
+                )
+                scan_len = (
+                    int(real_token_lens.max().item())
+                    if real_token_lens is not None
+                    else draft_token_num
+                )
                 out, _, _ = chunk_gated_delta_rule(
-                    q=mamba_cache_params.dvr_q_state_cache[dvr_indices],
-                    k=mamba_cache_params.dvr_k_state_cache[dvr_indices],
-                    v=mamba_cache_params.dvr_v_state_cache[dvr_indices],
-                    g=mamba_cache_params.dvr_g_state_cache[dvr_indices],
-                    beta=mamba_cache_params.dvr_beta_state_cache[dvr_indices],
+                    q=mamba_cache_params.dvr_q_state_cache[dvr_indices, :scan_len],
+                    k=mamba_cache_params.dvr_k_state_cache[dvr_indices, :scan_len],
+                    v=mamba_cache_params.dvr_v_state_cache[dvr_indices, :scan_len],
+                    g=mamba_cache_params.dvr_g_state_cache[dvr_indices, :scan_len],
+                    beta=mamba_cache_params.dvr_beta_state_cache[
+                        dvr_indices, :scan_len
+                    ],
                     initial_state=ssm_states,
                     initial_state_indices=dvr_indices,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                 )
+                if scan_len < draft_token_num:
+                    fixed_out = torch.zeros(
+                        (
+                            batch_size,
+                            draft_token_num,
+                            layer.num_v_heads,
+                            layer.head_v_dim,
+                        ),
+                        dtype=out.dtype,
+                        device=out.device,
+                    )
+                    fixed_out[:, :scan_len] = out
+                    out = fixed_out
                 gather_index = cols[:, :, None, None].expand(
                     batch_size, draft_token_num, layer.num_v_heads, layer.head_v_dim
                 )

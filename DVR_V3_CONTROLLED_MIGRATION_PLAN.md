@@ -369,3 +369,30 @@ Interpretation:
   checkpoint. The next debugging target should be the fixed-window GDN forward
   itself: q/k/v/g/beta rows, output gather rows, and whether the 80-row chunkwise
   computation is bitwise identical to ordinary prefill for the same real prefix.
+
+## 2026-05-14 Real-Length GDN Scan With Fixed Output Shape
+
+Adjusted the DVR GDN chunkwise verify path:
+
+- The input/output contract remains fixed-window shaped for the model stack and
+  graph capture: `CHUNK_SIZE + num_draft_tokens`.
+- The GDN chunkwise scan itself now runs only through the real
+  `verified_tail + draft_token` rows, then pads the GDN output back to the fixed
+  window length before later layers consume it.
+- This avoids computing GDN state over synthetic padding rows while preserving
+  fixed output shape and the existing gather path.
+
+Tests:
+
+- Static: `python3 -m py_compile gdn_backend.py`.
+- Qwen3.5-0.8B GDN smoke, cuda graph disabled:
+  - `max_new_tokens=8`: unchanged first mismatch token 5, maxdiff
+    `0.0032685399055480957`, `spec_accept_length=8.0`
+  - `max_new_tokens=16`: improved second-round behavior, first mismatch token 8,
+    maxdiff `5.557438254356384`, `spec_accept_length=5.333333333333333`
+
+Interpretation:
+
+- Padding rows were not the source of the first-round small mismatch.
+- Padding rows did worsen later rounds, so the real-length scan should be kept
+  while debugging the remaining first-round q/k/v/g/beta or output parity issue.
