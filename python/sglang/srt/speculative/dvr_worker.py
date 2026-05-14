@@ -134,6 +134,8 @@ class DecodeVerifyRollbackWorker:
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
         self._gdn_boundary_seqlen = {}
+        self._gdn_boundary_track_idx = {}
+        self._gdn_boundary_backup = None
 
         logger.info(
             "Initialized DVR self-decode worker: num_steps=%s, num_draft_tokens=%s",
@@ -261,6 +263,7 @@ class DecodeVerifyRollbackWorker:
             )
 
         self._ensure_gdn_boundary_state(batch)
+        self._backup_gdn_boundary_state(batch)
         self._draft_preprocess_decode(batch)
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -431,37 +434,99 @@ class DecodeVerifyRollbackWorker:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
         boundary_indices = torch.stack(
-            [req.mamba_ping_pong_track_buffer[0] for req in batch.reqs]
+            [
+                req.mamba_ping_pong_track_buffer[
+                    self._gdn_boundary_track_idx[req.rid]
+                ]
+                for req in batch.reqs
+            ]
         ).to(device=live_indices.device, dtype=torch.long)
         return live_indices.to(torch.long), boundary_indices
+
+    def _mamba_other_track_idx(self, batch: ScheduleBatch, track_idx: int) -> int:
+        return batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
+
+    def _current_prefill_checkpoint_track_idx(
+        self, batch: ScheduleBatch, req
+    ) -> Optional[int]:
+        boundary_seqlen = req.seqlen - 1
+        if req.mamba_last_track_seqlen != boundary_seqlen and (
+            boundary_seqlen <= 0 or boundary_seqlen % FLA_CHUNK_SIZE != 0
+        ):
+            return None
+        return self._mamba_other_track_idx(batch, req.mamba_next_track_idx)
 
     def _ensure_gdn_boundary_state(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
             return
-        live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
+        live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
         init_src = []
         init_dst = []
+        reset_pos_indices = []
         for i, req in enumerate(batch.reqs):
             if req.rid not in self._gdn_boundary_seqlen:
-                self._gdn_boundary_seqlen[req.rid] = req.seqlen
-                init_src.append(live_indices[i])
-                init_dst.append(boundary_indices[i])
+                reset_pos_indices.append(live_indices[i])
+                checkpoint_track_idx = self._current_prefill_checkpoint_track_idx(
+                    batch, req
+                )
+                if checkpoint_track_idx is not None:
+                    # Normal prefill already wrote the chunk-aligned state into
+                    # the ping-pong checkpoint buffer. Reuse that slot instead of
+                    # copying from the live decode slot, which may no longer hold
+                    # the deterministic prefill checkpoint.
+                    self._gdn_boundary_track_idx[req.rid] = checkpoint_track_idx
+                    self._gdn_boundary_seqlen[req.rid] = req.seqlen - 1
+                    req.mamba_last_track_seqlen = req.seqlen - 1
+                    req.mamba_next_track_idx = self._mamba_other_track_idx(
+                        batch, checkpoint_track_idx
+                    )
+                else:
+                    boundary_track_idx = req.mamba_next_track_idx
+                    self._gdn_boundary_track_idx[req.rid] = boundary_track_idx
+                    self._gdn_boundary_seqlen[req.rid] = req.seqlen - 1
+                    req.mamba_last_track_seqlen = req.seqlen - 1
+                    req.mamba_next_track_idx = self._mamba_other_track_idx(
+                        batch, boundary_track_idx
+                    )
+                    init_src.append(live_indices[i])
+                    init_dst.append(req.mamba_ping_pong_track_buffer[boundary_track_idx])
         if init_src:
             src = torch.stack(init_src)
             dst = torch.stack(init_dst)
             batch.req_to_token_pool.mamba_pool.copy_from(src, dst)
+        if reset_pos_indices:
             mamba_cache = (
                 batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
             )
             if getattr(mamba_cache, "dvr_qkvg_beta_pos", None) is not None:
-                mamba_cache.dvr_qkvg_beta_pos[:, src] = 0
+                mamba_cache.dvr_qkvg_beta_pos[:, torch.stack(reset_pos_indices)] = 0
 
     def _restore_gdn_boundary_state_for_verify(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
             return
         self._ensure_gdn_boundary_state(batch)
         live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
-        batch.req_to_token_pool.mamba_pool.copy_from(boundary_indices, live_indices)
+        if self._gdn_boundary_backup is not None:
+            # Draft decode must not affect the verify starting state. Keep an
+            # explicit snapshot because the shared extra-buffer slot can be
+            # touched by generic Mamba tracking/cache code while draft runs.
+            batch.req_to_token_pool.mamba_pool.restore_state(
+                self._gdn_boundary_backup, boundary_indices
+            )
+            batch.req_to_token_pool.mamba_pool.restore_state(
+                self._gdn_boundary_backup, live_indices
+            )
+        else:
+            batch.req_to_token_pool.mamba_pool.copy_from(boundary_indices, live_indices)
+
+    def _backup_gdn_boundary_state(self, batch: ScheduleBatch):
+        if not self._has_gdn_dvr_state(batch):
+            self._gdn_boundary_backup = None
+            return
+        _, boundary_indices = self._mamba_indices_for_batch(batch)
+        self._gdn_boundary_backup = batch.req_to_token_pool.mamba_pool.backup_state(
+            boundary_indices
+        )
 
     def _commit_gdn_state_after_verify(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
@@ -555,7 +620,9 @@ class DecodeVerifyRollbackWorker:
                         ].clone()
                 self._gdn_boundary_seqlen[req.rid] += FLA_CHUNK_SIZE
                 req.mamba_last_track_seqlen = self._gdn_boundary_seqlen[req.rid]
-                req.mamba_next_track_idx = 0
+                req.mamba_next_track_idx = self._mamba_other_track_idx(
+                    batch, self._gdn_boundary_track_idx[req.rid]
+                )
             pos_after = torch.where(crossing, new_pos, pos_after)
 
         mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = pos_after.to(torch.int32)
