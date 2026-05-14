@@ -14,6 +14,9 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -470,6 +473,99 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mamba_cache_params.dvr_v_state_cache[dst, cols] = value[src_start:src_end]
             mamba_cache_params.dvr_g_state_cache[dst, cols] = g[src_start:src_end]
             mamba_cache_params.dvr_beta_state_cache[dst, cols] = beta[src_start:src_end]
+
+    def update_dvr_state_after_verify(
+        self,
+        *,
+        live_indices: torch.Tensor,
+        boundary_indices: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+        accepted_steps: torch.Tensor,
+    ) -> torch.Tensor:
+        """Commit DVR GDN state after target verify.
+
+        The worker owns request-level bookkeeping, but the tensor lifecycle is
+        GDN-specific: q/k/v/g/beta windows, live temporal state, chunk-boundary
+        state, and conv windows must move together.
+        """
+
+        mamba_cache = self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        pos_before = mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(torch.long)
+        pos_after = pos_before + accepted_tokens
+        crossing = pos_after >= FLA_CHUNK_SIZE
+
+        # Rebuild live tail state from the deterministic chunk-boundary state
+        # plus the saved q/k/v/g/beta window. This repairs the state dirtied by
+        # draft/verify and lets the next self-decode continue from the last
+        # accepted token.
+        for layer_idx in range(mamba_cache.temporal.shape[0]):
+            tail_state = self.kernel_dispatcher.chunkwise_state_from_qkvg_beta(
+                mamba_cache.dvr_q_state_cache[layer_idx, live_indices],
+                mamba_cache.dvr_k_state_cache[layer_idx, live_indices],
+                mamba_cache.dvr_v_state_cache[layer_idx, live_indices],
+                mamba_cache.dvr_g_state_cache[layer_idx, live_indices],
+                mamba_cache.dvr_beta_state_cache[layer_idx, live_indices],
+                state_pool=mamba_cache.temporal[layer_idx],
+                state_indices=boundary_indices,
+                token_count=pos_after,
+            )
+            mamba_cache.temporal[layer_idx, live_indices] = tail_state
+
+        fused_mamba_state_scatter_with_mask(
+            mamba_cache.conv[0],
+            mamba_cache.intermediate_conv_window[0],
+            live_indices,
+            pos_before + accepted_steps,
+        )
+
+        if crossing.any():
+            commit_step = torch.where(
+                crossing,
+                FLA_CHUNK_SIZE - pos_before - 1,
+                torch.full_like(pos_before, -1),
+            )
+            for layer_idx in range(mamba_cache.temporal.shape[0]):
+                boundary_state = (
+                    self.kernel_dispatcher.chunkwise_boundary_state_from_qkvg_beta(
+                        mamba_cache.dvr_q_state_cache[layer_idx, live_indices],
+                        mamba_cache.dvr_k_state_cache[layer_idx, live_indices],
+                        mamba_cache.dvr_v_state_cache[layer_idx, live_indices],
+                        mamba_cache.dvr_g_state_cache[layer_idx, live_indices],
+                        mamba_cache.dvr_beta_state_cache[layer_idx, live_indices],
+                        state_pool=mamba_cache.temporal[layer_idx],
+                        state_indices=boundary_indices,
+                        boundary_token_count=FLA_CHUNK_SIZE,
+                    )
+                )
+                mamba_cache.temporal[layer_idx, boundary_indices] = boundary_state
+
+            fused_mamba_state_scatter_with_mask(
+                mamba_cache.conv[0],
+                mamba_cache.intermediate_conv_window[0],
+                boundary_indices,
+                commit_step,
+            )
+
+            new_pos = pos_after - FLA_CHUNK_SIZE
+            for req_i, slot in enumerate(live_indices.tolist()):
+                if not bool(crossing[req_i].item()):
+                    continue
+                remain = int(new_pos[req_i].item())
+                if remain > 0:
+                    for cache in (
+                        mamba_cache.dvr_q_state_cache,
+                        mamba_cache.dvr_k_state_cache,
+                        mamba_cache.dvr_v_state_cache,
+                        mamba_cache.dvr_g_state_cache,
+                        mamba_cache.dvr_beta_state_cache,
+                    ):
+                        cache[:, slot, :remain] = cache[
+                            :, slot, FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + remain
+                        ].clone()
+            pos_after = torch.where(crossing, new_pos, pos_after)
+
+        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = pos_after.to(torch.int32)
+        return crossing
 
     def forward_decode(
         self,

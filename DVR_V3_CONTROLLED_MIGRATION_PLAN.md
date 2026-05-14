@@ -252,3 +252,41 @@ Each commit message should include:
 - Why it differs from normal EAGLE.
 - Which tests were run.
 - Known limitations.
+
+## 2026-05-14 Backend State Commit Migration
+
+Migrated the GDN DVR post-verify tensor update out of
+`speculative/dvr_worker.py` and into `linear/gdn_backend.py` as
+`update_dvr_state_after_verify`.
+
+Reasoning:
+
+- The worker should keep EAGLE-like request/token acceptance bookkeeping.
+- GDN-specific tensor ownership belongs in the backend: q/k/v/g/beta rolling
+  windows, live temporal state, chunk-boundary temporal state, and conv window
+  commits have to be updated together.
+- This keeps the v3 branch closer to the reference branch shape, where Mamba/GDN
+  post-verify processing is owned by the attention backend, while preserving the
+  DVR fixed `CHUNK_SIZE + num_draft_tokens` verify window.
+
+Tests:
+
+- Static: `python3 -m py_compile` on `dvr_worker.py` and `gdn_backend.py`.
+- Qwen3-0.6B attention-only, cuda graph disabled, strict full-prefill oracle:
+  - `max_new_tokens=8`: maxdiff 0
+  - `max_new_tokens=31`: maxdiff 0
+  - `max_new_tokens=80`: maxdiff 0
+  - `max_new_tokens=128`: maxdiff 0
+- Qwen3.5-0.8B GDN smoke, cuda graph disabled:
+  - `max_new_tokens=8`: first mismatch token 5, maxdiff
+    `0.0032685399055480957`, `spec_accept_length=8.0`
+  - `max_new_tokens=16`: first mismatch token 8, maxdiff
+    `11.175168991088867`, `spec_accept_length=2.2857142857142856`
+
+Known limitation:
+
+- This commit is structural only. The remaining GDN correctness bug is still the
+  second-round state/conv handoff after the first accepted window. The next
+  useful fix should compare the backend helper against reference
+  `update_mamba_state_after_mtp_verify`, especially the conv scatter offset,
+  boundary-state update point, and qkvg_beta rolling-window slide.
