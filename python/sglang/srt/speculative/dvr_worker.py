@@ -549,6 +549,12 @@ class DecodeVerifyRollbackWorker:
                 self._gdn_boundary_backup, live_indices
             )
             if use_live_conv and self._gdn_live_backup is not None:
+                # DVR GDN has split state ownership. The SSM/temporal state
+                # used by chunkwise scan is restored from the deterministic
+                # chunk boundary, while this optional path restores conv from
+                # the live pre-draft tail for flows that verify only the new
+                # suffix. The fixed-window path keeps conv at the boundary and
+                # replays verified_token + draft_token before commit.
                 mamba_cache = (
                     batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
                 )

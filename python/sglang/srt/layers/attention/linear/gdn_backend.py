@@ -689,21 +689,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             if getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None:
-                # DVR verifies a fixed linear window
-                # (verified_token + draft_token + padding_token), so use the
-                # same causal conv path as ordinary extend instead of the tree
-                # update helper used by generic EAGLE target verify.
+                # DVR verifies a fixed linear chain
+                # (verified_token + draft_token + padding_token). Keep the
+                # ordinary extend conv kernel for logits, and save the
+                # per-token conv windows explicitly so accepted-state commit can
+                # follow the same scatter model as EAGLE.
+                mixed_qkv_linear = mixed_qkv
+                mixed_qkv_reshaped = mixed_qkv_linear.view(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+                dvr_conv_indices = cache_indices[:batch_size].to(torch.long)
+                initial_conv_windows = conv_states[dvr_conv_indices].clone()
                 mixed_qkv = causal_conv1d_fn(
-                    mixed_qkv.transpose(0, 1),
+                    mixed_qkv_linear.transpose(0, 1),
                     layer.conv_weights,
                     layer.bias,
                     activation=layer.activation,
                     conv_states=conv_states,
                     has_initial_state=has_initial_states,
-                    cache_indices=cache_indices[:batch_size],
+                    cache_indices=dvr_conv_indices,
                     query_start_loc=query_start_loc,
                     seq_lens_cpu=[draft_token_num] * batch_size,
                 ).transpose(0, 1)[:seq_len]
+                conv_source = torch.cat(
+                    [initial_conv_windows, mixed_qkv_reshaped], dim=2
+                )
+                state_len = initial_conv_windows.shape[-1]
+                conv_windows = torch.stack(
+                    [
+                        conv_source[:, :, step + 1 : step + 1 + state_len]
+                        for step in range(draft_token_num)
+                    ],
+                    dim=1,
+                )
+                intermediate_conv_window_cache[
+                    intermediate_state_indices[:batch_size].to(torch.long)
+                ] = conv_windows
             else:
                 mixed_qkv_reshaped = mixed_qkv.view(
                     batch_size, draft_token_num, -1
