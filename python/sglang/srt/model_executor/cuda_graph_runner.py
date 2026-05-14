@@ -982,7 +982,11 @@ class CudaGraphRunner:
         )
 
         with dvr_causal_verify_cuda_graph_metadata(
-            self.model_runner, attn_backend, forward_batch.forward_mode
+            self.model_runner,
+            attn_backend,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+            self.buffers.custom_mask,
         ):
             attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -1130,7 +1134,11 @@ class CudaGraphRunner:
         )
 
         with dvr_causal_verify_cuda_graph_metadata(
-            self.model_runner, attn_backend, self.capture_forward_mode
+            self.model_runner,
+            attn_backend,
+            self.capture_forward_mode,
+            forward_batch.spec_info,
+            buffers.custom_mask,
         ):
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,

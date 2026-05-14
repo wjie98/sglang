@@ -42,27 +42,44 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def dvr_causal_verify_cuda_graph_metadata(model_runner, attn_backend, forward_mode):
-    """Use ordinary causal attention for DVR target-verify cuda graphs.
+def dvr_causal_verify_cuda_graph_metadata(
+    model_runner, attn_backend, forward_mode, spec_info, fallback_custom_mask=None
+):
+    """Keep DVR cuda graph verify on causal attention without backend edits.
 
-    The EAGLE verify metadata contains a custom tree mask. In DVR chain mode the
-    logical mask is causal, but keeping it as a custom mask can still select a
-    different backend path from ordinary extend/prefill and breaks strict
-    logprob equality. The cuda graph runner owns capture/replay timing, so it
-    enters this DVR-owned context immediately around metadata initialization.
+    Some attention backends still read `spec_info.custom_mask.shape` while
+    building cuda-graph metadata. For DVR topk=1 the real mask is causal, so
+    temporarily provide the graph buffer only to satisfy metadata shape code,
+    then clear the captured metadata before graph capture/replay uses it.
     """
 
-    yield
-    if (
+    old_custom_mask = getattr(spec_info, "custom_mask", None)
+    should_clear = (
         model_runner.spec_algorithm.is_decode_verify_rollback()
         and forward_mode.is_target_verify()
-    ):
-        metadata = getattr(attn_backend, "forward_metadata", None)
-        if metadata is not None:
-            if hasattr(metadata, "custom_mask"):
-                metadata.custom_mask = None
-            if hasattr(metadata, "mask_indptr"):
-                metadata.mask_indptr = None
+        and spec_info is not None
+    )
+    if should_clear and old_custom_mask is None and fallback_custom_mask is not None:
+        # DVR target verify is a topk=1 chain, so the real attention mask is
+        # causal and `custom_mask` should stay None. Some cuda-graph metadata
+        # builders still read `spec_info.custom_mask.shape` before producing
+        # their metadata, so provide the fixed graph buffer only for that shape
+        # bookkeeping. The metadata is cleared below before graph capture/replay.
+        spec_info.custom_mask = fallback_custom_mask
+    try:
+        yield
+    finally:
+        if should_clear:
+            spec_info.custom_mask = old_custom_mask
+            metadata = getattr(attn_backend, "forward_metadata", None)
+            if metadata is not None:
+                # Restore DVR's causal semantics after metadata construction:
+                # do not let the temporary tree-mask buffer select a custom-mask
+                # attention path in the captured graph or replay metadata.
+                if hasattr(metadata, "custom_mask"):
+                    metadata.custom_mask = None
+                if hasattr(metadata, "mask_indptr"):
+                    metadata.mask_indptr = None
 
 
 class DecodeVerifyRollbackWorker:
@@ -189,6 +206,9 @@ class DecodeVerifyRollbackWorker:
                 spec_info.verified_id.to(torch.int64)
             )
 
+        # Self-draft decodes directly into the slots that target verify will
+        # read. Do not allocate a second verify window, or KV ownership and
+        # radix-cache rollback stop matching the normal speculative layout.
         out_cache_loc = alloc_token_slots(
             batch.tree_cache,
             num_seqs * self.speculative_num_draft_tokens * self.topk,
@@ -272,7 +292,11 @@ class DecodeVerifyRollbackWorker:
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
-            custom_mask=tree_mask,
+            # DVR uses topk=1 chain verify. The tree builder is still reused
+            # for token order/retrieve metadata, but attention itself should
+            # stay on the ordinary causal path instead of a backend-specific
+            # custom tree-mask path.
+            custom_mask=None,
             positions=positions,
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,
@@ -317,6 +341,9 @@ class DecodeVerifyRollbackWorker:
         origin_out_cache_loc = forward_batch.out_cache_loc
         forward_batch.spec_info = None
 
+        # Run the target model as its own draft model. The loop mutates
+        # ForwardBatch fields to look like one-token decode steps, so every
+        # scheduler-owned field is restored before target verify starts.
         for i in range(self.speculative_num_steps + 1):
             if i == 0:
                 input_ids = topk_index.flatten()
