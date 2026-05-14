@@ -123,6 +123,25 @@ Expected result:
 - Qwen3.5 can run target verify and save qkvg_beta without crashes in cuda graph
   and non-cuda graph modes.
 
+Current inspection:
+
+- Do not wholesale-port the dirty exp branch GDN diff.
+- Keep the useful idea from exp: DVR GDN verify needs a fixed logical window and
+  split state semantics.
+- Do not migrate exp debug prints.
+- Do not migrate padding-zeroing as a correctness fix; it did not remove the
+  observed GDN drift in previous experiments.
+- Avoid changing `cuda_graph_runner.py` first. Prefer making `EagleVerifyInput`
+  and the DVR worker carry enough metadata for GDN while keeping shared graph
+  code close to upstream.
+- The next minimal code boundary should be:
+  - add DVR-local fixed-window metadata only where needed;
+  - keep attention-only path unchanged;
+  - make GDN qkvg_beta capture explicitly understand
+    `verified_token + draft_token + padding_token`;
+  - make conv state restoration semantics explicit before touching state commit
+    kernels.
+
 ## Phase 4: Conv State Lifecycle
 
 Tasks:
