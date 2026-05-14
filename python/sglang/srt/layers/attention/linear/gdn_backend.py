@@ -686,23 +686,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            if getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None:
+                # DVR verifies a fixed linear window
+                # (verified_token + draft_token + padding_token), so use the
+                # same causal conv path as ordinary extend instead of the tree
+                # update helper used by generic EAGLE target verify.
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv.transpose(0, 1),
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states,
+                    cache_indices=cache_indices[:batch_size],
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=[draft_token_num] * batch_size,
+                ).transpose(0, 1)[:seq_len]
+            else:
+                mixed_qkv_reshaped = mixed_qkv.view(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+                mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (

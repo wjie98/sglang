@@ -290,3 +290,39 @@ Known limitation:
   useful fix should compare the backend helper against reference
   `update_mamba_state_after_mtp_verify`, especially the conv scatter offset,
   boundary-state update point, and qkvg_beta rolling-window slide.
+
+## 2026-05-14 DVR GDN Conv Verify Experiment
+
+Changed only the DVR GDN target-verify conv path:
+
+- Generic EAGLE target verify still uses `causal_conv1d_update`.
+- DVR fixed-window verify now uses ordinary `causal_conv1d_fn`, because the DVR
+  input is a linear `verified_token + draft_token + padding_token` window rather
+  than a tree.
+
+Rejected experiments:
+
+- Zeroing q/k/v/g/beta rows after `dvr_real_token_lens` did not improve the
+  first-round mismatch and worsened second-round behavior.
+- Rebuilding the live temporal state with recurrent qkvg_beta replay worsened
+  second-round behavior in the current fixed-window implementation, so the live
+  state remains chunkwise-rebuilt for now.
+
+Tests:
+
+- Static: `python3 -m py_compile gdn_backend.py`.
+- Qwen3.5-0.8B GDN smoke, cuda graph disabled, input-id oracle:
+  - `max_new_tokens=8`: first mismatch token 5, maxdiff
+    `0.0032685399055480957`, `spec_accept_length=8.0`
+  - `max_new_tokens=16`: first mismatch token 8, maxdiff
+    `8.744789600372314`, `spec_accept_length=2.2857142857142856`
+
+Interpretation:
+
+- The first-round mismatch is not caused by string retokenization; using
+  `input_ids=prompt_ids + output_ids` for the full-prefill oracle shows the same
+  mismatch.
+- The first-round mismatch is also not fixed by switching the conv path alone,
+  so the remaining issue is likely in the target-verify logits/logprob alignment
+  or in how the fixed 80-token GDN chunkwise pass differs from ordinary prefill
+  for the same prefix.
