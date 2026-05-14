@@ -7,6 +7,10 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -129,6 +133,7 @@ class DecodeVerifyRollbackWorker:
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+        self._gdn_boundary_seqlen = {}
 
         logger.info(
             "Initialized DVR self-decode worker: num_steps=%s, num_draft_tokens=%s",
@@ -255,6 +260,7 @@ class DecodeVerifyRollbackWorker:
                 self.speculative_num_draft_tokens,
             )
 
+        self._ensure_gdn_boundary_state(batch)
         self._draft_preprocess_decode(batch)
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -412,6 +418,148 @@ class DecodeVerifyRollbackWorker:
             probs = top_p_renorm_prob(probs, sampling_info.top_ps)
         return probs
 
+    def _has_gdn_dvr_state(self, batch: ScheduleBatch) -> bool:
+        return (
+            self.model_runner.hybrid_gdn_config is not None
+            and hasattr(batch.req_to_token_pool, "get_mamba_indices")
+            and batch.batch_size() > 0
+            and all(req.mamba_ping_pong_track_buffer is not None for req in batch.reqs)
+        )
+
+    def _mamba_indices_for_batch(
+        self, batch: ScheduleBatch
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
+        boundary_indices = torch.stack(
+            [req.mamba_ping_pong_track_buffer[0] for req in batch.reqs]
+        ).to(device=live_indices.device, dtype=torch.long)
+        return live_indices.to(torch.long), boundary_indices
+
+    def _ensure_gdn_boundary_state(self, batch: ScheduleBatch):
+        if not self._has_gdn_dvr_state(batch):
+            return
+        live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
+        init_src = []
+        init_dst = []
+        for i, req in enumerate(batch.reqs):
+            if req.rid not in self._gdn_boundary_seqlen:
+                self._gdn_boundary_seqlen[req.rid] = req.seqlen
+                init_src.append(live_indices[i])
+                init_dst.append(boundary_indices[i])
+        if init_src:
+            src = torch.stack(init_src)
+            dst = torch.stack(init_dst)
+            batch.req_to_token_pool.mamba_pool.copy_from(src, dst)
+            mamba_cache = (
+                batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+            if getattr(mamba_cache, "dvr_qkvg_beta_pos", None) is not None:
+                mamba_cache.dvr_qkvg_beta_pos[:, src] = 0
+
+    def _restore_gdn_boundary_state_for_verify(self, batch: ScheduleBatch):
+        if not self._has_gdn_dvr_state(batch):
+            return
+        self._ensure_gdn_boundary_state(batch)
+        live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
+        batch.req_to_token_pool.mamba_pool.copy_from(boundary_indices, live_indices)
+
+    def _commit_gdn_state_after_verify(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ):
+        if not self._has_gdn_dvr_state(batch):
+            return
+
+        live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
+        accepted_tokens = torch.tensor(
+            [x + 1 for x in verify_output.accept_length_per_req_cpu],
+            dtype=torch.long,
+            device=live_indices.device,
+        )
+        if accepted_tokens.numel() == 0:
+            return
+
+        attn_backend = self.model_runner.attn_backend
+        linear_backend = getattr(attn_backend, "linear_attn_backend", None)
+        if linear_backend is None:
+            return
+        dispatcher = linear_backend.kernel_dispatcher
+        mamba_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        pos_before = mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(torch.long)
+        pos_after = pos_before + accepted_tokens
+        crossing = pos_after >= FLA_CHUNK_SIZE
+
+        # Rebuild live tail state from the deterministic chunk-boundary state
+        # plus the saved q/k/v/g/beta window. This repairs the live state dirtied
+        # by draft/verify and lets the next self-decode continue from the last
+        # accepted token.
+        for layer_idx in range(mamba_cache.temporal.shape[0]):
+            initial_state = mamba_cache.temporal[layer_idx, boundary_indices]
+            tail_state = dispatcher.recurrent_state_from_qkvg_beta(
+                mamba_cache.dvr_q_state_cache[layer_idx, live_indices],
+                mamba_cache.dvr_k_state_cache[layer_idx, live_indices],
+                mamba_cache.dvr_v_state_cache[layer_idx, live_indices],
+                mamba_cache.dvr_g_state_cache[layer_idx, live_indices],
+                mamba_cache.dvr_beta_state_cache[layer_idx, live_indices],
+                initial_state=initial_state,
+                token_count=pos_after,
+            )
+            mamba_cache.temporal[layer_idx, live_indices] = tail_state
+
+        step_live = accepted_tokens - 1
+        fused_mamba_state_scatter_with_mask(
+            mamba_cache.conv[0],
+            mamba_cache.intermediate_conv_window[0],
+            live_indices,
+            step_live,
+        )
+
+        if crossing.any():
+            commit_step = torch.where(
+                crossing, FLA_CHUNK_SIZE - pos_before - 1, torch.full_like(pos_before, -1)
+            )
+            for layer_idx in range(mamba_cache.temporal.shape[0]):
+                boundary_state = dispatcher.chunkwise_boundary_state_from_qkvg_beta(
+                    mamba_cache.dvr_q_state_cache[layer_idx, live_indices],
+                    mamba_cache.dvr_k_state_cache[layer_idx, live_indices],
+                    mamba_cache.dvr_v_state_cache[layer_idx, live_indices],
+                    mamba_cache.dvr_g_state_cache[layer_idx, live_indices],
+                    mamba_cache.dvr_beta_state_cache[layer_idx, live_indices],
+                    state_pool=mamba_cache.temporal[layer_idx],
+                    state_indices=boundary_indices,
+                    boundary_token_count=FLA_CHUNK_SIZE,
+                )
+                mamba_cache.temporal[layer_idx, boundary_indices] = boundary_state
+            fused_mamba_state_scatter_with_mask(
+                mamba_cache.conv[0],
+                mamba_cache.intermediate_conv_window[0],
+                boundary_indices,
+                commit_step,
+            )
+
+            new_pos = pos_after - FLA_CHUNK_SIZE
+            for req_i, req in enumerate(batch.reqs):
+                if not bool(crossing[req_i].item()):
+                    continue
+                remain = int(new_pos[req_i].item())
+                slot = int(live_indices[req_i].item())
+                if remain > 0:
+                    for cache in (
+                        mamba_cache.dvr_q_state_cache,
+                        mamba_cache.dvr_k_state_cache,
+                        mamba_cache.dvr_v_state_cache,
+                        mamba_cache.dvr_g_state_cache,
+                        mamba_cache.dvr_beta_state_cache,
+                    ):
+                        cache[:, slot, :remain] = cache[
+                            :, slot, FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + remain
+                        ].clone()
+                self._gdn_boundary_seqlen[req.rid] += FLA_CHUNK_SIZE
+                req.mamba_last_track_seqlen = self._gdn_boundary_seqlen[req.rid]
+                req.mamba_next_track_idx = 0
+            pos_after = torch.where(crossing, new_pos, pos_after)
+
+        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = pos_after.to(torch.int32)
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -430,6 +578,7 @@ class DecodeVerifyRollbackWorker:
             else ForwardMode.IDLE
         )
         batch.spec_info = spec_info
+        self._restore_gdn_boundary_state_for_verify(batch)
 
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -463,6 +612,7 @@ class DecodeVerifyRollbackWorker:
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
 
+        self._commit_gdn_state_after_verify(batch, verify_output)
         self.postprocess_for_verify(batch, verify_output)
         return logits_output, verify_output, can_run_cuda_graph
 

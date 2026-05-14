@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -231,6 +232,7 @@ class MambaPool:
         dvr_v_state_cache: Optional[torch.Tensor] = None
         dvr_g_state_cache: Optional[torch.Tensor] = None
         dvr_beta_state_cache: Optional[torch.Tensor] = None
+        dvr_qkvg_beta_pos: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -318,11 +320,14 @@ class MambaPool:
                     for conv_shape in conv_state_shape
                 ]
                 if enable_dvr_qkvg_beta_cache:
+                    dvr_qkvg_beta_cache_len = (
+                        FLA_CHUNK_SIZE + speculative_num_draft_tokens
+                    )
                     dvr_q_state_cache = torch.zeros(
                         size=(
                             num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
+                            size + 1,
+                            dvr_qkvg_beta_cache_len,
                             temporal_state_shape[0],
                             temporal_state_shape[1],
                         ),
@@ -333,8 +338,8 @@ class MambaPool:
                     dvr_v_state_cache = torch.zeros(
                         size=(
                             num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
+                            size + 1,
+                            dvr_qkvg_beta_cache_len,
                             temporal_state_shape[0],
                             temporal_state_shape[2],
                         ),
@@ -344,20 +349,26 @@ class MambaPool:
                     dvr_g_state_cache = torch.zeros(
                         size=(
                             num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
+                            size + 1,
+                            dvr_qkvg_beta_cache_len,
                             temporal_state_shape[0],
                         ),
                         dtype=torch.float32,
                         device=device,
                     )
                     dvr_beta_state_cache = torch.zeros_like(dvr_g_state_cache)
+                    dvr_qkvg_beta_pos = torch.zeros(
+                        size=(num_mamba_layers, size + 1),
+                        dtype=torch.int32,
+                        device=device,
+                    )
                 else:
                     dvr_q_state_cache = None
                     dvr_k_state_cache = None
                     dvr_v_state_cache = None
                     dvr_g_state_cache = None
                     dvr_beta_state_cache = None
+                    dvr_qkvg_beta_pos = None
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -368,6 +379,7 @@ class MambaPool:
                     dvr_v_state_cache=dvr_v_state_cache,
                     dvr_g_state_cache=dvr_g_state_cache,
                     dvr_beta_state_cache=dvr_beta_state_cache,
+                    dvr_qkvg_beta_pos=dvr_qkvg_beta_pos,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -376,7 +388,7 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                    f"dvr_qkvg_beta_cache size: {sum(get_tensor_size_bytes(t) for t in (dvr_q_state_cache, dvr_k_state_cache, dvr_v_state_cache, dvr_g_state_cache, dvr_beta_state_cache) if t is not None) / GB:.2f}GB "
+                    f"dvr_qkvg_beta_cache size: {sum(get_tensor_size_bytes(t) for t in (dvr_q_state_cache, dvr_k_state_cache, dvr_v_state_cache, dvr_g_state_cache, dvr_beta_state_cache, dvr_qkvg_beta_pos) if t is not None) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -442,6 +454,8 @@ class MambaPool:
             t.shape[0], need_size, *t.shape[2:]
         )
         t[:, select_index] = z
+        if getattr(self.mamba_cache, "dvr_qkvg_beta_pos", None) is not None:
+            self.mamba_cache.dvr_qkvg_beta_pos[:, select_index] = 0
 
         return select_index
 
@@ -490,6 +504,7 @@ class MambaPool:
                 "dvr_v_state_cache",
                 "dvr_g_state_cache",
                 "dvr_beta_state_cache",
+                "dvr_qkvg_beta_pos",
             ):
                 continue
             value = getattr(self.mamba_cache, field)
@@ -529,6 +544,7 @@ class MambaPool:
                 "dvr_v_state_cache",
                 "dvr_g_state_cache",
                 "dvr_beta_state_cache",
+                "dvr_qkvg_beta_pos",
             ):
                 continue
             value = getattr(self.mamba_cache, field)

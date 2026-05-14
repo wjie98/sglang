@@ -116,3 +116,53 @@ Status:
   unchanged.
 - Static checks passed, and a direct CUDA tensor smoke test verified both helper
   output shapes and chunkwise state-pool update semantics.
+
+## Phase 3: Boundary State Wiring
+
+Scope:
+
+- Keep one DVR-owned GDN boundary state per request in the existing Mamba extra
+  buffer.
+- Before self-draft decode, make sure the boundary state exists. Draft decode is
+  allowed to advance the live temporal/conv state to the speculative tail.
+- Before target verify, restore the live temporal/conv state from the DVR
+  boundary state so GDN verify starts from the intended chunk window base.
+- During GDN target verify, save q/k/v/g/beta into a per-request rolling window
+  with length `FLA_CHUNK_SIZE + speculative_num_draft_tokens`.
+- For DVR GDN target verify, run the chunkwise scan path over the fixed rolling
+  window and gather the active draft-token logits.
+- After acceptance, rebuild the live tail temporal state by recurrent replay
+  from saved q/k/v/g/beta. If a request crosses `FLA_CHUNK_SIZE`, compute the new
+  boundary temporal state with chunkwise scan, update boundary conv state, slide
+  q/k/v/g/beta left by one chunk, and let DVR own the Mamba checkpoint metadata.
+
+Status:
+
+- Implemented the first working version of this wiring in `dvr_worker.py`,
+  `gdn_backend.py`, `memory_pool.py`, and the scheduler Mamba checkpoint update.
+- Static checks passed: `py_compile` for touched files and `git diff --check`.
+- Non-cuda-graph Qwen3.5 smoke tests run without crashes:
+  - `max_new_tokens=16`: generated 16, acceptance 1.0, strict oracle
+    `max_abs_diff=0.023709863424301147`.
+  - `max_new_tokens=32`: generated 19 due EOS, acceptance 0.3333333333333333,
+    strict oracle `max_abs_diff=15.424726724624634`.
+  - `max_new_tokens=80`: generated 80, acceptance 0.18412698412698414,
+    strict oracle `max_abs_diff=9.052518844604492`.
+- A 64-token aligned prompt still showed strict-oracle drift:
+  `max_abs_diff=0.27963473147246987`, acceptance 1.0. This means Phase 3 is a
+  state-management checkpoint, not yet a correct GDN KL=0 implementation.
+
+Known issues:
+
+- The initial DVR boundary currently falls back to the prompt-end state when no
+  chunk-aligned prefill checkpoint/qkvg window is available. For prompts whose
+  length is not `FLA_CHUNK_SIZE` aligned, strict DVR semantics require treating
+  the prompt tail as part of the first verify window or caching its q/k/v/g/beta
+  during prefill.
+- Even with a 64-token aligned prompt, GDN logits still differ from the full
+  prefill oracle, so the next debugging step is to compare the exact GDN
+  q/k/v/g/beta, conv state, temporal state, and gather offsets between full
+  prefill and DVR target verify.
+- The current q/k/v/g/beta cache is indexed by live Mamba pool slot for
+  graph-stable backend access. This is simple but memory-heavy; Qwen3.5-0.8B
+  logs roughly 4.7GB for this cache at `mem_fraction_static=0.45`.

@@ -543,38 +543,61 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             if getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None:
-                dvr_indices = intermediate_state_indices[:batch_size].to(torch.long)
-                mamba_cache_params.dvr_q_state_cache[dvr_indices] = query.reshape(
+                dvr_indices = cache_indices[:batch_size].to(torch.long)
+                pos = mamba_cache_params.dvr_qkvg_beta_pos[dvr_indices].to(torch.long)
+                cols = pos.unsqueeze(1) + torch.arange(
+                    draft_token_num, dtype=torch.long, device=pos.device
+                ).unsqueeze(0)
+                rows = dvr_indices.unsqueeze(1).expand(-1, draft_token_num)
+                mamba_cache_params.dvr_q_state_cache[rows, cols] = query.reshape(
                     batch_size, draft_token_num, layer.num_q_heads, layer.head_q_dim
                 )
-                mamba_cache_params.dvr_k_state_cache[dvr_indices] = key.reshape(
+                mamba_cache_params.dvr_k_state_cache[rows, cols] = key.reshape(
                     batch_size, draft_token_num, layer.num_k_heads, layer.head_k_dim
                 )
-                mamba_cache_params.dvr_v_state_cache[dvr_indices] = value.reshape(
+                mamba_cache_params.dvr_v_state_cache[rows, cols] = value.reshape(
                     batch_size, draft_token_num, layer.num_v_heads, layer.head_v_dim
                 )
-                mamba_cache_params.dvr_g_state_cache[dvr_indices] = g.reshape(
+                mamba_cache_params.dvr_g_state_cache[rows, cols] = g.reshape(
                     batch_size, draft_token_num, layer.num_v_heads
                 )
-                mamba_cache_params.dvr_beta_state_cache[dvr_indices] = beta.reshape(
+                mamba_cache_params.dvr_beta_state_cache[rows, cols] = beta.reshape(
                     batch_size, draft_token_num, layer.num_v_heads
                 )
-            core_attn_out = self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
-            )
+                out, _, _ = chunk_gated_delta_rule(
+                    q=mamba_cache_params.dvr_q_state_cache[dvr_indices],
+                    k=mamba_cache_params.dvr_k_state_cache[dvr_indices],
+                    v=mamba_cache_params.dvr_v_state_cache[dvr_indices],
+                    g=mamba_cache_params.dvr_g_state_cache[dvr_indices],
+                    beta=mamba_cache_params.dvr_beta_state_cache[dvr_indices],
+                    initial_state=ssm_states,
+                    initial_state_indices=dvr_indices,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                gather_index = cols[:, :, None, None].expand(
+                    batch_size, draft_token_num, layer.num_v_heads, layer.head_v_dim
+                )
+                core_attn_out = out.gather(1, gather_index).reshape(
+                    1, batch_size * draft_token_num, layer.num_v_heads, layer.head_v_dim
+                )
+            else:
+                core_attn_out = self.kernel_dispatcher.target_verify(
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    intermediate_states_buffer=intermediate_state_cache,
+                    intermediate_state_indices=intermediate_state_indices,
+                    cache_steps=forward_batch.spec_info.draft_token_num,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(

@@ -610,6 +610,8 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         i: int,
     ) -> None:
+        if batch.spec_algorithm.is_decode_verify_rollback():
+            return
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
             mamba_track_interval = get_global_server_args().mamba_track_interval
