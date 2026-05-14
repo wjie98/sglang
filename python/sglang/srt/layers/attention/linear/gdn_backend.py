@@ -672,8 +672,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
+            has_initial_states = (
+                forward_batch.seq_lens[: seq_len // forward_batch.spec_info.draft_token_num]
+                > 0
+            ).to(
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )

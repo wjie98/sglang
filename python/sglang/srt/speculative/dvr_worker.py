@@ -110,6 +110,15 @@ class DecodeVerifyRollbackWorker:
             raise ValueError("DVR currently requires page_size == 1.")
         if server_args.speculative_eagle_topk != 1:
             raise ValueError("DVR currently supports only chain mode with topk == 1.")
+        if (
+            target_worker.model_runner.hybrid_gdn_config is not None
+            and server_args.mamba_track_interval % FLA_CHUNK_SIZE != 0
+        ):
+            raise ValueError(
+                "DVR GDN requires mamba_track_interval to be aligned to "
+                f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, got "
+                f"{server_args.mamba_track_interval}."
+            )
 
         self.server_args = server_args
         self.target_worker = target_worker
@@ -458,17 +467,15 @@ class DecodeVerifyRollbackWorker:
         if not self._has_gdn_dvr_state(batch):
             return
         live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
-        init_src = []
-        init_dst = []
         zero_dst = []
         reset_pos_indices = []
         reset_pos_values = []
         for i, req in enumerate(batch.reqs):
             if req.rid not in self._gdn_boundary_seqlen:
                 boundary_seqlen = ((req.seqlen - 1) // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
-                num_verified_tokens = (req.seqlen - 1) - boundary_seqlen
+                verified_tail_len = (req.seqlen - 1) - boundary_seqlen
                 reset_pos_indices.append(live_indices[i])
-                reset_pos_values.append(num_verified_tokens)
+                reset_pos_values.append(verified_tail_len)
                 checkpoint_track_idx = self._current_prefill_checkpoint_track_idx(
                     batch, req
                 )
@@ -495,15 +502,14 @@ class DecodeVerifyRollbackWorker:
                     if boundary_seqlen == 0:
                         zero_dst.append(dst)
                     else:
-                        # Fallback for rare paths that did not materialize the
-                        # aligned checkpoint. The normal path should use
-                        # checkpoint_track_idx above.
-                        init_src.append(live_indices[i])
-                        init_dst.append(dst)
-        if init_src:
-            src = torch.stack(init_src)
-            dst = torch.stack(init_dst)
-            batch.req_to_token_pool.mamba_pool.copy_from(src, dst)
+                        raise RuntimeError(
+                            "DVR GDN could not find a chunk-aligned prefill "
+                            "checkpoint for boundary "
+                            f"{boundary_seqlen}. mamba_track_interval must be "
+                            f"aligned to FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, and "
+                            "ordinary prefill must materialize that checkpoint "
+                            "before DVR target verify starts."
+                        )
         if zero_dst:
             dst = torch.stack(zero_dst).to(device=live_indices.device, dtype=torch.long)
             mamba_cache = (
@@ -584,7 +590,7 @@ class DecodeVerifyRollbackWorker:
         req_to_token = batch.req_to_token_pool.req_to_token
         mamba_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
-        num_verified_tokens = mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(
+        verified_tail_lens = mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(
             torch.long
         )
 
@@ -595,30 +601,32 @@ class DecodeVerifyRollbackWorker:
         real_token_lens = []
         padding_locs = []
         for req_i, req in enumerate(batch.reqs):
-            num_verified_token = int(num_verified_tokens[req_i].item())
-            boundary = (req.seqlen - 1) - num_verified_token
+            verified_tail_len = int(verified_tail_lens[req_i].item())
+            boundary = (req.seqlen - 1) - verified_tail_len
             all_ids = req.origin_input_ids + req.output_ids
-            num_real_tokens = num_verified_token + self.speculative_num_draft_tokens
+            num_real_tokens = verified_tail_len + self.speculative_num_draft_tokens
             num_padding_tokens = verify_window - num_real_tokens
             if num_padding_tokens < 0:
                 raise RuntimeError(
-                    f"DVR GDN verify window overflow: verified={num_verified_token}, "
+                    f"DVR GDN verify window overflow: verified={verified_tail_len}, "
                     f"draft={self.speculative_num_draft_tokens}, window={verify_window}."
                 )
             real_token_lens.append(num_real_tokens)
 
             # DVR GDN target verify uses a graphable fixed window:
-            # verified_token + draft_token + padding_token. EAGLE/SPS still
-            # consumes only draft_token logits after the forward pass.
-            input_ids.extend(all_ids[boundary : boundary + num_verified_token])
+            # verified_tail + draft_token + padding_token. The prompt/extend
+            # tail is treated exactly like already accepted DVR tokens, so the
+            # rolling window has one ownership model from prefill through
+            # target verify.
+            input_ids.extend(all_ids[boundary : boundary + verified_tail_len])
             input_ids.extend(draft_tokens[req_i].tolist())
             input_ids.extend([0] * num_padding_tokens)
 
-            if num_verified_token > 0:
+            if verified_tail_len > 0:
                 out_cache_locs.append(
                     req_to_token[
                         batch.req_pool_indices[req_i],
-                        boundary : boundary + num_verified_token,
+                        boundary : boundary + verified_tail_len,
                     ]
                 )
             out_cache_locs.append(draft_cache_locs[req_i])
@@ -664,7 +672,7 @@ class DecodeVerifyRollbackWorker:
         )
         mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = 0
 
-        return original, padding_locs, num_verified_tokens
+        return original, padding_locs, verified_tail_lens
 
     def _restore_after_gdn_fixed_verify_window(
         self,
@@ -676,11 +684,11 @@ class DecodeVerifyRollbackWorker:
         if fixed_window_state is None:
             return
 
-        original, padding_locs, num_verified_tokens = fixed_window_state
+        original, padding_locs, verified_tail_lens = fixed_window_state
         verify_window = FLA_CHUNK_SIZE + self.speculative_num_draft_tokens
         keep = []
-        for req_i, num_verified_token in enumerate(num_verified_tokens.tolist()):
-            start = req_i * verify_window + int(num_verified_token)
+        for req_i, verified_tail_len in enumerate(verified_tail_lens.tolist()):
+            start = req_i * verify_window + int(verified_tail_len)
             keep.extend(range(start, start + self.speculative_num_draft_tokens))
         keep = torch.tensor(
             keep, dtype=torch.long, device=logits_output.next_token_logits.device
@@ -706,7 +714,7 @@ class DecodeVerifyRollbackWorker:
 
         mamba_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
-        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = num_verified_tokens.to(
+        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = verified_tail_lens.to(
             device=mamba_cache.dvr_qkvg_beta_pos.device,
             dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
         ).unsqueeze(0)

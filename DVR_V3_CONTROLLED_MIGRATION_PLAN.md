@@ -326,3 +326,46 @@ Interpretation:
   so the remaining issue is likely in the target-verify logits/logprob alignment
   or in how the fixed 80-token GDN chunkwise pass differs from ordinary prefill
   for the same prefix.
+
+## 2026-05-14 Chunk Boundary State Guard
+
+Tightened the GDN boundary-state source:
+
+- The prefill tail after the latest 64-aligned boundary is now named
+  `verified_tail` in the DVR worker. This makes the fixed verify window explicit:
+  `verified_tail + draft_token + padding_token`.
+- DVR GDN startup now requires `mamba_track_interval % FLA_CHUNK_SIZE == 0`.
+- The old fallback that copied the live Mamba state into the chunk-boundary slot
+  was removed. For nonzero boundaries, DVR must reuse a prefill/materialized
+  chunk-aligned checkpoint; if that checkpoint is missing, the worker raises.
+- For the fixed-window conv path, `has_initial_state` is derived from whether the
+  boundary length is nonzero. Boundary 0 therefore uses the same no-initial-state
+  branch as ordinary prefill.
+
+Rejected experiment:
+
+- Running GDN chunkwise scan only up to `dvr_real_token_lens` instead of the fixed
+  graphable window caused gather-index out-of-bounds. The output/gather path is
+  still fixed-window shaped, so this cannot be used as-is.
+
+Tests:
+
+- Static: `python3 -m py_compile dvr_worker.py gdn_backend.py`.
+- Qwen3-0.6B attention-only, cuda graph disabled, strict full-prefill oracle:
+  - `max_new_tokens=8`: maxdiff 0
+  - `max_new_tokens=80`: maxdiff 0
+  - `max_new_tokens=128`: maxdiff 0
+- Qwen3.5-0.8B GDN smoke, cuda graph disabled:
+  - `max_new_tokens=8`: first mismatch token 5, maxdiff
+    `0.0032685399055480957`, `spec_accept_length=8.0`
+  - `max_new_tokens=16`: first mismatch token 8, maxdiff
+    `13.705031394958496`, `spec_accept_length=2.0`
+
+Interpretation:
+
+- The new strict boundary checkpoint guard did not trigger in the normal
+  Qwen3.5 test, so the initial 64-aligned checkpoint is being materialized.
+- The remaining GDN mismatch is therefore not explained by a missing prefill
+  checkpoint. The next debugging target should be the fixed-window GDN forward
+  itself: q/k/v/g/beta rows, output gather rows, and whether the 80-row chunkwise
+  computation is bitwise identical to ordinary prefill for the same real prefix.
