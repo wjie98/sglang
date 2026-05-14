@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -40,6 +41,23 @@ if is_cuda():
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _GDNFixedVerifyWindowState:
+    input_ids: torch.Tensor
+    out_cache_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    seq_lens_sum: int
+    draft_token: torch.Tensor
+    positions: torch.Tensor
+    draft_token_num: int
+    num_tokens_per_req: int
+    spec_seq_lens_cpu: torch.Tensor
+    dvr_real_token_lens: Optional[torch.Tensor]
+    padding_locs: List[torch.Tensor]
+    verified_tail_lens: torch.Tensor
 
 
 @contextmanager
@@ -86,10 +104,10 @@ def dvr_causal_verify_cuda_graph_metadata(
 class DecodeVerifyRollbackWorker:
     """DVR speculative worker using the target model as a self draft model.
 
-    Phase 2 implements only the self-decode draft provider and reuses the
-    existing EAGLE chain verify structure to keep scheduler integration small.
-    Later phases will replace the target verify internals with the
-    prefill/extend-equivalent DVR verify path.
+    The control flow mirrors EAGLE: self-decode draft, target verify, then
+    EAGLE-compatible postprocess. DVR-specific work is kept local to this
+    worker: causal chain verify, GDN fixed-window target verify, and GDN state
+    rollback/commit around the verify window.
     """
 
     def __init__(
@@ -129,8 +147,9 @@ class DecodeVerifyRollbackWorker:
         self.page_size = server_args.page_size
         self.topk = 1
         self.max_batch_size = target_worker.max_running_requests
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.num_draft_steps = server_args.speculative_num_steps
+        self.num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.verify_window_size = FLA_CHUNK_SIZE + self.num_draft_tokens
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
@@ -146,8 +165,8 @@ class DecodeVerifyRollbackWorker:
 
         logger.info(
             "Initialized DVR self-decode worker: num_steps=%s, num_draft_tokens=%s",
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
+            self.num_draft_steps,
+            self.num_draft_tokens,
         )
 
     def __getattr__(self, name):
@@ -225,7 +244,7 @@ class DecodeVerifyRollbackWorker:
         # radix-cache rollback stop matching the normal speculative layout.
         out_cache_loc = alloc_token_slots(
             batch.tree_cache,
-            num_seqs * self.speculative_num_draft_tokens * self.topk,
+            num_seqs * self.num_draft_tokens * self.topk,
         )
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
@@ -240,10 +259,10 @@ class DecodeVerifyRollbackWorker:
             0,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
-            self.speculative_num_draft_tokens,
+            self.num_draft_tokens,
             self.page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_draft_tokens + self.page_size),
+            next_power_of_2(self.num_draft_tokens + self.page_size),
         )
 
         batch.out_cache_loc = out_cache_loc
@@ -265,8 +284,8 @@ class DecodeVerifyRollbackWorker:
             self._draft_preprocess_idle(batch)
             return EagleVerifyInput.create_idle_input(
                 self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
+                self.num_draft_steps,
+                self.num_draft_tokens,
             )
 
         self._ensure_gdn_boundary_state(batch)
@@ -301,8 +320,8 @@ class DecodeVerifyRollbackWorker:
             batch.seq_lens,
             batch.seq_lens_sum,
             self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
+            self.num_draft_steps,
+            self.num_draft_tokens,
         )
         draft_tokens = draft_tokens.to(torch.long)
 
@@ -318,9 +337,9 @@ class DecodeVerifyRollbackWorker:
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
             retrive_cum_len=None,
-            spec_steps=self.speculative_num_steps,
+            spec_steps=self.num_draft_steps,
             topk=self.topk,
-            draft_token_num=self.speculative_num_draft_tokens,
+            draft_token_num=self.num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
@@ -332,10 +351,10 @@ class DecodeVerifyRollbackWorker:
         assert isinstance(spec_info, EagleDraftInput)
 
         out_cache_loc = forward_batch.out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_draft_tokens
+            forward_batch.batch_size, self.topk, self.num_draft_tokens
         )
         out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_draft_tokens, -1
+            self.num_draft_tokens, -1
         )
 
         score_list: List[torch.Tensor] = []
@@ -360,7 +379,7 @@ class DecodeVerifyRollbackWorker:
         # Run the target model as its own draft model. The loop mutates
         # ForwardBatch fields to look like one-token decode steps, so every
         # scheduler-owned field is restored before target verify starts.
-        for i in range(self.speculative_num_steps + 1):
+        for i in range(self.num_draft_steps + 1):
             if i == 0:
                 input_ids = topk_index.flatten()
             else:
@@ -377,7 +396,7 @@ class DecodeVerifyRollbackWorker:
                 parents_list.append(tree_info[2])
                 forward_batch.positions.add_(1)
 
-            if i == self.speculative_num_steps:
+            if i == self.num_draft_steps:
                 break
 
             forward_batch.input_ids = input_ids
@@ -411,7 +430,7 @@ class DecodeVerifyRollbackWorker:
             score_list,
             token_list,
             parents_list,
-            self.speculative_num_draft_tokens,
+            self.num_draft_tokens,
         )
         draft_probs = (
             torch.stack(draft_probs_list, dim=1) if draft_probs_list else None
@@ -572,26 +591,28 @@ class DecodeVerifyRollbackWorker:
             return None
 
         bs = batch.batch_size()
-        verify_window = FLA_CHUNK_SIZE + self.speculative_num_draft_tokens
-        original = {
-            "input_ids": batch.input_ids,
-            "out_cache_loc": batch.out_cache_loc,
-            "seq_lens": batch.seq_lens,
-            "seq_lens_cpu": batch.seq_lens_cpu,
-            "seq_lens_sum": batch.seq_lens_sum,
-            "draft_token": spec_info.draft_token,
-            "positions": spec_info.positions,
-            "draft_token_num": spec_info.draft_token_num,
-            "num_tokens_per_req": spec_info.num_tokens_per_req,
-            "seq_lens_cpu_info": spec_info.seq_lens_cpu,
-            "dvr_real_token_lens": spec_info.dvr_real_token_lens,
-        }
+        verify_window = self.verify_window_size
+        original = _GDNFixedVerifyWindowState(
+            input_ids=batch.input_ids,
+            out_cache_loc=batch.out_cache_loc,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens_sum=batch.seq_lens_sum,
+            draft_token=spec_info.draft_token,
+            positions=spec_info.positions,
+            draft_token_num=spec_info.draft_token_num,
+            num_tokens_per_req=spec_info.num_tokens_per_req,
+            spec_seq_lens_cpu=spec_info.seq_lens_cpu,
+            dvr_real_token_lens=spec_info.dvr_real_token_lens,
+            padding_locs=[],
+            verified_tail_lens=torch.empty(0, dtype=torch.long),
+        )
 
         draft_tokens = spec_info.draft_token.reshape(
-            bs, self.speculative_num_draft_tokens
+            bs, self.num_draft_tokens
         )
         draft_cache_locs = batch.out_cache_loc.reshape(
-            bs, self.speculative_num_draft_tokens
+            bs, self.num_draft_tokens
         )
         req_to_token = batch.req_to_token_pool.req_to_token
         mamba_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
@@ -610,12 +631,12 @@ class DecodeVerifyRollbackWorker:
             verified_tail_len = int(verified_tail_lens[req_i].item())
             boundary = (req.seqlen - 1) - verified_tail_len
             all_ids = req.origin_input_ids + req.output_ids
-            num_real_tokens = verified_tail_len + self.speculative_num_draft_tokens
+            num_real_tokens = verified_tail_len + self.num_draft_tokens
             num_padding_tokens = verify_window - num_real_tokens
             if num_padding_tokens < 0:
                 raise RuntimeError(
                     f"DVR GDN verify window overflow: verified={verified_tail_len}, "
-                    f"draft={self.speculative_num_draft_tokens}, window={verify_window}."
+                    f"draft={self.num_draft_tokens}, window={verify_window}."
                 )
             real_token_lens.append(num_real_tokens)
 
@@ -655,15 +676,15 @@ class DecodeVerifyRollbackWorker:
             input_ids, dtype=torch.long, device=spec_info.draft_token.device
         )
         batch.out_cache_loc = torch.cat(out_cache_locs).to(
-            device=spec_info.draft_token.device, dtype=original["out_cache_loc"].dtype
+            device=spec_info.draft_token.device, dtype=original.out_cache_loc.dtype
         )
         batch.seq_lens = torch.tensor(
-            boundary_lens, dtype=original["seq_lens"].dtype, device=batch.seq_lens.device
+            boundary_lens, dtype=original.seq_lens.dtype, device=batch.seq_lens.device
         )
         batch.seq_lens_cpu = torch.tensor(
             boundary_lens,
-            dtype=original["seq_lens_cpu"].dtype,
-            device=original["seq_lens_cpu"].device,
+            dtype=original.seq_lens_cpu.dtype,
+            device=original.seq_lens_cpu.device,
         )
         batch.seq_lens_sum = sum(boundary_lens)
         spec_info.draft_token = batch.input_ids
@@ -678,7 +699,9 @@ class DecodeVerifyRollbackWorker:
         )
         mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = 0
 
-        return original, padding_locs, verified_tail_lens
+        original.padding_locs.extend(padding_locs)
+        original.verified_tail_lens = verified_tail_lens
+        return original
 
     def _restore_after_gdn_fixed_verify_window(
         self,
@@ -690,12 +713,12 @@ class DecodeVerifyRollbackWorker:
         if fixed_window_state is None:
             return
 
-        original, padding_locs, verified_tail_lens = fixed_window_state
-        verify_window = FLA_CHUNK_SIZE + self.speculative_num_draft_tokens
+        state: _GDNFixedVerifyWindowState = fixed_window_state
+        verify_window = self.verify_window_size
         keep = []
-        for req_i, verified_tail_len in enumerate(verified_tail_lens.tolist()):
+        for req_i, verified_tail_len in enumerate(state.verified_tail_lens.tolist()):
             start = req_i * verify_window + int(verified_tail_len)
-            keep.extend(range(start, start + self.speculative_num_draft_tokens))
+            keep.extend(range(start, start + self.num_draft_tokens))
         keep = torch.tensor(
             keep, dtype=torch.long, device=logits_output.next_token_logits.device
         )
@@ -703,24 +726,24 @@ class DecodeVerifyRollbackWorker:
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[keep]
 
-        batch.input_ids = original["input_ids"]
-        batch.out_cache_loc = original["out_cache_loc"]
-        batch.seq_lens = original["seq_lens"]
-        batch.seq_lens_cpu = original["seq_lens_cpu"]
-        batch.seq_lens_sum = original["seq_lens_sum"]
-        spec_info.draft_token = original["draft_token"]
-        spec_info.positions = original["positions"]
-        spec_info.draft_token_num = original["draft_token_num"]
-        spec_info.num_tokens_per_req = original["num_tokens_per_req"]
-        spec_info.seq_lens_cpu = original["seq_lens_cpu_info"]
-        spec_info.dvr_real_token_lens = original["dvr_real_token_lens"]
+        batch.input_ids = state.input_ids
+        batch.out_cache_loc = state.out_cache_loc
+        batch.seq_lens = state.seq_lens
+        batch.seq_lens_cpu = state.seq_lens_cpu
+        batch.seq_lens_sum = state.seq_lens_sum
+        spec_info.draft_token = state.draft_token
+        spec_info.positions = state.positions
+        spec_info.draft_token_num = state.draft_token_num
+        spec_info.num_tokens_per_req = state.num_tokens_per_req
+        spec_info.seq_lens_cpu = state.spec_seq_lens_cpu
+        spec_info.dvr_real_token_lens = state.dvr_real_token_lens
 
-        if padding_locs:
-            self.token_to_kv_pool_allocator.free(torch.cat(padding_locs))
+        if state.padding_locs:
+            self.token_to_kv_pool_allocator.free(torch.cat(state.padding_locs))
 
         mamba_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
-        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = verified_tail_lens.to(
+        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = state.verified_tail_lens.to(
             device=mamba_cache.dvr_qkvg_beta_pos.device,
             dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
         ).unsqueeze(0)
@@ -860,7 +883,7 @@ class DecodeVerifyRollbackWorker:
         # window over the same tokens.
         if not batch.forward_mode.is_idle():
             batch.input_ids = spec_info.draft_token
-        spec_info.num_tokens_per_req = self.speculative_num_draft_tokens
+        spec_info.num_tokens_per_req = self.num_draft_tokens
         batch.return_hidden_states = False
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
