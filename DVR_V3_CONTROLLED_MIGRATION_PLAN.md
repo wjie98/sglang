@@ -108,6 +108,44 @@ Expected result:
 - The code clearly separates verified tokens, draft tokens, and padding tokens.
 - The scheduler still sees normal accepted output tokens and logprobs.
 
+Status:
+
+- Implemented the first v3-local fixed-window scaffold for GDN only.
+- Attention-only DVR still uses the existing draft-token verify path.
+- Added `EagleVerifyInput.dvr_real_token_lens` so DVR/GDN can carry real token
+  lengths separately from the fixed graphable window length.
+- DVR worker now expands GDN target verify into:
+  `verified_token + draft_token + padding_token`, with total length
+  `FLA_CHUNK_SIZE + speculative_num_draft_tokens`.
+- After the target forward, DVR restores EAGLE/SPS metadata and keeps only the
+  draft-token logits before calling normal verify/postprocess.
+- GDN speculative intermediate buffers are also sized to
+  `FLA_CHUNK_SIZE + draft_tokens` when DVR qkvg_beta cache is enabled. This is
+  necessary because conv-state commit reads positions inside the fixed window,
+  not just inside the draft-token suffix.
+
+Validation:
+
+- Static checks passed:
+  - `py_compile` for `eagle_info.py`, `dvr_worker.py`, `gdn_backend.py`, and
+    `memory_pool.py`
+  - `git diff --check`
+- Qwen3-0.6B attention-only regression, cuda graph disabled:
+  - `max_new_tokens`: `8, 31, 80, 128`
+  - every case reported `maxdiff=0.0`
+
+Known issue:
+
+- Qwen3.5-0.8B GDN still diverges after the first verify round:
+  - `max_new_tokens=8`: `maxdiff=0.0032685399055480957`, first mismatch token
+    index 5, acceptance 8.0
+  - `max_new_tokens=16`: first mismatch token index 8, acceptance around
+    2.3-2.7 depending on the live-state reconstruction variant
+- Interpretation: first-round 80-window logits are close but not strictly equal,
+  while second-round self draft starts from a still-misaligned post-verify GDN
+  live state. The next work item is GDN post-verify state/anchor repair, not
+  more broad metadata movement.
+
 ## Phase 3: GDN Input Capture
 
 Tasks:

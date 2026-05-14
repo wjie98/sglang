@@ -72,6 +72,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     # Shape info for padding
     num_tokens_per_req: int = -1
+    dvr_real_token_lens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)

@@ -350,6 +350,45 @@ class GDNKernelDispatcher:
         )
         return h[:, -1].to(state_pool.dtype, copy=False)
 
+    def chunkwise_state_from_qkvg_beta(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        token_count: Union[int, torch.Tensor],
+    ) -> torch.Tensor:
+        if is_cpu():
+            raise NotImplementedError("DVR GDN chunkwise post-verify is GPU-only.")
+        if isinstance(token_count, int):
+            token_count = torch.full(
+                (q.shape[0],), token_count, dtype=torch.long, device=q.device
+            )
+        token_count = token_count.to(device=q.device, dtype=torch.long)
+
+        states = []
+        for i, end in enumerate(token_count.tolist()):
+            if end == 0:
+                states.append(state_pool[state_indices[i : i + 1]])
+                continue
+            _, _, h = chunk_gated_delta_rule(
+                q=q[i : i + 1, :end],
+                k=k[i : i + 1, :end],
+                v=v[i : i + 1, :end],
+                g=g[i : i + 1, :end],
+                beta=beta[i : i + 1, :end],
+                initial_state=state_pool,
+                initial_state_indices=state_indices[i : i + 1],
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            states.append(h[:, -1])
+        return torch.cat(states, dim=0).to(state_pool.dtype, copy=False)
+
 
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
@@ -367,6 +406,70 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+
+    def _cache_dvr_extend_verified_qkvg_beta(
+        self,
+        forward_batch: ForwardBatch,
+        mamba_cache_params: MambaPool.SpeculativeState,
+        cache_indices: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ):
+        if getattr(mamba_cache_params, "dvr_q_state_cache", None) is None:
+            return
+        if (
+            forward_batch.extend_prefix_lens_cpu is None
+            or forward_batch.extend_seq_lens_cpu is None
+            or self.forward_metadata.query_start_loc is None
+        ):
+            return
+
+        query = query.reshape(query.shape[1], query.shape[2], query.shape[3])
+        key = key.reshape(key.shape[1], key.shape[2], key.shape[3])
+        value = value.reshape(value.shape[1], value.shape[2], value.shape[3])
+        g = g.reshape(-1, g.shape[-1])
+        beta = beta.reshape(-1, beta.shape[-1])
+        query_start_loc = self.forward_metadata.query_start_loc
+
+        for req_i, (prefix_len, extend_len) in enumerate(
+            zip(
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                strict=True,
+            )
+        ):
+            seq_len = prefix_len + extend_len
+            boundary = (seq_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+            num_verified_tokens = seq_len - boundary
+            dst = cache_indices[req_i].to(torch.long)
+            mamba_cache_params.dvr_qkvg_beta_pos[dst] = num_verified_tokens
+            if num_verified_tokens == 0:
+                continue
+
+            write_start = max(prefix_len, boundary)
+            write_end = seq_len
+            if write_start >= write_end:
+                continue
+
+            src_start = int(query_start_loc[req_i].item()) + (write_start - prefix_len)
+            src_end = src_start + (write_end - write_start)
+            cols = torch.arange(
+                write_start - boundary,
+                write_end - boundary,
+                dtype=torch.long,
+                device=cache_indices.device,
+            )
+            # Seed the DVR rolling window with the prompt/extend tail after the
+            # latest chunk boundary. Later target verify appends draft_token
+            # rows to this same qkvg_beta window.
+            mamba_cache_params.dvr_q_state_cache[dst, cols] = query[src_start:src_end]
+            mamba_cache_params.dvr_k_state_cache[dst, cols] = key[src_start:src_end]
+            mamba_cache_params.dvr_v_state_cache[dst, cols] = value[src_start:src_end]
+            mamba_cache_params.dvr_g_state_cache[dst, cols] = g[src_start:src_end]
+            mamba_cache_params.dvr_beta_state_cache[dst, cols] = beta[src_start:src_end]
 
     def forward_decode(
         self,
@@ -600,6 +703,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            self._cache_dvr_extend_verified_qkvg_beta(
+                forward_batch,
+                mamba_cache_params,
+                cache_indices,
+                query,
+                key,
+                value,
+                g,
+                beta,
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
