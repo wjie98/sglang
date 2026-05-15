@@ -560,6 +560,40 @@ class DecodeVerifyRollbackWorker:
             dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
         ).unsqueeze(0)
 
+    def _init_gdn_boundary_for_req(
+        self, batch: ScheduleBatch, req, boundary_seqlen: int
+    ) -> Optional[torch.Tensor]:
+        checkpoint_track_idx = self._current_prefill_checkpoint_track_idx(batch, req)
+        if checkpoint_track_idx is not None:
+            # Normal prefill already wrote the chunk-aligned state into the
+            # ping-pong checkpoint buffer. Reuse that slot instead of copying
+            # from the live decode slot, which may no longer hold the
+            # deterministic prefill checkpoint.
+            self._gdn_boundary_track_idx[req.rid] = checkpoint_track_idx
+            self._gdn_boundary_seqlen[req.rid] = boundary_seqlen
+            req.mamba_last_track_seqlen = boundary_seqlen
+            req.mamba_next_track_idx = self._mamba_other_track_idx(
+                batch, checkpoint_track_idx
+            )
+            return None
+
+        boundary_track_idx = req.mamba_next_track_idx
+        self._gdn_boundary_track_idx[req.rid] = boundary_track_idx
+        self._gdn_boundary_seqlen[req.rid] = boundary_seqlen
+        req.mamba_last_track_seqlen = boundary_seqlen
+        req.mamba_next_track_idx = self._mamba_other_track_idx(
+            batch, boundary_track_idx
+        )
+        dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
+        if boundary_seqlen == 0:
+            return dst
+        raise RuntimeError(
+            "DVR GDN could not find a chunk-aligned prefill checkpoint "
+            f"for boundary {boundary_seqlen}. mamba_track_interval must be "
+            f"aligned to FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, and ordinary prefill "
+            "must materialize that checkpoint before DVR target verify starts."
+        )
+
     def _ensure_gdn_boundary_state(
         self, batch: ScheduleBatch, ctx: Optional[_GDNDVRStateContext] = None
     ):
@@ -574,40 +608,11 @@ class DecodeVerifyRollbackWorker:
                 boundary_seqlen, verified_tail_len = self._gdn_boundary_and_tail(req)
                 reset_pos_indices.append(ctx.live_indices[i])
                 reset_pos_values.append(verified_tail_len)
-                checkpoint_track_idx = self._current_prefill_checkpoint_track_idx(
-                    batch, req
+                zero_dst_idx = self._init_gdn_boundary_for_req(
+                    batch, req, boundary_seqlen
                 )
-                if checkpoint_track_idx is not None:
-                    # Normal prefill already wrote the chunk-aligned state into
-                    # the ping-pong checkpoint buffer. Reuse that slot instead of
-                    # copying from the live decode slot, which may no longer hold
-                    # the deterministic prefill checkpoint.
-                    self._gdn_boundary_track_idx[req.rid] = checkpoint_track_idx
-                    self._gdn_boundary_seqlen[req.rid] = boundary_seqlen
-                    req.mamba_last_track_seqlen = boundary_seqlen
-                    req.mamba_next_track_idx = self._mamba_other_track_idx(
-                        batch, checkpoint_track_idx
-                    )
-                else:
-                    boundary_track_idx = req.mamba_next_track_idx
-                    self._gdn_boundary_track_idx[req.rid] = boundary_track_idx
-                    self._gdn_boundary_seqlen[req.rid] = boundary_seqlen
-                    req.mamba_last_track_seqlen = boundary_seqlen
-                    req.mamba_next_track_idx = self._mamba_other_track_idx(
-                        batch, boundary_track_idx
-                    )
-                    dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
-                    if boundary_seqlen == 0:
-                        zero_dst.append(dst)
-                    else:
-                        raise RuntimeError(
-                            "DVR GDN could not find a chunk-aligned prefill "
-                            "checkpoint for boundary "
-                            f"{boundary_seqlen}. mamba_track_interval must be "
-                            f"aligned to FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, and "
-                            "ordinary prefill must materialize that checkpoint "
-                            "before DVR target verify starts."
-                        )
+                if zero_dst_idx is not None:
+                    zero_dst.append(zero_dst_idx)
         if zero_dst:
             dst = torch.stack(zero_dst).to(
                 device=ctx.live_indices.device, dtype=torch.long
