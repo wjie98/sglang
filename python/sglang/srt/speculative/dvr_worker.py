@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -86,6 +86,13 @@ class _GDNFixedVerifyWindowState:
         spec_info.draft_token_num = self.draft_token_num
         spec_info.num_tokens_per_req = self.num_tokens_per_req
         spec_info.seq_lens_cpu = self.spec_seq_lens_cpu
+
+
+@dataclass
+class _GDNDVRStateContext:
+    mamba_cache: Any
+    live_indices: torch.Tensor
+    boundary_indices: Optional[torch.Tensor] = None
 
 
 @contextmanager
@@ -521,27 +528,29 @@ class DecodeVerifyRollbackWorker:
             and all(req.mamba_ping_pong_track_buffer is not None for req in batch.reqs)
         )
 
-    def _gdn_mamba_cache(self, batch: ScheduleBatch):
-        return batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-
-    def _gdn_live_indices(self, batch: ScheduleBatch) -> torch.Tensor:
-        return batch.req_to_token_pool.get_mamba_indices(
+    def _gdn_state_context(
+        self, batch: ScheduleBatch, require_boundary: bool = False
+    ) -> Optional[_GDNDVRStateContext]:
+        if not self._has_gdn_dvr_state(batch):
+            return None
+        live_indices = batch.req_to_token_pool.get_mamba_indices(
             batch.req_pool_indices
         ).to(torch.long)
-
-    def _mamba_indices_for_batch(
-        self, batch: ScheduleBatch
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        live_indices = self._gdn_live_indices(batch)
-        boundary_indices = torch.stack(
-            [
-                req.mamba_ping_pong_track_buffer[
-                    self._gdn_boundary_track_idx[req.rid]
+        boundary_indices = None
+        if require_boundary:
+            boundary_indices = torch.stack(
+                [
+                    req.mamba_ping_pong_track_buffer[
+                        self._gdn_boundary_track_idx[req.rid]
+                    ]
+                    for req in batch.reqs
                 ]
-                for req in batch.reqs
-            ]
-        ).to(device=live_indices.device, dtype=torch.long)
-        return live_indices, boundary_indices
+            ).to(device=live_indices.device, dtype=torch.long)
+        return _GDNDVRStateContext(
+            mamba_cache=batch.req_to_token_pool.get_speculative_mamba2_params_all_layers(),
+            live_indices=live_indices,
+            boundary_indices=boundary_indices,
+        )
 
     def _fixed_verify_draft_rows(
         self, verified_tail_lens: torch.Tensor, device: torch.device
@@ -559,10 +568,11 @@ class DecodeVerifyRollbackWorker:
         return boundary_seqlen, verified_tail_len
 
     def _chunk_boundary_tail_lens(self, batch: ScheduleBatch) -> torch.Tensor:
-        if self._has_gdn_dvr_state(batch):
-            mamba_cache = self._gdn_mamba_cache(batch)
-            live_indices = self._gdn_live_indices(batch)
-            return mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(torch.long)
+        ctx = self._gdn_state_context(batch)
+        if ctx is not None:
+            return ctx.mamba_cache.dvr_qkvg_beta_pos[0, ctx.live_indices].to(
+                torch.long
+            )
         return torch.tensor(
             [self._gdn_boundary_and_tail(req)[1] for req in batch.reqs],
             dtype=torch.long,
@@ -584,11 +594,10 @@ class DecodeVerifyRollbackWorker:
 
     def _set_gdn_verified_tail_lens(
         self,
-        batch: ScheduleBatch,
+        mamba_cache,
         live_indices: torch.Tensor,
         verified_tail_lens: torch.Tensor,
     ):
-        mamba_cache = self._gdn_mamba_cache(batch)
         if getattr(mamba_cache, "dvr_qkvg_beta_pos", None) is None:
             return
         mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = verified_tail_lens.to(
@@ -597,16 +606,16 @@ class DecodeVerifyRollbackWorker:
         ).unsqueeze(0)
 
     def _ensure_gdn_boundary_state(self, batch: ScheduleBatch):
-        if not self._has_gdn_dvr_state(batch):
+        ctx = self._gdn_state_context(batch)
+        if ctx is None:
             return
-        live_indices = self._gdn_live_indices(batch)
         zero_dst = []
         reset_pos_indices = []
         reset_pos_values = []
         for i, req in enumerate(batch.reqs):
             if req.rid not in self._gdn_boundary_seqlen:
                 boundary_seqlen, verified_tail_len = self._gdn_boundary_and_tail(req)
-                reset_pos_indices.append(live_indices[i])
+                reset_pos_indices.append(ctx.live_indices[i])
                 reset_pos_values.append(verified_tail_len)
                 checkpoint_track_idx = self._current_prefill_checkpoint_track_idx(
                     batch, req
@@ -643,35 +652,39 @@ class DecodeVerifyRollbackWorker:
                             "before DVR target verify starts."
                         )
         if zero_dst:
-            dst = torch.stack(zero_dst).to(device=live_indices.device, dtype=torch.long)
-            mamba_cache = self._gdn_mamba_cache(batch)
-            for conv in mamba_cache.conv:
+            dst = torch.stack(zero_dst).to(
+                device=ctx.live_indices.device, dtype=torch.long
+            )
+            for conv in ctx.mamba_cache.conv:
                 conv[:, dst] = 0
-            mamba_cache.temporal[:, dst] = 0
+            ctx.mamba_cache.temporal[:, dst] = 0
         if reset_pos_indices:
             self._set_gdn_verified_tail_lens(
-                batch,
+                ctx.mamba_cache,
                 torch.stack(reset_pos_indices),
-                torch.tensor(reset_pos_values, device=live_indices.device),
+                torch.tensor(reset_pos_values, device=ctx.live_indices.device),
             )
 
     def _restore_gdn_boundary_state_for_verify(self, batch: ScheduleBatch):
-        if not self._has_gdn_dvr_state(batch):
-            return
         self._ensure_gdn_boundary_state(batch)
-        live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
+        ctx = self._gdn_state_context(batch, require_boundary=True)
+        if ctx is None:
+            return
+        assert ctx.boundary_indices is not None
         if self._gdn_boundary_backup is not None:
             # Draft decode must not affect the verify starting state. Keep an
             # explicit snapshot because the shared extra-buffer slot can be
             # touched by generic Mamba tracking/cache code while draft runs.
             batch.req_to_token_pool.mamba_pool.restore_state(
-                self._gdn_boundary_backup, boundary_indices
+                self._gdn_boundary_backup, ctx.boundary_indices
             )
             batch.req_to_token_pool.mamba_pool.restore_state(
-                self._gdn_boundary_backup, live_indices
+                self._gdn_boundary_backup, ctx.live_indices
             )
         else:
-            batch.req_to_token_pool.mamba_pool.copy_from(boundary_indices, live_indices)
+            batch.req_to_token_pool.mamba_pool.copy_from(
+                ctx.boundary_indices, ctx.live_indices
+            )
 
     def _prepare_fixed_verify_window(
         self, batch: ScheduleBatch, spec_info: EagleVerifyInput
@@ -763,10 +776,9 @@ class DecodeVerifyRollbackWorker:
         spec_info.draft_token_num = verify_window
         spec_info.num_tokens_per_req = verify_window
         spec_info.seq_lens_cpu = batch.seq_lens_cpu
-        if self._has_gdn_dvr_state(batch):
-            mamba_cache = self._gdn_mamba_cache(batch)
-            live_indices = self._gdn_live_indices(batch)
-            mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = 0
+        ctx = self._gdn_state_context(batch)
+        if ctx is not None:
+            ctx.mamba_cache.dvr_qkvg_beta_pos[:, ctx.live_indices] = 0
 
         original.padding_locs.extend(padding_locs)
         original.verified_tail_lens = verified_tail_lens
@@ -795,29 +807,32 @@ class DecodeVerifyRollbackWorker:
         if state.padding_locs:
             self.token_to_kv_pool_allocator.free(torch.cat(state.padding_locs))
 
-        if self._has_gdn_dvr_state(batch):
+        ctx = self._gdn_state_context(batch)
+        if ctx is not None:
             self._set_gdn_verified_tail_lens(
-                batch, self._gdn_live_indices(batch), state.verified_tail_lens
+                ctx.mamba_cache, ctx.live_indices, state.verified_tail_lens
             )
 
     def _backup_gdn_boundary_state(self, batch: ScheduleBatch):
-        if not self._has_gdn_dvr_state(batch):
+        ctx = self._gdn_state_context(batch, require_boundary=True)
+        if ctx is None:
             self._gdn_boundary_backup = None
             return
-        _, boundary_indices = self._mamba_indices_for_batch(batch)
+        assert ctx.boundary_indices is not None
         self._gdn_boundary_backup = batch.req_to_token_pool.mamba_pool.backup_state(
-            boundary_indices
+            ctx.boundary_indices
         )
 
     def _commit_gdn_state_after_verify(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        if not self._has_gdn_dvr_state(batch):
+        ctx = self._gdn_state_context(batch, require_boundary=True)
+        if ctx is None:
             return
+        assert ctx.boundary_indices is not None
 
-        live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
         accepted_tokens, accepted_steps = self._accepted_token_metadata(
-            batch, verify_output, live_indices.device
+            batch, verify_output, ctx.live_indices.device
         )
         if accepted_tokens.numel() == 0:
             return
@@ -827,11 +842,11 @@ class DecodeVerifyRollbackWorker:
         if linear_backend is None:
             return
         verified_tail_lens = self._chunk_boundary_tail_lens(batch).to(
-            device=live_indices.device, dtype=torch.long
+            device=ctx.live_indices.device, dtype=torch.long
         )
         crossing = linear_backend.update_dvr_state_after_verify(
-            live_indices=live_indices,
-            boundary_indices=boundary_indices,
+            live_indices=ctx.live_indices,
+            boundary_indices=ctx.boundary_indices,
             verified_tail_lens=verified_tail_lens,
             accepted_tokens=accepted_tokens,
             accepted_steps=accepted_steps,
