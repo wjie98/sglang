@@ -992,7 +992,7 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
-        from sglang.srt.speculative.dvr_worker import (
+        from sglang.srt.speculative.dvr_utils import (
             dvr_causal_verify_cuda_graph_metadata,
             dvr_runtime_verify_window,
         )
@@ -1150,7 +1150,7 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
-        from sglang.srt.speculative.dvr_worker import (
+        from sglang.srt.speculative.dvr_utils import (
             dvr_causal_verify_cuda_graph_metadata,
         )
 
