@@ -557,8 +557,12 @@ class DecodeVerifyRollbackWorker:
     ) -> torch.Tensor:
         keep = []
         for req_i, verified_tail_len in enumerate(verified_tail_lens.tolist()):
-            start = req_i * self.verify_window_size + int(verified_tail_len)
-            keep.extend(range(start, start + self.num_draft_tokens))
+            physical_row_start = req_i * self.verify_window_size + int(
+                verified_tail_len
+            )
+            keep.extend(
+                range(physical_row_start, physical_row_start + self.num_draft_tokens)
+            )
         return torch.tensor(keep, dtype=torch.long, device=device)
 
     @staticmethod
@@ -696,14 +700,15 @@ class DecodeVerifyRollbackWorker:
             return None
 
         bs = batch.batch_size()
-        verify_window = self.verify_window_size
+        physical_verify_len = self.verify_window_size
+        logical_draft_len = self.num_draft_tokens
         original = _GDNFixedVerifyWindowState.capture(batch, spec_info)
 
         draft_tokens = spec_info.draft_token.reshape(
-            bs, self.num_draft_tokens
+            bs, logical_draft_len
         )
         draft_cache_locs = batch.out_cache_loc.reshape(
-            bs, self.num_draft_tokens
+            bs, logical_draft_len
         )
         req_to_token = batch.req_to_token_pool.req_to_token
         verified_tail_lens = self._chunk_boundary_tail_lens(batch)
@@ -717,12 +722,12 @@ class DecodeVerifyRollbackWorker:
             verified_tail_len = int(verified_tail_lens[req_i].item())
             boundary = (req.seqlen - 1) - verified_tail_len
             all_ids = req.origin_input_ids + req.output_ids
-            num_real_tokens = verified_tail_len + self.num_draft_tokens
-            num_padding_tokens = verify_window - num_real_tokens
+            num_real_tokens = verified_tail_len + logical_draft_len
+            num_padding_tokens = physical_verify_len - num_real_tokens
             if num_padding_tokens < 0:
                 raise RuntimeError(
                     f"DVR GDN verify window overflow: verified={verified_tail_len}, "
-                    f"draft={self.num_draft_tokens}, window={verify_window}."
+                    f"draft={logical_draft_len}, window={physical_verify_len}."
                 )
             # DVR chunk-boundary target verify uses a graphable fixed window:
             # verified_tail + draft_token + padding_token. The prompt/extend
@@ -749,7 +754,7 @@ class DecodeVerifyRollbackWorker:
             positions.append(
                 torch.arange(
                     boundary,
-                    boundary + verify_window,
+                    boundary + physical_verify_len,
                     dtype=spec_info.positions.dtype,
                     device=spec_info.positions.device,
                 )
@@ -773,8 +778,8 @@ class DecodeVerifyRollbackWorker:
         batch.seq_lens_sum = sum(boundary_lens)
         spec_info.draft_token = batch.input_ids
         spec_info.positions = torch.cat(positions)
-        spec_info.draft_token_num = verify_window
-        spec_info.num_tokens_per_req = verify_window
+        spec_info.draft_token_num = physical_verify_len
+        spec_info.num_tokens_per_req = physical_verify_len
         spec_info.seq_lens_cpu = batch.seq_lens_cpu
         ctx = self._gdn_state_context(batch)
         if ctx is not None:
