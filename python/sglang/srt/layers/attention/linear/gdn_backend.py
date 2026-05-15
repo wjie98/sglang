@@ -752,6 +752,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        is_dvr_target_verify = (
+            is_target_verify
+            and getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None
+        )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -774,7 +778,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            if getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None:
+            if is_dvr_target_verify:
                 # DVR uses a fixed 64+draft linear verify window. Keep the
                 # generic GDN forward path here; only export the tensors needed
                 # by DVR state replay.
@@ -846,7 +850,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            if getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None:
+            if is_dvr_target_verify:
                 core_attn_out = self._dvr_target_verify_extend(
                     layer=layer,
                     mamba_cache_params=mamba_cache_params,
