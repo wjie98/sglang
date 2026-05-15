@@ -1,5 +1,3 @@
-import os
-from itertools import count
 from typing import Optional, Tuple, Union
 
 import torch
@@ -27,7 +25,6 @@ from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
-    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
@@ -59,33 +56,6 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
-
-_DVR_GDN_TRACE_COUNTER = count()
-
-
-def _dvr_gdn_trace_dump(layer_id: int, kind: str, **payload):
-    trace_dir = os.environ.get("SGLANG_DVR_TRACE_DIR")
-    if not trace_dir:
-        return
-    raw_layers = os.environ.get("SGLANG_DVR_TRACE_LAYERS")
-    if raw_layers:
-        layers = {int(x) for x in raw_layers.replace(",", " ").split()}
-        if layer_id not in layers:
-            return
-    os.makedirs(trace_dir, exist_ok=True)
-    item = {"kind": kind, "layer": layer_id}
-    for key, value in payload.items():
-        if torch.is_tensor(value):
-            item[key] = value.detach().cpu()
-        else:
-            item[key] = value
-    torch.save(
-        item,
-        os.path.join(
-            trace_dir, f"{next(_DVR_GDN_TRACE_COUNTER):06d}_gdn_{layer_id}_{kind}.pt"
-        ),
-    )
-
 
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
@@ -340,47 +310,6 @@ class GDNKernelDispatcher:
             )
             states.append(final_state)
         return torch.cat(states, dim=0).to(initial_state.dtype, copy=False)
-
-    def chunkwise_boundary_state_from_qkvg_beta(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        *,
-        state_pool: torch.Tensor,
-        state_indices: torch.Tensor,
-        boundary_token_count: int = FLA_CHUNK_SIZE,
-    ) -> torch.Tensor:
-        if is_cpu():
-            raise NotImplementedError("DVR GDN chunkwise post-verify is GPU-only.")
-        if boundary_token_count % FLA_CHUNK_SIZE != 0:
-            raise ValueError(
-                f"boundary_token_count must align to {FLA_CHUNK_SIZE}, "
-                f"got {boundary_token_count}."
-            )
-        if boundary_token_count == 0:
-            return state_pool[state_indices]
-        if boundary_token_count > q.shape[1]:
-            raise ValueError(
-                f"boundary_token_count={boundary_token_count} exceeds saved "
-                f"qkvg beta length {q.shape[1]}."
-            )
-
-        _, _, h = chunk_gated_delta_rule(
-            q=q[:, :boundary_token_count],
-            k=k[:, :boundary_token_count],
-            v=v[:, :boundary_token_count],
-            g=g[:, :boundary_token_count],
-            beta=beta[:, :boundary_token_count],
-            initial_state=state_pool,
-            initial_state_indices=state_indices,
-            head_first=False,
-            use_qk_l2norm_in_kernel=True,
-        )
-        return h[:, -1].to(state_pool.dtype, copy=False)
-
 
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
@@ -644,14 +573,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
             )
-            _dvr_gdn_trace_dump(
-                layer.layer_id,
-                "decode_core",
-                core_attn_out=core_attn_out,
-                input_ids=forward_batch.input_ids,
-                positions=forward_batch.positions,
-                seq_lens=forward_batch.seq_lens,
-            )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices
             )
@@ -679,14 +600,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-        )
-        _dvr_gdn_trace_dump(
-            layer.layer_id,
-            "decode_core",
-            core_attn_out=core_attn_out,
-            input_ids=forward_batch.input_ids,
-            positions=forward_batch.positions,
-            seq_lens=forward_batch.seq_lens,
         )
 
         self._track_mamba_state_decode(
@@ -854,23 +767,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         intermediate_state_indices[:batch_size].to(torch.long),
                         FLA_CHUNK_SIZE - 1,
                     ] = h[:, 1].to(intermediate_state_cache.dtype)
-                _dvr_gdn_trace_dump(
-                    layer.layer_id,
-                    "verify_chunkwise_core",
-                    core_attn_out=core_attn_out,
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    h=h,
-                    initial_conv_windows=initial_conv_windows,
-                    conv_windows=conv_windows,
-                    input_ids=forward_batch.input_ids,
-                    positions=forward_batch.positions,
-                    seq_lens=forward_batch.seq_lens,
-                    query_start_loc=query_start_loc,
-                )
                 self._export_dvr_verify_qkvg_beta(
                     mamba_cache_params=mamba_cache_params,
                     dvr_indices=dvr_indices,
@@ -920,22 +816,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 beta=beta,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-            )
-            _dvr_gdn_trace_dump(
-                layer.layer_id,
-                "extend_chunkwise_core",
-                core_attn_out=core_attn_out,
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                h=h,
-                last_recurrent_state=last_recurrent_state,
-                input_ids=forward_batch.input_ids,
-                positions=forward_batch.positions,
-                seq_lens=forward_batch.seq_lens,
                 query_start_loc=query_start_loc,
             )
 

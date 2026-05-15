@@ -816,7 +816,7 @@ class DecodeVerifyRollbackWorker:
             return
 
         live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
-        accepted_tokens, _, accepted_steps = self._accepted_token_metadata(
+        accepted_tokens, accepted_steps = self._accepted_token_metadata(
             batch, verify_output, live_indices.device
         )
         if accepted_tokens.numel() == 0:
@@ -852,21 +852,15 @@ class DecodeVerifyRollbackWorker:
         batch: ScheduleBatch,
         verify_output: EagleVerifyOutput,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         accepted_tokens = torch.tensor(
             [x + 1 for x in verify_output.accept_length_per_req_cpu],
             dtype=torch.long,
             device=device,
         )
         if accepted_tokens.numel() == 0:
-            return accepted_tokens, accepted_tokens, accepted_tokens
+            return accepted_tokens, accepted_tokens
 
-        accepted_starts = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.long, device=device),
-                torch.cumsum(accepted_tokens, dim=0)[:-1],
-            ]
-        )
         accepted_indices_offset = torch.arange(
             0,
             len(batch.seq_lens) * batch.spec_info.draft_token_num,
@@ -879,6 +873,12 @@ class DecodeVerifyRollbackWorker:
             batch.spec_info.topk > 1
             and verify_output.accepted_indices.shape[0] > 0
         ):
+            accepted_starts = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.long, device=device),
+                    torch.cumsum(accepted_tokens, dim=0)[:-1],
+                ]
+            )
             accepted_steps = (
                 verify_output.accepted_indices[
                     accepted_starts + accepted_tokens - 1
@@ -887,7 +887,7 @@ class DecodeVerifyRollbackWorker:
             )
         else:
             accepted_steps = accepted_tokens - 1
-        return accepted_tokens, accepted_starts, accepted_steps
+        return accepted_tokens, accepted_steps
 
     def _select_accepted_verify_outputs(
         self,

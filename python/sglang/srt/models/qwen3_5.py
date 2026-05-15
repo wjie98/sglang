@@ -15,8 +15,6 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
-import os
-from itertools import count
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -43,7 +41,6 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import (
     RMSNorm as RMSNormGated,
-    rms_norm_ref,
 )
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -109,38 +106,6 @@ _is_amx_available = cpu_has_amx_support()
 
 
 cached_get_processor = lru_cache(get_processor)
-_DVR_TRACE_COUNTER = count()
-
-
-def _dvr_trace_layers():
-    raw = os.environ.get("SGLANG_DVR_TRACE_LAYERS")
-    if not raw:
-        return None
-    return {int(x) for x in raw.replace(",", " ").split()}
-
-
-def _dvr_trace_dump_layer(
-    layer_idx: int,
-    hidden_states: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    forward_batch: ForwardBatch,
-):
-    trace_dir = os.environ.get("SGLANG_DVR_TRACE_DIR")
-    layers = _dvr_trace_layers()
-    if not trace_dir or (layers is not None and layer_idx not in layers):
-        return
-    os.makedirs(trace_dir, exist_ok=True)
-    item = {
-        "kind": "model_layer_output",
-        "layer": layer_idx,
-        "forward_mode": str(forward_batch.forward_mode),
-        "input_ids": forward_batch.input_ids.detach().cpu(),
-        "positions": forward_batch.positions.detach().cpu(),
-        "seq_lens": forward_batch.seq_lens.detach().cpu(),
-        "hidden_states": hidden_states.detach().cpu(),
-        "residual": None if residual is None else residual.detach().cpu(),
-    }
-    torch.save(item, os.path.join(trace_dir, f"{next(_DVR_TRACE_COUNTER):06d}_layer_{layer_idx}.pt"))
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -522,21 +487,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        # Temporary DVR determinism patch: the fused gated RMSNorm kernel is
-        # sensitive to the physical row count (e.g. prefix rows differ between
-        # 17-token and 80-token prefill). DVR fixed-window verify needs prefix
-        # invariance, so use the reference implementation until the fused
-        # kernel is made batch/row-count invariant.
-        core_attn_out = rms_norm_ref(
-            core_attn_out,
-            self.norm.weight,
-            self.norm.bias,
-            z=z,
-            eps=self.norm.eps,
-            group_size=self.norm.group_size,
-            norm_before_gate=self.norm.norm_before_gate,
-            upcast=True,
-        )
+        core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
@@ -1040,9 +991,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     forward_batch=forward_batch,
-                )
-                _dvr_trace_dump_layer(
-                    layer_idx, hidden_states, residual, forward_batch
                 )
 
             # Process deepstack embeddings if provided
