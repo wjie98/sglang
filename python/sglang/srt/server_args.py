@@ -501,6 +501,7 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    speculative_dvr_chunk_boundary_verify: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -4894,6 +4895,14 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dvr-chunk-boundary-verify",
+            action="store_true",
+            help=(
+                "For DECODE_VERIFY_ROLLBACK, use a CHUNK_SIZE + draft-token "
+                "physical target-verify window aligned to the FLA chunk boundary."
+            ),
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

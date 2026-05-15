@@ -15,6 +15,8 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
+from itertools import count
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -104,6 +106,38 @@ _is_amx_available = cpu_has_amx_support()
 
 
 cached_get_processor = lru_cache(get_processor)
+_DVR_TRACE_COUNTER = count()
+
+
+def _dvr_trace_layers():
+    raw = os.environ.get("SGLANG_DVR_TRACE_LAYERS")
+    if not raw:
+        return None
+    return {int(x) for x in raw.replace(",", " ").split()}
+
+
+def _dvr_trace_dump_layer(
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+):
+    trace_dir = os.environ.get("SGLANG_DVR_TRACE_DIR")
+    layers = _dvr_trace_layers()
+    if not trace_dir or (layers is not None and layer_idx not in layers):
+        return
+    os.makedirs(trace_dir, exist_ok=True)
+    item = {
+        "kind": "model_layer_output",
+        "layer": layer_idx,
+        "forward_mode": str(forward_batch.forward_mode),
+        "input_ids": forward_batch.input_ids.detach().cpu(),
+        "positions": forward_batch.positions.detach().cpu(),
+        "seq_lens": forward_batch.seq_lens.detach().cpu(),
+        "hidden_states": hidden_states.detach().cpu(),
+        "residual": None if residual is None else residual.detach().cpu(),
+    }
+    torch.save(item, os.path.join(trace_dir, f"{next(_DVR_TRACE_COUNTER):06d}_layer_{layer_idx}.pt"))
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -989,6 +1023,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     forward_batch=forward_batch,
+                )
+                _dvr_trace_dump_layer(
+                    layer_idx, hidden_states, residual, forward_batch
                 )
 
             # Process deepstack embeddings if provided

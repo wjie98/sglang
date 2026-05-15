@@ -152,6 +152,70 @@ This checkpoint intentionally does not fix the Qwen3.5/GDN divergence after
 token 8. It establishes a stable Qwen3 attention-only base for the next repair
 round.
 
+## 2026-05-15 Non-DVR GDN Cache-Hit Determinism
+
+Purpose:
+
+- Check whether Qwen3.5/GDN has a fundamental obstacle to deterministic
+  prefill/checkpoint reuse.
+- Separate ordinary GDN radix/mamba checkpoint correctness from DVR worker state
+  handoff bugs.
+
+Server shape:
+
+- model: `/home/hwj/Qwen3.5-0.8B`
+- no DVR/speculative algorithm
+- `--enable-deterministic-inference`
+- `--mamba-scheduler-strategy extra_buffer`
+- `--mamba-track-interval 64`
+- `--disable-overlap-schedule`
+- `--disable-cuda-graph`
+- `--disable-piecewise-cuda-graph`
+- DeepGEMM disabled through environment variables
+
+Important testing detail:
+
+- Do not use `logprob_start_len=0` when testing prefix-cache hits. In scheduler
+  prefill matching, full input-logprob requests cap `max_prefix_len` at
+  `logprob_start_len`, so `logprob_start_len=0` intentionally disables prefix
+  cache matching.
+- To test the cache-hit path, compare the next-token `output_token_logprobs` and
+  `output_top_logprobs` after the same prefix with and without cache.
+
+Results:
+
+- Dense checkpoints were created by warming shared prefixes at 64-token
+  boundaries.
+- The server log confirmed real cache hits:
+  - `#new-token: 64, #cached-token: 64`
+  - `#new-token: 64, #cached-token: 128`
+- `L=128`, with 64 cached tokens:
+  - generated next-token id matched
+  - output logprob diff: `0.0`
+  - output top-5 logprobs matched exactly
+- `L=192`, with 128 cached tokens:
+  - generated next-token id matched
+  - output logprob diff: `0.0`
+  - output top-5 logprobs matched exactly
+
+Interpretation:
+
+- Ordinary Qwen3.5/GDN deterministic prefill plus radix/mamba checkpoint reuse is
+  strict-equal at 64-token boundaries under the tested path.
+- Therefore, implementing deterministic inference for GDN through DVR has no
+  observed principle-level blocker. The remaining DVR divergence is an
+  implementation issue in how DVR obtains, restores, and commits the chunk
+  boundary temporal state and conv state.
+- The next debugging target should be the DVR worker/backend boundary-state
+  path: compare the state/conv state used by DVR target verify against the state
+  used by the ordinary non-DVR cache-hit path above.
+
+Rejected/unstable testing setup:
+
+- The same extra-buffer cache-hit experiment without `--disable-overlap-schedule`
+  hung around the mamba radix cache runtime sanity check. This appears to be an
+  overlap/cache stability risk and was not used for the correctness conclusion.
+
 Server command shape:
 
 - model: `/home/hwj/Qwen3-0.6B`
@@ -204,3 +268,242 @@ The following debug-only code was removed before returning to a clean baseline:
 - `SGLANG_DVR_DEBUG_DUMP_DIR` tensor dumps in `gdn_backend.py`
 - `SGLANG_DVR_LAYER_DEBUG_DUMP_DIR` layer dumps in `qwen3_5.py`
 - `SGLANG_DVR_DEBUG_ACCEPT` accept metadata logs in `dvr_worker.py`
+## 2026-05-15 GDN DVR Acceptance Debug on v3
+
+Worktree: `/home/hwj/dvr_qwen3_5/sglang-dvr-clean-v3`
+Branch: `dvr-v3-controlled-migration`
+
+Test setup:
+
+- Model: `/home/hwj/Qwen3.5-0.8B`
+- DVR: `DECODE_VERIFY_ROLLBACK`, topk=1, `speculative_num_steps=15`, `speculative_num_draft_tokens=16`
+- GDN state mode: `--mamba-scheduler-strategy extra_buffer --mamba-track-interval 64`
+- Deterministic inference enabled, overlap/cuda graph disabled, DeepGEMM disabled.
+
+Findings:
+
+- The current fixed-window GDN verify already forwards a `64 + 16` window and slices the logits back to the 16 `draft_token` rows before calling `EagleVerifyInput.verify()`. Passing all 80 rows into SPS verify is not the current bug.
+- For chain verify, `draft_token[0]` is the current anchor. The verify logits row selected at `verified_tail_len` predicts `draft_token[1]`, so the existing row offset is semantically correct.
+- A temporary debug log showed greedy first-round alignment like:
+  - `candidates=[anchor, draft1, draft2, ...]`
+  - `target_top[0] == draft1`
+  This confirms the first verify row is not off by one.
+- I tried changing GDN state commit to advance by `accept_length` only, assuming `accept_length + 1` was committing the bonus token. That was wrong. The `+1` is the previous anchor, not the new bonus. The correct rolling tail after verify should include `old_anchor + accepted_draft_tokens` and exclude the new bonus anchor. The original `accept_length + 1` behavior matches that invariant.
+- Low acceptance is therefore not explained by verify row selection or bonus duplication. The remaining issue is that recurrent self-decode draft and chunkwise target verify diverge within a chunk. After the first accepted span, the next round's self-draft is often no longer close to the next chunkwise verify distribution.
+
+Useful invariant:
+
+- `verified_tail` for the next 80-window should contain tokens from the chunk boundary through the token before the next anchor.
+- `draft_token[0]` is the next anchor and is processed by the next verify/draft step.
+- GDN live recurrent/conv state used by self-decode should correspond to the state before this next anchor.
+
+Next debugging direction:
+
+- Compare the live recurrent/conv state rebuilt in `update_dvr_state_after_verify()` against a normal deterministic cache-hit prefill state at the same prefix, especially after non-greedy accepted spans.
+- Check whether the recurrent replay from saved q/k/v/g/beta is expected to match the state needed for high-acceptance self-decode, or whether high acceptance requires a different draft path for GDN within a chunk.
+
+## 2026-05-15 Layerwise DVR GDN Decode-vs-Verify Comparison
+
+Temporary instrumentation compared each GDN layer's self-decode `core_attn_out`
+against the corresponding row in the `64 + 16` target verify window for the
+same `anchor + draft` sequence.
+
+Setup:
+
+- Model: `/home/hwj/Qwen3.5-0.8B`
+- Prompt: `Explain deterministic verification in one short sentence:`
+- Sampling: greedy, `max_new_tokens=8`
+- DVR: topk=1, draft tokens=16, fixed GDN verify window=80
+- CUDA graph disabled, overlap disabled, DeepGEMM disabled
+
+Observed first verify round with `tail=[9]`:
+
+- GDN layer 0: first 8 step max abs diffs around `2e-4 ~ 5e-4`
+- GDN layer 1: around `3e-5 ~ 2e-4`
+- GDN layer 2: around `1e-4 ~ 5e-4`
+- GDN layer 4: first 7 steps still small, but step 7 jumps to about `6.6e-2`
+- Later GDN layers inherit/amplify the difference.
+
+Observed second verify round with `tail=[11]`:
+
+- GDN layer 0/1/2 are still small for the first several steps.
+- GDN layer 4 jumps around step 5 to about `1.9e-1`; later layers amplify it.
+
+Interpretation:
+
+- This result argues against the hypothesis that recurrent and chunkwise GDN
+  kernels produce a huge mismatch immediately in short sequences.
+- The first large mismatch is visible at GDN layer 4. In Qwen3.5 the missing
+  layer between GDN layer 2 and GDN layer 4 is a full-attention layer, so the
+  most likely first source is the attention layer 3 output or the hidden-state
+  handoff through that layer, not the early GDN recurrent/chunkwise kernel
+  itself.
+- Next focused check should dump model-layer outputs around layers 2, 3, and 4:
+  layer 2 output, layer 3 attention output/post-MLP output, and layer 4 input.
+  That should distinguish an attention KV/mask/position issue from a later GDN
+  state issue.
+
+## 2026-05-15 Full-Layer DVR GDN Trace: Root Cause of >=8 Divergence
+
+Temporary trace hooks exported:
+
+- normal deterministic full prefill/scoring for `prompt + greedy_output`;
+- DVR self-decode rows;
+- DVR target verify rows;
+- GDN target-verify q/k/v/g/beta and chunkwise `core_attn_out`.
+
+Setup:
+
+- Model: `/home/hwj/Qwen3.5-0.8B`
+- Prompt: `Explain deterministic verification in one short sentence:`
+- Greedy output ids: `[271, 248068, 271, 248069, 271, 89454, 4384, 22188]`
+- Full ids length: 17, prompt length: 9
+- DVR: topk=1, draft tokens=16, GDN fixed verify window=80
+- CUDA graph disabled, overlap disabled, DeepGEMM disabled
+
+Important alignment correction:
+
+- The first verify round did not contain the final greedy output after position
+  10, because the later draft candidates were rejected.
+- The correct baseline comparison must select the verify round whose
+  `input_ids` prefix matches the complete `prompt + greedy_output`.
+- After aligning this way, positions 9..15 match exactly. The first real
+  divergence is position 16.
+
+Model layer output, aligned to the matching verify pass:
+
+| layer | type | verify vs full-prefill max | first pos >1e-2 | decode vs full-prefill max |
+|---:|---|---:|---|---:|
+| 0 | GDN | 0 | - | 0.00195312 |
+| 1 | GDN | 0.000244141 | - | 0.00390625 |
+| 2 | GDN | 0.000488281 | - | 0.00390625 |
+| 3 | ATTN | 0.100098 | 16 | 0.00830078 |
+| 4 | GDN | 0.0722656 | 16 | 0.00585938 |
+| 5 | GDN | 0.0869141 | 16 | 0.00390625 |
+| 6 | GDN | 0.107666 | 16 | 0.00292969 |
+| 7 | ATTN | 0.174683 | 16 | 0.00634766 |
+| 8 | GDN | 0.12439 | 16 | 0.00427246 |
+| 9 | GDN | 0.12915 | 16 | 0.00439453 |
+| 10 | GDN | 0.109863 | 16 | 0.00390625 |
+| 11 | ATTN | 0.157715 | 16 | 0.00585938 |
+| 12 | GDN | 0.169434 | 16 | 0.0057373 |
+| 13 | GDN | 0.300491 | 16 | 0.00585938 |
+| 14 | GDN | 0.15918 | 16 | 0.00927734 |
+| 15 | ATTN | 0.222656 | 16 | 0.00585938 |
+| 16 | GDN | 0.201538 | 16 | 0.00537109 |
+| 17 | GDN | 0.189087 | 16 | 0.00537109 |
+| 18 | GDN | 0.816406 | 16 | 0.0117188 |
+| 19 | ATTN | 0.215332 | 16 | 0.0117188 |
+| 20 | GDN | 0.235352 | 16 | 0.0166016 |
+| 21 | GDN | 0.246338 | 16 | 0.012085 |
+| 22 | GDN | 1.20166 | 16 | 0.015625 |
+| 23 | ATTN | 0.887695 | 16 | 0.140625 |
+
+GDN core/qkvg-beta comparison, aligned to the same verify pass:
+
+| gdn layer | verify core max | first pos >1e-2 | q max | k max | v max | g max | beta max |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 0 | 0 | - | 0 | 0 | 0 | 0 | 0 |
+| 1 | 0 | - | 0 | 0 | 0 | 0 | 0 |
+| 2 | 3.05176e-05 | - | 0.00390625 | 0.00390625 | 0.00195312 | 8.56519e-05 | 0.00195312 |
+| 4 | 0.0419922 | 16 | 1.59375 | 0.605469 | 0.759766 | 0.81162 | 0.132812 |
+| 5 | 0.00390625 | - | 0.726562 | 0.351562 | 0.1875 | 0.234367 | 0.0664062 |
+| 6 | 0.000961304 | - | 1.01367 | 0.230469 | 0.0793457 | 0.201281 | 0.09375 |
+| 8 | 0.0800781 | 16 | 1.28223 | 0.724609 | 0.354492 | 0.180371 | 0.234375 |
+| 9 | 0.00378418 | - | 1.21973 | 0.242676 | 0.265625 | 0.109712 | 0.368164 |
+| 10 | 0.00259399 | - | 1.29688 | 0.722656 | 0.20459 | 0.335996 | 0.195312 |
+| 12 | 0.0144615 | 16 | 1.90625 | 0.730652 | 0.880859 | 0.19733 | 0.138672 |
+| 13 | 0.00730896 | - | 2.53906 | 1.03223 | 0.392578 | 0.208069 | 0.154297 |
+| 14 | 0.00259399 | - | 1.08984 | 0.194824 | 0.548828 | 0.183772 | 0.265625 |
+| 16 | 0.03125 | 16 | 4.53125 | 0.640625 | 0.914062 | 0.300087 | 0.304688 |
+| 17 | 0.0477295 | 16 | 5.125 | 1.00781 | 1.51562 | 0.144813 | 0.269531 |
+| 18 | 0.0410156 | 16 | 0.896484 | 0.9375 | 0.84375 | 0.181114 | 0.144531 |
+| 20 | 0.121094 | 16 | 1.75 | 1.7627 | 1.39062 | 0.252073 | 0.359375 |
+| 21 | 0.0712891 | 16 | 1.53125 | 2.125 | 0.796875 | 0.265596 | 0.21875 |
+| 22 | 0.0288086 | 16 | 1.23047 | 1.35156 | 0.976562 | 0.684968 | 0.171875 |
+
+First divergence by token position:
+
+| pos | token | first layer >1e-2 | max layer diff |
+|---:|---:|---|---:|
+| 9 | 271 | - | 0 |
+| 10 | 248068 | - | 0 |
+| 11 | 271 | - | 0 |
+| 12 | 248069 | - | 0 |
+| 13 | 271 | - | 0 |
+| 14 | 89454 | - | 0 |
+| 15 | 4384 | - | 0 |
+| 16 | 22188 | 3 | 1.20166 |
+
+Root cause:
+
+- Layer 0/1/2 are GDN and match full prefill through position 16.
+- The first bad layer is layer 3, which is a full-attention layer.
+- This points to target-verify full-attention metadata, not to early GDN
+  recurrent/chunkwise state.
+- The fixed DVR GDN verify window changes `spec_info.draft_token_num` from 16
+  to 80 before forward. GDN backend reads `spec_info.draft_token_num`, so it
+  processes all 80 rows.
+- The triton full-attention target-verify metadata still uses backend
+  `self.num_draft_tokens`, initialized from CLI as 16, to build `qo_indptr`,
+  `seq_mask_len`, and `max_extend_len`.
+- Therefore the attention target-verify kernel only computes query rows 0..15
+  in the 80-row window. Row 16 is the first row outside that range, so the
+  repeated ">=8 generated tokens" symptom is actually "the first generated row
+  that maps to fixed-window row 16".
+
+Next fix:
+
+- Make target-verify attention metadata use the runtime verify length
+  (`spec_info.draft_token_num` / `spec_info.num_tokens_per_req`) instead of the
+  backend's static `self.num_draft_tokens`.
+- Keep the change narrow to target-verify metadata construction. The GDN path
+  already follows the runtime window length.
+
+Validation after applying that fix to triton target-verify metadata:
+
+- Same prompt/output, same 80-row fixed verify window, CUDA graph still disabled.
+- DVR output ids stayed `[271, 248068, 271, 248069, 271, 89454, 4384, 22188]`.
+- Acceptance improved from `0.2` to `0.5333333333333333`.
+- The layer 3 attention error disappeared:
+  - before: layer 3 `verify vs full-prefill max = 0.100098`, first bad pos 16
+  - after: layer 3 `verify vs full-prefill max = 0.000976562`, no bad pos
+- GDN core errors also collapsed:
+  - before: GDN layer 4 core max `0.0419922`, first bad pos 16
+  - after: GDN layer 4 core max `0.00195312`, no bad pos
+- Remaining aligned layer-output max after the fix:
+
+| layer | type | verify vs full-prefill max | first pos >1e-2 |
+|---:|---|---:|---|
+| 0 | GDN | 0 | - |
+| 1 | GDN | 0.000244141 | - |
+| 2 | GDN | 0.000488281 | - |
+| 3 | ATTN | 0.000976562 | - |
+| 4 | GDN | 0.00140381 | - |
+| 5 | GDN | 0.0012207 | - |
+| 6 | GDN | 0.00134277 | - |
+| 7 | ATTN | 0.00128174 | - |
+| 8 | GDN | 0.00115967 | - |
+| 9 | GDN | 0.00109863 | - |
+| 10 | GDN | 0.00195312 | - |
+| 11 | ATTN | 0.00109863 | - |
+| 12 | GDN | 0.00134277 | - |
+| 13 | GDN | 0.00195312 | - |
+| 14 | GDN | 0.00170898 | - |
+| 15 | ATTN | 0.00244141 | - |
+| 16 | GDN | 0.00390625 | - |
+| 17 | GDN | 0.00256348 | - |
+| 18 | GDN | 0.00585938 | - |
+| 19 | ATTN | 0.0078125 | - |
+| 20 | GDN | 0.00585938 | - |
+| 21 | GDN | 0.00488281 | - |
+| 22 | GDN | 0.00390625 | - |
+| 23 | ATTN | 0.0117188 | 16 |
+
+Conclusion after this fix:
+
+- The large `>=8 token` failure was a fixed-window/full-attention metadata bug,
+  not a GDN recurrent-vs-chunkwise kernel failure.
+- There is still a smaller final-layer discrepancy around one bf16 quantum
+  scale (`~1e-2`) at the last attention layer for this example. That should be
+  investigated separately after the current metadata bug is kept fixed.

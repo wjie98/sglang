@@ -129,6 +129,34 @@ def dvr_causal_verify_cuda_graph_metadata(
                     metadata.mask_indptr = None
 
 
+@contextmanager
+def dvr_runtime_verify_window(attn_backend, num_verify_tokens: int):
+    """Temporarily make full-attention target verify use DVR's fixed window.
+
+    GDN DVR verifies a `CHUNK_SIZE + num_draft_tokens` linear window, while the
+    generic speculative attention backends cache their CLI draft length on the
+    backend object. Keep that generic code untouched and locally override only
+    the full-attention backend for this DVR verify forward.
+    """
+
+    backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    old_num_draft_tokens = getattr(backend, "num_draft_tokens", None)
+    old_speculative_num_draft_tokens = getattr(
+        backend, "speculative_num_draft_tokens", None
+    )
+    try:
+        if old_num_draft_tokens is not None:
+            backend.num_draft_tokens = num_verify_tokens
+        if old_speculative_num_draft_tokens is not None:
+            backend.speculative_num_draft_tokens = num_verify_tokens
+        yield
+    finally:
+        if old_num_draft_tokens is not None:
+            backend.num_draft_tokens = old_num_draft_tokens
+        if old_speculative_num_draft_tokens is not None:
+            backend.speculative_num_draft_tokens = old_speculative_num_draft_tokens
+
+
 class DecodeVerifyRollbackWorker:
     """DVR speculative worker using the target model as a self draft model.
 
@@ -177,6 +205,9 @@ class DecodeVerifyRollbackWorker:
         self.max_batch_size = target_worker.max_running_requests
         self.num_draft_steps = server_args.speculative_num_steps
         self.num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.enable_chunk_boundary_verify = (
+            server_args.speculative_dvr_chunk_boundary_verify
+        )
         self.verify_window_size = FLA_CHUNK_SIZE + self.num_draft_tokens
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -519,6 +550,17 @@ class DecodeVerifyRollbackWorker:
         verified_tail_len = (req.seqlen - 1) - boundary_seqlen
         return boundary_seqlen, verified_tail_len
 
+    def _chunk_boundary_tail_lens(self, batch: ScheduleBatch) -> torch.Tensor:
+        if self._has_gdn_dvr_state(batch):
+            mamba_cache = self._gdn_mamba_cache(batch)
+            live_indices = self._gdn_live_indices(batch)
+            return mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(torch.long)
+        return torch.tensor(
+            [self._gdn_boundary_and_tail(req)[1] for req in batch.reqs],
+            dtype=torch.long,
+            device=batch.seq_lens.device,
+        )
+
     def _mamba_other_track_idx(self, batch: ScheduleBatch, track_idx: int) -> int:
         return batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
 
@@ -623,10 +665,13 @@ class DecodeVerifyRollbackWorker:
         else:
             batch.req_to_token_pool.mamba_pool.copy_from(boundary_indices, live_indices)
 
-    def _prepare_gdn_fixed_verify_window(
+    def _prepare_fixed_verify_window(
         self, batch: ScheduleBatch, spec_info: EagleVerifyInput
     ):
-        if not self._has_gdn_dvr_state(batch) or batch.forward_mode.is_idle():
+        if (
+            not self.enable_chunk_boundary_verify
+            or batch.forward_mode.is_idle()
+        ):
             return None
 
         bs = batch.batch_size()
@@ -640,11 +685,7 @@ class DecodeVerifyRollbackWorker:
             bs, self.num_draft_tokens
         )
         req_to_token = batch.req_to_token_pool.req_to_token
-        mamba_cache = self._gdn_mamba_cache(batch)
-        live_indices = self._gdn_live_indices(batch)
-        verified_tail_lens = mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(
-            torch.long
-        )
+        verified_tail_lens = self._chunk_boundary_tail_lens(batch)
 
         input_ids = []
         out_cache_locs = []
@@ -662,7 +703,7 @@ class DecodeVerifyRollbackWorker:
                     f"DVR GDN verify window overflow: verified={verified_tail_len}, "
                     f"draft={self.num_draft_tokens}, window={verify_window}."
                 )
-            # DVR GDN target verify uses a graphable fixed window:
+            # DVR chunk-boundary target verify uses a graphable fixed window:
             # verified_tail + draft_token + padding_token. The prompt/extend
             # tail is treated exactly like already accepted DVR tokens, so the
             # rolling window has one ownership model from prefill through
@@ -714,13 +755,16 @@ class DecodeVerifyRollbackWorker:
         spec_info.draft_token_num = verify_window
         spec_info.num_tokens_per_req = verify_window
         spec_info.seq_lens_cpu = batch.seq_lens_cpu
-        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = 0
+        if self._has_gdn_dvr_state(batch):
+            mamba_cache = self._gdn_mamba_cache(batch)
+            live_indices = self._gdn_live_indices(batch)
+            mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = 0
 
         original.padding_locs.extend(padding_locs)
         original.verified_tail_lens = verified_tail_lens
         return original
 
-    def _restore_after_gdn_fixed_verify_window(
+    def _restore_after_fixed_verify_window(
         self,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
@@ -743,9 +787,10 @@ class DecodeVerifyRollbackWorker:
         if state.padding_locs:
             self.token_to_kv_pool_allocator.free(torch.cat(state.padding_locs))
 
-        self._set_gdn_verified_tail_lens(
-            batch, self._gdn_live_indices(batch), state.verified_tail_lens
-        )
+        if self._has_gdn_dvr_state(batch):
+            self._set_gdn_verified_tail_lens(
+                batch, self._gdn_live_indices(batch), state.verified_tail_lens
+            )
 
     def _backup_gdn_boundary_state(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
@@ -887,20 +932,23 @@ class DecodeVerifyRollbackWorker:
         )
         batch.spec_info = spec_info
         self._restore_gdn_boundary_state_for_verify(batch)
-        fixed_window_state = self._prepare_gdn_fixed_verify_window(batch, spec_info)
+        fixed_window_state = self._prepare_fixed_verify_window(batch, spec_info)
 
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
         )
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
-        )
+        with dvr_runtime_verify_window(
+            self.model_runner.attn_backend, spec_info.num_tokens_per_req
+        ):
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
         maybe_detect_nan(logits_output.next_token_logits, "dvr target verify")
-        self._restore_after_gdn_fixed_verify_window(
+        self._restore_after_fixed_verify_window(
             batch, spec_info, logits_output, fixed_window_state
         )
 
