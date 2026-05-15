@@ -597,8 +597,10 @@ class DecodeVerifyRollbackWorker:
         verified_tail_len = (req.seqlen - 1) - boundary_seqlen
         return boundary_seqlen, verified_tail_len
 
-    def _chunk_boundary_tail_lens(self, batch: ScheduleBatch) -> torch.Tensor:
-        ctx = self._gdn_state_context(batch)
+    def _chunk_boundary_tail_lens(
+        self, batch: ScheduleBatch, ctx: Optional[_GDNDVRStateContext] = None
+    ) -> torch.Tensor:
+        ctx = ctx or self._gdn_state_context(batch)
         if ctx is not None:
             return ctx.mamba_cache.dvr_qkvg_beta_pos[0, ctx.live_indices].to(
                 torch.long
@@ -635,8 +637,10 @@ class DecodeVerifyRollbackWorker:
             dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
         ).unsqueeze(0)
 
-    def _ensure_gdn_boundary_state(self, batch: ScheduleBatch):
-        ctx = self._gdn_state_context(batch)
+    def _ensure_gdn_boundary_state(
+        self, batch: ScheduleBatch, ctx: Optional[_GDNDVRStateContext] = None
+    ):
+        ctx = ctx or self._gdn_state_context(batch)
         if ctx is None:
             return
         zero_dst = []
@@ -695,11 +699,13 @@ class DecodeVerifyRollbackWorker:
                 torch.tensor(reset_pos_values, device=ctx.live_indices.device),
             )
 
-    def _restore_gdn_boundary_state_for_verify(self, batch: ScheduleBatch):
+    def _restore_gdn_boundary_state_for_verify(
+        self, batch: ScheduleBatch
+    ) -> Optional[_GDNDVRStateContext]:
         self._ensure_gdn_boundary_state(batch)
         ctx = self._gdn_state_context(batch, require_boundary=True)
         if ctx is None:
-            return
+            return None
         assert ctx.boundary_indices is not None
         if self._gdn_boundary_backup is not None:
             # Draft decode must not affect the verify starting state. Keep an
@@ -715,9 +721,13 @@ class DecodeVerifyRollbackWorker:
             batch.req_to_token_pool.mamba_pool.copy_from(
                 ctx.boundary_indices, ctx.live_indices
             )
+        return ctx
 
     def _prepare_fixed_verify_window(
-        self, batch: ScheduleBatch, spec_info: EagleVerifyInput
+        self,
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+        ctx: Optional[_GDNDVRStateContext] = None,
     ):
         if (
             not self.enable_chunk_boundary_verify
@@ -737,7 +747,7 @@ class DecodeVerifyRollbackWorker:
             bs, logical_draft_len
         )
         req_to_token = batch.req_to_token_pool.req_to_token
-        verified_tail_lens = self._chunk_boundary_tail_lens(batch)
+        verified_tail_lens = self._chunk_boundary_tail_lens(batch, ctx)
 
         input_ids: List[int] = []
         out_cache_locs = []
@@ -784,7 +794,6 @@ class DecodeVerifyRollbackWorker:
         spec_info.draft_token_num = physical_verify_len
         spec_info.num_tokens_per_req = physical_verify_len
         spec_info.seq_lens_cpu = batch.seq_lens_cpu
-        ctx = self._gdn_state_context(batch)
         if ctx is not None:
             ctx.mamba_cache.dvr_qkvg_beta_pos[:, ctx.live_indices] = 0
 
@@ -859,6 +868,7 @@ class DecodeVerifyRollbackWorker:
         spec_info: EagleVerifyInput,
         logits_output: LogitsProcessorOutput,
         fixed_window_state,
+        ctx: Optional[_GDNDVRStateContext] = None,
     ):
         if fixed_window_state is None:
             return
@@ -876,7 +886,7 @@ class DecodeVerifyRollbackWorker:
         if state.padding_locs:
             self.token_to_kv_pool_allocator.free(torch.cat(state.padding_locs))
 
-        ctx = self._gdn_state_context(batch)
+        ctx = ctx or self._gdn_state_context(batch)
         if ctx is not None:
             self._set_gdn_verified_tail_lens(
                 ctx.mamba_cache, ctx.live_indices, state.verified_tail_lens
@@ -897,9 +907,12 @@ class DecodeVerifyRollbackWorker:
         )
 
     def _commit_gdn_state_after_verify(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+        self,
+        batch: ScheduleBatch,
+        verify_output: EagleVerifyOutput,
+        ctx: Optional[_GDNDVRStateContext] = None,
     ):
-        ctx = self._gdn_state_context(batch, require_boundary=True)
+        ctx = ctx or self._gdn_state_context(batch, require_boundary=True)
         if ctx is None:
             return
         assert ctx.boundary_indices is not None
@@ -914,7 +927,7 @@ class DecodeVerifyRollbackWorker:
         linear_backend = getattr(attn_backend, "linear_attn_backend", None)
         if linear_backend is None:
             return
-        verified_tail_lens = self._chunk_boundary_tail_lens(batch).to(
+        verified_tail_lens = self._chunk_boundary_tail_lens(batch, ctx).to(
             device=ctx.live_indices.device, dtype=torch.long
         )
         crossing = linear_backend.update_dvr_state_after_verify(
@@ -1038,8 +1051,8 @@ class DecodeVerifyRollbackWorker:
             else ForwardMode.IDLE
         )
         batch.spec_info = spec_info
-        self._restore_gdn_boundary_state_for_verify(batch)
-        fixed_window_state = self._prepare_fixed_verify_window(batch, spec_info)
+        gdn_ctx = self._restore_gdn_boundary_state_for_verify(batch)
+        fixed_window_state = self._prepare_fixed_verify_window(batch, spec_info, gdn_ctx)
 
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -1056,7 +1069,7 @@ class DecodeVerifyRollbackWorker:
         )
         maybe_detect_nan(logits_output.next_token_logits, "dvr target verify")
         self._restore_after_fixed_verify_window(
-            batch, spec_info, logits_output, fixed_window_state
+            batch, spec_info, logits_output, fixed_window_state, gdn_ctx
         )
 
         spec_info.hidden_states = logits_output.hidden_states
@@ -1069,7 +1082,7 @@ class DecodeVerifyRollbackWorker:
         )
 
         self._select_accepted_verify_outputs(logits_output, verify_output)
-        self._commit_gdn_state_after_verify(batch, verify_output)
+        self._commit_gdn_state_after_verify(batch, verify_output, gdn_ctx)
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
         self.postprocess_for_verify(batch, verify_output)
