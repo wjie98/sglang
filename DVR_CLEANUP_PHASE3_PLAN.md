@@ -110,3 +110,25 @@ Validation:
 
 Stop after these steps unless another redundancy is clearly DVR-local and can
 be validated independently. Do not refactor broad shared paths just for style.
+
+## Execution Log
+
+- Phase 3.1 committed as `a45f3cee1 dvr: vectorize fixed verify row selection`.
+  - Validated `dvr_worker.py` py_compile, `git diff --check`, Qwen3 graph
+    strict KL=0, and Qwen3.5/GDN graph strict KL=0 with bs=2 and lengths
+    `65,129,257`.
+- Phase 3.2 committed as
+  `e92738870 dvr: split fixed verify request window assembly`.
+  - Validated `dvr_worker.py` py_compile, `git diff --check`, and Qwen3.5/GDN
+    graph and no-graph strict KL=0 with bs=2 and lengths `65,129,257`.
+- Phase 3.3 committed as `b9211e394 dvr: group gdn qkvg beta caches`.
+  - Validated `gdn_backend.py` py_compile, `git diff --check`, and Qwen3.5/GDN
+    graph and no-graph strict KL=0 with bs=2 and lengths `65,129,257`.
+- Phase 3.4 committed as `998b302dd dvr: reuse gdn state context during verify`.
+  - Validated `dvr_worker.py` py_compile, `git diff --check`, Qwen3 graph
+    strict KL=0, and Qwen3.5/GDN graph and no-graph strict KL=0 with bs=2 and
+    lengths `65,129,257`.
+- Phase 3.5 committed as `ab9962320 dvr: move cuda graph helpers to utils`.
+  - Validated `dvr_worker.py`, `dvr_utils.py`, and `cuda_graph_runner.py`
+    py_compile, `git diff --check`, Qwen3 graph strict KL=0, and Qwen3.5/GDN
+    graph and no-graph strict KL=0 with bs=2 and lengths `65,129,257`.
