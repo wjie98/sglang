@@ -234,6 +234,65 @@ class MambaPool:
         dvr_beta_state_cache: Optional[torch.Tensor] = None
         dvr_qkvg_beta_pos: Optional[torch.Tensor] = None
 
+    @staticmethod
+    def _alloc_dvr_qkvg_beta_cache(
+        *,
+        num_mamba_layers: int,
+        size: int,
+        speculative_num_draft_tokens: int,
+        temporal_state_shape: Tuple[int, ...],
+        conv_dtype: torch.dtype,
+        device: str,
+    ):
+        dvr_qkvg_beta_cache_len = FLA_CHUNK_SIZE + speculative_num_draft_tokens
+        dvr_q_state_cache = torch.zeros(
+            size=(
+                num_mamba_layers,
+                size + 1,
+                dvr_qkvg_beta_cache_len,
+                temporal_state_shape[0],
+                temporal_state_shape[1],
+            ),
+            dtype=conv_dtype,
+            device=device,
+        )
+        dvr_k_state_cache = torch.zeros_like(dvr_q_state_cache)
+        dvr_v_state_cache = torch.zeros(
+            size=(
+                num_mamba_layers,
+                size + 1,
+                dvr_qkvg_beta_cache_len,
+                temporal_state_shape[0],
+                temporal_state_shape[2],
+            ),
+            dtype=conv_dtype,
+            device=device,
+        )
+        dvr_g_state_cache = torch.zeros(
+            size=(
+                num_mamba_layers,
+                size + 1,
+                dvr_qkvg_beta_cache_len,
+                temporal_state_shape[0],
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        dvr_beta_state_cache = torch.zeros_like(dvr_g_state_cache)
+        dvr_qkvg_beta_pos = torch.zeros(
+            size=(num_mamba_layers, size + 1),
+            dtype=torch.int32,
+            device=device,
+        )
+        return (
+            dvr_q_state_cache,
+            dvr_k_state_cache,
+            dvr_v_state_cache,
+            dvr_g_state_cache,
+            dvr_beta_state_cache,
+            dvr_qkvg_beta_pos,
+        )
+
     def __init__(
         self,
         *,
@@ -325,46 +384,19 @@ class MambaPool:
                     for conv_shape in conv_state_shape
                 ]
                 if enable_dvr_qkvg_beta_cache:
-                    dvr_qkvg_beta_cache_len = (
-                        FLA_CHUNK_SIZE + speculative_num_draft_tokens
-                    )
-                    dvr_q_state_cache = torch.zeros(
-                        size=(
-                            num_mamba_layers,
-                            size + 1,
-                            dvr_qkvg_beta_cache_len,
-                            temporal_state_shape[0],
-                            temporal_state_shape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device=device,
-                    )
-                    dvr_k_state_cache = torch.zeros_like(dvr_q_state_cache)
-                    dvr_v_state_cache = torch.zeros(
-                        size=(
-                            num_mamba_layers,
-                            size + 1,
-                            dvr_qkvg_beta_cache_len,
-                            temporal_state_shape[0],
-                            temporal_state_shape[2],
-                        ),
-                        dtype=conv_dtype,
-                        device=device,
-                    )
-                    dvr_g_state_cache = torch.zeros(
-                        size=(
-                            num_mamba_layers,
-                            size + 1,
-                            dvr_qkvg_beta_cache_len,
-                            temporal_state_shape[0],
-                        ),
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                    dvr_beta_state_cache = torch.zeros_like(dvr_g_state_cache)
-                    dvr_qkvg_beta_pos = torch.zeros(
-                        size=(num_mamba_layers, size + 1),
-                        dtype=torch.int32,
+                    (
+                        dvr_q_state_cache,
+                        dvr_k_state_cache,
+                        dvr_v_state_cache,
+                        dvr_g_state_cache,
+                        dvr_beta_state_cache,
+                        dvr_qkvg_beta_pos,
+                    ) = self._alloc_dvr_qkvg_beta_cache(
+                        num_mamba_layers=num_mamba_layers,
+                        size=size,
+                        speculative_num_draft_tokens=speculative_num_draft_tokens,
+                        temporal_state_shape=temporal_state_shape,
+                        conv_dtype=conv_dtype,
                         device=device,
                     )
                 else:
