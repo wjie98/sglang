@@ -97,7 +97,7 @@ if TYPE_CHECKING:
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
-def get_target_verify_num_tokens_per_bs(model_runner: "ModelRunner") -> int:
+def get_target_verify_graph_num_tokens_per_bs(model_runner: "ModelRunner") -> int:
     num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
     if (
         model_runner.spec_algorithm.is_decode_verify_rollback()
@@ -568,7 +568,7 @@ class CudaGraphRunner:
                 raise RuntimeError("This should not happen")
             else:
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = get_target_verify_num_tokens_per_bs(
+                self.num_tokens_per_bs = get_target_verify_graph_num_tokens_per_bs(
                     self.model_runner
                 )
         elif self.is_dllm:
