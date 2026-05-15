@@ -105,3 +105,25 @@ Validation:
 
 - `git diff --check`.
 - Worktree clean after commit.
+
+## Execution Log
+
+- Phase 2.1 committed as `7f94d904e dvr: add gdn worker state context`.
+  - Validated `dvr_worker.py` py_compile, `git diff --check`, and
+    Qwen3.5/GDN graph strict KL=0 with bs=2 and lengths `65,129,257`.
+- Phase 2.2 committed as `112bda800 dvr: clarify fixed verify window naming`.
+  - Validated `dvr_worker.py` py_compile, `git diff --check`,
+    Qwen3 graph strict KL=0, and Qwen3.5/GDN graph strict KL=0 with bs=2
+    and lengths `65,129,257`.
+- Phase 2.3 committed as `44ceda375 dvr: group worker helpers by verify flow`.
+  - Validated `dvr_worker.py` py_compile, `git diff --check`, and
+    Qwen3.5/GDN graph and no-graph strict KL=0 with bs=2 and lengths
+    `65,129,257`.
+- Phase 2.4 committed as `0824823d4 dvr: isolate gdn verify export helpers`.
+  - Validated `gdn_backend.py` py_compile, `git diff --check`, and
+    Qwen3.5/GDN graph and no-graph strict KL=0 with bs=2 and lengths
+    `65,129,257`.
+- Phase 2.5 found no stale DVR debug hooks from the targeted scan:
+  `backup_mamba_state`, `restore_mamba_state`,
+  `chunkwise_boundary_state_from_qkvg_beta`, `SGLANG_DVR_TRACE`,
+  `_dvr_trace`, `_dvr_gdn_trace`, `breakpoint()`, and `pdb.set_trace`.
