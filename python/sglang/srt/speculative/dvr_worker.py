@@ -248,6 +248,9 @@ class DecodeVerifyRollbackWorker:
     def clear_cache_pool(self):
         return None
 
+    # Public worker entrypoints. The shape follows EAGLE: normal extend produces
+    # the first verified token, then decode-verify-rollback handles generation.
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, can_run_cuda_graph = (
@@ -295,6 +298,9 @@ class DecodeVerifyRollbackWorker:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         return logits_output, next_token_ids, batch_result.can_run_cuda_graph
+
+    # Self-draft path. DVR uses the target model's decode path as a draft model,
+    # but keeps EAGLE-compatible tree/retrieve metadata for verification.
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
@@ -520,6 +526,9 @@ class DecodeVerifyRollbackWorker:
             probs = top_p_renorm_prob(probs, sampling_info.top_ps)
         return probs
 
+    # GDN state context helpers. These keep Mamba/GDN cache lookup local to DVR
+    # and avoid passing speculative-worker semantics into generic GDN backends.
+
     def _has_gdn_dvr_state(self, batch: ScheduleBatch) -> bool:
         return (
             self.model_runner.hybrid_gdn_config is not None
@@ -551,6 +560,11 @@ class DecodeVerifyRollbackWorker:
             live_indices=live_indices,
             boundary_indices=boundary_indices,
         )
+
+    # Fixed physical verify window helpers. For GDN, target verify runs over
+    # verified_tail + draft_token + padding_token, whose physical length is
+    # FLA_CHUNK_SIZE + num_draft_tokens even though only the draft rows are
+    # returned to speculative sampling.
 
     def _fixed_verify_draft_rows(
         self, verified_tail_lens: torch.Tensor, device: torch.device
@@ -818,6 +832,10 @@ class DecodeVerifyRollbackWorker:
                 ctx.mamba_cache, ctx.live_indices, state.verified_tail_lens
             )
 
+    # GDN boundary-state lifecycle. The boundary slot is the deterministic
+    # chunk-aligned state used as the next target-verify starting point; the live
+    # slot remains the autoregressive state consumed by following draft decode.
+
     def _backup_gdn_boundary_state(self, batch: ScheduleBatch):
         ctx = self._gdn_state_context(batch, require_boundary=True)
         if ctx is None:
@@ -866,6 +884,10 @@ class DecodeVerifyRollbackWorker:
                 req.mamba_next_track_idx = self._mamba_other_track_idx(
                     batch, self._gdn_boundary_track_idx[req.rid]
                 )
+
+    # Accepted-token and verify-output helpers. These intentionally stay close
+    # to EAGLE's postprocess contract so scheduler/radix-cache ownership remains
+    # compatible with normal speculative decoding.
 
     def _accepted_token_metadata(
         self,
@@ -944,6 +966,9 @@ class DecodeVerifyRollbackWorker:
             dtype=torch.float32,
             device=batch.spec_info.verified_id.device,
         )
+
+    # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
+    # then locally adapts GDN's physical window and state restore/commit.
 
     def verify(
         self,
