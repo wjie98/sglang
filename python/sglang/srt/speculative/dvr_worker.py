@@ -59,6 +59,37 @@ class _GDNFixedVerifyWindowState:
     padding_locs: List[torch.Tensor]
     verified_tail_lens: torch.Tensor
 
+    @classmethod
+    def capture(cls, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        return cls(
+            input_ids=batch.input_ids,
+            out_cache_loc=batch.out_cache_loc,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens_sum=batch.seq_lens_sum,
+            draft_token=spec_info.draft_token,
+            positions=spec_info.positions,
+            draft_token_num=spec_info.draft_token_num,
+            num_tokens_per_req=spec_info.num_tokens_per_req,
+            spec_seq_lens_cpu=spec_info.seq_lens_cpu,
+            dvr_real_token_lens=spec_info.dvr_real_token_lens,
+            padding_locs=[],
+            verified_tail_lens=torch.empty(0, dtype=torch.long),
+        )
+
+    def restore(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        batch.input_ids = self.input_ids
+        batch.out_cache_loc = self.out_cache_loc
+        batch.seq_lens = self.seq_lens
+        batch.seq_lens_cpu = self.seq_lens_cpu
+        batch.seq_lens_sum = self.seq_lens_sum
+        spec_info.draft_token = self.draft_token
+        spec_info.positions = self.positions
+        spec_info.draft_token_num = self.draft_token_num
+        spec_info.num_tokens_per_req = self.num_tokens_per_req
+        spec_info.seq_lens_cpu = self.spec_seq_lens_cpu
+        spec_info.dvr_real_token_lens = self.dvr_real_token_lens
+
 
 @contextmanager
 def dvr_causal_verify_cuda_graph_metadata(
@@ -486,18 +517,38 @@ class DecodeVerifyRollbackWorker:
             keep.extend(range(start, start + self.num_draft_tokens))
         return torch.tensor(keep, dtype=torch.long, device=device)
 
+    @staticmethod
+    def _gdn_boundary_and_tail(req) -> Tuple[int, int]:
+        boundary_seqlen = ((req.seqlen - 1) // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+        verified_tail_len = (req.seqlen - 1) - boundary_seqlen
+        return boundary_seqlen, verified_tail_len
+
     def _mamba_other_track_idx(self, batch: ScheduleBatch, track_idx: int) -> int:
         return batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
 
     def _current_prefill_checkpoint_track_idx(
         self, batch: ScheduleBatch, req
     ) -> Optional[int]:
-        boundary_seqlen = ((req.seqlen - 1) // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+        boundary_seqlen, _ = self._gdn_boundary_and_tail(req)
         if boundary_seqlen <= 0:
             return None
         if req.mamba_last_track_seqlen != boundary_seqlen:
             return None
         return self._mamba_other_track_idx(batch, req.mamba_next_track_idx)
+
+    def _set_gdn_verified_tail_lens(
+        self,
+        batch: ScheduleBatch,
+        live_indices: torch.Tensor,
+        verified_tail_lens: torch.Tensor,
+    ):
+        mamba_cache = self._gdn_mamba_cache(batch)
+        if getattr(mamba_cache, "dvr_qkvg_beta_pos", None) is None:
+            return
+        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = verified_tail_lens.to(
+            device=mamba_cache.dvr_qkvg_beta_pos.device,
+            dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
+        ).unsqueeze(0)
 
     def _ensure_gdn_boundary_state(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
@@ -508,8 +559,7 @@ class DecodeVerifyRollbackWorker:
         reset_pos_values = []
         for i, req in enumerate(batch.reqs):
             if req.rid not in self._gdn_boundary_seqlen:
-                boundary_seqlen = ((req.seqlen - 1) // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
-                verified_tail_len = (req.seqlen - 1) - boundary_seqlen
+                boundary_seqlen, verified_tail_len = self._gdn_boundary_and_tail(req)
                 reset_pos_indices.append(live_indices[i])
                 reset_pos_values.append(verified_tail_len)
                 checkpoint_track_idx = self._current_prefill_checkpoint_track_idx(
@@ -553,15 +603,11 @@ class DecodeVerifyRollbackWorker:
                 conv[:, dst] = 0
             mamba_cache.temporal[:, dst] = 0
         if reset_pos_indices:
-            mamba_cache = self._gdn_mamba_cache(batch)
-            if getattr(mamba_cache, "dvr_qkvg_beta_pos", None) is not None:
-                indices = torch.stack(reset_pos_indices)
-                values = torch.tensor(
-                    reset_pos_values,
-                    dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
-                    device=mamba_cache.dvr_qkvg_beta_pos.device,
-                )
-                mamba_cache.dvr_qkvg_beta_pos[:, indices] = values.unsqueeze(0)
+            self._set_gdn_verified_tail_lens(
+                batch,
+                torch.stack(reset_pos_indices),
+                torch.tensor(reset_pos_values, device=live_indices.device),
+            )
 
     def _restore_gdn_boundary_state_for_verify(
         self, batch: ScheduleBatch, *, use_live_conv: bool = True
@@ -603,21 +649,7 @@ class DecodeVerifyRollbackWorker:
 
         bs = batch.batch_size()
         verify_window = self.verify_window_size
-        original = _GDNFixedVerifyWindowState(
-            input_ids=batch.input_ids,
-            out_cache_loc=batch.out_cache_loc,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            seq_lens_sum=batch.seq_lens_sum,
-            draft_token=spec_info.draft_token,
-            positions=spec_info.positions,
-            draft_token_num=spec_info.draft_token_num,
-            num_tokens_per_req=spec_info.num_tokens_per_req,
-            spec_seq_lens_cpu=spec_info.seq_lens_cpu,
-            dvr_real_token_lens=spec_info.dvr_real_token_lens,
-            padding_locs=[],
-            verified_tail_lens=torch.empty(0, dtype=torch.long),
-        )
+        original = _GDNFixedVerifyWindowState.capture(batch, spec_info)
 
         draft_tokens = spec_info.draft_token.reshape(
             bs, self.num_draft_tokens
@@ -732,27 +764,14 @@ class DecodeVerifyRollbackWorker:
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[keep]
 
-        batch.input_ids = state.input_ids
-        batch.out_cache_loc = state.out_cache_loc
-        batch.seq_lens = state.seq_lens
-        batch.seq_lens_cpu = state.seq_lens_cpu
-        batch.seq_lens_sum = state.seq_lens_sum
-        spec_info.draft_token = state.draft_token
-        spec_info.positions = state.positions
-        spec_info.draft_token_num = state.draft_token_num
-        spec_info.num_tokens_per_req = state.num_tokens_per_req
-        spec_info.seq_lens_cpu = state.spec_seq_lens_cpu
-        spec_info.dvr_real_token_lens = state.dvr_real_token_lens
+        state.restore(batch, spec_info)
 
         if state.padding_locs:
             self.token_to_kv_pool_allocator.free(torch.cat(state.padding_locs))
 
-        mamba_cache = self._gdn_mamba_cache(batch)
-        live_indices = self._gdn_live_indices(batch)
-        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = state.verified_tail_lens.to(
-            device=mamba_cache.dvr_qkvg_beta_pos.device,
-            dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
-        ).unsqueeze(0)
+        self._set_gdn_verified_tail_lens(
+            batch, self._gdn_live_indices(batch), state.verified_tail_lens
+        )
 
     def _backup_gdn_boundary_state(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
