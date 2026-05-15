@@ -568,21 +568,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 torch.full_like(pos_before, FLA_CHUNK_SIZE - 1),
                 torch.full_like(pos_before, -1),
             )
-            for layer_idx in range(mamba_cache.temporal.shape[0]):
-                boundary_state = (
-                    self.kernel_dispatcher.chunkwise_boundary_state_from_qkvg_beta(
-                        mamba_cache.dvr_q_state_cache[layer_idx, live_indices],
-                        mamba_cache.dvr_k_state_cache[layer_idx, live_indices],
-                        mamba_cache.dvr_v_state_cache[layer_idx, live_indices],
-                        mamba_cache.dvr_g_state_cache[layer_idx, live_indices],
-                        mamba_cache.dvr_beta_state_cache[layer_idx, live_indices],
-                        state_pool=mamba_cache.temporal[layer_idx],
-                        state_indices=boundary_indices,
-                        boundary_token_count=FLA_CHUNK_SIZE,
-                    )
-                )
-                mamba_cache.temporal[layer_idx, boundary_indices] = boundary_state
-
+            fused_mamba_state_scatter_with_mask(
+                mamba_cache.temporal,
+                mamba_cache.intermediate_ssm,
+                boundary_indices,
+                commit_step,
+            )
             fused_mamba_state_scatter_with_mask(
                 mamba_cache.conv[0],
                 mamba_cache.intermediate_conv_window[0],
@@ -843,7 +834,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             if getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None:
                 dvr_indices = cache_indices[:batch_size].to(torch.long)
-                core_attn_out, _, _ = self.kernel_dispatcher.extend(
+                core_attn_out, _, h = self.kernel_dispatcher.extend(
                     q=query,
                     k=key,
                     v=value,
@@ -853,6 +844,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_indices=dvr_indices,
                     query_start_loc=query_start_loc,
                 )
+                if h is not None and h.shape[1] > 1:
+                    # DVR target verify is a fixed chunk-aligned window. The
+                    # chunkwise prefill kernel already materializes the state at
+                    # the first CHUNK_SIZE boundary in `h[:, 1]` (`h[:, 0]` is
+                    # the starting state); commit that exact state later instead
+                    # of recomputing it from q/k/v/g/beta.
+                    intermediate_state_cache[
+                        intermediate_state_indices[:batch_size].to(torch.long),
+                        FLA_CHUNK_SIZE - 1,
+                    ] = h[:, 1].to(intermediate_state_cache.dtype)
                 _dvr_gdn_trace_dump(
                     layer.layer_id,
                     "verify_chunkwise_core",
@@ -862,6 +863,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     v=value,
                     g=g,
                     beta=beta,
+                    h=h,
+                    initial_conv_windows=initial_conv_windows,
+                    conv_windows=conv_windows,
                     input_ids=forward_batch.input_ids,
                     positions=forward_batch.positions,
                     seq_lens=forward_batch.seq_lens,

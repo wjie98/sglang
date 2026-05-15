@@ -41,7 +41,10 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
-from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.srt.layers.attention.fla.layernorm_gated import (
+    RMSNorm as RMSNormGated,
+    rms_norm_ref,
+)
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -519,7 +522,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        # Temporary DVR determinism patch: the fused gated RMSNorm kernel is
+        # sensitive to the physical row count (e.g. prefix rows differ between
+        # 17-token and 80-token prefill). DVR fixed-window verify needs prefix
+        # invariance, so use the reference implementation until the fused
+        # kernel is made batch/row-count invariant.
+        core_attn_out = rms_norm_ref(
+            core_attn_out,
+            self.norm.weight,
+            self.norm.bias,
+            z=z,
+            eps=self.norm.eps,
+            group_size=self.norm.group_size,
+            norm_before_gate=self.norm.norm_before_gate,
+            upcast=True,
+        )
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
