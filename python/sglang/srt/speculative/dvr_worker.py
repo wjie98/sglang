@@ -569,15 +569,18 @@ class DecodeVerifyRollbackWorker:
     def _fixed_verify_draft_rows(
         self, verified_tail_lens: torch.Tensor, device: torch.device
     ) -> torch.Tensor:
-        keep = []
-        for req_i, verified_tail_len in enumerate(verified_tail_lens.tolist()):
-            physical_row_start = req_i * self.verify_window_size + int(
-                verified_tail_len
+        verified_tail_lens = verified_tail_lens.to(device=device, dtype=torch.long)
+        row_starts = (
+            torch.arange(
+                verified_tail_lens.shape[0], dtype=torch.long, device=device
             )
-            keep.extend(
-                range(physical_row_start, physical_row_start + self.num_draft_tokens)
-            )
-        return torch.tensor(keep, dtype=torch.long, device=device)
+            * self.verify_window_size
+            + verified_tail_lens
+        )
+        draft_offsets = torch.arange(
+            self.num_draft_tokens, dtype=torch.long, device=device
+        )
+        return (row_starts[:, None] + draft_offsets[None, :]).reshape(-1)
 
     @staticmethod
     def _gdn_boundary_and_tail(req) -> Tuple[int, int]:
