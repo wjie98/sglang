@@ -512,6 +512,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         *,
         live_indices: torch.Tensor,
         boundary_indices: torch.Tensor,
+        verified_tail_lens: torch.Tensor,
         accepted_tokens: torch.Tensor,
         accepted_steps: torch.Tensor,
     ) -> torch.Tensor:
@@ -523,7 +524,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         """
 
         mamba_cache = self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        pos_before = mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(torch.long)
+        pos_before = verified_tail_lens.to(
+            device=live_indices.device, dtype=torch.long
+        )
         pos_after = pos_before + accepted_tokens
         crossing = pos_after >= FLA_CHUNK_SIZE
 

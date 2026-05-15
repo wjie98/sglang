@@ -507,3 +507,72 @@ Conclusion after this fix:
 - There is still a smaller final-layer discrepancy around one bf16 quantum
   scale (`~1e-2`) at the last attention layer for this example. That should be
   investigated separately after the current metadata bug is kept fixed.
+
+## 2026-05-15 Follow-up: fixed window vs final partial scoring
+
+After committing `e01ab8da4 dvr: align chunk verify graph window`, I reran the
+GDN no-graph path and traced a short `max_new_tokens=8` case. The scoring oracle
+request had `#cached-token: 0`, so the short mismatch is not caused by radix
+cache reusing polluted DVR state.
+
+Trace setup:
+
+- Model: `/home/hwj/Qwen3.5-0.8B`
+- DVR: `DECODE_VERIFY_ROLLBACK`, topk=1, draft tokens=16
+- Verify: chunk-boundary fixed physical window, `FLA_CHUNK_SIZE + draft = 80`
+- CUDA graph: disabled
+- Trace layers: 0..23
+
+Observed result:
+
+- The generated output length was 8, so the oracle full-prefill scoring request
+  ran over `prompt + output = 17` tokens.
+- DVR target verify still ran over the full fixed verify input:
+  `verified_token + 16 draft_token + padding_token = 80` physical rows.
+- For the first GDN layer, the first 17 rows of
+  `verify_chunkwise_core` exactly matched the 17-row ordinary scoring prefill.
+- For the second GDN layer, q/k/v/g/beta and GDN core still matched for the first
+  17 rows.
+- The first visible difference appeared in layer 1 **after** the GDN core,
+  i.e. in the layer post-processing path (gated norm / output projection / MLP /
+  layer communicator), starting at physical row 13.
+- This row maps to the first returned-logprob mismatch:
+  output index 5 compares the logits for scoring position 14, whose hidden state
+  depends on row 13.
+
+Control experiment:
+
+- Restarting with `SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT=1`
+  did not change the mismatch:
+  `max_new_tokens=8` still failed with max abs `0.0032685399055480957`.
+- `max_new_tokens=16` passed strictly because the oracle scoring length
+  (`prompt + 16 = 25`) lines up with the useful verify rows for a full draft
+  round much better than the 8-token final partial case.
+
+Current interpretation:
+
+- The remaining short-window mismatch is not a GDN state replay bug. It happens
+  before post-verify state commit matters.
+- It is a "future draft rows are present during verify" issue. DVR computes a
+  longer speculative verify window than the final oracle scoring request when
+  generation stops in the middle of a draft block. For pure attention Qwen3 this
+  is batch-invariant enough to stay bitwise equal; for Qwen3.5 GDN, at least one
+  post-GDN dense/norm path is still sensitive to the physical row count.
+- Therefore, strict `full prefill scoring == returned logprobs` for GDN final
+  partial blocks requires either:
+  1. not forwarding future draft/padding rows through row-count-sensitive dense
+     post-processing, or
+  2. recomputing/overwriting final partial returned logprobs with an ordinary
+     prefill-equivalent scoring path, or
+  3. making the remaining Qwen3.5 post-GDN dense/norm path fully batch-invariant
+     for `M=17` vs `M=80`.
+
+This is separate from the cross-chunk state/conv/qkvg replay path. The replay
+path still needs to use one fixed-window view:
+
+- `pos_before = verified_tail_lens`
+- `pos_after = pos_before + accepted_tokens`
+- live temporal state uses recurrent replay up to `pos_after`
+- chunk boundary state uses chunkwise replay at physical row `FLA_CHUNK_SIZE - 1`
+- live conv uses `intermediate_conv_window[pos_after - 1]`
+- boundary conv uses `intermediate_conv_window[FLA_CHUNK_SIZE - 1]`

@@ -818,9 +818,13 @@ class DecodeVerifyRollbackWorker:
         linear_backend = getattr(attn_backend, "linear_attn_backend", None)
         if linear_backend is None:
             return
+        verified_tail_lens = self._chunk_boundary_tail_lens(batch).to(
+            device=live_indices.device, dtype=torch.long
+        )
         crossing = linear_backend.update_dvr_state_after_verify(
             live_indices=live_indices,
             boundary_indices=boundary_indices,
+            verified_tail_lens=verified_tail_lens,
             accepted_tokens=accepted_tokens,
             accepted_steps=accepted_steps,
         )
