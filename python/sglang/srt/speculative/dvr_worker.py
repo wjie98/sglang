@@ -55,7 +55,6 @@ class _GDNFixedVerifyWindowState:
     draft_token_num: int
     num_tokens_per_req: int
     spec_seq_lens_cpu: torch.Tensor
-    dvr_real_token_lens: Optional[torch.Tensor]
     padding_locs: List[torch.Tensor]
     verified_tail_lens: torch.Tensor
 
@@ -72,7 +71,6 @@ class _GDNFixedVerifyWindowState:
             draft_token_num=spec_info.draft_token_num,
             num_tokens_per_req=spec_info.num_tokens_per_req,
             spec_seq_lens_cpu=spec_info.seq_lens_cpu,
-            dvr_real_token_lens=spec_info.dvr_real_token_lens,
             padding_locs=[],
             verified_tail_lens=torch.empty(0, dtype=torch.long),
         )
@@ -88,7 +86,6 @@ class _GDNFixedVerifyWindowState:
         spec_info.draft_token_num = self.draft_token_num
         spec_info.num_tokens_per_req = self.num_tokens_per_req
         spec_info.seq_lens_cpu = self.spec_seq_lens_cpu
-        spec_info.dvr_real_token_lens = self.dvr_real_token_lens
 
 
 @contextmanager
@@ -653,7 +650,6 @@ class DecodeVerifyRollbackWorker:
         out_cache_locs = []
         positions = []
         boundary_lens = []
-        real_token_lens = []
         padding_locs = []
         for req_i, req in enumerate(batch.reqs):
             verified_tail_len = int(verified_tail_lens[req_i].item())
@@ -666,8 +662,6 @@ class DecodeVerifyRollbackWorker:
                     f"DVR GDN verify window overflow: verified={verified_tail_len}, "
                     f"draft={self.num_draft_tokens}, window={verify_window}."
                 )
-            real_token_lens.append(num_real_tokens)
-
             # DVR GDN target verify uses a graphable fixed window:
             # verified_tail + draft_token + padding_token. The prompt/extend
             # tail is treated exactly like already accepted DVR tokens, so the
@@ -720,11 +714,6 @@ class DecodeVerifyRollbackWorker:
         spec_info.draft_token_num = verify_window
         spec_info.num_tokens_per_req = verify_window
         spec_info.seq_lens_cpu = batch.seq_lens_cpu
-        spec_info.dvr_real_token_lens = torch.tensor(
-            real_token_lens,
-            dtype=torch.long,
-            device=spec_info.positions.device,
-        )
         mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = 0
 
         original.padding_locs.extend(padding_locs)
