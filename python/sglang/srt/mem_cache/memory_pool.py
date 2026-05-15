@@ -706,17 +706,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
-    def backup_mamba_state(self, req_indices: torch.Tensor) -> MambaPool.StateBackup:
-        return self.mamba_pool.backup_state(self.get_mamba_indices(req_indices))
-
-    def restore_mamba_state(
-        self,
-        backup: MambaPool.StateBackup,
-        req_indices: Optional[torch.Tensor] = None,
-    ):
-        mamba_indices = None if req_indices is None else self.get_mamba_indices(req_indices)
-        self.mamba_pool.restore_state(backup, mamba_indices)
-
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
