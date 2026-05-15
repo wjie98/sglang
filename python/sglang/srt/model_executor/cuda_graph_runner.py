@@ -680,6 +680,19 @@ class CudaGraphRunner:
     def can_run(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode != self.capture_forward_mode:
             return False
+        if (
+            self.model_runner.spec_algorithm.is_decode_verify_rollback()
+            and self.model_runner.server_args.speculative_dvr_chunk_boundary_verify
+            and self.model_runner.hybrid_gdn_config is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            # GDN DVR currently verifies a physical CHUNK_SIZE + draft window.
+            # The non-graph path is bit-exact, but the captured graph path still
+            # replays incorrect linear-state/logit alignment for this window.
+            # Keep pure-attention DVR graph enabled, and route only GDN target
+            # verify through the ordinary forward until the GDN graph metadata
+            # path is made equivalent.
+            return False
 
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
