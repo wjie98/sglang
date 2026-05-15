@@ -118,11 +118,19 @@ def dvr_causal_verify_cuda_graph_metadata(
     finally:
         if should_clear:
             spec_info.custom_mask = old_custom_mask
-            metadata = getattr(attn_backend, "forward_metadata", None)
-            if metadata is not None:
+            backends = [attn_backend]
+            full_attn_backend = getattr(attn_backend, "full_attn_backend", None)
+            if full_attn_backend is not None:
+                backends.append(full_attn_backend)
+            for backend in backends:
+                metadata = getattr(backend, "forward_metadata", None)
+                if metadata is None:
+                    continue
                 # Restore DVR's causal semantics after metadata construction:
                 # do not let the temporary tree-mask buffer select a custom-mask
-                # attention path in the captured graph or replay metadata.
+                # attention path in the captured graph or replay metadata. For
+                # hybrid GDN models the real attention metadata lives inside the
+                # nested full-attention backend, so clear both levels.
                 if hasattr(metadata, "custom_mask"):
                     metadata.custom_mask = None
                 if hasattr(metadata, "mask_indptr"):
