@@ -436,6 +436,109 @@ class GDNAttnBackend(MambaAttnBackendBase):
             batch_size, verify_window_size, layer.num_v_heads
         )
 
+    def _dvr_target_verify_conv(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_conv_window_cache: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        batch_size: int,
+        verify_window_size: int,
+    ) -> torch.Tensor:
+        """Run DVR's linear fixed-window conv and export per-token conv windows."""
+
+        mixed_qkv_linear = mixed_qkv
+        mixed_qkv_reshaped = mixed_qkv_linear.view(
+            batch_size, verify_window_size, -1
+        ).transpose(1, 2)
+        dvr_indices = cache_indices[:batch_size].to(torch.long)
+        initial_conv_windows = conv_states[dvr_indices].clone()
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv_linear.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=conv_states,
+            has_initial_state=has_initial_states,
+            cache_indices=dvr_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=[verify_window_size] * batch_size,
+        ).transpose(0, 1)[: mixed_qkv.shape[0]]
+
+        conv_source = torch.cat([initial_conv_windows, mixed_qkv_reshaped], dim=2)
+        state_len = initial_conv_windows.shape[-1]
+        conv_windows = torch.stack(
+            [
+                conv_source[:, :, step + 1 : step + 1 + state_len]
+                for step in range(verify_window_size)
+            ],
+            dim=1,
+        )
+        intermediate_conv_window_cache[
+            intermediate_state_indices[:batch_size].to(torch.long)
+        ] = conv_windows
+        return mixed_qkv
+
+    def _dvr_target_verify_extend(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mamba_cache_params: MambaPool.SpeculativeState,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        batch_size: int,
+        verify_window_size: int,
+    ) -> torch.Tensor:
+        """Run chunkwise DVR verify and export state inputs for later commit."""
+
+        dvr_indices = cache_indices[:batch_size].to(torch.long)
+        core_attn_out, _, h = self.kernel_dispatcher.extend(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=dvr_indices,
+            query_start_loc=query_start_loc,
+        )
+        if h is not None and h.shape[1] > 1:
+            # DVR target verify is a fixed chunk-aligned window. The chunkwise
+            # prefill kernel already materializes the state at the first
+            # CHUNK_SIZE boundary in `h[:, 1]` (`h[:, 0]` is the starting state);
+            # commit that exact state later instead of recomputing it from
+            # q/k/v/g/beta.
+            intermediate_state_cache[
+                intermediate_state_indices[:batch_size].to(torch.long),
+                FLA_CHUNK_SIZE - 1,
+            ] = h[:, 1].to(intermediate_state_cache.dtype)
+        self._export_dvr_verify_qkvg_beta(
+            mamba_cache_params=mamba_cache_params,
+            dvr_indices=dvr_indices,
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            batch_size=batch_size,
+            verify_window_size=verify_window_size,
+            layer=layer,
+        )
+        return core_attn_out
+
     def update_dvr_state_after_verify(
         self,
         *,
@@ -658,37 +761,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # DVR uses a fixed 64+draft linear verify window. Keep the
                 # generic GDN forward path here; only export the tensors needed
                 # by DVR state replay.
-                mixed_qkv_linear = mixed_qkv
-                mixed_qkv_reshaped = mixed_qkv_linear.view(
-                    batch_size, draft_token_num, -1
-                ).transpose(1, 2)
-                dvr_conv_indices = cache_indices[:batch_size].to(torch.long)
-                initial_conv_windows = conv_states[dvr_conv_indices].clone()
-                mixed_qkv = causal_conv1d_fn(
-                    mixed_qkv_linear.transpose(0, 1),
-                    layer.conv_weights,
-                    layer.bias,
-                    activation=layer.activation,
+                mixed_qkv = self._dvr_target_verify_conv(
+                    layer=layer,
+                    mixed_qkv=mixed_qkv,
                     conv_states=conv_states,
-                    has_initial_state=has_initial_states,
-                    cache_indices=dvr_conv_indices,
+                    has_initial_states=has_initial_states,
+                    cache_indices=cache_indices,
                     query_start_loc=query_start_loc,
-                    seq_lens_cpu=[draft_token_num] * batch_size,
-                ).transpose(0, 1)[:seq_len]
-                conv_source = torch.cat(
-                    [initial_conv_windows, mixed_qkv_reshaped], dim=2
+                    intermediate_conv_window_cache=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices,
+                    batch_size=batch_size,
+                    verify_window_size=draft_token_num,
                 )
-                state_len = initial_conv_windows.shape[-1]
-                conv_windows = torch.stack(
-                    [
-                        conv_source[:, :, step + 1 : step + 1 + state_len]
-                        for step in range(draft_token_num)
-                    ],
-                    dim=1,
-                )
-                intermediate_conv_window_cache[
-                    intermediate_state_indices[:batch_size].to(torch.long)
-                ] = conv_windows
             else:
                 mixed_qkv_reshaped = mixed_qkv.view(
                     batch_size, draft_token_num, -1
@@ -746,38 +830,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             if getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None:
-                dvr_indices = cache_indices[:batch_size].to(torch.long)
-                core_attn_out, _, h = self.kernel_dispatcher.extend(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    ssm_states=ssm_states,
-                    cache_indices=dvr_indices,
-                    query_start_loc=query_start_loc,
-                )
-                if h is not None and h.shape[1] > 1:
-                    # DVR target verify is a fixed chunk-aligned window. The
-                    # chunkwise prefill kernel already materializes the state at
-                    # the first CHUNK_SIZE boundary in `h[:, 1]` (`h[:, 0]` is
-                    # the starting state); commit that exact state later instead
-                    # of recomputing it from q/k/v/g/beta.
-                    intermediate_state_cache[
-                        intermediate_state_indices[:batch_size].to(torch.long),
-                        FLA_CHUNK_SIZE - 1,
-                    ] = h[:, 1].to(intermediate_state_cache.dtype)
-                self._export_dvr_verify_qkvg_beta(
+                core_attn_out = self._dvr_target_verify_extend(
+                    layer=layer,
                     mamba_cache_params=mamba_cache_params,
-                    dvr_indices=dvr_indices,
                     query=query,
                     key=key,
                     value=value,
                     g=g,
                     beta=beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    intermediate_state_cache=intermediate_state_cache,
+                    intermediate_state_indices=intermediate_state_indices,
                     batch_size=batch_size,
                     verify_window_size=draft_token_num,
-                    layer=layer,
                 )
             else:
                 core_attn_out = self.kernel_dispatcher.target_verify(
