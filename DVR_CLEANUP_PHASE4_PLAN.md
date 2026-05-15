@@ -101,3 +101,27 @@ Validation:
 
 Stop after these phases unless another change is clearly DVR-local, behavior
 neutral, and independently testable.
+
+## Execution Log
+
+- `194a7107b dvr: name gdn target verify branch`
+  - `py_compile` for `gdn_backend.py`.
+  - `git diff --check`.
+  - Qwen3.5/GDN graph bs=2 lengths `65,129,257`: strict KL=0.
+  - Qwen3.5/GDN no-graph bs=2 lengths `65,129,257`: strict KL=0.
+- `ebfe7ecd2 dvr: extract qkvg beta cache allocation`
+  - `py_compile` for `memory_pool.py`.
+  - `git diff --check`.
+  - Qwen3.5/GDN graph bs=2 lengths `65,129,257`: strict KL=0.
+  - Qwen3.5/GDN no-graph bs=2 lengths `65,129,257`: strict KL=0.
+- `c88b8e8c7 dvr: split gdn boundary init per request`
+  - `py_compile` for `dvr_worker.py`.
+  - `git diff --check`.
+  - Qwen3 pure-attention graph bs=2 lengths `17,65,129`: strict KL=0.
+  - Qwen3.5/GDN graph bs=2 lengths `65,129,257`: strict KL=0.
+  - Qwen3.5/GDN no-graph bs=2 lengths `65,129,257`: strict KL=0.
+- `ade8fc1d2 dvr: clarify target verify graph token helper`
+  - `py_compile` for `cuda_graph_runner.py` and `model_runner.py`.
+  - `git diff --check`.
+  - Qwen3 pure-attention graph bs=2 lengths `17,65,129`: strict KL=0.
+  - Qwen3.5/GDN graph bs=2 lengths `65,129,257`: strict KL=0.
