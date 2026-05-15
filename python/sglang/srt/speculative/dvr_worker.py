@@ -192,7 +192,6 @@ class DecodeVerifyRollbackWorker:
         self._gdn_boundary_seqlen = {}
         self._gdn_boundary_track_idx = {}
         self._gdn_boundary_backup = None
-        self._gdn_live_backup = None
 
         logger.info(
             "Initialized DVR self-decode worker: num_steps=%s, num_draft_tokens=%s",
@@ -609,9 +608,7 @@ class DecodeVerifyRollbackWorker:
                 torch.tensor(reset_pos_values, device=live_indices.device),
             )
 
-    def _restore_gdn_boundary_state_for_verify(
-        self, batch: ScheduleBatch, *, use_live_conv: bool = True
-    ):
+    def _restore_gdn_boundary_state_for_verify(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
             return
         self._ensure_gdn_boundary_state(batch)
@@ -626,18 +623,6 @@ class DecodeVerifyRollbackWorker:
             batch.req_to_token_pool.mamba_pool.restore_state(
                 self._gdn_boundary_backup, live_indices
             )
-            if use_live_conv and self._gdn_live_backup is not None:
-                # DVR GDN has split state ownership. The SSM/temporal state
-                # used by chunkwise scan is restored from the deterministic
-                # chunk boundary, while this optional path restores conv from
-                # the live pre-draft tail for flows that verify only the new
-                # suffix. The fixed-window path keeps conv at the boundary and
-                # replays verified_token + draft_token before commit.
-                mamba_cache = self._gdn_mamba_cache(batch)
-                for conv, saved_conv in zip(
-                    mamba_cache.conv, self._gdn_live_backup.conv
-                ):
-                    conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)
         else:
             batch.req_to_token_pool.mamba_pool.copy_from(boundary_indices, live_indices)
 
@@ -776,12 +761,8 @@ class DecodeVerifyRollbackWorker:
     def _backup_gdn_boundary_state(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
             self._gdn_boundary_backup = None
-            self._gdn_live_backup = None
             return
-        live_indices, boundary_indices = self._mamba_indices_for_batch(batch)
-        self._gdn_live_backup = batch.req_to_token_pool.mamba_pool.backup_state(
-            live_indices
-        )
+        _, boundary_indices = self._mamba_indices_for_batch(batch)
         self._gdn_boundary_backup = batch.req_to_token_pool.mamba_pool.backup_state(
             boundary_indices
         )
@@ -916,15 +897,8 @@ class DecodeVerifyRollbackWorker:
             else ForwardMode.IDLE
         )
         batch.spec_info = spec_info
-        has_gdn_dvr_state = self._has_gdn_dvr_state(batch)
-        self._restore_gdn_boundary_state_for_verify(
-            batch, use_live_conv=not has_gdn_dvr_state
-        )
-        fixed_window_state = (
-            self._prepare_gdn_fixed_verify_window(batch, spec_info)
-            if has_gdn_dvr_state
-            else None
-        )
+        self._restore_gdn_boundary_state_for_verify(batch)
+        fixed_window_state = self._prepare_gdn_fixed_verify_window(batch, spec_info)
 
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
