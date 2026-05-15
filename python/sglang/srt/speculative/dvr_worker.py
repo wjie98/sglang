@@ -95,6 +95,15 @@ class _GDNDVRStateContext:
     boundary_indices: Optional[torch.Tensor] = None
 
 
+@dataclass
+class _GDNFixedVerifyRequestWindow:
+    input_ids: List[int]
+    out_cache_locs: List[torch.Tensor]
+    positions: torch.Tensor
+    boundary_len: int
+    padding_locs: List[torch.Tensor]
+
+
 @contextmanager
 def dvr_causal_verify_cuda_graph_metadata(
     model_runner, attn_backend, forward_mode, spec_info, fallback_custom_mask=None
@@ -730,53 +739,30 @@ class DecodeVerifyRollbackWorker:
         req_to_token = batch.req_to_token_pool.req_to_token
         verified_tail_lens = self._chunk_boundary_tail_lens(batch)
 
-        input_ids = []
+        input_ids: List[int] = []
         out_cache_locs = []
         positions = []
         boundary_lens = []
         padding_locs = []
         for req_i, req in enumerate(batch.reqs):
             verified_tail_len = int(verified_tail_lens[req_i].item())
-            boundary = (req.seqlen - 1) - verified_tail_len
-            all_ids = req.origin_input_ids + req.output_ids
-            num_real_tokens = verified_tail_len + logical_draft_len
-            num_padding_tokens = physical_verify_len - num_real_tokens
-            if num_padding_tokens < 0:
-                raise RuntimeError(
-                    f"DVR GDN verify window overflow: verified={verified_tail_len}, "
-                    f"draft={logical_draft_len}, window={physical_verify_len}."
-                )
-            # DVR chunk-boundary target verify uses a graphable fixed window:
-            # verified_tail + draft_token + padding_token. The prompt/extend
-            # tail is treated exactly like already accepted DVR tokens, so the
-            # rolling window has one ownership model from prefill through
-            # target verify.
-            input_ids.extend(all_ids[boundary : boundary + verified_tail_len])
-            input_ids.extend(draft_tokens[req_i].tolist())
-            input_ids.extend([0] * num_padding_tokens)
-
-            if verified_tail_len > 0:
-                out_cache_locs.append(
-                    req_to_token[
-                        batch.req_pool_indices[req_i],
-                        boundary : boundary + verified_tail_len,
-                    ]
-                )
-            out_cache_locs.append(draft_cache_locs[req_i])
-            if num_padding_tokens > 0:
-                pad_locs = alloc_token_slots(batch.tree_cache, num_padding_tokens)
-                padding_locs.append(pad_locs)
-                out_cache_locs.append(pad_locs)
-
-            positions.append(
-                torch.arange(
-                    boundary,
-                    boundary + physical_verify_len,
-                    dtype=spec_info.positions.dtype,
-                    device=spec_info.positions.device,
-                )
+            req_window = self._build_fixed_verify_req_window(
+                batch=batch,
+                spec_info=spec_info,
+                req_i=req_i,
+                req=req,
+                verified_tail_len=verified_tail_len,
+                draft_tokens=draft_tokens[req_i],
+                draft_cache_locs=draft_cache_locs[req_i],
+                req_to_token=req_to_token,
+                logical_draft_len=logical_draft_len,
+                physical_verify_len=physical_verify_len,
             )
-            boundary_lens.append(boundary)
+            input_ids.extend(req_window.input_ids)
+            out_cache_locs.extend(req_window.out_cache_locs)
+            positions.append(req_window.positions)
+            boundary_lens.append(req_window.boundary_len)
+            padding_locs.extend(req_window.padding_locs)
 
         batch.input_ids = torch.tensor(
             input_ids, dtype=torch.long, device=spec_info.draft_token.device
@@ -805,6 +791,67 @@ class DecodeVerifyRollbackWorker:
         original.padding_locs.extend(padding_locs)
         original.verified_tail_lens = verified_tail_lens
         return original
+
+    def _build_fixed_verify_req_window(
+        self,
+        *,
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+        req_i: int,
+        req,
+        verified_tail_len: int,
+        draft_tokens: torch.Tensor,
+        draft_cache_locs: torch.Tensor,
+        req_to_token: torch.Tensor,
+        logical_draft_len: int,
+        physical_verify_len: int,
+    ) -> _GDNFixedVerifyRequestWindow:
+        boundary = (req.seqlen - 1) - verified_tail_len
+        num_real_tokens = verified_tail_len + logical_draft_len
+        num_padding_tokens = physical_verify_len - num_real_tokens
+        if num_padding_tokens < 0:
+            raise RuntimeError(
+                f"DVR GDN verify window overflow: verified={verified_tail_len}, "
+                f"draft={logical_draft_len}, window={physical_verify_len}."
+            )
+
+        # DVR chunk-boundary target verify uses a graphable fixed window:
+        # verified_tail + draft_token + padding_token. The prompt/extend tail is
+        # treated exactly like already accepted DVR tokens, so the rolling window
+        # has one ownership model from prefill through target verify.
+        all_ids = req.origin_input_ids + req.output_ids
+        input_ids = list(all_ids[boundary : boundary + verified_tail_len])
+        input_ids.extend(draft_tokens.tolist())
+        input_ids.extend([0] * num_padding_tokens)
+
+        out_cache_locs = []
+        if verified_tail_len > 0:
+            out_cache_locs.append(
+                req_to_token[
+                    batch.req_pool_indices[req_i],
+                    boundary : boundary + verified_tail_len,
+                ]
+            )
+        out_cache_locs.append(draft_cache_locs)
+        padding_locs = []
+        if num_padding_tokens > 0:
+            pad_locs = alloc_token_slots(batch.tree_cache, num_padding_tokens)
+            padding_locs.append(pad_locs)
+            out_cache_locs.append(pad_locs)
+
+        positions = torch.arange(
+            boundary,
+            boundary + physical_verify_len,
+            dtype=spec_info.positions.dtype,
+            device=spec_info.positions.device,
+        )
+        return _GDNFixedVerifyRequestWindow(
+            input_ids=input_ids,
+            out_cache_locs=out_cache_locs,
+            positions=positions,
+            boundary_len=boundary,
+            padding_locs=padding_locs,
+        )
 
     def _restore_after_fixed_verify_window(
         self,
