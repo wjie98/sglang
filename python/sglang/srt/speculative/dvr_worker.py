@@ -455,10 +455,18 @@ class DecodeVerifyRollbackWorker:
             and all(req.mamba_ping_pong_track_buffer is not None for req in batch.reqs)
         )
 
+    def _gdn_mamba_cache(self, batch: ScheduleBatch):
+        return batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+
+    def _gdn_live_indices(self, batch: ScheduleBatch) -> torch.Tensor:
+        return batch.req_to_token_pool.get_mamba_indices(
+            batch.req_pool_indices
+        ).to(torch.long)
+
     def _mamba_indices_for_batch(
         self, batch: ScheduleBatch
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
+        live_indices = self._gdn_live_indices(batch)
         boundary_indices = torch.stack(
             [
                 req.mamba_ping_pong_track_buffer[
@@ -467,7 +475,16 @@ class DecodeVerifyRollbackWorker:
                 for req in batch.reqs
             ]
         ).to(device=live_indices.device, dtype=torch.long)
-        return live_indices.to(torch.long), boundary_indices
+        return live_indices, boundary_indices
+
+    def _fixed_verify_draft_rows(
+        self, verified_tail_lens: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        keep = []
+        for req_i, verified_tail_len in enumerate(verified_tail_lens.tolist()):
+            start = req_i * self.verify_window_size + int(verified_tail_len)
+            keep.extend(range(start, start + self.num_draft_tokens))
+        return torch.tensor(keep, dtype=torch.long, device=device)
 
     def _mamba_other_track_idx(self, batch: ScheduleBatch, track_idx: int) -> int:
         return batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
@@ -485,7 +502,7 @@ class DecodeVerifyRollbackWorker:
     def _ensure_gdn_boundary_state(self, batch: ScheduleBatch):
         if not self._has_gdn_dvr_state(batch):
             return
-        live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
+        live_indices = self._gdn_live_indices(batch)
         zero_dst = []
         reset_pos_indices = []
         reset_pos_values = []
@@ -531,16 +548,12 @@ class DecodeVerifyRollbackWorker:
                         )
         if zero_dst:
             dst = torch.stack(zero_dst).to(device=live_indices.device, dtype=torch.long)
-            mamba_cache = (
-                batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-            )
+            mamba_cache = self._gdn_mamba_cache(batch)
             for conv in mamba_cache.conv:
                 conv[:, dst] = 0
             mamba_cache.temporal[:, dst] = 0
         if reset_pos_indices:
-            mamba_cache = (
-                batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-            )
+            mamba_cache = self._gdn_mamba_cache(batch)
             if getattr(mamba_cache, "dvr_qkvg_beta_pos", None) is not None:
                 indices = torch.stack(reset_pos_indices)
                 values = torch.tensor(
@@ -574,9 +587,7 @@ class DecodeVerifyRollbackWorker:
                 # the live pre-draft tail for flows that verify only the new
                 # suffix. The fixed-window path keeps conv at the boundary and
                 # replays verified_token + draft_token before commit.
-                mamba_cache = (
-                    batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-                )
+                mamba_cache = self._gdn_mamba_cache(batch)
                 for conv, saved_conv in zip(
                     mamba_cache.conv, self._gdn_live_backup.conv
                 ):
@@ -615,8 +626,8 @@ class DecodeVerifyRollbackWorker:
             bs, self.num_draft_tokens
         )
         req_to_token = batch.req_to_token_pool.req_to_token
-        mamba_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
+        mamba_cache = self._gdn_mamba_cache(batch)
+        live_indices = self._gdn_live_indices(batch)
         verified_tail_lens = mamba_cache.dvr_qkvg_beta_pos[0, live_indices].to(
             torch.long
         )
@@ -714,13 +725,8 @@ class DecodeVerifyRollbackWorker:
             return
 
         state: _GDNFixedVerifyWindowState = fixed_window_state
-        verify_window = self.verify_window_size
-        keep = []
-        for req_i, verified_tail_len in enumerate(state.verified_tail_lens.tolist()):
-            start = req_i * verify_window + int(verified_tail_len)
-            keep.extend(range(start, start + self.num_draft_tokens))
-        keep = torch.tensor(
-            keep, dtype=torch.long, device=logits_output.next_token_logits.device
+        keep = self._fixed_verify_draft_rows(
+            state.verified_tail_lens, logits_output.next_token_logits.device
         )
         logits_output.next_token_logits = logits_output.next_token_logits[keep]
         if logits_output.hidden_states is not None:
@@ -741,8 +747,8 @@ class DecodeVerifyRollbackWorker:
         if state.padding_locs:
             self.token_to_kv_pool_allocator.free(torch.cat(state.padding_locs))
 
-        mamba_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        live_indices = batch.req_to_token_pool.get_mamba_indices(batch.req_pool_indices)
+        mamba_cache = self._gdn_mamba_cache(batch)
+        live_indices = self._gdn_live_indices(batch)
         mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = state.verified_tail_lens.to(
             device=mamba_cache.dvr_qkvg_beta_pos.device,
             dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
