@@ -328,6 +328,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
 
+    @staticmethod
+    def _dvr_qkvg_beta_caches(mamba_cache_params: MambaPool.SpeculativeState):
+        return (
+            mamba_cache_params.dvr_q_state_cache,
+            mamba_cache_params.dvr_k_state_cache,
+            mamba_cache_params.dvr_v_state_cache,
+            mamba_cache_params.dvr_g_state_cache,
+            mamba_cache_params.dvr_beta_state_cache,
+        )
+
     def _cache_dvr_extend_verified_qkvg_beta(
         self,
         forward_batch: ForwardBatch,
@@ -386,11 +396,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Seed the DVR rolling window with the prompt/extend tail after the
             # latest chunk boundary. Later target verify appends draft_token
             # rows to this same qkvg_beta window.
-            mamba_cache_params.dvr_q_state_cache[dst, cols] = query[src_start:src_end]
-            mamba_cache_params.dvr_k_state_cache[dst, cols] = key[src_start:src_end]
-            mamba_cache_params.dvr_v_state_cache[dst, cols] = value[src_start:src_end]
-            mamba_cache_params.dvr_g_state_cache[dst, cols] = g[src_start:src_end]
-            mamba_cache_params.dvr_beta_state_cache[dst, cols] = beta[src_start:src_end]
+            (
+                q_cache,
+                k_cache,
+                v_cache,
+                g_cache,
+                beta_cache,
+            ) = self._dvr_qkvg_beta_caches(mamba_cache_params)
+            q_cache[dst, cols] = query[src_start:src_end]
+            k_cache[dst, cols] = key[src_start:src_end]
+            v_cache[dst, cols] = value[src_start:src_end]
+            g_cache[dst, cols] = g[src_start:src_end]
+            beta_cache[dst, cols] = beta[src_start:src_end]
 
     @staticmethod
     def _export_dvr_verify_qkvg_beta(
@@ -420,19 +437,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             verify_window_size, dtype=torch.long, device=dvr_indices.device
         ).unsqueeze(0)
         rows = dvr_indices.unsqueeze(1).expand(-1, verify_window_size)
-        mamba_cache_params.dvr_q_state_cache[rows, cols] = query.reshape(
+        q_cache, k_cache, v_cache, g_cache, beta_cache = (
+            GDNAttnBackend._dvr_qkvg_beta_caches(mamba_cache_params)
+        )
+        q_cache[rows, cols] = query.reshape(
             batch_size, verify_window_size, layer.num_q_heads, layer.head_q_dim
         )
-        mamba_cache_params.dvr_k_state_cache[rows, cols] = key.reshape(
+        k_cache[rows, cols] = key.reshape(
             batch_size, verify_window_size, layer.num_k_heads, layer.head_k_dim
         )
-        mamba_cache_params.dvr_v_state_cache[rows, cols] = value.reshape(
+        v_cache[rows, cols] = value.reshape(
             batch_size, verify_window_size, layer.num_v_heads, layer.head_v_dim
         )
-        mamba_cache_params.dvr_g_state_cache[rows, cols] = g.reshape(
+        g_cache[rows, cols] = g.reshape(
             batch_size, verify_window_size, layer.num_v_heads
         )
-        mamba_cache_params.dvr_beta_state_cache[rows, cols] = beta.reshape(
+        beta_cache[rows, cols] = beta.reshape(
             batch_size, verify_window_size, layer.num_v_heads
         )
 
@@ -567,13 +587,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 return
             tail_live_indices = live_indices[req_indices]
             tail_boundary_indices = boundary_indices[req_indices]
+            q_cache, k_cache, v_cache, g_cache, beta_cache = (
+                self._dvr_qkvg_beta_caches(mamba_cache)
+            )
             for layer_idx in range(mamba_cache.temporal.shape[0]):
                 tail_state = self.kernel_dispatcher.recurrent_state_from_qkvg_beta(
-                    mamba_cache.dvr_q_state_cache[layer_idx, tail_live_indices],
-                    mamba_cache.dvr_k_state_cache[layer_idx, tail_live_indices],
-                    mamba_cache.dvr_v_state_cache[layer_idx, tail_live_indices],
-                    mamba_cache.dvr_g_state_cache[layer_idx, tail_live_indices],
-                    mamba_cache.dvr_beta_state_cache[layer_idx, tail_live_indices],
+                    q_cache[layer_idx, tail_live_indices],
+                    k_cache[layer_idx, tail_live_indices],
+                    v_cache[layer_idx, tail_live_indices],
+                    g_cache[layer_idx, tail_live_indices],
+                    beta_cache[layer_idx, tail_live_indices],
                     initial_state=mamba_cache.temporal[
                         layer_idx, tail_boundary_indices
                     ],
@@ -619,13 +642,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     continue
                 remain = int(new_pos[req_i].item())
                 if remain > 0:
-                    for cache in (
-                        mamba_cache.dvr_q_state_cache,
-                        mamba_cache.dvr_k_state_cache,
-                        mamba_cache.dvr_v_state_cache,
-                        mamba_cache.dvr_g_state_cache,
-                        mamba_cache.dvr_beta_state_cache,
-                    ):
+                    for cache in self._dvr_qkvg_beta_caches(mamba_cache):
                         cache[:, slot, :remain] = cache[
                             :, slot, FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + remain
                         ].clone()
