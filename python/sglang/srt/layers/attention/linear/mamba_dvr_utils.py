@@ -118,43 +118,6 @@ class MambaDVRQKVGBetaCache:
         g_cache[dst, cols] = g
         beta_cache[dst, cols] = beta
 
-    def write_verify_window(
-        self,
-        *,
-        indices: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        batch_size: int,
-        verify_window_size: int,
-        num_q_heads: int,
-        head_q_dim: int,
-        num_k_heads: int,
-        head_k_dim: int,
-        num_v_heads: int,
-        head_v_dim: int,
-    ):
-        cols = torch.arange(
-            verify_window_size, dtype=torch.long, device=indices.device
-        ).unsqueeze(0)
-        rows = indices.unsqueeze(1).expand(-1, verify_window_size)
-        q_cache, k_cache, v_cache, g_cache, beta_cache = self.tensors()
-        q_cache[rows, cols] = q.reshape(
-            batch_size, verify_window_size, num_q_heads, head_q_dim
-        )
-        k_cache[rows, cols] = k.reshape(
-            batch_size, verify_window_size, num_k_heads, head_k_dim
-        )
-        v_cache[rows, cols] = v.reshape(
-            batch_size, verify_window_size, num_v_heads, head_v_dim
-        )
-        g_cache[rows, cols] = g.reshape(batch_size, verify_window_size, num_v_heads)
-        beta_cache[rows, cols] = beta.reshape(
-            batch_size, verify_window_size, num_v_heads
-        )
-
     def write_draft_rows(
         self,
         *,
@@ -264,6 +227,61 @@ def build_dvr_conv_windows(
     return conv_source.unfold(
         dimension=2, size=state_len, step=1
     )[:, :, 1 : verify_window_size + 1].transpose(1, 2)
+
+
+def write_dvr_conv_windows(
+    *,
+    intermediate_conv_window_cache: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+    initial_conv_windows: torch.Tensor,
+    mixed_qkv_reshaped: torch.Tensor,
+    verify_window_size: int,
+):
+    conv_windows = build_dvr_conv_windows(
+        initial_conv_windows=initial_conv_windows,
+        mixed_qkv_reshaped=mixed_qkv_reshaped,
+        verify_window_size=verify_window_size,
+    )
+    rows = (
+        intermediate_state_indices[: initial_conv_windows.shape[0]]
+        .to(torch.long)
+        .unsqueeze(1)
+        .expand(-1, verify_window_size)
+    )
+    cols = torch.arange(
+        verify_window_size,
+        dtype=torch.long,
+        device=intermediate_state_indices.device,
+    ).unsqueeze(0)
+    intermediate_conv_window_cache[rows, cols] = conv_windows
+
+
+def select_dvr_draft_suffix(
+    core_attn_out: torch.Tensor,
+    *,
+    tail_lens: torch.Tensor,
+    batch_size: int,
+    verify_window_size: int,
+    draft_token_num: int,
+    num_v_heads: int,
+    head_v_dim: int,
+) -> torch.Tensor:
+    core_attn_out = core_attn_out.view(
+        batch_size, verify_window_size, num_v_heads, head_v_dim
+    )
+    rows = (
+        torch.arange(batch_size, dtype=torch.long, device=core_attn_out.device)
+        .unsqueeze(1)
+        .expand(-1, draft_token_num)
+    )
+    cols = (
+        torch.arange(draft_token_num, dtype=torch.long, device=core_attn_out.device)
+        .unsqueeze(0)
+        .add(tail_lens.unsqueeze(1))
+    )
+    return core_attn_out[rows, cols].reshape(
+        1, batch_size * draft_token_num, num_v_heads, head_v_dim
+    ).contiguous()
 
 
 def rebuild_mamba_dvr_live_state_grouped(

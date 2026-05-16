@@ -8,9 +8,10 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 from sglang.srt.layers.attention.linear.mamba_dvr_utils import (
     MambaDVRFlaOps,
     MambaDVRQKVGBetaCache,
-    build_dvr_conv_windows,
     rebuild_mamba_dvr_live_state_grouped,
+    select_dvr_draft_suffix,
     write_dvr_chunk_boundary_state,
+    write_dvr_conv_windows,
 )
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -412,49 +413,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 beta=beta[src_start:src_end],
             )
 
-    @staticmethod
-    def _cache_dvr_verify_qkvg_beta_window(
-        *,
-        mamba_cache_params: MambaPool.SpeculativeState,
-        dvr_indices: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        batch_size: int,
-        verify_window_size: int,
-        layer: RadixLinearAttention,
-    ):
-        """Export the fixed DVR verify window for later state replay.
-
-        DVR worker owns the layout semantics
-        (verified_token + draft_token + padding_token). The GDN backend only
-        exposes the deterministic q/k/v/g/beta inputs produced by the same
-        chunkwise verify forward, so post-verify can replay states from a known
-        chunk boundary without coupling generic GDN kernels to speculative
-        accept/reject logic.
-        """
-
-        MambaDVRQKVGBetaCache.from_mamba_cache(
-            mamba_cache_params
-        ).write_verify_window(
-            indices=dvr_indices,
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            batch_size=batch_size,
-            verify_window_size=verify_window_size,
-            num_q_heads=layer.num_q_heads,
-            head_q_dim=layer.head_q_dim,
-            num_k_heads=layer.num_k_heads,
-            head_k_dim=layer.head_k_dim,
-            num_v_heads=layer.num_v_heads,
-            head_v_dim=layer.head_v_dim,
-        )
-
     def _run_dvr_verify_conv(
         self,
         *,
@@ -489,21 +447,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             seq_lens_cpu=[draft_token_num] * batch_size,
         ).transpose(0, 1)[: mixed_qkv.shape[0]]
 
-        conv_windows = build_dvr_conv_windows(
+        write_dvr_conv_windows(
+            intermediate_conv_window_cache=intermediate_conv_window_cache,
+            intermediate_state_indices=intermediate_state_indices,
             initial_conv_windows=initial_conv_windows,
             mixed_qkv_reshaped=mixed_qkv_reshaped,
             verify_window_size=draft_token_num,
         )
-        rows = (
-            intermediate_state_indices[:batch_size]
-            .to(torch.long)
-            .unsqueeze(1)
-            .expand(-1, draft_token_num)
-        )
-        cols = torch.arange(
-            draft_token_num, dtype=torch.long, device=dvr_indices.device
-        ).unsqueeze(0)
-        intermediate_conv_window_cache[rows, cols] = conv_windows
         return mixed_qkv
 
     def _run_dvr_verify_chunk_scan(
@@ -569,24 +519,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             batch_size=batch_size,
             verify_window_size=verify_window_size,
         )
-        core_attn_out = core_attn_out.view(
-            batch_size, verify_window_size, layer.num_v_heads, layer.head_v_dim
+        return select_dvr_draft_suffix(
+            core_attn_out,
+            tail_lens=tail_lens,
+            batch_size=batch_size,
+            verify_window_size=verify_window_size,
+            draft_token_num=draft_token_num,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
         )
-        rows = (
-            torch.arange(batch_size, dtype=torch.long, device=core_attn_out.device)
-            .unsqueeze(1)
-            .expand(-1, draft_token_num)
-        )
-        cols = (
-            torch.arange(
-                draft_token_num, dtype=torch.long, device=core_attn_out.device
-            )
-            .unsqueeze(0)
-            .add(tail_lens.unsqueeze(1))
-        )
-        return core_attn_out[rows, cols].reshape(
-            1, batch_size * draft_token_num, layer.num_v_heads, layer.head_v_dim
-        ).contiguous()
 
     @staticmethod
     def _check_dvr_qkvg_tail_position(
