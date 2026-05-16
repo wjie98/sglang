@@ -661,7 +661,7 @@ class DVRGatedStateAdapter:
             device=forward_batch.input_ids.device,
         )
 
-    def maybe_cache_extend_state_inputs(
+    def cache_extend_state_inputs(
         self,
         *,
         context: DVRGatedForwardContext,
@@ -706,7 +706,6 @@ class DVRGatedStateAdapter:
         *,
         context: DVRGatedForwardContext,
         mixed_qkv: torch.Tensor,
-        has_initial_states: torch.Tensor,
     ) -> torch.Tensor:
         """Run DVR draft conv and export absolute-offset conv windows."""
 
@@ -715,6 +714,7 @@ class DVRGatedStateAdapter:
         )
 
         batch_size, draft_token_num = self.target_verify_shape(context)
+        has_initial_states = self.target_verify_has_initial_states(context)
         mixed_qkv_linear = mixed_qkv
         mixed_qkv_reshaped = mixed_qkv_linear.view(
             batch_size, draft_token_num, -1

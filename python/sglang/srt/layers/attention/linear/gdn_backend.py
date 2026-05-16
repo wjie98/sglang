@@ -268,31 +268,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
 
-    def commit_dvr_state_after_verify(
-        self,
-        *,
-        live_indices: torch.Tensor,
-        boundary_indices: torch.Tensor,
-        verified_tail_lens: torch.Tensor,
-        accepted_tokens: torch.Tensor,
-        accepted_steps: torch.Tensor,
-    ) -> torch.Tensor:
-        """Commit DVR GDN state after target verify.
-
-        The worker owns request-level bookkeeping, but the tensor lifecycle is
-        GDN-specific: q/k/v/g/beta windows, live temporal state, chunk-boundary
-        state, and conv windows must move together.
-        """
-
-        return self.dvr_state_adapter.commit_after_verify(
-            state_cache=self.req_to_token_pool.get_speculative_mamba2_params_all_layers(),
-            live_indices=live_indices,
-            boundary_indices=boundary_indices,
-            verified_tail_lens=verified_tail_lens,
-            accepted_tokens=accepted_tokens,
-            accepted_steps=accepted_steps,
-        )
-
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -407,9 +382,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            has_initial_states = self.dvr_state_adapter.target_verify_has_initial_states(
-                dvr_context
-            )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
@@ -417,7 +389,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = self.dvr_state_adapter.process_target_verify_conv(
                 context=dvr_context,
                 mixed_qkv=mixed_qkv,
-                has_initial_states=has_initial_states,
             )
         elif is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
@@ -519,7 +490,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            self.dvr_state_adapter.maybe_cache_extend_state_inputs(
+            self.dvr_state_adapter.cache_extend_state_inputs(
                 context=dvr_context,
                 q=query,
                 k=key,

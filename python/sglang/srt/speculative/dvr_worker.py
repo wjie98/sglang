@@ -700,10 +700,15 @@ class DecodeVerifyRollbackWorker:
         linear_backend = getattr(attn_backend, "linear_attn_backend", None)
         if linear_backend is None:
             return
+        dvr_state_adapter = getattr(linear_backend, "dvr_state_adapter", None)
+        if dvr_state_adapter is None:
+            return
         verified_tail_lens = self._chunk_boundary_tail_lens(batch, ctx).to(
             device=ctx.live_indices.device, dtype=torch.long
         )
-        crossing = linear_backend.commit_dvr_state_after_verify(
+        state_cache = linear_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        crossing = dvr_state_adapter.commit_after_verify(
+            state_cache=state_cache,
             live_indices=ctx.live_indices,
             boundary_indices=ctx.boundary_indices,
             verified_tail_lens=verified_tail_lens,
