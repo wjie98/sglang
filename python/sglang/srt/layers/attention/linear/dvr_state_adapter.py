@@ -644,6 +644,23 @@ class DVRGatedStateAdapter:
         draft_token_num = spec_info.draft_token_num
         return seq_len // draft_token_num, draft_token_num
 
+    def target_verify_shape(
+        self, context: DVRGatedForwardContext
+    ) -> Tuple[int, int]:
+        return self.verify_shape(
+            seq_len=context.seq_len, spec_info=context.spec_info
+        )
+
+    def target_verify_has_initial_states(
+        self, context: DVRGatedForwardContext
+    ) -> torch.Tensor:
+        batch_size, _ = self.target_verify_shape(context)
+        forward_batch = context.forward_batch
+        return (forward_batch.seq_lens[:batch_size] > 0).to(
+            dtype=torch.bool,
+            device=forward_batch.input_ids.device,
+        )
+
     def maybe_cache_extend_state_inputs(
         self,
         *,
@@ -684,23 +701,20 @@ class DVRGatedStateAdapter:
             chunk_size=self.chunk_size,
         )
 
-    def maybe_process_target_verify_conv(
+    def process_target_verify_conv(
         self,
         *,
         context: DVRGatedForwardContext,
         mixed_qkv: torch.Tensor,
         has_initial_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor:
         """Run DVR draft conv and export absolute-offset conv windows."""
 
-        if not self.is_verify_enabled(
+        assert self.is_verify_enabled(
             state_cache=context.state_cache, is_target_verify=context.is_target_verify
-        ):
-            return None
-
-        batch_size, draft_token_num = self.verify_shape(
-            seq_len=context.seq_len, spec_info=context.spec_info
         )
+
+        batch_size, draft_token_num = self.target_verify_shape(context)
         mixed_qkv_linear = mixed_qkv
         mixed_qkv_reshaped = mixed_qkv_linear.view(
             batch_size, draft_token_num, -1
@@ -734,7 +748,7 @@ class DVRGatedStateAdapter:
         )
         return mixed_qkv
 
-    def maybe_process_target_verify_state(
+    def process_target_verify_state(
         self,
         *,
         context: DVRGatedForwardContext,
@@ -743,15 +757,12 @@ class DVRGatedStateAdapter:
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        if not self.is_verify_enabled(
+    ) -> torch.Tensor:
+        assert self.is_verify_enabled(
             state_cache=context.state_cache, is_target_verify=context.is_target_verify
-        ):
-            return None
-
-        batch_size, draft_token_num = self.verify_shape(
-            seq_len=context.seq_len, spec_info=context.spec_info
         )
+
+        batch_size, draft_token_num = self.target_verify_shape(context)
         return run_dvr_chunkwise_verify(
             state_ops=self.ops,
             state_window=DVRStateInputWindow.from_cache(context.state_cache),

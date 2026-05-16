@@ -402,54 +402,51 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             seq_len=seq_len,
         )
+        dvr_verify = self.dvr_state_adapter.is_verify_enabled(
+            state_cache=mamba_cache_params, is_target_verify=is_target_verify
+        )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-            has_initial_states = (
-                forward_batch.seq_lens[: seq_len // forward_batch.spec_info.draft_token_num]
-                > 0
-            ).to(
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
+            has_initial_states = self.dvr_state_adapter.target_verify_has_initial_states(
+                dvr_context
             )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
-        if is_target_verify:
-            dvr_mixed_qkv = self.dvr_state_adapter.maybe_process_target_verify_conv(
+        if dvr_verify:
+            mixed_qkv = self.dvr_state_adapter.process_target_verify_conv(
                 context=dvr_context,
                 mixed_qkv=mixed_qkv,
                 has_initial_states=has_initial_states,
             )
-            if dvr_mixed_qkv is not None:
-                mixed_qkv = dvr_mixed_qkv
-            else:
-                batch_size = seq_len // forward_batch.spec_info.draft_token_num
-                draft_token_num = forward_batch.spec_info.draft_token_num
-                intermediate_conv_window_cache = (
-                    mamba_cache_params.intermediate_conv_window[0]
-                )
-                intermediate_state_indices = torch.arange(
-                    cache_indices.shape[0],
-                    dtype=torch.int32,
-                    device=cache_indices.device,
-                )
-                mixed_qkv_reshaped = mixed_qkv.view(
-                    batch_size, draft_token_num, -1
-                ).transpose(1, 2)
-                mixed_qkv_processed = causal_conv1d_update(
-                    mixed_qkv_reshaped,
-                    conv_states,
-                    layer.conv_weights,
-                    layer.bias,
-                    layer.activation,
-                    conv_state_indices=cache_indices[:batch_size],
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                    intermediate_state_indices=intermediate_state_indices[:batch_size],
-                    retrieve_next_token=retrieve_next_token,
-                    retrieve_next_sibling=retrieve_next_sibling,
-                    retrieve_parent_token=retrieve_parent_token,
-                )
-                mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+        elif is_target_verify:
+            batch_size = seq_len // forward_batch.spec_info.draft_token_num
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            intermediate_conv_window_cache = (
+                mamba_cache_params.intermediate_conv_window[0]
+            )
+            intermediate_state_indices = torch.arange(
+                cache_indices.shape[0],
+                dtype=torch.int32,
+                device=cache_indices.device,
+            )
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
+            mixed_qkv_processed = causal_conv1d_update(
+                mixed_qkv_reshaped,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv_window_cache,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
@@ -488,15 +485,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            core_attn_out = self.dvr_state_adapter.maybe_process_target_verify_state(
-                context=dvr_context,
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-            )
-            if core_attn_out is None:
+            if dvr_verify:
+                core_attn_out = self.dvr_state_adapter.process_target_verify_state(
+                    context=dvr_context,
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                )
+            else:
                 intermediate_state_cache = mamba_cache_params.intermediate_ssm
                 intermediate_state_indices = torch.arange(
                     cache_indices.shape[0],
