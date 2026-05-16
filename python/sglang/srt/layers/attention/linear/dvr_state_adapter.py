@@ -6,8 +6,17 @@ import torch
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 
 
+@dataclass(frozen=True)
+class DVRStateCommitPlan:
+    pos_before: torch.Tensor
+    pos_after: torch.Tensor
+    crossing: torch.Tensor
+    accepted_window_steps: torch.Tensor
+    boundary_conv_steps: torch.Tensor
+
+
 @dataclass
-class DVRLinearStateOps:
+class DVRStateKernels:
     """Linear-state operators used by DVR verification."""
 
     chunk_scan: Optional[Callable] = None
@@ -68,7 +77,7 @@ class DVRLinearStateOps:
 
 
 @dataclass(frozen=True)
-class DVRGatedStateInputCache:
+class DVRStateInputWindow:
     q: Optional[torch.Tensor]
     k: Optional[torch.Tensor]
     v: Optional[torch.Tensor]
@@ -200,11 +209,81 @@ class DVRGatedStateInputCache:
             else:
                 cache[slots, :length] = cache[slots, start : start + length].clone()
 
+    def shift_after_boundary(
+        self,
+        *,
+        live_indices: torch.Tensor,
+        crossing: torch.Tensor,
+        new_pos: torch.Tensor,
+        chunk_size: int = FLA_CHUNK_SIZE,
+    ):
+        crossing_idx = crossing.nonzero(as_tuple=True)[0]
+        crossing_slots = live_indices[crossing_idx]
+        if crossing_slots.numel() == 0:
+            return
 
-def has_dvr_state_input_cache(state_cache) -> bool:
+        tail_capacity = self.capacity - chunk_size
+        tail_len = min(int(new_pos[crossing_idx].max().item()), tail_capacity)
+        if tail_len > 0:
+            self.shift_suffix(
+                slots=crossing_slots,
+                start=chunk_size,
+                length=tail_len,
+            )
+
+    def write_extend_tail(
+        self,
+        *,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        chunk_size: int = FLA_CHUNK_SIZE,
+    ):
+        for req_i, (prefix_len, extend_len) in enumerate(
+            zip(extend_prefix_lens_cpu, extend_seq_lens_cpu, strict=True)
+        ):
+            seq_len = prefix_len + extend_len
+            boundary = (seq_len // chunk_size) * chunk_size
+            num_verified_tokens = seq_len - boundary
+            dst = cache_indices[req_i].to(torch.long)
+            self.set_tail_lens(indices=dst, value=num_verified_tokens)
+            if num_verified_tokens == 0:
+                continue
+
+            write_start = max(prefix_len, boundary)
+            write_end = seq_len
+            if write_start >= write_end:
+                continue
+
+            src_start = int(query_start_loc[req_i].item()) + (write_start - prefix_len)
+            src_end = src_start + (write_end - write_start)
+            cols = torch.arange(
+                write_start - boundary,
+                write_end - boundary,
+                dtype=torch.long,
+                device=cache_indices.device,
+            )
+            self.write_tail(
+                dst=dst,
+                cols=cols,
+                q=q[src_start:src_end],
+                k=k[src_start:src_end],
+                v=v[src_start:src_end],
+                g=g[src_start:src_end],
+                beta=beta[src_start:src_end],
+            )
+
+
+def has_dvr_state_window(state_cache) -> bool:
     """Return whether a cache exposes DVR's rolling state-input window."""
 
-    return DVRGatedStateInputCache.from_cache(state_cache).enabled
+    return DVRStateInputWindow.from_cache(state_cache).enabled
 
 
 def check_dvr_state_input_position(
@@ -212,29 +291,29 @@ def check_dvr_state_input_position(
     pos_before: torch.Tensor,
     pos_after: torch.Tensor,
     accepted_tokens: torch.Tensor,
-    state_input_capacity: int,
+    window_capacity: int,
 ):
     if (
         torch.any(pos_before < 0).item()
         or torch.any(pos_before >= FLA_CHUNK_SIZE).item()
-        or torch.any(pos_after > state_input_capacity).item()
+        or torch.any(pos_after > window_capacity).item()
     ):
         raise RuntimeError(
             "Invalid DVR GDN state-input tail position: "
             f"pos_before={pos_before.tolist()}, "
             f"accepted_tokens={accepted_tokens.tolist()}, "
-            f"capacity={state_input_capacity}, chunk_size={FLA_CHUNK_SIZE}."
+            f"capacity={window_capacity}, chunk_size={FLA_CHUNK_SIZE}."
         )
 
 
 def check_dvr_state_steps(
-    *, accepted_state_steps: torch.Tensor, state_input_capacity: int
+    *, accepted_window_steps: torch.Tensor, window_capacity: int
 ):
-    if torch.any(accepted_state_steps >= state_input_capacity).item():
+    if torch.any(accepted_window_steps >= window_capacity).item():
         raise RuntimeError(
             "Invalid DVR GDN accepted state step: "
-            f"steps={accepted_state_steps.tolist()}, "
-            f"capacity={state_input_capacity}."
+            f"steps={accepted_window_steps.tolist()}, "
+            f"capacity={window_capacity}."
         )
 
 
@@ -261,6 +340,46 @@ def check_dvr_conv_steps(
                 f"steps={crossing_boundary_steps.tolist()}, "
                 f"capacity={conv_capacity}."
             )
+
+
+def build_dvr_state_commit_plan(
+    *,
+    verified_tail_lens: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    accepted_steps: torch.Tensor,
+    window_capacity: int,
+    conv_capacity: int,
+    device: torch.device,
+    chunk_size: int = FLA_CHUNK_SIZE,
+) -> DVRStateCommitPlan:
+    pos_before = verified_tail_lens.to(device=device, dtype=torch.long)
+    pos_after = pos_before + accepted_tokens
+    check_dvr_state_input_position(
+        pos_before=pos_before,
+        pos_after=pos_after,
+        accepted_tokens=accepted_tokens,
+        window_capacity=window_capacity,
+    )
+    crossing = pos_after >= chunk_size
+    accepted_window_steps = pos_before + accepted_steps
+    check_dvr_state_steps(
+        accepted_window_steps=accepted_window_steps,
+        window_capacity=window_capacity,
+    )
+    boundary_conv_steps = chunk_size - 1 - pos_before
+    check_dvr_conv_steps(
+        accepted_steps=accepted_steps,
+        boundary_steps=boundary_conv_steps,
+        crossing=crossing,
+        conv_capacity=conv_capacity,
+    )
+    return DVRStateCommitPlan(
+        pos_before=pos_before,
+        pos_after=pos_after,
+        crossing=crossing,
+        accepted_window_steps=accepted_window_steps,
+        boundary_conv_steps=boundary_conv_steps,
+    )
 
 
 def write_dvr_chunk_boundary_state(
@@ -368,10 +487,94 @@ def select_dvr_draft_suffix(
     ).contiguous()
 
 
+def run_dvr_chunkwise_verify(
+    *,
+    state_ops: DVRStateKernels,
+    state_window: DVRStateInputWindow,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    intermediate_state_cache: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    num_q_heads: int,
+    head_q_dim: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    chunk_size: int = FLA_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Run DVR's fixed chunk+draft linear-state verify window.
+
+    Backends provide state-input tensors and kernels; the adapter owns the DVR
+    rolling-window mechanics and only returns the draft suffix consumed by the
+    normal target-verify path.
+    """
+
+    indices = cache_indices[:batch_size].to(torch.long)
+    tail_lens = state_window.tail_lens(indices=indices).to(torch.long)
+    state_window.write_draft_rows(
+        indices=indices,
+        col_start=tail_lens,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        batch_size=batch_size,
+        draft_token_num=draft_token_num,
+        num_q_heads=num_q_heads,
+        head_q_dim=head_q_dim,
+        num_k_heads=num_k_heads,
+        head_k_dim=head_k_dim,
+        num_v_heads=num_v_heads,
+        head_v_dim=head_v_dim,
+    )
+    verify_window_size = chunk_size + draft_token_num
+    q_window, k_window, v_window, g_window, beta_window = state_window.read_window(
+        indices=indices
+    )
+    core_attn_out, _, h = state_ops.scan_chunkwise(
+        q=q_window,
+        k=k_window,
+        v=v_window,
+        g=g_window,
+        beta=beta_window,
+        ssm_states=ssm_states,
+        cache_indices=indices,
+        # Equal-length [bs, chunk+draft, ...] avoids variable-length chunk
+        # preparation, which can synchronize CPU/GPU and is not graph-safe.
+        query_start_loc=None,
+    )
+    write_dvr_chunk_boundary_state(
+        h=h,
+        intermediate_state_cache=intermediate_state_cache,
+        intermediate_state_indices=intermediate_state_indices,
+        batch_size=batch_size,
+        verify_window_size=verify_window_size,
+        chunk_size=chunk_size,
+    )
+    return select_dvr_draft_suffix(
+        core_attn_out,
+        tail_lens=tail_lens,
+        batch_size=batch_size,
+        verify_window_size=verify_window_size,
+        draft_token_num=draft_token_num,
+        num_v_heads=num_v_heads,
+        head_v_dim=head_v_dim,
+    )
+
+
 def rebuild_dvr_live_state_grouped(
     *,
-    state_ops: DVRLinearStateOps,
-    state_input_cache: DVRGatedStateInputCache,
+    state_ops: DVRStateKernels,
+    state_window: DVRStateInputWindow,
     temporal_state: torch.Tensor,
     live_indices: torch.Tensor,
     boundary_indices: torch.Tensor,
@@ -391,7 +594,7 @@ def rebuild_dvr_live_state_grouped(
 
     state_live_indices = live_indices[req_indices]
     state_boundary_indices = boundary_indices[req_indices]
-    q_cache, k_cache, v_cache, g_cache, beta_cache = state_input_cache.tensors()
+    q_cache, k_cache, v_cache, g_cache, beta_cache = state_window.tensors()
     num_layers = temporal_state.shape[0]
     num_reqs = state_live_indices.numel()
     token_count = token_count.to(device=temporal_state.device, dtype=torch.long)
