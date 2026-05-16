@@ -650,21 +650,15 @@ class DVRGatedStateAdapter:
     kernels: DVRStateKernels
     chunk_size: int = FLA_CHUNK_SIZE
 
-    def set_kernels(self, *, chunk_scan: Callable, recurrent_state: Callable):
-        self.kernels.set_ops(
-            chunk_scan=chunk_scan,
-            recurrent_state=recurrent_state,
-        )
-
     def has_window(self, state_cache) -> bool:
         return has_dvr_state_window(state_cache)
 
-    def cache_extend_tail(
+    def maybe_cache_extend_tail(
         self,
         *,
         state_cache,
         cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
+        query_start_loc: Optional[torch.Tensor],
         extend_prefix_lens_cpu,
         extend_seq_lens_cpu,
         q: torch.Tensor,
@@ -676,6 +670,18 @@ class DVRGatedStateAdapter:
         state_window = DVRStateInputWindow.from_cache(state_cache)
         if not state_window.enabled:
             return
+        if (
+            extend_prefix_lens_cpu is None
+            or extend_seq_lens_cpu is None
+            or query_start_loc is None
+        ):
+            return
+
+        q = q.reshape(q.shape[1], q.shape[2], q.shape[3])
+        k = k.reshape(k.shape[1], k.shape[2], k.shape[3])
+        v = v.reshape(v.shape[1], v.shape[2], v.shape[3])
+        g = g.reshape(-1, g.shape[-1])
+        beta = beta.reshape(-1, beta.shape[-1])
 
         state_window.write_extend_tail(
             cache_indices=cache_indices,
@@ -690,26 +696,54 @@ class DVRGatedStateAdapter:
             chunk_size=self.chunk_size,
         )
 
-    def write_conv_windows(
+    def run_verify_conv(
         self,
         *,
+        layer,
+        conv_fn: Callable,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
         intermediate_conv_window_cache: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
-        initial_conv_windows: torch.Tensor,
-        mixed_qkv_reshaped: torch.Tensor,
-        verify_window_size: int,
-    ):
+        batch_size: int,
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        """Run DVR draft conv and export absolute-offset conv windows."""
+
+        mixed_qkv_linear = mixed_qkv
+        mixed_qkv_reshaped = mixed_qkv_linear.view(
+            batch_size, draft_token_num, -1
+        ).transpose(1, 2)
+        dvr_indices = cache_indices[:batch_size].to(torch.long)
+        initial_conv_windows = conv_states[dvr_indices].clone()
+        mixed_qkv = conv_fn(
+            mixed_qkv_linear.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=conv_states,
+            has_initial_state=has_initial_states,
+            cache_indices=dvr_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=[draft_token_num] * batch_size,
+        ).transpose(0, 1)[: mixed_qkv.shape[0]]
+
         write_dvr_conv_windows(
             intermediate_conv_window_cache=intermediate_conv_window_cache,
             intermediate_state_indices=intermediate_state_indices,
             initial_conv_windows=initial_conv_windows,
             mixed_qkv_reshaped=mixed_qkv_reshaped,
-            verify_window_size=verify_window_size,
+            verify_window_size=draft_token_num,
         )
+        return mixed_qkv
 
-    def run_chunkwise_verify(
+    def run_verify_chunkwise(
         self,
         *,
+        layer,
         state_cache,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -722,12 +756,6 @@ class DVRGatedStateAdapter:
         intermediate_state_indices: torch.Tensor,
         batch_size: int,
         draft_token_num: int,
-        num_q_heads: int,
-        head_q_dim: int,
-        num_k_heads: int,
-        head_k_dim: int,
-        num_v_heads: int,
-        head_v_dim: int,
     ) -> torch.Tensor:
         return run_dvr_chunkwise_verify(
             state_ops=self.kernels,
@@ -743,12 +771,12 @@ class DVRGatedStateAdapter:
             intermediate_state_indices=intermediate_state_indices,
             batch_size=batch_size,
             draft_token_num=draft_token_num,
-            num_q_heads=num_q_heads,
-            head_q_dim=head_q_dim,
-            num_k_heads=num_k_heads,
-            head_k_dim=head_k_dim,
-            num_v_heads=num_v_heads,
-            head_v_dim=head_v_dim,
+            num_q_heads=layer.num_q_heads,
+            head_q_dim=layer.head_q_dim,
+            num_k_heads=layer.num_k_heads,
+            head_k_dim=layer.head_k_dim,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
             chunk_size=self.chunk_size,
         )
 

@@ -331,136 +331,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        self.dvr_state_adapter = DVRGatedStateAdapter(DVRStateKernels())
-        self._set_dvr_state_kernels()
-
-    def _set_dvr_state_kernels(self):
-        self.dvr_state_adapter.set_kernels(
-            chunk_scan=self.kernel_dispatcher.extend,
-            recurrent_state=self.kernel_dispatcher.recurrent_state_from_qkvg_beta,
-        )
-
-    def _cache_dvr_extend_state_tail(
-        self,
-        forward_batch: ForwardBatch,
-        mamba_cache_params: MambaPool.SpeculativeState,
-        cache_indices: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-    ):
-        if not self.dvr_state_adapter.has_window(mamba_cache_params):
-            return
-        if (
-            forward_batch.extend_prefix_lens_cpu is None
-            or forward_batch.extend_seq_lens_cpu is None
-            or self.forward_metadata.query_start_loc is None
-        ):
-            return
-
-        query = query.reshape(query.shape[1], query.shape[2], query.shape[3])
-        key = key.reshape(key.shape[1], key.shape[2], key.shape[3])
-        value = value.reshape(value.shape[1], value.shape[2], value.shape[3])
-        g = g.reshape(-1, g.shape[-1])
-        beta = beta.reshape(-1, beta.shape[-1])
-        query_start_loc = self.forward_metadata.query_start_loc
-
-        self.dvr_state_adapter.cache_extend_tail(
-            state_cache=mamba_cache_params,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-        )
-
-    def _run_dvr_verify_conv(
-        self,
-        *,
-        layer: RadixLinearAttention,
-        mixed_qkv: torch.Tensor,
-        conv_states: torch.Tensor,
-        has_initial_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        intermediate_conv_window_cache: torch.Tensor,
-        intermediate_state_indices: torch.Tensor,
-        batch_size: int,
-        draft_token_num: int,
-    ) -> torch.Tensor:
-        """Run draft-suffix conv and export windows at DVR absolute offsets."""
-
-        mixed_qkv_linear = mixed_qkv
-        mixed_qkv_reshaped = mixed_qkv_linear.view(
-            batch_size, draft_token_num, -1
-        ).transpose(1, 2)
-        dvr_indices = cache_indices[:batch_size].to(torch.long)
-        initial_conv_windows = conv_states[dvr_indices].clone()
-        mixed_qkv = causal_conv1d_fn(
-            mixed_qkv_linear.transpose(0, 1),
-            layer.conv_weights,
-            layer.bias,
-            activation=layer.activation,
-            conv_states=conv_states,
-            has_initial_state=has_initial_states,
-            cache_indices=dvr_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=[draft_token_num] * batch_size,
-        ).transpose(0, 1)[: mixed_qkv.shape[0]]
-
-        self.dvr_state_adapter.write_conv_windows(
-            intermediate_conv_window_cache=intermediate_conv_window_cache,
-            intermediate_state_indices=intermediate_state_indices,
-            initial_conv_windows=initial_conv_windows,
-            mixed_qkv_reshaped=mixed_qkv_reshaped,
-            verify_window_size=draft_token_num,
-        )
-        return mixed_qkv
-
-    def _run_dvr_verify_chunk_scan(
-        self,
-        *,
-        layer: RadixLinearAttention,
-        mamba_cache_params: MambaPool.SpeculativeState,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        ssm_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        intermediate_state_cache: torch.Tensor,
-        intermediate_state_indices: torch.Tensor,
-        batch_size: int,
-        draft_token_num: int,
-    ) -> torch.Tensor:
-        """Run DVR's internal 64+draft chunkwise scan and return draft suffix."""
-
-        return self.dvr_state_adapter.run_chunkwise_verify(
-            state_cache=mamba_cache_params,
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            intermediate_state_cache=intermediate_state_cache,
-            intermediate_state_indices=intermediate_state_indices,
-            batch_size=batch_size,
-            draft_token_num=draft_token_num,
-            num_q_heads=layer.num_q_heads,
-            head_q_dim=layer.head_q_dim,
-            num_k_heads=layer.num_k_heads,
-            head_k_dim=layer.head_k_dim,
-            num_v_heads=layer.num_v_heads,
-            head_v_dim=layer.head_v_dim,
+        self.dvr_state_adapter = DVRGatedStateAdapter(
+            DVRStateKernels(
+                chunk_scan=self.kernel_dispatcher.extend,
+                recurrent_state=self.kernel_dispatcher.recurrent_state_from_qkvg_beta,
+            )
         )
 
     def commit_dvr_state_after_verify(
@@ -503,7 +378,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-        self._set_dvr_state_kernels()
 
         assert isinstance(mixed_qkv, torch.Tensor)
         mixed_qkv = causal_conv1d_update(
@@ -576,7 +450,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
-        self._set_dvr_state_kernels()
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
@@ -619,8 +492,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # DVR uses a fixed 64+draft linear verify window. Keep the
                 # generic GDN forward path here; only export the tensors needed
                 # by DVR state replay.
-                mixed_qkv = self._run_dvr_verify_conv(
+                mixed_qkv = self.dvr_state_adapter.run_verify_conv(
                     layer=layer,
+                    conv_fn=causal_conv1d_fn,
                     mixed_qkv=mixed_qkv,
                     conv_states=conv_states,
                     has_initial_states=has_initial_states,
@@ -688,12 +562,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             if is_dvr_target_verify:
-                core_attn_out = self._run_dvr_verify_chunk_scan(
+                core_attn_out = self.dvr_state_adapter.run_verify_chunkwise(
                     layer=layer,
-                    mamba_cache_params=mamba_cache_params,
-                    query=query,
-                    key=key,
-                    value=value,
+                    state_cache=mamba_cache_params,
+                    q=query,
+                    k=key,
+                    v=value,
                     g=g,
                     beta=beta,
                     ssm_states=ssm_states,
@@ -722,15 +596,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            self._cache_dvr_extend_state_tail(
-                forward_batch,
-                mamba_cache_params,
-                cache_indices,
-                query,
-                key,
-                value,
-                g,
-                beta,
+            self.dvr_state_adapter.maybe_cache_extend_tail(
+                state_cache=mamba_cache_params,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
             )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
