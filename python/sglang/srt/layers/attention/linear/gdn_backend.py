@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.linear.mamba_dvr_utils import (
     MambaDVRFlaOps,
     MambaDVRQKVGBetaCache,
     build_dvr_conv_windows,
+    rebuild_mamba_dvr_live_state_grouped,
     write_dvr_chunk_boundary_state,
 )
 from sglang.srt.layers.attention.linear.utils import (
@@ -673,31 +674,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         crossing = pos_after >= FLA_CHUNK_SIZE
 
-        def rebuild_live_tail(req_indices: torch.Tensor, token_count: torch.Tensor):
-            if req_indices.numel() == 0:
-                return
-            tail_live_indices = live_indices[req_indices]
-            tail_boundary_indices = boundary_indices[req_indices]
-            q_cache, k_cache, v_cache, g_cache, beta_cache = qkvg_beta_cache.tensors()
-            for layer_idx in range(mamba_cache.temporal.shape[0]):
-                tail_state = self.dvr_fla_ops.rebuild_recurrent_state(
-                    q_cache[layer_idx, tail_live_indices],
-                    k_cache[layer_idx, tail_live_indices],
-                    v_cache[layer_idx, tail_live_indices],
-                    g_cache[layer_idx, tail_live_indices],
-                    beta_cache[layer_idx, tail_live_indices],
-                    initial_state=mamba_cache.temporal[
-                        layer_idx, tail_boundary_indices
-                    ],
-                    token_count=token_count,
-                )
-                mamba_cache.temporal[layer_idx, tail_live_indices] = tail_state
-
         # Rebuild live state with the recurrent kernel. The chunkwise kernel is
         # reserved for chunk-boundary checkpoints; between boundaries, self
         # decode should continue from the recurrent state of the last accepted
         # token.
-        rebuild_live_tail((~crossing).nonzero(as_tuple=True)[0], pos_after[~crossing])
+        rebuild_mamba_dvr_live_state_grouped(
+            fla_ops=self.dvr_fla_ops,
+            qkvg_beta_cache=qkvg_beta_cache,
+            temporal_state=mamba_cache.temporal,
+            live_indices=live_indices,
+            boundary_indices=boundary_indices,
+            req_indices=(~crossing).nonzero(as_tuple=True)[0],
+            token_count=pos_after[~crossing],
+        )
 
         accepted_state_steps = pos_before + accepted_steps
         self._check_dvr_accepted_state_steps(
@@ -759,7 +748,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         start=FLA_CHUNK_SIZE,
                         length=tail_len,
                     )
-            rebuild_live_tail(crossing_idx, new_pos[crossing_idx])
+            rebuild_mamba_dvr_live_state_grouped(
+                fla_ops=self.dvr_fla_ops,
+                qkvg_beta_cache=qkvg_beta_cache,
+                temporal_state=mamba_cache.temporal,
+                live_indices=live_indices,
+                boundary_indices=boundary_indices,
+                req_indices=crossing_idx,
+                token_count=new_pos[crossing_idx],
+            )
             pos_after = torch.where(crossing, new_pos, pos_after)
 
         mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = pos_after.to(torch.int32)

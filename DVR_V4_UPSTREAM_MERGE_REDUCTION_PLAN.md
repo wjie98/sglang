@@ -47,6 +47,11 @@ Validation:
 
 ## Step 4: Move DVR/GDN Mechanics Into Mamba DVR Helpers
 
+Status: in progress. The live-state rebuild has been moved into
+`rebuild_mamba_dvr_live_state_grouped`, which keeps recurrent decode semantics
+but groups layers x requests by accepted length before calling the recurrent FLA
+kernel.
+
 Keep generic `gdn_backend.py` readable by moving q/k/v/g/beta cache writes,
 internal verify scan preparation, boundary-state writeback, and conv-step
 mapping into `mamba_dvr_utils.py`. The backend should expose data produced by

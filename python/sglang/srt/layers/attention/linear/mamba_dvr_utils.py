@@ -264,3 +264,70 @@ def build_dvr_conv_windows(
     return conv_source.unfold(
         dimension=2, size=state_len, step=1
     )[:, :, 1 : verify_window_size + 1].transpose(1, 2)
+
+
+def rebuild_mamba_dvr_live_state_grouped(
+    *,
+    fla_ops: MambaDVRFlaOps,
+    qkvg_beta_cache: MambaDVRQKVGBetaCache,
+    temporal_state: torch.Tensor,
+    live_indices: torch.Tensor,
+    boundary_indices: torch.Tensor,
+    req_indices: torch.Tensor,
+    token_count: torch.Tensor,
+):
+    """Rebuild DVR live recurrent state from chunk-boundary checkpoints.
+
+    The live state is consumed by the next self-draft decode, so it should use
+    the recurrent semantics of normal decode. Grouping flattens
+    layers x requests and calls the recurrent FLA kernel once per distinct
+    accepted length instead of once per layer/request.
+    """
+
+    if req_indices.numel() == 0:
+        return
+
+    state_live_indices = live_indices[req_indices]
+    state_boundary_indices = boundary_indices[req_indices]
+    q_cache, k_cache, v_cache, g_cache, beta_cache = qkvg_beta_cache.tensors()
+    num_layers = temporal_state.shape[0]
+    num_reqs = state_live_indices.numel()
+    token_count = token_count.to(device=temporal_state.device, dtype=torch.long)
+
+    q = q_cache[:, state_live_indices]
+    k = k_cache[:, state_live_indices]
+    v = v_cache[:, state_live_indices]
+    g = g_cache[:, state_live_indices]
+    beta = beta_cache[:, state_live_indices]
+    initial_state = temporal_state[:, state_boundary_indices]
+
+    flat_shape = (num_layers * num_reqs,)
+    q = q.reshape(*flat_shape, *q.shape[2:])
+    k = k.reshape(*flat_shape, *k.shape[2:])
+    v = v.reshape(*flat_shape, *v.shape[2:])
+    g = g.reshape(*flat_shape, *g.shape[2:])
+    beta = beta.reshape(*flat_shape, *beta.shape[2:])
+    initial_state = initial_state.reshape(*flat_shape, *initial_state.shape[2:])
+    flat_token_count = (
+        token_count.unsqueeze(0).expand(num_layers, -1).reshape(-1).contiguous()
+    )
+
+    rebuilt_state = initial_state.clone()
+    for count in torch.unique(flat_token_count).tolist():
+        count = int(count)
+        if count == 0:
+            continue
+        group = (flat_token_count == count).nonzero(as_tuple=True)[0]
+        rebuilt_state[group] = fla_ops.rebuild_recurrent_state(
+            q[group, :count],
+            k[group, :count],
+            v[group, :count],
+            g[group, :count],
+            beta[group, :count],
+            initial_state=initial_state[group],
+            token_count=count,
+        )
+
+    temporal_state[:, state_live_indices] = rebuilt_state.reshape(
+        num_layers, num_reqs, *rebuilt_state.shape[1:]
+    )
