@@ -214,7 +214,7 @@ full-prefill oracle.
 The reusable batch oracle script lives at:
 
 ```bash
-test/srt/test_dvr_batch_kl.py
+test/manual/dvr/test_dvr_batch_kl.py
 ```
 
 Run both single-request and batched cases:
