@@ -99,7 +99,6 @@ class _GDNDVRStateContext:
 class _GDNFixedVerifyRequestWindow:
     input_ids: List[int]
     out_cache_locs: List[torch.Tensor]
-    positions: torch.Tensor
     boundary_len: int
     padding_locs: List[torch.Tensor]
 
@@ -679,7 +678,6 @@ class DecodeVerifyRollbackWorker:
 
         input_ids: List[int] = []
         out_cache_locs = []
-        positions = []
         boundary_lens = []
         padding_locs = []
         for req_i, req in enumerate(batch.reqs):
@@ -698,7 +696,6 @@ class DecodeVerifyRollbackWorker:
             )
             input_ids.extend(req_window.input_ids)
             out_cache_locs.extend(req_window.out_cache_locs)
-            positions.append(req_window.positions)
             boundary_lens.append(req_window.boundary_len)
             padding_locs.extend(req_window.padding_locs)
 
@@ -716,9 +713,19 @@ class DecodeVerifyRollbackWorker:
             dtype=original.seq_lens_cpu.dtype,
             device=original.seq_lens_cpu.device,
         )
+        boundary_lens_gpu = batch.seq_lens.to(
+            device=spec_info.positions.device, dtype=spec_info.positions.dtype
+        )
+        position_offsets = torch.arange(
+            physical_verify_len,
+            dtype=spec_info.positions.dtype,
+            device=spec_info.positions.device,
+        )
         batch.seq_lens_sum = sum(boundary_lens)
         spec_info.draft_token = batch.input_ids
-        spec_info.positions = torch.cat(positions)
+        spec_info.positions = (
+            boundary_lens_gpu[:, None] + position_offsets[None, :]
+        ).reshape(-1)
         spec_info.draft_token_num = physical_verify_len
         spec_info.num_tokens_per_req = physical_verify_len
         spec_info.seq_lens_cpu = batch.seq_lens_cpu
@@ -776,16 +783,9 @@ class DecodeVerifyRollbackWorker:
             padding_locs.append(pad_locs)
             out_cache_locs.append(pad_locs)
 
-        positions = torch.arange(
-            boundary,
-            boundary + physical_verify_len,
-            dtype=spec_info.positions.dtype,
-            device=spec_info.positions.device,
-        )
         return _GDNFixedVerifyRequestWindow(
             input_ids=input_ids,
             out_cache_locs=out_cache_locs,
-            positions=positions,
             boundary_len=boundary,
             padding_locs=padding_locs,
         )
