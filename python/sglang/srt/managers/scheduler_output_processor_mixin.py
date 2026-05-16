@@ -610,10 +610,14 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         i: int,
     ) -> None:
-        if batch.spec_algorithm.is_decode_verify_rollback():
-            return
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
+            if batch.spec_algorithm.is_decode_verify_rollback():
+                # DVR commits chunk-aligned Mamba/GDN checkpoints in its worker
+                # from the verified chunkwise-scan state. The generic
+                # speculative update below only knows accepted lengths, so it
+                # must not flip the ping-pong checkpoint a second time.
+                return
             mamba_track_interval = get_global_server_args().mamba_track_interval
             if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
                 # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
