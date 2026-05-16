@@ -653,6 +653,14 @@ class DVRGatedStateAdapter:
     def has_window(self, state_cache) -> bool:
         return has_dvr_state_window(state_cache)
 
+    def is_verify_enabled(self, *, state_cache, is_target_verify: bool) -> bool:
+        return is_target_verify and self.has_window(state_cache)
+
+    @staticmethod
+    def verify_shape(*, seq_len: int, spec_info) -> Tuple[int, int]:
+        draft_token_num = spec_info.draft_token_num
+        return seq_len // draft_token_num, draft_token_num
+
     def maybe_cache_extend_tail(
         self,
         *,
@@ -696,9 +704,13 @@ class DVRGatedStateAdapter:
             chunk_size=self.chunk_size,
         )
 
-    def run_verify_conv(
+    def prepare_verify_conv(
         self,
         *,
+        state_cache,
+        is_target_verify: bool,
+        seq_len: int,
+        spec_info,
         layer,
         conv_fn: Callable,
         mixed_qkv: torch.Tensor,
@@ -706,13 +718,17 @@ class DVRGatedStateAdapter:
         has_initial_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        intermediate_conv_window_cache: torch.Tensor,
-        intermediate_state_indices: torch.Tensor,
-        batch_size: int,
-        draft_token_num: int,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """Run DVR draft conv and export absolute-offset conv windows."""
 
+        if not self.is_verify_enabled(
+            state_cache=state_cache, is_target_verify=is_target_verify
+        ):
+            return None
+
+        batch_size, draft_token_num = self.verify_shape(
+            seq_len=seq_len, spec_info=spec_info
+        )
         mixed_qkv_linear = mixed_qkv
         mixed_qkv_reshaped = mixed_qkv_linear.view(
             batch_size, draft_token_num, -1
@@ -732,8 +748,12 @@ class DVRGatedStateAdapter:
         ).transpose(0, 1)[: mixed_qkv.shape[0]]
 
         write_dvr_conv_windows(
-            intermediate_conv_window_cache=intermediate_conv_window_cache,
-            intermediate_state_indices=intermediate_state_indices,
+            intermediate_conv_window_cache=state_cache.intermediate_conv_window[0],
+            intermediate_state_indices=torch.arange(
+                cache_indices.shape[0],
+                dtype=torch.int32,
+                device=cache_indices.device,
+            ),
             initial_conv_windows=initial_conv_windows,
             mixed_qkv_reshaped=mixed_qkv_reshaped,
             verify_window_size=draft_token_num,
@@ -743,6 +763,9 @@ class DVRGatedStateAdapter:
     def run_verify_chunkwise(
         self,
         *,
+        is_target_verify: bool,
+        seq_len: int,
+        spec_info,
         layer,
         state_cache,
         q: torch.Tensor,
@@ -752,11 +775,15 @@ class DVRGatedStateAdapter:
         beta: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
-        intermediate_state_cache: torch.Tensor,
-        intermediate_state_indices: torch.Tensor,
-        batch_size: int,
-        draft_token_num: int,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
+        if not self.is_verify_enabled(
+            state_cache=state_cache, is_target_verify=is_target_verify
+        ):
+            return None
+
+        batch_size, draft_token_num = self.verify_shape(
+            seq_len=seq_len, spec_info=spec_info
+        )
         return run_dvr_chunkwise_verify(
             state_ops=self.kernels,
             state_window=DVRStateInputWindow.from_cache(state_cache),
@@ -767,8 +794,12 @@ class DVRGatedStateAdapter:
             beta=beta,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
-            intermediate_state_cache=intermediate_state_cache,
-            intermediate_state_indices=intermediate_state_indices,
+            intermediate_state_cache=state_cache.intermediate_ssm,
+            intermediate_state_indices=torch.arange(
+                cache_indices.shape[0],
+                dtype=torch.int32,
+                device=cache_indices.device,
+            ),
             batch_size=batch_size,
             draft_token_num=draft_token_num,
             num_q_heads=layer.num_q_heads,

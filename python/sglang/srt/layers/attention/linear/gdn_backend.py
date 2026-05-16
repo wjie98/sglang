@@ -463,9 +463,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
-        is_dvr_target_verify = is_target_verify and self.dvr_state_adapter.has_window(
-            mamba_cache_params
-        )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -488,23 +485,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            if is_dvr_target_verify:
-                # DVR uses a fixed 64+draft linear verify window. Keep the
-                # generic GDN forward path here; only export the tensors needed
-                # by DVR state replay.
-                mixed_qkv = self.dvr_state_adapter.run_verify_conv(
-                    layer=layer,
-                    conv_fn=causal_conv1d_fn,
-                    mixed_qkv=mixed_qkv,
-                    conv_states=conv_states,
-                    has_initial_states=has_initial_states,
-                    cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    intermediate_conv_window_cache=intermediate_conv_window_cache,
-                    intermediate_state_indices=intermediate_state_indices,
-                    batch_size=batch_size,
-                    draft_token_num=draft_token_num,
-                )
+            dvr_mixed_qkv = self.dvr_state_adapter.prepare_verify_conv(
+                state_cache=mamba_cache_params,
+                is_target_verify=is_target_verify,
+                seq_len=seq_len,
+                spec_info=forward_batch.spec_info,
+                layer=layer,
+                conv_fn=causal_conv1d_fn,
+                mixed_qkv=mixed_qkv,
+                conv_states=conv_states,
+                has_initial_states=has_initial_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
+            if dvr_mixed_qkv is not None:
+                mixed_qkv = dvr_mixed_qkv
             else:
                 mixed_qkv_reshaped = mixed_qkv.view(
                     batch_size, draft_token_num, -1
@@ -561,23 +556,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            if is_dvr_target_verify:
-                core_attn_out = self.dvr_state_adapter.run_verify_chunkwise(
-                    layer=layer,
-                    state_cache=mamba_cache_params,
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices,
-                    intermediate_state_cache=intermediate_state_cache,
-                    intermediate_state_indices=intermediate_state_indices,
-                    batch_size=batch_size,
-                    draft_token_num=draft_token_num,
-                )
-            else:
+            core_attn_out = self.dvr_state_adapter.run_verify_chunkwise(
+                is_target_verify=is_target_verify,
+                seq_len=seq_len,
+                spec_info=forward_batch.spec_info,
+                layer=layer,
+                state_cache=mamba_cache_params,
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+            )
+            if core_attn_out is None:
                 core_attn_out = self.kernel_dispatcher.target_verify(
                     A_log=layer.A_log,
                     dt_bias=layer.dt_bias,
