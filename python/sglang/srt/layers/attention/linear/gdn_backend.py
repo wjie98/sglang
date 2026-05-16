@@ -34,6 +34,7 @@ if not is_cpu():
     )
     from sglang.srt.layers.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule,
+        fused_recurrent_gated_delta_rule_update,
     )
 else:
     FLA_CHUNK_SIZE = 64
@@ -297,23 +298,51 @@ class GDNKernelDispatcher:
             )
             return final_state.to(initial_state.dtype, copy=False)
 
-        states = []
-        for i, end in enumerate(token_count.tolist()):
-            if end == 0:
-                states.append(initial_state[i : i + 1])
-                continue
-            _, final_state = fused_recurrent_gated_delta_rule(
-                q=q[i : i + 1, :end],
-                k=k[i : i + 1, :end],
-                v=v[i : i + 1, :end],
-                g=g[i : i + 1, :end],
-                beta=beta[i : i + 1, :end],
-                initial_state=initial_state[i : i + 1],
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
+        max_count = q.shape[1]
+        if torch.any(token_count < 0).item() or torch.any(token_count > max_count).item():
+            raise RuntimeError(
+                "Invalid DVR GDN recurrent rebuild length: "
+                f"token_count={token_count.tolist()}, max_count={max_count}."
             )
-            states.append(final_state)
-        return torch.cat(states, dim=0).to(initial_state.dtype, copy=False)
+
+        total_tokens = int(token_count.sum().item())
+        if total_tokens == 0:
+            return initial_state
+
+        row_mask = (
+            torch.arange(max_count, device=q.device, dtype=torch.long).unsqueeze(0)
+            < token_count.unsqueeze(1)
+        )
+        row_idx, col_idx = row_mask.nonzero(as_tuple=True)
+        q_packed = q[row_idx, col_idx].unsqueeze(0).contiguous()
+        k_packed = k[row_idx, col_idx].unsqueeze(0).contiguous()
+        v_packed = v[row_idx, col_idx].unsqueeze(0).contiguous()
+        g_packed = g[row_idx, col_idx].unsqueeze(0).contiguous()
+        beta_packed = beta[row_idx, col_idx].unsqueeze(0).contiguous()
+        cu_seqlens = torch.empty(
+            token_count.shape[0] + 1, dtype=torch.int32, device=q.device
+        )
+        cu_seqlens[0] = 0
+        cu_seqlens[1:] = torch.cumsum(token_count.to(torch.int32), dim=0)
+        state_indices = torch.arange(
+            token_count.shape[0], dtype=torch.int32, device=q.device
+        )
+        final_state = initial_state.clone()
+        fused_recurrent_gated_delta_rule_update(
+            q=q_packed,
+            k=k_packed,
+            v=v_packed,
+            g=g_packed,
+            beta=beta_packed,
+            initial_state_source=final_state,
+            initial_state_indices=state_indices,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+            disable_state_update=False,
+            disable_output_calculation=True,
+            intermediate_state_indices=state_indices,
+        )
+        return final_state.to(initial_state.dtype, copy=False)
 
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
@@ -463,6 +492,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        dvr_context = self.dvr_state_adapter.make_forward_context(
+            layer=layer,
+            forward_batch=forward_batch,
+            state_cache=mamba_cache_params,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            seq_len=seq_len,
+        )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             has_initial_states = (
@@ -477,17 +516,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             dvr_mixed_qkv = self.dvr_state_adapter.maybe_process_target_verify_conv(
-                state_cache=mamba_cache_params,
-                is_target_verify=is_target_verify,
-                seq_len=seq_len,
-                spec_info=forward_batch.spec_info,
-                layer=layer,
+                context=dvr_context,
                 conv_fn=causal_conv1d_fn,
                 mixed_qkv=mixed_qkv,
-                conv_states=conv_states,
                 has_initial_states=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
             )
             if dvr_mixed_qkv is not None:
                 mixed_qkv = dvr_mixed_qkv
@@ -558,18 +590,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out = self.dvr_state_adapter.maybe_process_target_verify_state(
-                is_target_verify=is_target_verify,
-                seq_len=seq_len,
-                spec_info=forward_batch.spec_info,
-                layer=layer,
-                state_cache=mamba_cache_params,
+                context=dvr_context,
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
             )
             if core_attn_out is None:
                 intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -597,11 +623,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             self.dvr_state_adapter.maybe_cache_extend_state_inputs(
-                state_cache=mamba_cache_params,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                context=dvr_context,
                 q=query,
                 k=key,
                 v=value,
