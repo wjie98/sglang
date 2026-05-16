@@ -1128,6 +1128,70 @@ class ServerArgs:
             aligned //= 2
         return aligned
 
+    def _validate_dvr_page_size(self):
+        if self.page_size == 1:
+            return
+        if (
+            self.speculative_dvr_chunk_boundary_verify
+            and self.page_size <= FLA_CHUNK_SIZE
+            and FLA_CHUNK_SIZE % self.page_size == 0
+        ):
+            return
+        raise ValueError(
+            "DVR page_size > 1 requires chunk-boundary verify and an aligned "
+            "configuration: page_size must be no larger than and divide "
+            f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}."
+        )
+
+    def _handle_dvr_speculative_decoding(self) -> bool:
+        if self.speculative_algorithm != "DECODE_VERIFY_ROLLBACK":
+            return False
+
+        if not self.device.startswith("cuda"):
+            raise ValueError("DVR currently only supports CUDA device.")
+        if self.enable_dp_attention:
+            raise ValueError("DVR currently does not support DP attention.")
+        if self.speculative_draft_model_path is not None:
+            raise ValueError("DVR self draft does not use a draft model path.")
+
+        if self.speculative_num_draft_tokens is None:
+            self.speculative_num_draft_tokens = 16
+            logger.warning(
+                "speculative_num_draft_tokens is set to 16 by default for DVR. "
+                "You can override this by explicitly setting "
+                "--speculative-num-draft-tokens."
+            )
+
+        self._validate_dvr_page_size()
+
+        if self.speculative_num_steps is None:
+            self.speculative_num_steps = self.speculative_num_draft_tokens - 1
+        elif self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
+            logger.warning(
+                "speculative_num_draft_tokens is adjusted to "
+                "speculative_num_steps + 1 for DVR chain mode."
+            )
+            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
+        if self.speculative_eagle_topk is None:
+            self.speculative_eagle_topk = 1
+        elif self.speculative_eagle_topk != 1:
+            raise ValueError("DVR currently supports only chain mode with topk == 1.")
+
+        if self.max_running_requests is None:
+            self.max_running_requests = 48
+            logger.warning(
+                "Max running requests is reset to 48 for DVR. You can override "
+                "this by explicitly setting --max-running-requests."
+            )
+
+        self.disable_overlap_schedule = True
+        self.enable_mixed_chunk = False
+        logger.warning(
+            "Overlap scheduler and mixed chunked prefill are disabled for DVR."
+        )
+        return True
+
     def _handle_hpu_backends(self):
         if self.device == "hpu":
             self.attention_backend = "torch_native"
@@ -3104,50 +3168,8 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK":
-            if not self.device.startswith("cuda"):
-                raise ValueError("DVR currently only supports CUDA device.")
-            if self.enable_dp_attention:
-                raise ValueError("DVR currently does not support DP attention.")
-            if self.speculative_draft_model_path is not None:
-                raise ValueError("DVR self draft does not use a draft model path.")
-            if self.speculative_num_draft_tokens is None:
-                self.speculative_num_draft_tokens = 16
-                logger.warning(
-                    "speculative_num_draft_tokens is set to 16 by default for DVR. "
-                    "You can override this by explicitly setting --speculative-num-draft-tokens."
-                )
-            if self.page_size != 1 and (
-                not self.speculative_dvr_chunk_boundary_verify
-                or self.page_size > FLA_CHUNK_SIZE
-                or FLA_CHUNK_SIZE % self.page_size != 0
-            ):
-                raise ValueError(
-                    "DVR page_size > 1 requires chunk-boundary verify and an "
-                    "aligned configuration: page_size must be no larger than "
-                    f"and divide FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}."
-                )
-            if self.speculative_num_steps is None:
-                self.speculative_num_steps = self.speculative_num_draft_tokens - 1
-            elif self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
-                logger.warning(
-                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 for DVR chain mode."
-                )
-                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
-            if self.speculative_eagle_topk is None:
-                self.speculative_eagle_topk = 1
-            elif self.speculative_eagle_topk != 1:
-                raise ValueError("DVR currently supports only chain mode with topk == 1.")
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
-                logger.warning(
-                    "Max running requests is reset to 48 for DVR. You can override this by explicitly setting --max-running-requests."
-                )
-            self.disable_overlap_schedule = True
-            self.enable_mixed_chunk = False
-            logger.warning(
-                "Overlap scheduler and mixed chunked prefill are disabled for DVR."
-            )
+        if self._handle_dvr_speculative_decoding():
+            return
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:

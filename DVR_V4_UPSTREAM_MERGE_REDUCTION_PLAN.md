@@ -74,6 +74,12 @@ Validation:
 
 ## Step 6: Server Args Cleanup
 
+Status: in progress. DVR speculative-decoding defaults and validation are now
+handled by a dedicated helper with an early return from the generic speculative
+decoding branch. Page-size normalization and GDN-specific state tracking
+defaults stay in the chunk-boundary helper because they must run before Mamba
+backend/cache setup.
+
 Keep DVR launch defaults in one server-args helper:
 
 - normalize DVR chunk page size;
