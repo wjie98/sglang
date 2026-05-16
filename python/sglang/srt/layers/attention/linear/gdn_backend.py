@@ -720,9 +720,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         if crossing.any():
+            boundary_state_step = (
+                0
+                if mamba_cache.intermediate_ssm.shape[2] == 1
+                else FLA_CHUNK_SIZE - 1
+            )
             commit_step = torch.where(
                 crossing,
-                torch.full_like(pos_before, FLA_CHUNK_SIZE - 1),
+                torch.full_like(pos_before, boundary_state_step),
                 torch.full_like(pos_before, -1),
             )
             fused_mamba_state_scatter_with_mask(

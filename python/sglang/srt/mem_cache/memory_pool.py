@@ -349,7 +349,7 @@ class MambaPool:
             )
             if speculative_num_draft_tokens is not None:
                 if enable_dvr_qkvg_beta_cache:
-                    intermediate_ssm_tokens = FLA_CHUNK_SIZE
+                    intermediate_ssm_tokens = 1
                     intermediate_conv_tokens = speculative_num_draft_tokens
                 else:
                     intermediate_ssm_tokens = speculative_num_draft_tokens

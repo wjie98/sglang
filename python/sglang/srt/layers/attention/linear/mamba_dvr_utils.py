@@ -243,9 +243,13 @@ def write_dvr_chunk_boundary_state(
             + 1
         )
         boundary_state = h.squeeze(0)[boundary_h_indices]
+    # DVR only commits the first chunk-boundary state. Newer DVR cache layouts
+    # store that state in a one-slot boundary buffer; the fallback keeps
+    # compatibility with the older per-token speculative state cache.
+    boundary_slot = 0 if intermediate_state_cache.shape[1] == 1 else chunk_size - 1
     intermediate_state_cache[
         intermediate_state_indices[:batch_size].to(torch.long),
-        chunk_size - 1,
+        boundary_slot,
     ] = boundary_state.to(intermediate_state_cache.dtype)
 
 
