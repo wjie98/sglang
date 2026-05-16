@@ -25,7 +25,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
-from sglang.srt.speculative.dvr_sampling import chain_speculative_sampling
+from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
