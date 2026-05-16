@@ -28,7 +28,7 @@ class MambaDVRFlaOps:
         beta: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
+        query_start_loc: Optional[torch.Tensor],
         **kwargs,
     ) -> tuple:
         assert self.chunk_scan is not None
@@ -155,6 +155,56 @@ class MambaDVRQKVGBetaCache:
             batch_size, verify_window_size, num_v_heads
         )
 
+    def write_draft_rows(
+        self,
+        *,
+        indices: torch.Tensor,
+        col_start: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+        num_q_heads: int,
+        head_q_dim: int,
+        num_k_heads: int,
+        head_k_dim: int,
+        num_v_heads: int,
+        head_v_dim: int,
+    ):
+        cols = (
+            torch.arange(draft_token_num, dtype=torch.long, device=indices.device)
+            .unsqueeze(0)
+            .add(col_start.to(torch.long).unsqueeze(1))
+        )
+        rows = indices.unsqueeze(1).expand(-1, draft_token_num)
+        q_cache, k_cache, v_cache, g_cache, beta_cache = self.tensors()
+        q_cache[rows, cols] = q.reshape(
+            batch_size, draft_token_num, num_q_heads, head_q_dim
+        )
+        k_cache[rows, cols] = k.reshape(
+            batch_size, draft_token_num, num_k_heads, head_k_dim
+        )
+        v_cache[rows, cols] = v.reshape(
+            batch_size, draft_token_num, num_v_heads, head_v_dim
+        )
+        g_cache[rows, cols] = g.reshape(batch_size, draft_token_num, num_v_heads)
+        beta_cache[rows, cols] = beta.reshape(
+            batch_size, draft_token_num, num_v_heads
+        )
+
+    def read_window(self, *, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        q_cache, k_cache, v_cache, g_cache, beta_cache = self.tensors()
+        return (
+            q_cache[indices],
+            k_cache[indices],
+            v_cache[indices],
+            g_cache[indices],
+            beta_cache[indices],
+        )
+
     def shift_suffix(self, *, slots: torch.Tensor, start: int, length: int):
         if length <= 0 or slots.numel() == 0:
             return
@@ -178,19 +228,25 @@ def write_dvr_chunk_boundary_state(
     if h is None or h.shape[1] <= 1:
         return
 
-    # FLA packs all request chunks into h[0, total_chunks, ...]. DVR's
-    # physical window is chunk + draft, so each request contributes two
-    # chunks and the first boundary is at offsets 1, 3, 5, ...
     chunks_per_req = (verify_window_size - 1) // chunk_size + 1
-    boundary_h_indices = (
-        torch.arange(batch_size, dtype=torch.long, device=h.device)
-        * chunks_per_req
-        + 1
-    )
+    if h.shape[0] == batch_size:
+        # Equal-length graph-friendly path: GDN DVR passes q/k/v/g/beta as
+        # [batch, chunk+draft, ...], so the first chunk boundary is h[:, 1].
+        boundary_state = h[:, 1]
+    else:
+        # Variable-length path packs all request chunks into h[0, total_chunks].
+        # DVR's physical window is chunk + draft, so each request contributes
+        # two chunks and the first boundary is at offsets 1, 3, 5, ...
+        boundary_h_indices = (
+            torch.arange(batch_size, dtype=torch.long, device=h.device)
+            * chunks_per_req
+            + 1
+        )
+        boundary_state = h.squeeze(0)[boundary_h_indices]
     intermediate_state_cache[
         intermediate_state_indices[:batch_size].to(torch.long),
         chunk_size - 1,
-    ] = h.squeeze(0)[boundary_h_indices].to(intermediate_state_cache.dtype)
+    ] = boundary_state.to(intermediate_state_cache.dtype)
 
 
 def build_dvr_conv_windows(

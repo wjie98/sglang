@@ -466,13 +466,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         intermediate_conv_window_cache: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         batch_size: int,
-        verify_window_size: int,
+        draft_token_num: int,
     ) -> torch.Tensor:
-        """Run DVR's linear fixed-window conv and export per-token conv windows."""
+        """Run draft-suffix conv and export windows at DVR absolute offsets."""
 
         mixed_qkv_linear = mixed_qkv
         mixed_qkv_reshaped = mixed_qkv_linear.view(
-            batch_size, verify_window_size, -1
+            batch_size, draft_token_num, -1
         ).transpose(1, 2)
         dvr_indices = cache_indices[:batch_size].to(torch.long)
         initial_conv_windows = conv_states[dvr_indices].clone()
@@ -485,17 +485,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
             has_initial_state=has_initial_states,
             cache_indices=dvr_indices,
             query_start_loc=query_start_loc,
-            seq_lens_cpu=[verify_window_size] * batch_size,
+            seq_lens_cpu=[draft_token_num] * batch_size,
         ).transpose(0, 1)[: mixed_qkv.shape[0]]
 
         conv_windows = build_dvr_conv_windows(
             initial_conv_windows=initial_conv_windows,
             mixed_qkv_reshaped=mixed_qkv_reshaped,
-            verify_window_size=verify_window_size,
+            verify_window_size=draft_token_num,
         )
-        intermediate_conv_window_cache[
-            intermediate_state_indices[:batch_size].to(torch.long)
-        ] = conv_windows
+        rows = (
+            intermediate_state_indices[:batch_size]
+            .to(torch.long)
+            .unsqueeze(1)
+            .expand(-1, draft_token_num)
+        )
+        cols = torch.arange(
+            draft_token_num, dtype=torch.long, device=dvr_indices.device
+        ).unsqueeze(0)
+        intermediate_conv_window_cache[rows, cols] = conv_windows
         return mixed_qkv
 
     def _run_dvr_verify_chunk_scan(
@@ -510,24 +517,49 @@ class GDNAttnBackend(MambaAttnBackendBase):
         beta: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
         intermediate_state_cache: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         batch_size: int,
-        verify_window_size: int,
+        draft_token_num: int,
     ) -> torch.Tensor:
-        """Run chunkwise DVR verify and export state inputs for later commit."""
+        """Run DVR's internal 64+draft chunkwise scan and return draft suffix."""
 
         dvr_indices = cache_indices[:batch_size].to(torch.long)
-        core_attn_out, _, h = self.dvr_fla_ops.scan_chunkwise(
+        qkvg_beta_cache = MambaDVRQKVGBetaCache.from_mamba_cache(mamba_cache_params)
+        tail_lens = mamba_cache_params.dvr_qkvg_beta_pos[dvr_indices].to(torch.long)
+        qkvg_beta_cache.write_draft_rows(
+            indices=dvr_indices,
+            col_start=tail_lens,
             q=query,
             k=key,
             v=value,
             g=g,
             beta=beta,
+            batch_size=batch_size,
+            draft_token_num=draft_token_num,
+            num_q_heads=layer.num_q_heads,
+            head_q_dim=layer.head_q_dim,
+            num_k_heads=layer.num_k_heads,
+            head_k_dim=layer.head_k_dim,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
+        )
+        verify_window_size = FLA_CHUNK_SIZE + draft_token_num
+        q_window, k_window, v_window, g_window, beta_window = (
+            qkvg_beta_cache.read_window(indices=dvr_indices)
+        )
+        core_attn_out, _, h = self.dvr_fla_ops.scan_chunkwise(
+            q=q_window,
+            k=k_window,
+            v=v_window,
+            g=g_window,
+            beta=beta_window,
             ssm_states=ssm_states,
             cache_indices=dvr_indices,
-            query_start_loc=query_start_loc,
+            # Equal-length [bs, 64+draft, ...] avoids FLA's variable-length
+            # prepare_chunk_indices path, which does a CUDA->CPU sync and is
+            # illegal while target-verify CUDA graph is being captured.
+            query_start_loc=None,
         )
         write_dvr_chunk_boundary_state(
             h=h,
@@ -536,19 +568,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
             batch_size=batch_size,
             verify_window_size=verify_window_size,
         )
-        self._cache_dvr_verify_qkvg_beta_window(
-            mamba_cache_params=mamba_cache_params,
-            dvr_indices=dvr_indices,
-            query=query,
-            key=key,
-            value=value,
-            g=g,
-            beta=beta,
-            batch_size=batch_size,
-            verify_window_size=verify_window_size,
-            layer=layer,
+        core_attn_out = core_attn_out.view(
+            batch_size, verify_window_size, layer.num_v_heads, layer.head_v_dim
         )
-        return core_attn_out
+        rows = (
+            torch.arange(batch_size, dtype=torch.long, device=core_attn_out.device)
+            .unsqueeze(1)
+            .expand(-1, draft_token_num)
+        )
+        cols = (
+            torch.arange(
+                draft_token_num, dtype=torch.long, device=core_attn_out.device
+            )
+            .unsqueeze(0)
+            .add(tail_lens.unsqueeze(1))
+        )
+        return core_attn_out[rows, cols].reshape(
+            1, batch_size * draft_token_num, layer.num_v_heads, layer.head_v_dim
+        ).contiguous()
 
     @staticmethod
     def _check_dvr_qkvg_tail_position(
@@ -579,6 +616,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 "Invalid DVR GDN accepted state step: "
                 f"steps={accepted_state_steps.tolist()}, capacity={qkvg_capacity}."
             )
+
+    @staticmethod
+    def _check_dvr_conv_steps(
+        *,
+        accepted_steps: torch.Tensor,
+        boundary_steps: torch.Tensor,
+        crossing: torch.Tensor,
+        conv_capacity: int,
+    ):
+        if torch.any(accepted_steps >= conv_capacity).item():
+            raise RuntimeError(
+                "Invalid DVR GDN accepted conv step: "
+                f"steps={accepted_steps.tolist()}, capacity={conv_capacity}."
+            )
+        if crossing.any():
+            crossing_boundary_steps = boundary_steps[crossing]
+            if (
+                torch.any(crossing_boundary_steps < 0).item()
+                or torch.any(crossing_boundary_steps >= conv_capacity).item()
+            ):
+                raise RuntimeError(
+                    "Invalid DVR GDN boundary conv step: "
+                    f"steps={crossing_boundary_steps.tolist()}, "
+                    f"capacity={conv_capacity}."
+                )
 
     def commit_dvr_state_after_verify(
         self,
@@ -642,11 +704,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             accepted_state_steps=accepted_state_steps,
             qkvg_capacity=qkvg_capacity,
         )
+        boundary_conv_steps = FLA_CHUNK_SIZE - 1 - pos_before
+        conv_capacity = mamba_cache.intermediate_conv_window[0].shape[2]
+        self._check_dvr_conv_steps(
+            accepted_steps=accepted_steps,
+            boundary_steps=boundary_conv_steps,
+            crossing=crossing,
+            conv_capacity=conv_capacity,
+        )
         fused_mamba_state_scatter_with_mask(
             mamba_cache.conv[0],
             mamba_cache.intermediate_conv_window[0],
             live_indices,
-            accepted_state_steps,
+            accepted_steps,
         )
 
         if crossing.any():
@@ -665,7 +735,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mamba_cache.conv[0],
                 mamba_cache.intermediate_conv_window[0],
                 boundary_indices,
-                commit_step,
+                torch.where(crossing, boundary_conv_steps, commit_step),
             )
 
             new_pos = pos_after - FLA_CHUNK_SIZE
@@ -831,7 +901,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     intermediate_conv_window_cache=intermediate_conv_window_cache,
                     intermediate_state_indices=intermediate_state_indices,
                     batch_size=batch_size,
-                    verify_window_size=draft_token_num,
+                    draft_token_num=draft_token_num,
                 )
             else:
                 mixed_qkv_reshaped = mixed_qkv.view(
@@ -900,11 +970,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     beta=beta,
                     ssm_states=ssm_states,
                     cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
                     intermediate_state_cache=intermediate_state_cache,
                     intermediate_state_indices=intermediate_state_indices,
                     batch_size=batch_size,
-                    verify_window_size=draft_token_num,
+                    draft_token_num=draft_token_num,
                 )
             else:
                 core_attn_out = self.kernel_dispatcher.target_verify(

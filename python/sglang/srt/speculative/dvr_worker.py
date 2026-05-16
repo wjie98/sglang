@@ -127,6 +127,7 @@ class DecodeVerifyRollbackWorker:
         self._gdn_boundary_seqlen = {}
         self._gdn_boundary_track_idx = {}
         self._gdn_boundary_backup = None
+        self._gdn_live_backup = None
 
         logger.info(
             "Initialized DVR self-decode worker: num_steps=%s, num_draft_tokens=%s",
@@ -620,19 +621,28 @@ class DecodeVerifyRollbackWorker:
             return None
         assert ctx.boundary_indices is not None
         if self._gdn_boundary_backup is not None:
-            # Draft decode must not affect the verify starting state. Keep an
-            # explicit snapshot because the shared extra-buffer slot can be
-            # touched by generic Mamba tracking/cache code while draft runs.
+            # Draft decode mutates the live recurrent slot. DVR target verify
+            # needs the chunk-boundary SSM state for chunkwise scan, but the
+            # draft-start conv state for producing q/k/v on the draft suffix.
             batch.req_to_token_pool.mamba_pool.restore_state(
                 self._gdn_boundary_backup, ctx.boundary_indices
             )
-            batch.req_to_token_pool.mamba_pool.restore_state(
-                self._gdn_boundary_backup, ctx.live_indices
+            ctx.mamba_cache.temporal[:, ctx.live_indices] = (
+                self._gdn_boundary_backup.temporal.to(
+                    ctx.mamba_cache.temporal.dtype, copy=False
+                )
             )
+            if self._gdn_live_backup is not None:
+                for conv, saved_conv in zip(
+                    ctx.mamba_cache.conv, self._gdn_live_backup.conv, strict=True
+                ):
+                    conv[:, ctx.live_indices] = saved_conv.to(
+                        conv.dtype, copy=False
+                    )
         else:
-            batch.req_to_token_pool.mamba_pool.copy_from(
-                ctx.boundary_indices, ctx.live_indices
-            )
+            ctx.mamba_cache.temporal[:, ctx.live_indices] = ctx.mamba_cache.temporal[
+                :, ctx.boundary_indices
+            ]
         return ctx
 
     # GDN boundary-state lifecycle. The boundary slot is the deterministic
@@ -643,10 +653,14 @@ class DecodeVerifyRollbackWorker:
         ctx = self._gdn_state_context(batch, require_boundary=True)
         if ctx is None:
             self._gdn_boundary_backup = None
+            self._gdn_live_backup = None
             return
         assert ctx.boundary_indices is not None
         self._gdn_boundary_backup = batch.req_to_token_pool.mamba_pool.backup_state(
             ctx.boundary_indices
+        )
+        self._gdn_live_backup = batch.req_to_token_pool.mamba_pool.backup_state(
+            ctx.live_indices
         )
 
     def _commit_gdn_state_after_verify(
@@ -690,6 +704,8 @@ class DecodeVerifyRollbackWorker:
                 req.mamba_next_track_idx = self._mamba_other_track_idx(
                     batch, self._gdn_boundary_track_idx[req.rid]
                 )
+        self._gdn_boundary_backup = None
+        self._gdn_live_backup = None
 
     # Accepted-token and verify-output helpers. These intentionally stay close
     # to EAGLE's postprocess contract so scheduler/radix-cache ownership remains

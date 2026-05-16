@@ -348,18 +348,19 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
-                speculative_state_tokens = (
-                    FLA_CHUNK_SIZE + speculative_num_draft_tokens
-                    if enable_dvr_qkvg_beta_cache
-                    else speculative_num_draft_tokens
-                )
+                if enable_dvr_qkvg_beta_cache:
+                    intermediate_ssm_tokens = FLA_CHUNK_SIZE
+                    intermediate_conv_tokens = speculative_num_draft_tokens
+                else:
+                    intermediate_ssm_tokens = speculative_num_draft_tokens
+                    intermediate_conv_tokens = speculative_num_draft_tokens
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
                     size=(
                         num_mamba_layers,
                         spec_state_size + 1,
-                        speculative_state_tokens,
+                        intermediate_ssm_tokens,
                         temporal_state_shape[0],
                         temporal_state_shape[1],
                         temporal_state_shape[2],
@@ -374,7 +375,7 @@ class MambaPool:
                         size=(
                             num_mamba_layers,
                             spec_state_size + 1,
-                            speculative_state_tokens,
+                            intermediate_conv_tokens,
                             conv_shape[0],
                             conv_shape[1],
                         ),
