@@ -394,9 +394,6 @@ class ModelRunnerKVCacheMixin:
             extra_max_context_len = 4
             if self.server_args.speculative_num_draft_tokens is not None:
                 extra_max_context_len += self.server_args.speculative_num_draft_tokens
-            enable_dvr_qkvg_beta_cache = (
-                self.server_args.speculative_algorithm == "DECODE_VERIFY_ROLLBACK"
-            )
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
@@ -432,7 +429,6 @@ class ModelRunnerKVCacheMixin:
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,
                         start_layer=self.start_layer,
-                        enable_dvr_qkvg_beta_cache=enable_dvr_qkvg_beta_cache,
                     )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(
@@ -464,7 +460,6 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
-                    enable_dvr_qkvg_beta_cache=enable_dvr_qkvg_beta_cache,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(

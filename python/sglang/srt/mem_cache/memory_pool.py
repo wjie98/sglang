@@ -303,7 +303,6 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
-        enable_dvr_qkvg_beta_cache: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -348,6 +347,12 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
+                from sglang.srt.server_args import get_global_server_args
+
+                enable_dvr_qkvg_beta_cache = (
+                    get_global_server_args().speculative_algorithm
+                    == "DECODE_VERIFY_ROLLBACK"
+                )
                 if enable_dvr_qkvg_beta_cache:
                     intermediate_ssm_tokens = 1
                     intermediate_conv_tokens = speculative_num_draft_tokens
@@ -621,7 +626,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
-        enable_dvr_qkvg_beta_cache: bool = False,
     ):
         super().__init__(
             size=size,
@@ -643,7 +647,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
-            enable_dvr_qkvg_beta_cache=enable_dvr_qkvg_beta_cache,
         )
 
     def _init_mamba_pool(
@@ -655,7 +658,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
-        enable_dvr_qkvg_beta_cache: bool = False,
     ):
         self.mamba_pool = MambaPool(
             size=size,
@@ -665,7 +667,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
-            enable_dvr_qkvg_beta_cache=enable_dvr_qkvg_beta_cache,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
