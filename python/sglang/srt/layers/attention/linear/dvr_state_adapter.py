@@ -661,7 +661,7 @@ class DVRGatedStateAdapter:
         draft_token_num = spec_info.draft_token_num
         return seq_len // draft_token_num, draft_token_num
 
-    def maybe_cache_extend_tail(
+    def maybe_cache_extend_state_inputs(
         self,
         *,
         state_cache,
@@ -704,7 +704,7 @@ class DVRGatedStateAdapter:
             chunk_size=self.chunk_size,
         )
 
-    def prepare_verify_conv(
+    def maybe_process_target_verify_conv(
         self,
         *,
         state_cache,
@@ -760,7 +760,7 @@ class DVRGatedStateAdapter:
         )
         return mixed_qkv
 
-    def run_verify_chunkwise(
+    def maybe_process_target_verify_state(
         self,
         *,
         is_target_verify: bool,
