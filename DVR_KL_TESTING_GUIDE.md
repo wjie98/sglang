@@ -31,12 +31,22 @@ conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-dvr-chunk-boundary-verify \
   --page-size 1 \
-  --mamba-scheduler-strategy extra_buffer \
-  --mamba-track-interval 64 \
-  --mamba-ssm-dtype float32 \
   --linear-attn-backend triton \
   --enable-deterministic-inference
 ```
+
+When `--speculative-dvr-chunk-boundary-verify` is enabled on GDN/Mamba models,
+server-args postprocessing fixes the state-related settings required by DVR:
+`--mamba-scheduler-strategy extra_buffer`, `--mamba-track-interval 64`, and
+`--mamba-ssm-dtype float32`. Passing them explicitly is still fine, but not
+required.
+
+Keep `--page-size 1` for DVR for now. Although the verify path uses a fixed
+`FLA_CHUNK_SIZE + speculative_num_draft_tokens` physical window, page-size 16
+currently makes the actual KV/cache rows shorter than the fixed window
+(`73` vs `80` in the local Qwen3 test), causing both CUDA graph replay and
+no-graph KV writes to fail. This is a physical window / paged-slot integration
+limitation, not an attention causality limitation.
 
 `SGLANG_RETURN_ORIGINAL_LOGPROB=True` is needed by the strict-KL oracle because
 the test compares returned generation logprobs with a full-prefill scoring pass.

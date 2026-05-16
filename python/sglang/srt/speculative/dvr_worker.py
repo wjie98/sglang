@@ -127,7 +127,10 @@ class DecodeVerifyRollbackWorker:
         del gpu_id, dp_rank, moe_ep_rank, attn_cp_rank, moe_dp_rank, nccl_port
 
         if server_args.page_size != 1:
-            raise ValueError("DVR currently requires page_size == 1.")
+            raise ValueError(
+                "DVR currently requires page_size == 1 because the fixed "
+                "chunk-boundary verify window is not paged yet."
+            )
         if server_args.speculative_eagle_topk != 1:
             raise ValueError("DVR currently supports only chain mode with topk == 1.")
         if (

@@ -982,6 +982,8 @@ class ServerArgs:
             #       [overlap, non-overlap]
             self.mamba_scheduler_strategy = "no_buffer"
 
+        self._handle_dvr_chunk_boundary_verify_defaults()
+
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
@@ -1053,6 +1055,61 @@ class ServerArgs:
                 self.speculative_draft_model_path,
                 revision=self.speculative_draft_model_revision or "main",
             )
+
+    def _handle_dvr_chunk_boundary_verify_defaults(self):
+        if (
+            self.speculative_algorithm != "DECODE_VERIFY_ROLLBACK"
+            or not self.speculative_dvr_chunk_boundary_verify
+        ):
+            return
+
+        hf_architectures = self.get_model_config().hf_config.architectures or []
+        is_gdn_model = (
+            hf_architectures[0]
+            in [
+                "Qwen3NextForCausalLM",
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+            ]
+            if hf_architectures
+            else False
+        )
+
+        if self.page_size not in (None, 1):
+            logger.warning(
+                "DVR chunk-boundary verify currently requires page_size=1 "
+                "because the physical verify window is fixed to "
+                "FLA_CHUNK_SIZE+draft tokens. Setting --page-size 1 instead "
+                "of %s.",
+                self.page_size,
+            )
+            self.page_size = 1
+
+        if not is_gdn_model:
+            return
+
+        if self.mamba_scheduler_strategy != "extra_buffer":
+            logger.warning(
+                "DVR chunk-boundary verify for GDN requires mamba extra_buffer "
+                "state tracking. Setting --mamba-scheduler-strategy extra_buffer."
+            )
+            self.mamba_scheduler_strategy = "extra_buffer"
+
+        if self.mamba_track_interval != FLA_CHUNK_SIZE:
+            logger.warning(
+                "DVR chunk-boundary verify for GDN requires mamba_track_interval "
+                "to match FLA_CHUNK_SIZE=%s. Setting --mamba-track-interval %s.",
+                FLA_CHUNK_SIZE,
+                FLA_CHUNK_SIZE,
+            )
+            self.mamba_track_interval = FLA_CHUNK_SIZE
+
+        if self.mamba_ssm_dtype != "float32":
+            logger.warning(
+                "DVR chunk-boundary verify for GDN requires fp32 Mamba/GDN SSM "
+                "states. Setting --mamba-ssm-dtype float32."
+            )
+            self.mamba_ssm_dtype = "float32"
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -3027,7 +3084,11 @@ class ServerArgs:
             if self.speculative_draft_model_path is not None:
                 raise ValueError("DVR self draft does not use a draft model path.")
             if self.page_size != 1:
-                raise ValueError("DVR currently requires --page-size 1.")
+                raise ValueError(
+                    "DVR currently requires --page-size 1. The chunk-boundary "
+                    "verify path uses a fixed physical verify window and is not "
+                    "compatible with paged verify slots yet."
+                )
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = 16
                 logger.warning(
