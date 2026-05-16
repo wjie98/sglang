@@ -79,13 +79,12 @@ class DecodeVerifyRollbackWorker:
         if server_args.speculative_eagle_topk != 1:
             raise ValueError("DVR currently supports only chain mode with topk == 1.")
         if server_args.page_size != 1 and (
-            not server_args.speculative_dvr_chunk_boundary_verify
-            or server_args.page_size > FLA_CHUNK_SIZE
+            server_args.page_size > FLA_CHUNK_SIZE
             or FLA_CHUNK_SIZE % server_args.page_size != 0
         ):
             raise ValueError(
-                "DVR page_size > 1 requires chunk-boundary verify and page_size "
-                "no larger than and aligned to FLA_CHUNK_SIZE."
+                "DVR page_size > 1 requires page_size no larger than and "
+                "aligned to FLA_CHUNK_SIZE."
             )
         if (
             target_worker.model_runner.hybrid_gdn_config is not None

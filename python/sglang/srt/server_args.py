@@ -501,7 +501,6 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
-    speculative_dvr_chunk_boundary_verify: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -982,7 +981,7 @@ class ServerArgs:
             #       [overlap, non-overlap]
             self.mamba_scheduler_strategy = "no_buffer"
 
-        self._handle_dvr_chunk_boundary_verify_defaults()
+        self._handle_dvr_defaults()
 
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
@@ -1056,11 +1055,8 @@ class ServerArgs:
                 revision=self.speculative_draft_model_revision or "main",
             )
 
-    def _handle_dvr_chunk_boundary_verify_defaults(self):
-        if (
-            self.speculative_algorithm != "DECODE_VERIFY_ROLLBACK"
-            or not self.speculative_dvr_chunk_boundary_verify
-        ):
+    def _handle_dvr_defaults(self):
+        if self.speculative_algorithm != "DECODE_VERIFY_ROLLBACK":
             return
 
         hf_architectures = self.get_model_config().hf_config.architectures or []
@@ -1078,7 +1074,7 @@ class ServerArgs:
         normalized_page_size = self._normalize_dvr_chunk_page_size(self.page_size)
         if normalized_page_size != self.page_size:
             logger.warning(
-                "DVR chunk-boundary verify requires page_size to be no larger "
+                "DVR requires page_size to be no larger "
                 "than and divide FLA_CHUNK_SIZE=%s. Setting --page-size %s "
                 "instead of %s.",
                 FLA_CHUNK_SIZE,
@@ -1092,14 +1088,14 @@ class ServerArgs:
 
         if self.mamba_scheduler_strategy != "extra_buffer":
             logger.warning(
-                "DVR chunk-boundary verify for GDN requires mamba extra_buffer "
+                "DVR for GDN requires mamba extra_buffer "
                 "state tracking. Setting --mamba-scheduler-strategy extra_buffer."
             )
             self.mamba_scheduler_strategy = "extra_buffer"
 
         if self.mamba_track_interval != FLA_CHUNK_SIZE:
             logger.warning(
-                "DVR chunk-boundary verify for GDN requires mamba_track_interval "
+                "DVR for GDN requires mamba_track_interval "
                 "to match FLA_CHUNK_SIZE=%s. Larger intervals may still be "
                 "chunk-size multiples, but the current extra_buffer prefill path "
                 "keeps only one tracked checkpoint and can miss the first "
@@ -1111,7 +1107,7 @@ class ServerArgs:
 
         if self.mamba_ssm_dtype != "float32":
             logger.warning(
-                "DVR chunk-boundary verify for GDN requires fp32 Mamba/GDN SSM "
+                "DVR for GDN requires fp32 Mamba/GDN SSM "
                 "states. Setting --mamba-ssm-dtype float32."
             )
             self.mamba_ssm_dtype = "float32"
@@ -1131,26 +1127,21 @@ class ServerArgs:
     def _validate_dvr_page_size(self):
         if self.page_size == 1:
             return
-        if (
-            self.speculative_dvr_chunk_boundary_verify
-            and self.page_size <= FLA_CHUNK_SIZE
-            and FLA_CHUNK_SIZE % self.page_size == 0
-        ):
+        if self.page_size <= FLA_CHUNK_SIZE and FLA_CHUNK_SIZE % self.page_size == 0:
             return
         raise ValueError(
-            "DVR page_size > 1 requires chunk-boundary verify and an aligned "
-            "configuration: page_size must be no larger than and divide "
+            "DVR page_size > 1 requires page_size to be no larger than and divide "
             f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}."
         )
 
-    def _handle_dvr_speculative_decoding(self) -> bool:
-        if self.speculative_algorithm != "DECODE_VERIFY_ROLLBACK":
-            return False
-
+    def _handle_dvr_speculative_decoding(self):
+        assert self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK"
         if not self.device.startswith("cuda"):
             raise ValueError("DVR currently only supports CUDA device.")
         if self.enable_dp_attention:
             raise ValueError("DVR currently does not support DP attention.")
+        if self.disaggregation_mode != "null":
+            raise ValueError("DVR currently does not support disaggregation mode.")
         if self.speculative_draft_model_path is not None:
             raise ValueError("DVR self draft does not use a draft model path.")
 
@@ -1190,7 +1181,6 @@ class ServerArgs:
         logger.warning(
             "Overlap scheduler and mixed chunked prefill are disabled for DVR."
         )
-        return True
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -3168,9 +3158,6 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self._handle_dvr_speculative_decoding():
-            return
-
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -3319,6 +3306,9 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+
+        if self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK":
+            self._handle_dvr_speculative_decoding()
 
     def _handle_load_format(self):
         if (
@@ -5010,14 +5000,6 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
-        )
-        parser.add_argument(
-            "--speculative-dvr-chunk-boundary-verify",
-            action="store_true",
-            help=(
-                "For DECODE_VERIFY_ROLLBACK, use a CHUNK_SIZE + draft-token "
-                "physical target-verify window aligned to the FLA chunk boundary."
-            ),
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
