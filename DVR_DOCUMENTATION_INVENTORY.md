@@ -7,6 +7,8 @@ delete, rename, or supersede any existing record.
 
 - `DVR_KL_TESTING_GUIDE.md`: keep as the seed for a smaller upstream testing
   note. It contains the most reusable strict-KL oracle workflow.
+- `DVR_UPDATE_REPORT.md`: current branch-level implementation report against
+  `upstream/sglang-miles`.
 - `DVR_V3_MERGE_CONTEXT.md`: keep as historical context while preparing the
   final PR description, then condense heavily.
 - `DVR_V3_CONTROLLED_MIGRATION_PLAN.md`: useful as merge rationale, but should
@@ -18,6 +20,8 @@ delete, rename, or supersede any existing record.
 - `DVR_CLEANUP_PHASE2_PLAN.md`
 - `DVR_CLEANUP_PHASE3_PLAN.md`
 - `DVR_CLEANUP_PHASE4_PLAN.md`
+- `DVR_CLEANUP_PHASE5_PLAN.md`
+- `DVR_CLEANUP_PHASE6_PLAN.md`
 - `DVR_EAGLE_POSTPROCESS_EXPERIMENT.md`
 - `DVR_GDN_EXPERIMENT_NOTES.md`
 - `DVR_GDN_MERGE_PLAN.md`

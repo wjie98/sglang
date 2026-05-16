@@ -134,12 +134,12 @@ class DecodeVerifyRollbackWorker:
             raise ValueError("DVR currently supports only chain mode with topk == 1.")
         if server_args.page_size != 1 and (
             not server_args.speculative_dvr_chunk_boundary_verify
+            or server_args.page_size > FLA_CHUNK_SIZE
             or FLA_CHUNK_SIZE % server_args.page_size != 0
-            or server_args.speculative_num_draft_tokens % server_args.page_size != 0
         ):
             raise ValueError(
                 "DVR page_size > 1 requires chunk-boundary verify and page_size "
-                "aligned to both FLA_CHUNK_SIZE and num_draft_tokens."
+                "no larger than and aligned to FLA_CHUNK_SIZE."
             )
         if (
             target_worker.model_runner.hybrid_gdn_config is not None
@@ -578,7 +578,9 @@ class DecodeVerifyRollbackWorker:
             locs = alloc_token_slots(batch.tree_cache, num_tokens)
             return locs, locs
 
-        alloc_len = ((num_tokens + self.page_size - 1) // self.page_size) * self.page_size
+        alloc_len = (
+            (num_tokens + self.page_size - 1) // self.page_size
+        ) * self.page_size
         owned_locs = alloc_token_slots(batch.tree_cache, alloc_len)
         return owned_locs[:num_tokens], owned_locs
 
@@ -972,7 +974,7 @@ class DecodeVerifyRollbackWorker:
         verified_tail_lens = self._chunk_boundary_tail_lens(batch, ctx).to(
             device=ctx.live_indices.device, dtype=torch.long
         )
-        crossing = linear_backend.update_dvr_state_after_verify(
+        crossing = linear_backend.commit_dvr_state_after_verify(
             live_indices=ctx.live_indices,
             boundary_indices=ctx.boundary_indices,
             verified_tail_lens=verified_tail_lens,

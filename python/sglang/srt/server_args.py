@@ -1075,28 +1075,17 @@ class ServerArgs:
             else False
         )
 
-        if self.speculative_num_draft_tokens is None:
-            num_draft_tokens = 16
-        else:
-            num_draft_tokens = self.speculative_num_draft_tokens
-
-        if (
-            self.page_size not in (None, 1)
-            and (
-                FLA_CHUNK_SIZE % self.page_size != 0
-                or num_draft_tokens % self.page_size != 0
-            )
-        ):
+        normalized_page_size = self._normalize_dvr_chunk_page_size(self.page_size)
+        if normalized_page_size != self.page_size:
             logger.warning(
-                "DVR chunk-boundary verify supports page_size > 1 only when "
-                "page_size divides both FLA_CHUNK_SIZE=%s and "
-                "speculative_num_draft_tokens=%s. Setting --page-size 1 "
+                "DVR chunk-boundary verify requires page_size to be no larger "
+                "than and divide FLA_CHUNK_SIZE=%s. Setting --page-size %s "
                 "instead of %s.",
                 FLA_CHUNK_SIZE,
-                num_draft_tokens,
+                normalized_page_size,
                 self.page_size,
             )
-            self.page_size = 1
+            self.page_size = normalized_page_size
 
         if not is_gdn_model:
             return
@@ -1126,6 +1115,18 @@ class ServerArgs:
                 "states. Setting --mamba-ssm-dtype float32."
             )
             self.mamba_ssm_dtype = "float32"
+
+    @staticmethod
+    def _normalize_dvr_chunk_page_size(page_size: Optional[int]) -> Optional[int]:
+        if page_size in (None, 1):
+            return page_size
+        if page_size <= 0:
+            return page_size
+
+        aligned = 1 << (min(page_size, FLA_CHUNK_SIZE).bit_length() - 1)
+        while FLA_CHUNK_SIZE % aligned != 0:
+            aligned //= 2
+        return aligned
 
     def _handle_hpu_backends(self):
         if self.device == "hpu":
@@ -1165,6 +1166,17 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_piecewise_cuda_graph(self):
+        if self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK":
+            if self.enforce_piecewise_cuda_graph:
+                logger.warning(
+                    "DVR does not support piecewise CUDA graph. Setting "
+                    "--disable-piecewise-cuda-graph and ignoring "
+                    "--enforce-piecewise-cuda-graph."
+                )
+            self.enforce_piecewise_cuda_graph = False
+            self.disable_piecewise_cuda_graph = True
+            return
+
         # Skip auto-disable when enforce flag is set (for testing)
         if self.enforce_piecewise_cuda_graph:
             self.disable_piecewise_cuda_graph = False
@@ -3107,14 +3119,13 @@ class ServerArgs:
                 )
             if self.page_size != 1 and (
                 not self.speculative_dvr_chunk_boundary_verify
+                or self.page_size > FLA_CHUNK_SIZE
                 or FLA_CHUNK_SIZE % self.page_size != 0
-                or self.speculative_num_draft_tokens % self.page_size != 0
             ):
                 raise ValueError(
                     "DVR page_size > 1 requires chunk-boundary verify and an "
-                    "aligned configuration: page_size must divide both "
-                    f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE} and "
-                    f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}."
+                    "aligned configuration: page_size must be no larger than "
+                    f"and divide FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}."
                 )
             if self.speculative_num_steps is None:
                 self.speculative_num_steps = self.speculative_num_draft_tokens - 1

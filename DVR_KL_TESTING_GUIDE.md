@@ -46,12 +46,13 @@ multiple of 64. The current extra_buffer prefill tracker keeps one checkpoint
 per prefill/extend pass, so larger intervals can miss the first prefill's latest
 64-token boundary. DVR relies on that boundary state as the verify start point.
 
-For DVR chunk-boundary verify, `page_size > 1` is supported when it divides both
-`FLA_CHUNK_SIZE` and `speculative_num_draft_tokens`. The locally validated
-configuration is `FLA_CHUNK_SIZE=64`, `speculative_num_draft_tokens=16`, and
-`--page-size 16`. Other page sizes fall back to `1` unless they satisfy the same
-alignment rule. This is an attention-KV paging constraint; the GDN/Mamba
-checkpoint interval still follows `FLA_CHUNK_SIZE`.
+For DVR chunk-boundary verify, `page_size > 1` is supported when it is no larger
+than and divides `FLA_CHUNK_SIZE`. The draft-token count does not need to be
+page-aligned because DVR tracks the real token locations separately from the
+owned page allocations. Values larger than `FLA_CHUNK_SIZE` are lowered to
+`FLA_CHUNK_SIZE`; non-divisor values are lowered to the nearest power-of-two
+divisor not greater than the requested value. This is an attention-KV paging
+constraint; the GDN/Mamba checkpoint interval still follows `FLA_CHUNK_SIZE`.
 
 `SGLANG_RETURN_ORIGINAL_LOGPROB=True` is needed by the strict-KL oracle because
 the test compares returned generation logprobs with a full-prefill scoring pass.
