@@ -636,3 +636,208 @@ def rebuild_dvr_live_state_grouped(
     temporal_state[:, state_live_indices] = rebuilt_state.reshape(
         num_layers, num_reqs, *rebuilt_state.shape[1:]
     )
+
+
+@dataclass
+class DVRGatedStateAdapter:
+    """Adapter for DVR state replay in gated linear-state layers.
+
+    The backend still produces layer-specific tensors such as q/k/v/g/beta and
+    conv windows. This adapter owns the DVR rolling-window and commit mechanics
+    so a model backend can opt in through a small set of calls.
+    """
+
+    kernels: DVRStateKernels
+    chunk_size: int = FLA_CHUNK_SIZE
+
+    def set_kernels(self, *, chunk_scan: Callable, recurrent_state: Callable):
+        self.kernels.set_ops(
+            chunk_scan=chunk_scan,
+            recurrent_state=recurrent_state,
+        )
+
+    def has_window(self, state_cache) -> bool:
+        return has_dvr_state_window(state_cache)
+
+    def cache_extend_tail(
+        self,
+        *,
+        state_cache,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ):
+        state_window = DVRStateInputWindow.from_cache(state_cache)
+        if not state_window.enabled:
+            return
+
+        state_window.write_extend_tail(
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            chunk_size=self.chunk_size,
+        )
+
+    def write_conv_windows(
+        self,
+        *,
+        intermediate_conv_window_cache: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        initial_conv_windows: torch.Tensor,
+        mixed_qkv_reshaped: torch.Tensor,
+        verify_window_size: int,
+    ):
+        write_dvr_conv_windows(
+            intermediate_conv_window_cache=intermediate_conv_window_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            initial_conv_windows=initial_conv_windows,
+            mixed_qkv_reshaped=mixed_qkv_reshaped,
+            verify_window_size=verify_window_size,
+        )
+
+    def run_chunkwise_verify(
+        self,
+        *,
+        state_cache,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        intermediate_state_cache: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+        num_q_heads: int,
+        head_q_dim: int,
+        num_k_heads: int,
+        head_k_dim: int,
+        num_v_heads: int,
+        head_v_dim: int,
+    ) -> torch.Tensor:
+        return run_dvr_chunkwise_verify(
+            state_ops=self.kernels,
+            state_window=DVRStateInputWindow.from_cache(state_cache),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            intermediate_state_cache=intermediate_state_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            batch_size=batch_size,
+            draft_token_num=draft_token_num,
+            num_q_heads=num_q_heads,
+            head_q_dim=head_q_dim,
+            num_k_heads=num_k_heads,
+            head_k_dim=head_k_dim,
+            num_v_heads=num_v_heads,
+            head_v_dim=head_v_dim,
+            chunk_size=self.chunk_size,
+        )
+
+    def commit_after_verify(
+        self,
+        *,
+        state_cache,
+        state_scatter: Callable,
+        live_indices: torch.Tensor,
+        boundary_indices: torch.Tensor,
+        verified_tail_lens: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+        accepted_steps: torch.Tensor,
+    ) -> torch.Tensor:
+        state_window = DVRStateInputWindow.from_cache(state_cache)
+        commit_plan = build_dvr_state_commit_plan(
+            verified_tail_lens=verified_tail_lens,
+            accepted_tokens=accepted_tokens,
+            accepted_steps=accepted_steps,
+            window_capacity=state_window.capacity,
+            conv_capacity=state_cache.intermediate_conv_window[0].shape[2],
+            device=live_indices.device,
+            chunk_size=self.chunk_size,
+        )
+        crossing = commit_plan.crossing
+
+        rebuild_dvr_live_state_grouped(
+            state_ops=self.kernels,
+            state_window=state_window,
+            temporal_state=state_cache.temporal,
+            live_indices=live_indices,
+            boundary_indices=boundary_indices,
+            req_indices=(~crossing).nonzero(as_tuple=True)[0],
+            token_count=commit_plan.pos_after[~crossing],
+        )
+
+        state_scatter(
+            state_cache.conv[0],
+            state_cache.intermediate_conv_window[0],
+            live_indices,
+            accepted_steps,
+        )
+
+        if crossing.any():
+            boundary_state_step = (
+                0
+                if state_cache.intermediate_ssm.shape[2] == 1
+                else self.chunk_size - 1
+            )
+            commit_step = torch.where(
+                crossing,
+                torch.full_like(commit_plan.pos_before, boundary_state_step),
+                torch.full_like(commit_plan.pos_before, -1),
+            )
+            state_scatter(
+                state_cache.temporal,
+                state_cache.intermediate_ssm,
+                boundary_indices,
+                commit_step,
+            )
+            state_scatter(
+                state_cache.conv[0],
+                state_cache.intermediate_conv_window[0],
+                boundary_indices,
+                torch.where(crossing, commit_plan.boundary_conv_steps, commit_step),
+            )
+
+            new_pos = commit_plan.pos_after - self.chunk_size
+            crossing_idx = crossing.nonzero(as_tuple=True)[0]
+            state_window.shift_after_boundary(
+                live_indices=live_indices,
+                crossing=crossing,
+                new_pos=new_pos,
+                chunk_size=self.chunk_size,
+            )
+            rebuild_dvr_live_state_grouped(
+                state_ops=self.kernels,
+                state_window=state_window,
+                temporal_state=state_cache.temporal,
+                live_indices=live_indices,
+                boundary_indices=boundary_indices,
+                req_indices=crossing_idx,
+                token_count=new_pos[crossing_idx],
+            )
+            pos_after = torch.where(crossing, new_pos, commit_plan.pos_after)
+        else:
+            pos_after = commit_plan.pos_after
+
+        state_window.set_tail_lens(
+            indices=live_indices, value=pos_after.to(torch.int32)
+        )
+        return crossing
