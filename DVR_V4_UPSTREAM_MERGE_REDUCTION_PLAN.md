@@ -24,20 +24,28 @@ Validation:
 - Qwen3.5 no-graph KL=0 for lengths crossing 64.
 - Qwen3.5 CUDA graph KL=0 for lengths crossing 64.
 
-## Step 2: Grouped Recurrent State Helper
+## Step 2: Compact Boundary State Buffer
 
-The current live-state rebuild calls the recurrent FLA path per layer. Add a
-small Triton/grouped helper next to chain reject sampling so DVR can rebuild
-accepted live states with fewer launches. The first version may keep the same
-semantics and fall back to the current implementation if shape assumptions are
-not met.
+Status: completed in `dvr: compact GDN boundary state cache`.
+
+DVR now stores only the first chunk-boundary state exported by the internal
+GDN `64 + draft` scan. This keeps the deterministic state commit path unchanged
+while avoiding the old 64-token SSM intermediate buffer.
+
+## Step 3: DVR Sampling Kernel
+
+Move chain reject sampling into a DVR sampling helper and add a Triton fast path
+with the existing torch implementation as fallback. Keep the public call
+contract identical to EAGLE verify so self-DVR remains close to the upstream
+speculative decoding flow.
 
 Validation:
 
-- Compare Qwen3.5 strict KL=0 before and after.
-- Include unequal accepted lengths in batch if practical.
+- Static Python compile and `git diff --check`.
+- Qwen3/Qwen3.5 strict KL=0 smoke tests.
+- Batch test where practical.
 
-## Step 3: Move DVR/GDN Mechanics Into Mamba DVR Helpers
+## Step 4: Move DVR/GDN Mechanics Into Mamba DVR Helpers
 
 Keep generic `gdn_backend.py` readable by moving q/k/v/g/beta cache writes,
 internal verify scan preparation, boundary-state writeback, and conv-step
@@ -49,7 +57,7 @@ Validation:
 - Static checks after each move.
 - Qwen3 and Qwen3.5 KL=0 smoke tests.
 
-## Step 4: Upstream Diff Hygiene
+## Step 5: Upstream Diff Hygiene
 
 Do not include root-level experimental docs in a final upstream patch series.
 Keep developer notes in archive/local files. Keep only manual test scripts that
@@ -59,7 +67,7 @@ Validation:
 
 - `git diff --name-only upstream/sglang-miles..HEAD` review.
 
-## Step 5: Server Args Cleanup
+## Step 6: Server Args Cleanup
 
 Keep DVR launch defaults in one server-args helper:
 
