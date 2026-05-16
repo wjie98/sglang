@@ -138,3 +138,26 @@ Validation, all with DeepGEMM disabled:
 - Qwen3.5 GDN graph, `page_size=16`, bs=2, lengths `65,129,257`: strict KL=0.
 - Qwen3.5 GDN no-graph, `page_size=16`, bs=2, lengths `65,129,257`: strict
   KL=0.
+
+## 2026-05-16 GDN Track-State Guard
+
+For GDN DVR, the Mamba/GDN prefill tracking interval must be exactly
+`FLA_CHUNK_SIZE`, not merely a multiple of it. Larger multiples are chunk
+aligned, but the current extra_buffer prefill path stores only one tracked
+checkpoint per prefill/extend pass. If the interval is larger than
+`FLA_CHUNK_SIZE`, a first prompt prefill can miss the latest chunk boundary that
+DVR needs as the next target-verify starting state.
+
+The launch path now rewrites GDN DVR `mamba_track_interval` to `FLA_CHUNK_SIZE`
+with an explicit warning, and the DVR worker asserts the same invariant at
+runtime. It also asserts fp32 temporal/intermediate SSM state storage, because
+bf16/fp16 chunk-boundary checkpoints round the chunkwise scan state and can
+diverge from full prefill across chunks.
+
+Validation:
+
+- Qwen3.5 GDN no-graph launched with `--mamba-track-interval 256`; server-args
+  postprocessing reset it to `64`, and bs=2 lengths `65,129,257` passed strict
+  KL=0.
+- Qwen3 attention-only no-graph, bs=2 lengths `65,129`, still passed strict
+  KL=0.

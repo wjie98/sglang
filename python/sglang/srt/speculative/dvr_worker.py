@@ -143,13 +143,21 @@ class DecodeVerifyRollbackWorker:
             )
         if (
             target_worker.model_runner.hybrid_gdn_config is not None
-            and server_args.mamba_track_interval % FLA_CHUNK_SIZE != 0
+            and server_args.mamba_track_interval != FLA_CHUNK_SIZE
         ):
             raise ValueError(
-                "DVR GDN requires mamba_track_interval to be aligned to "
+                "DVR GDN requires mamba_track_interval to match "
                 f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, got "
-                f"{server_args.mamba_track_interval}."
+                f"{server_args.mamba_track_interval}. Multiples larger than "
+                "FLA_CHUNK_SIZE can miss the latest chunk boundary from the "
+                "first prefill because the current extra_buffer path stores "
+                "only one tracked prefill checkpoint."
             )
+        if (
+            target_worker.model_runner.hybrid_gdn_config is not None
+            and server_args.mamba_ssm_dtype != "float32"
+        ):
+            raise ValueError("DVR GDN requires fp32 Mamba/GDN SSM state storage.")
 
         self.server_args = server_args
         self.target_worker = target_worker
@@ -508,9 +516,23 @@ class DecodeVerifyRollbackWorker:
     ) -> Optional[_GDNDVRStateContext]:
         if not self._has_gdn_dvr_state(batch):
             return None
+        assert self.server_args.mamba_track_interval == FLA_CHUNK_SIZE, (
+            "DVR GDN target verify must start from FLA chunk boundaries. "
+            "The current prefill tracker only guarantees the latest boundary "
+            "when mamba_track_interval equals FLA_CHUNK_SIZE."
+        )
         live_indices = batch.req_to_token_pool.get_mamba_indices(
             batch.req_pool_indices
         ).to(torch.long)
+        mamba_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        assert mamba_cache.temporal.dtype == torch.float32, (
+            "DVR GDN requires fp32 temporal state checkpoints. bf16/fp16 "
+            "checkpoints round the chunkwise scan state and can diverge from "
+            "full prefill across chunks."
+        )
+        assert mamba_cache.intermediate_ssm.dtype == torch.float32, (
+            "DVR GDN requires fp32 intermediate prefill states."
+        )
         boundary_indices = None
         if require_boundary:
             boundary_indices = torch.stack(
@@ -522,7 +544,7 @@ class DecodeVerifyRollbackWorker:
                 ]
             ).to(device=live_indices.device, dtype=torch.long)
         return _GDNDVRStateContext(
-            mamba_cache=batch.req_to_token_pool.get_speculative_mamba2_params_all_layers(),
+            mamba_cache=mamba_cache,
             live_indices=live_indices,
             boundary_indices=boundary_indices,
         )
@@ -620,9 +642,15 @@ class DecodeVerifyRollbackWorker:
         self, batch: ScheduleBatch, req
     ) -> Optional[int]:
         boundary_seqlen, _ = self._gdn_boundary_and_tail(req)
+        assert boundary_seqlen % FLA_CHUNK_SIZE == 0
+        last_track_seqlen = req.mamba_last_track_seqlen
+        if last_track_seqlen is not None and last_track_seqlen > 0:
+            assert last_track_seqlen % FLA_CHUNK_SIZE == 0, (
+                "DVR GDN must not reuse non-chunk-boundary Mamba checkpoints."
+            )
         if boundary_seqlen <= 0:
             return None
-        if req.mamba_last_track_seqlen != boundary_seqlen:
+        if last_track_seqlen != boundary_seqlen:
             return None
         return self._mamba_other_track_idx(batch, req.mamba_next_track_idx)
 
@@ -642,6 +670,7 @@ class DecodeVerifyRollbackWorker:
     def _init_gdn_boundary_for_req(
         self, batch: ScheduleBatch, req, boundary_seqlen: int
     ) -> Optional[torch.Tensor]:
+        assert boundary_seqlen % FLA_CHUNK_SIZE == 0
         checkpoint_track_idx = self._current_prefill_checkpoint_track_idx(batch, req)
         if checkpoint_track_idx is not None:
             # Normal prefill already wrote the chunk-aligned state into the

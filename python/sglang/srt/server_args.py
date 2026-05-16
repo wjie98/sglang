@@ -1111,7 +1111,10 @@ class ServerArgs:
         if self.mamba_track_interval != FLA_CHUNK_SIZE:
             logger.warning(
                 "DVR chunk-boundary verify for GDN requires mamba_track_interval "
-                "to match FLA_CHUNK_SIZE=%s. Setting --mamba-track-interval %s.",
+                "to match FLA_CHUNK_SIZE=%s. Larger intervals may still be "
+                "chunk-size multiples, but the current extra_buffer prefill path "
+                "keeps only one tracked checkpoint and can miss the first "
+                "prefill's last chunk boundary. Setting --mamba-track-interval %s.",
                 FLA_CHUNK_SIZE,
                 FLA_CHUNK_SIZE,
             )

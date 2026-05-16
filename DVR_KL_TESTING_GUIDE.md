@@ -41,6 +41,11 @@ server-args postprocessing fixes the state-related settings required by DVR:
 `--mamba-ssm-dtype float32`. Passing them explicitly is still fine, but not
 required.
 
+Do not increase `--mamba-track-interval` for GDN DVR even if the value remains a
+multiple of 64. The current extra_buffer prefill tracker keeps one checkpoint
+per prefill/extend pass, so larger intervals can miss the first prefill's latest
+64-token boundary. DVR relies on that boundary state as the verify start point.
+
 For DVR chunk-boundary verify, `page_size > 1` is supported when it divides both
 `FLA_CHUNK_SIZE` and `speculative_num_draft_tokens`. The locally validated
 configuration is `FLA_CHUNK_SIZE=64`, `speculative_num_draft_tokens=16`, and
