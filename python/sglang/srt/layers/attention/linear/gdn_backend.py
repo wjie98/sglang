@@ -633,16 +633,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
             new_pos = pos_after - FLA_CHUNK_SIZE
-            for req_i, slot in enumerate(live_indices.tolist()):
-                if not bool(crossing[req_i].item()):
-                    continue
-                remain = int(new_pos[req_i].item())
-                if remain > 0:
-                    for cache in self._dvr_qkvg_beta_caches(mamba_cache):
-                        cache[:, slot, :remain] = cache[
-                            :, slot, FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + remain
-                        ].clone()
             crossing_idx = crossing.nonzero(as_tuple=True)[0]
+            crossing_slots = live_indices[crossing_idx]
+            if crossing_slots.numel() > 0:
+                # After a boundary commit, only the draft suffix can remain in
+                # the rolling qkvg/beta window. Copy the full draft-width suffix
+                # once for all crossing requests; dvr_qkvg_beta_pos below keeps
+                # the effective per-request tail length.
+                tail_capacity = mamba_cache.dvr_q_state_cache.shape[2] - FLA_CHUNK_SIZE
+                tail_len = min(int(new_pos[crossing_idx].max().item()), tail_capacity)
+                if tail_len > 0:
+                    for cache in self._dvr_qkvg_beta_caches(mamba_cache):
+                        cache[:, crossing_slots, :tail_len] = cache[
+                            :,
+                            crossing_slots,
+                            FLA_CHUNK_SIZE : FLA_CHUNK_SIZE + tail_len,
+                        ].clone()
             rebuild_live_tail(crossing_idx, new_pos[crossing_idx])
             pos_after = torch.where(crossing, new_pos, pos_after)
 
