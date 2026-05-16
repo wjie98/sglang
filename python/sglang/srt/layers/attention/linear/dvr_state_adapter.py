@@ -77,14 +77,14 @@ class DVRGatedStateInputCache:
     pos: Optional[torch.Tensor]
 
     @classmethod
-    def from_mamba_cache(cls, mamba_cache):
+    def from_cache(cls, state_cache):
         return cls(
-            q=getattr(mamba_cache, "dvr_q_state_cache", None),
-            k=getattr(mamba_cache, "dvr_k_state_cache", None),
-            v=getattr(mamba_cache, "dvr_v_state_cache", None),
-            g=getattr(mamba_cache, "dvr_g_state_cache", None),
-            beta=getattr(mamba_cache, "dvr_beta_state_cache", None),
-            pos=getattr(mamba_cache, "dvr_qkvg_beta_pos", None),
+            q=getattr(state_cache, "dvr_q_state_cache", None),
+            k=getattr(state_cache, "dvr_k_state_cache", None),
+            v=getattr(state_cache, "dvr_v_state_cache", None),
+            g=getattr(state_cache, "dvr_g_state_cache", None),
+            beta=getattr(state_cache, "dvr_beta_state_cache", None),
+            pos=getattr(state_cache, "dvr_qkvg_beta_pos", None),
         )
 
     @property
@@ -99,6 +99,28 @@ class DVRGatedStateInputCache:
         assert self.g is not None
         assert self.beta is not None
         return self.q, self.k, self.v, self.g, self.beta
+
+    @property
+    def capacity(self) -> int:
+        assert self.enabled
+        assert self.q is not None
+        # Full-cache layout is [layers, slots, window, ...]. Layer-local cache
+        # layout is [slots, window, ...].
+        return self.q.shape[2] if self.q.dim() >= 5 else self.q.shape[1]
+
+    def tail_lens(self, *, indices: torch.Tensor) -> torch.Tensor:
+        assert self.pos is not None
+        indices = indices.to(device=self.pos.device, dtype=torch.long)
+        return self.pos[indices]
+
+    def set_tail_lens(self, *, indices: torch.Tensor, value: Union[int, torch.Tensor]):
+        assert self.pos is not None
+        indices = indices.to(device=self.pos.device, dtype=torch.long)
+        value = torch.as_tensor(value, device=self.pos.device, dtype=self.pos.dtype)
+        if self.pos.dim() == 2:
+            self.pos[:, indices] = value
+        else:
+            self.pos[indices] = value
 
     def write_tail(
         self,
@@ -179,10 +201,10 @@ class DVRGatedStateInputCache:
                 cache[slots, :length] = cache[slots, start : start + length].clone()
 
 
-def has_dvr_state_input_cache(mamba_cache) -> bool:
+def has_dvr_state_input_cache(state_cache) -> bool:
     """Return whether a cache exposes DVR's rolling state-input window."""
 
-    return DVRGatedStateInputCache.from_mamba_cache(mamba_cache).enabled
+    return DVRGatedStateInputCache.from_cache(state_cache).enabled
 
 
 def check_dvr_state_input_position(

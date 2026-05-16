@@ -359,7 +359,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         g: torch.Tensor,
         beta: torch.Tensor,
     ):
-        state_input_cache = DVRGatedStateInputCache.from_mamba_cache(mamba_cache_params)
+        state_input_cache = DVRGatedStateInputCache.from_cache(mamba_cache_params)
         if not state_input_cache.enabled:
             return
         if (
@@ -387,7 +387,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             boundary = (seq_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
             num_verified_tokens = seq_len - boundary
             dst = cache_indices[req_i].to(torch.long)
-            mamba_cache_params.dvr_qkvg_beta_pos[dst] = num_verified_tokens
+            state_input_cache.set_tail_lens(indices=dst, value=num_verified_tokens)
             if num_verified_tokens == 0:
                 continue
 
@@ -480,8 +480,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         """Run DVR's internal 64+draft chunkwise scan and return draft suffix."""
 
         dvr_indices = cache_indices[:batch_size].to(torch.long)
-        state_input_cache = DVRGatedStateInputCache.from_mamba_cache(mamba_cache_params)
-        tail_lens = mamba_cache_params.dvr_qkvg_beta_pos[dvr_indices].to(torch.long)
+        state_input_cache = DVRGatedStateInputCache.from_cache(mamba_cache_params)
+        tail_lens = state_input_cache.tail_lens(indices=dvr_indices).to(torch.long)
         state_input_cache.write_draft_rows(
             indices=dvr_indices,
             col_start=tail_lens,
@@ -554,8 +554,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             device=live_indices.device, dtype=torch.long
         )
         pos_after = pos_before + accepted_tokens
-        state_input_cache = DVRGatedStateInputCache.from_mamba_cache(mamba_cache)
-        state_input_capacity = mamba_cache.dvr_q_state_cache.shape[2]
+        state_input_cache = DVRGatedStateInputCache.from_cache(mamba_cache)
+        state_input_capacity = state_input_cache.capacity
         check_dvr_state_input_position(
             pos_before=pos_before,
             pos_after=pos_after,
@@ -630,7 +630,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # the rolling qkvg/beta window. Copy the full draft-width suffix
                 # once for all crossing requests; dvr_qkvg_beta_pos below keeps
                 # the effective per-request tail length.
-                tail_capacity = mamba_cache.dvr_q_state_cache.shape[2] - FLA_CHUNK_SIZE
+                tail_capacity = state_input_capacity - FLA_CHUNK_SIZE
                 tail_len = min(int(new_pos[crossing_idx].max().item()), tail_capacity)
                 if tail_len > 0:
                     state_input_cache.shift_suffix(
@@ -649,7 +649,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             pos_after = torch.where(crossing, new_pos, pos_after)
 
-        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = pos_after.to(torch.int32)
+        state_input_cache.set_tail_lens(
+            indices=live_indices, value=pos_after.to(torch.int32)
+        )
         return crossing
 
     def forward_decode(
