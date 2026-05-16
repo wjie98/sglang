@@ -343,6 +343,56 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return core_attn_out
 
+    def forward_dvr_target_verify(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        mamba_cache_params,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ):
+        seq_len = mixed_qkv.shape[0]
+        conv_states = mamba_cache_params.conv[0]
+        ssm_states = mamba_cache_params.temporal
+        dvr_context = self.dvr_state_adapter.make_forward_context(
+            layer=layer,
+            forward_batch=forward_batch,
+            state_cache=mamba_cache_params,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            seq_len=seq_len,
+        )
+        mixed_qkv = self.dvr_state_adapter.process_target_verify_conv(
+            context=dvr_context,
+            mixed_qkv=mixed_qkv,
+        )
+
+        query, key, value = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        actual_seq_len = query.shape[0]
+        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        return self.dvr_state_adapter.process_target_verify_state(
+            context=dvr_context,
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+        )
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -365,32 +415,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        if self.dvr_state_adapter.is_verify_enabled(
+            state_cache=mamba_cache_params, is_target_verify=is_target_verify
+        ):
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            return self.forward_dvr_target_verify(
+                layer,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+                mamba_cache_params=mamba_cache_params,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
+
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
-        dvr_context = self.dvr_state_adapter.make_forward_context(
-            layer=layer,
-            forward_batch=forward_batch,
-            state_cache=mamba_cache_params,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            conv_states=conv_states,
-            ssm_states=ssm_states,
-            seq_len=seq_len,
-        )
-        dvr_verify = self.dvr_state_adapter.is_verify_enabled(
-            state_cache=mamba_cache_params, is_target_verify=is_target_verify
-        )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
-        if dvr_verify:
-            mixed_qkv = self.dvr_state_adapter.process_target_verify_conv(
-                context=dvr_context,
-                mixed_qkv=mixed_qkv,
-            )
-        elif is_target_verify:
+        if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             intermediate_conv_window_cache = (
@@ -455,41 +502,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            if dvr_verify:
-                core_attn_out = self.dvr_state_adapter.process_target_verify_state(
-                    context=dvr_context,
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                )
-            else:
-                intermediate_state_cache = mamba_cache_params.intermediate_ssm
-                intermediate_state_indices = torch.arange(
-                    cache_indices.shape[0],
-                    dtype=torch.int32,
-                    device=cache_indices.device,
-                )
-                core_attn_out = self.kernel_dispatcher.target_verify(
-                    A_log=layer.A_log,
-                    dt_bias=layer.dt_bias,
-                    q=query,
-                    k=key,
-                    v=value,
-                    a=a,
-                    b=b,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    intermediate_states_buffer=intermediate_state_cache,
-                    intermediate_state_indices=intermediate_state_indices,
-                    cache_steps=forward_batch.spec_info.draft_token_num,
-                    retrieve_parent_token=retrieve_parent_token,
-                )
+            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            intermediate_state_indices = torch.arange(
+                cache_indices.shape[0],
+                dtype=torch.int32,
+                device=cache_indices.device,
+            )
+            core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=forward_batch.spec_info.draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+            )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            dvr_context = self.dvr_state_adapter.make_forward_context(
+                layer=layer,
+                forward_batch=forward_batch,
+                state_cache=mamba_cache_params,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                seq_len=seq_len,
+            )
             self.dvr_state_adapter.cache_extend_state_inputs(
                 context=dvr_context,
                 q=query,
