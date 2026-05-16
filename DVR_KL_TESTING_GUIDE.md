@@ -5,6 +5,54 @@ it to test the new v3 implementation; do not copy v2 implementation details.
 
 ## Server Template
 
+Minimum attention-only DVR launch:
+
+```bash
+PYTHONPATH=python \
+conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
+  --model-path /home/hwj/Qwen3-0.6B \
+  --speculative-algorithm DECODE_VERIFY_ROLLBACK \
+  --speculative-num-steps 15 \
+  --speculative-num-draft-tokens 16 \
+  --speculative-eagle-topk 1 \
+  --page-size 1 \
+  --enable-deterministic-inference
+```
+
+Minimum GDN DVR launch:
+
+```bash
+PYTHONPATH=python \
+conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
+  --model-path /home/hwj/Qwen3.5-0.8B \
+  --speculative-algorithm DECODE_VERIFY_ROLLBACK \
+  --speculative-num-steps 15 \
+  --speculative-num-draft-tokens 16 \
+  --speculative-eagle-topk 1 \
+  --speculative-dvr-chunk-boundary-verify \
+  --page-size 1 \
+  --mamba-scheduler-strategy extra_buffer \
+  --mamba-track-interval 64 \
+  --mamba-ssm-dtype float32 \
+  --linear-attn-backend triton \
+  --enable-deterministic-inference
+```
+
+`SGLANG_RETURN_ORIGINAL_LOGPROB=True` is needed by the strict-KL oracle because
+the test compares returned generation logprobs with a full-prefill scoring pass.
+It is not a serving requirement.
+
+On the local 5090 test machine, keep these DeepGEMM workarounds in test
+commands until the upstream kernel issue is resolved:
+
+```bash
+SGLANG_ENABLE_JIT_DEEPGEMM=0
+SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0
+```
+
+The longer templates below include host/port, memory, and warmup settings for
+repeatable local testing. They are not the semantic minimum for DVR.
+
 Attention-only model:
 
 ```bash
@@ -163,4 +211,3 @@ Useful metrics to print from each response:
 - `spec_accept_rate`
 - `spec_accept_token_num`
 - `spec_verify_ct`
-

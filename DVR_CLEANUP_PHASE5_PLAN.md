@@ -96,3 +96,32 @@ Validation:
 
 Stop after these phases unless another optimization is clearly DVR-local,
 behavior-neutral, and independently testable.
+
+## Execution Log
+
+- `d9fc0f88e dvr: add cleanup phase 5 plan`
+  - `git diff --check`.
+- `23991870b dvr: vectorize gdn conv window export`
+  - `py_compile` for `gdn_backend.py`.
+  - `git diff --check`.
+  - Qwen3 pure-attention graph bs=2 lengths `17,65,129`: strict KL=0.
+  - Qwen3.5/GDN graph bs=2 lengths `65,129,257`: strict KL=0.
+  - Qwen3.5/GDN no-graph bs=2 lengths `65,129,257`: strict KL=0.
+- `f3fc05cb1 dvr: vectorize gdn qkvg beta rolling shift`
+  - `py_compile` for `gdn_backend.py`.
+  - `git diff --check`.
+  - Qwen3 pure-attention graph bs=2 lengths `17,65,129`: strict KL=0.
+  - Qwen3.5/GDN graph bs=2 lengths `65,129,257`: strict KL=0.
+  - Qwen3.5/GDN no-graph bs=2 lengths `65,129,257`: strict KL=0.
+- `af8ae01ce dvr: vectorize fixed verify positions`
+  - `py_compile` for `dvr_worker.py`.
+  - `git diff --check`.
+  - Qwen3 pure-attention graph bs=2 lengths `17,65,129`: strict KL=0.
+  - Qwen3.5/GDN graph bs=2 lengths `65,129,257`: strict KL=0.
+  - Qwen3.5/GDN no-graph bs=2 lengths `65,129,257`: strict KL=0.
+- Documentation cleanup
+  - Added minimum attention-only and GDN DVR launch commands to
+    `DVR_KL_TESTING_GUIDE.md`.
+  - Marked `SGLANG_RETURN_ORIGINAL_LOGPROB=True` as a strict-KL oracle setting.
+  - Marked the DeepGEMM-disabling env vars as local 5090 test protection.
+  - Final Qwen3.5/GDN graph stress bs=2 lengths `257,513`: strict KL=0.
