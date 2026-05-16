@@ -8,6 +8,10 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 from sglang.srt.layers.attention.linear.mamba_dvr_utils import (
     MambaDVRFlaOps,
     MambaDVRQKVGBetaCache,
+    check_dvr_accepted_state_steps,
+    check_dvr_conv_steps,
+    check_dvr_qkvg_tail_position,
+    has_dvr_qkvg_beta_cache,
     rebuild_mamba_dvr_live_state_grouped,
     select_dvr_draft_suffix,
     write_dvr_chunk_boundary_state,
@@ -529,61 +533,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             head_v_dim=layer.head_v_dim,
         )
 
-    @staticmethod
-    def _check_dvr_qkvg_tail_position(
-        *,
-        pos_before: torch.Tensor,
-        pos_after: torch.Tensor,
-        accepted_tokens: torch.Tensor,
-        qkvg_capacity: int,
-    ):
-        if (
-            torch.any(pos_before < 0).item()
-            or torch.any(pos_before >= FLA_CHUNK_SIZE).item()
-            or torch.any(pos_after > qkvg_capacity).item()
-        ):
-            raise RuntimeError(
-                "Invalid DVR GDN qkvg/beta tail position: "
-                f"pos_before={pos_before.tolist()}, "
-                f"accepted_tokens={accepted_tokens.tolist()}, "
-                f"capacity={qkvg_capacity}, chunk_size={FLA_CHUNK_SIZE}."
-            )
-
-    @staticmethod
-    def _check_dvr_accepted_state_steps(
-        *, accepted_state_steps: torch.Tensor, qkvg_capacity: int
-    ):
-        if torch.any(accepted_state_steps >= qkvg_capacity).item():
-            raise RuntimeError(
-                "Invalid DVR GDN accepted state step: "
-                f"steps={accepted_state_steps.tolist()}, capacity={qkvg_capacity}."
-            )
-
-    @staticmethod
-    def _check_dvr_conv_steps(
-        *,
-        accepted_steps: torch.Tensor,
-        boundary_steps: torch.Tensor,
-        crossing: torch.Tensor,
-        conv_capacity: int,
-    ):
-        if torch.any(accepted_steps >= conv_capacity).item():
-            raise RuntimeError(
-                "Invalid DVR GDN accepted conv step: "
-                f"steps={accepted_steps.tolist()}, capacity={conv_capacity}."
-            )
-        if crossing.any():
-            crossing_boundary_steps = boundary_steps[crossing]
-            if (
-                torch.any(crossing_boundary_steps < 0).item()
-                or torch.any(crossing_boundary_steps >= conv_capacity).item()
-            ):
-                raise RuntimeError(
-                    "Invalid DVR GDN boundary conv step: "
-                    f"steps={crossing_boundary_steps.tolist()}, "
-                    f"capacity={conv_capacity}."
-                )
-
     def commit_dvr_state_after_verify(
         self,
         *,
@@ -607,7 +556,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         pos_after = pos_before + accepted_tokens
         qkvg_beta_cache = MambaDVRQKVGBetaCache.from_mamba_cache(mamba_cache)
         qkvg_capacity = mamba_cache.dvr_q_state_cache.shape[2]
-        self._check_dvr_qkvg_tail_position(
+        check_dvr_qkvg_tail_position(
             pos_before=pos_before,
             pos_after=pos_after,
             accepted_tokens=accepted_tokens,
@@ -630,13 +579,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         accepted_state_steps = pos_before + accepted_steps
-        self._check_dvr_accepted_state_steps(
+        check_dvr_accepted_state_steps(
             accepted_state_steps=accepted_state_steps,
             qkvg_capacity=qkvg_capacity,
         )
         boundary_conv_steps = FLA_CHUNK_SIZE - 1 - pos_before
         conv_capacity = mamba_cache.intermediate_conv_window[0].shape[2]
-        self._check_dvr_conv_steps(
+        check_dvr_conv_steps(
             accepted_steps=accepted_steps,
             boundary_steps=boundary_conv_steps,
             crossing=crossing,
@@ -804,9 +753,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
-        is_dvr_target_verify = (
-            is_target_verify
-            and getattr(mamba_cache_params, "dvr_q_state_cache", None) is not None
+        is_dvr_target_verify = is_target_verify and has_dvr_qkvg_beta_cache(
+            mamba_cache_params
         )
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)

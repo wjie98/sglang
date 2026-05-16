@@ -179,6 +179,67 @@ class MambaDVRQKVGBetaCache:
                 cache[slots, :length] = cache[slots, start : start + length].clone()
 
 
+def has_dvr_qkvg_beta_cache(mamba_cache) -> bool:
+    """Return whether a Mamba-like cache exposes DVR's q/k/v/g/beta window."""
+
+    return MambaDVRQKVGBetaCache.from_mamba_cache(mamba_cache).enabled
+
+
+def check_dvr_qkvg_tail_position(
+    *,
+    pos_before: torch.Tensor,
+    pos_after: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    qkvg_capacity: int,
+):
+    if (
+        torch.any(pos_before < 0).item()
+        or torch.any(pos_before >= FLA_CHUNK_SIZE).item()
+        or torch.any(pos_after > qkvg_capacity).item()
+    ):
+        raise RuntimeError(
+            "Invalid DVR GDN qkvg/beta tail position: "
+            f"pos_before={pos_before.tolist()}, "
+            f"accepted_tokens={accepted_tokens.tolist()}, "
+            f"capacity={qkvg_capacity}, chunk_size={FLA_CHUNK_SIZE}."
+        )
+
+
+def check_dvr_accepted_state_steps(
+    *, accepted_state_steps: torch.Tensor, qkvg_capacity: int
+):
+    if torch.any(accepted_state_steps >= qkvg_capacity).item():
+        raise RuntimeError(
+            "Invalid DVR GDN accepted state step: "
+            f"steps={accepted_state_steps.tolist()}, capacity={qkvg_capacity}."
+        )
+
+
+def check_dvr_conv_steps(
+    *,
+    accepted_steps: torch.Tensor,
+    boundary_steps: torch.Tensor,
+    crossing: torch.Tensor,
+    conv_capacity: int,
+):
+    if torch.any(accepted_steps >= conv_capacity).item():
+        raise RuntimeError(
+            "Invalid DVR GDN accepted conv step: "
+            f"steps={accepted_steps.tolist()}, capacity={conv_capacity}."
+        )
+    if crossing.any():
+        crossing_boundary_steps = boundary_steps[crossing]
+        if (
+            torch.any(crossing_boundary_steps < 0).item()
+            or torch.any(crossing_boundary_steps >= conv_capacity).item()
+        ):
+            raise RuntimeError(
+                "Invalid DVR GDN boundary conv step: "
+                f"steps={crossing_boundary_steps.tolist()}, "
+                f"capacity={conv_capacity}."
+            )
+
+
 def write_dvr_chunk_boundary_state(
     *,
     h: Optional[torch.Tensor],
