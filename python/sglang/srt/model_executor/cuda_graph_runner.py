@@ -547,6 +547,9 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        # EAGLE/NGRAM/DVR all replay a target-verify forward instead of a
+        # one-token decode graph. DVR is topk=1, but its verify graph still has
+        # `speculative_num_draft_tokens` rows per request.
         if model_runner.spec_algorithm.uses_target_verify_forward():
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -662,6 +665,9 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        # A decode graph and a target-verify graph can have the same batch size
+        # but incompatible metadata and token shape. Reject mode mismatches
+        # before checking batch-size support.
         if forward_batch.forward_mode != self.capture_forward_mode:
             return False
         if self.require_mlp_tp_gather:
@@ -975,7 +981,9 @@ class CudaGraphRunner:
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-        # Attention backend
+        # Attention backend. DVR chain verify is causal, but cuda-graph metadata
+        # construction may still require a temporary custom-mask buffer for
+        # shape bookkeeping. The context clears it before capture uses metadata.
         from sglang.srt.speculative.dvr_utils import (
             dvr_causal_verify_cuda_graph_metadata,
         )
@@ -1122,7 +1130,8 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
-        # Attention backend
+        # Attention backend. Keep DVR target-verify replay on the causal path
+        # even though the shared graph buffers include a custom-mask tensor.
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
@@ -1225,6 +1234,8 @@ class CudaGraphRunner:
                     retrive_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
+                    # For DVR the graph is captured with the actual verify row
+                    # count, not necessarily the raw server arg after padding.
                     draft_token_num=self.num_tokens_per_bs,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
