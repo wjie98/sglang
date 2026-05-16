@@ -34,6 +34,216 @@ reviewing and continuing the DVR merge.
 
 ## File-Level Summary
 
+## Complete File Inventory
+
+This section lists every file changed relative to `upstream/sglang-miles`.
+
+1. `DVR_CLEANUP_PHASE1_PLAN.md` (+49)
+   - Records the first cleanup pass for the v3 migration.
+   - Focus: keep DVR close to EAGLE control flow and reduce early scaffolding.
+
+2. `DVR_CLEANUP_PHASE2_PLAN.md` (+129)
+   - Documents the self-decode draft provider cleanup.
+   - Records the decision to use target/self decode as the draft path instead
+     of an extend-based draft path.
+
+3. `DVR_CLEANUP_PHASE3_PLAN.md` (+134)
+   - Tracks readability and structure cleanup around fixed verify windows.
+   - Contains the optimization rules used later: EAGLE-style control flow,
+     minimal intrusion, loop-invariant simplification, and strict KL=0.
+
+4. `DVR_CLEANUP_PHASE4_PLAN.md` (+127)
+   - Records the GDN deterministic-verify cleanup direction.
+   - Focus: separate ordinary EAGLE verify from DVR's chunk-aligned GDN verify.
+
+5. `DVR_CLEANUP_PHASE5_PLAN.md` (+143)
+   - Documents page-size and radix-cache cleanup.
+   - Records the page-safe allocation/free model for DVR fixed windows.
+
+6. `DVR_CLEANUP_PHASE6_PLAN.md` (+165)
+   - Latest cleanup plan and execution log.
+   - Records the `MambaDVRQKVGBetaCache` helper, page-size normalization,
+     piecewise CUDA graph disabling, and final KL=0 validation matrix.
+
+7. `DVR_DOCUMENTATION_INVENTORY.md` (+46)
+   - Index of root-level DVR notes.
+   - Separates upstream-facing candidates from development-only records.
+
+8. `DVR_EAGLE_POSTPROCESS_EXPERIMENT.md` (+50)
+   - Records the experiment that aligned DVR verify/postprocess with EAGLE's
+     anchor/bonus and acceptance contract.
+
+9. `DVR_GDN_EXPERIMENT_NOTES.md` (+580)
+   - Detailed GDN debugging notes.
+   - Covers conv state, q/k/v/g/beta, temporal state, chunkwise/recurrent
+     differences, and known failure modes encountered during migration.
+
+10. `DVR_GDN_MERGE_PLAN.md` (+168)
+    - GDN merge plan.
+    - Explains target verify, post-verify, q/k/v/g/beta caching, and state
+      commit requirements.
+
+11. `DVR_KL_TESTING_GUIDE.md` (+230)
+    - Strict KL=0 testing guide.
+    - Documents full-prefill scoring oracle, launch flags, DeepGEMM disable
+      flags, page-size rules, and expected validation commands.
+
+12. `DVR_PAGE_SIZE_FIX_PLAN.md` (+163)
+    - Page-size and radix-cache design note.
+    - Explains why DVR can support page sizes that divide `FLA_CHUNK_SIZE`
+      without requiring `num_draft_tokens % page_size == 0`.
+
+13. `DVR_QWEN35_DIVERGENCE_REPORT.md` (+38)
+    - Early Qwen3.5/GDN divergence note.
+    - Records the observed divergence before later GDN state fixes.
+
+14. `DVR_QWEN35_DIVERGENCE_REPORT.py` (+194)
+    - Debug script for Qwen3.5/GDN divergence measurements.
+    - Generates comparison data for different generation lengths.
+
+15. `DVR_QWEN35_DIVERGENCE_REPORT_256.md` (+44)
+    - Longer Qwen3.5 divergence report at 256-token scale.
+    - Kept as historical debugging evidence.
+
+16. `DVR_QWEN35_DIVERGENCE_SUMMARY.md` (+101)
+    - Condensed summary of Qwen3.5 divergence experiments.
+    - Captures the path from divergence to GDN state-management fixes.
+
+17. `DVR_QWEN3_BATCH_KL_TEST.py` (+144)
+    - Batch KL test script used for Qwen3 and Qwen3.5.
+    - Compares served generation logprobs against full-prefill scoring and
+      reports strict KL/maxdiff plus acceptance stats.
+
+18. `DVR_UPDATE_REPORT.md` (+258 in the previous commit, now expanded)
+    - Current implementation report against `upstream/sglang-miles`.
+    - This file now includes a complete changed-file inventory.
+
+19. `DVR_V3_BASELINE_RESULTS.md` (+103)
+    - Baseline deterministic inference results before DVR-specific changes.
+    - Used to distinguish upstream deterministic behavior from DVR behavior.
+
+20. `DVR_V3_CONTROLLED_MIGRATION_PLAN.md` (+398)
+    - Main v3 controlled migration plan and execution record.
+    - Tracks how v3 moved from scaffold to self-draft, fixed-window verify,
+      GDN state management, and cleanup.
+
+21. `DVR_V3_IMPLEMENTATION_PLAN.md` (+470)
+    - Early v3 implementation plan.
+    - Captures the intended architecture before the controlled migration.
+
+22. `DVR_V3_MERGE_CONTEXT.md` (+193)
+    - Context note for the third merge attempt.
+    - Summarizes reference-branch intent, assumptions, and upstream target.
+
+23. `python/sglang/srt/disaggregation/decode.py` (+2)
+    - Adds `enable_dvr_qkvg_beta_cache` plumbing into
+      `HybridMambaDecodeReqToTokenPool`.
+    - Ensures decode-disaggregation Mamba pools can allocate DVR q/k/v/g/beta
+      cache when DVR is enabled.
+
+24. `python/sglang/srt/layers/attention/fla/chunk_delta_h.py` (+7/-1)
+    - Small FLA wrapper adjustment for deterministic GDN/DVR behavior.
+    - Keeps chunk size and chunkwise scan behavior aligned with DVR's
+      chunk-boundary verify assumptions.
+
+25. `python/sglang/srt/layers/attention/fla/chunk_o.py` (+5/-1)
+    - Companion FLA chunk-output adjustment.
+    - Part of the local deterministic FLA/GDN compatibility changes.
+
+26. `python/sglang/srt/layers/attention/fla/fused_norm_gate.py` (+1/-1)
+    - Sets gated norm Triton block rows to deterministic policy
+      `MAX_ROWS_PER_BLOCK = 1`.
+    - This matches the GDN deterministic-inference requirement discussed with
+      upstream/core developers.
+
+27. `python/sglang/srt/layers/attention/fla/layernorm_gated.py` (+1/-1)
+    - Applies the same deterministic gated RMSNorm row-block policy.
+    - Prevents row-block fusion from introducing GDN logit drift.
+
+28. `python/sglang/srt/layers/attention/linear/gdn_backend.py` (+560/-? overall)
+    - Adds DVR-specific data interfaces to GDN backend while keeping
+      accept/reject logic in the worker.
+    - Caches prompt-tail and verify-window q/k/v/g/beta.
+    - Runs DVR target verify through chunkwise scan.
+    - Exports conv windows and chunk-boundary state.
+    - Commits live recurrent state, boundary state, conv state, and q/k/v/g/beta
+      rolling positions after verify.
+
+29. `python/sglang/srt/layers/attention/linear/mamba_dvr_utils.py` (+206)
+    - New Mamba/DVR helper module.
+    - Provides `MambaDVRFlaOps`, `MambaDVRQKVGBetaCache`,
+      `write_dvr_chunk_boundary_state`, and `build_dvr_conv_windows`.
+    - Keeps reusable Mamba-like DVR state operations out of the generic GDN
+      backend body.
+
+30. `python/sglang/srt/managers/scheduler_output_processor_mixin.py` (+2)
+    - Skips ordinary Mamba checkpoint postprocessing for DVR requests.
+    - DVR worker/backend owns the GDN state commit path after target verify.
+
+31. `python/sglang/srt/mem_cache/memory_pool.py` (+167/-?)
+    - Extends `MambaPool.SpeculativeState` with DVR q/k/v/g/beta caches and
+      rolling position tracking.
+    - Allocates `FLA_CHUNK_SIZE + num_draft_tokens` rows for DVR fixed windows.
+    - Logs q/k/v/g/beta cache memory usage for capacity debugging.
+
+32. `python/sglang/srt/model_executor/cuda_graph_runner.py` (+95/-?)
+    - Adds `get_target_verify_graph_num_tokens_per_bs`.
+    - Captures DVR target-verify CUDA graph with physical window size
+      `FLA_CHUNK_SIZE + draft`.
+    - Copies Mamba track metadata into replay buffers.
+    - Supports ordinary CUDA graph for DVR while piecewise graph remains
+      disabled.
+
+33. `python/sglang/srt/model_executor/model_runner.py` (+17/-?)
+    - Treats DVR as a target-verify speculative algorithm for CUDA graph
+      capture.
+    - Builds `EagleVerifyInput` metadata for DVR graph capture using physical
+      verify token count.
+
+34. `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py` (+5)
+    - Computes `enable_dvr_qkvg_beta_cache` from the speculative algorithm.
+    - Passes the flag into Mamba/hybrid request-token pool construction.
+
+35. `python/sglang/srt/models/qwen3_5.py` (+4/-1)
+    - Formatting-only import cleanup around `RMSNormGated`.
+    - No behavioral model change in this file.
+
+36. `python/sglang/srt/server_args.py` (+148/-?)
+    - Adds `speculative_dvr_chunk_boundary_verify`.
+    - Adds DVR defaulting/validation for CUDA-only, topk=1, self-draft, default
+      draft count 16, and `num_steps=draft-1`.
+    - For GDN chunk-boundary verify, forces `extra_buffer`,
+      `mamba_track_interval=64`, and fp32 SSM state.
+    - Normalizes page size to a divisor of `FLA_CHUNK_SIZE`.
+    - Disables piecewise CUDA graph for DVR.
+
+37. `python/sglang/srt/speculative/chain_rejection.py` (+69)
+    - New chain-mode reject sampling helper.
+    - Used by DVR when self-draft probabilities are available.
+    - Keeps EAGLE-compatible output layout.
+
+38. `python/sglang/srt/speculative/dvr_utils.py` (+78)
+    - New DVR utility context managers.
+    - Clears custom tree mask for causal DVR verify in CUDA graph metadata.
+    - Temporarily adjusts backend verify-window token count for fixed physical
+      windows.
+
+39. `python/sglang/srt/speculative/dvr_worker.py` (+1138)
+    - New DVR worker implementation.
+    - Implements self-decode draft, EAGLE-compatible target verify/postprocess,
+      fixed GDN verify windows, page-safe padding KV management, GDN state
+      backup/restore/commit, and accepted-logit selection.
+
+40. `python/sglang/srt/speculative/eagle_info.py` (+17/-?)
+    - Extends EAGLE verify metadata with optional `draft_probs`.
+    - Adds non-greedy chain rejection sampling path for DVR/self-draft.
+    - Keeps target-only fallback for ordinary EAGLE-style target verify.
+
+41. `python/sglang/srt/speculative/spec_info.py` (+21)
+    - Adds `SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK`.
+    - Adds helper predicates for DVR and target-verify-forward algorithms.
+    - Wires DVR algorithm to `DecodeVerifyRollbackWorker`.
+
 ### `python/sglang/srt/speculative/dvr_worker.py`
 
 - Lines 50-108: fixed-window state dataclasses.
