@@ -13,7 +13,10 @@ from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.common import alloc_token_slots
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -31,6 +34,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
+    get_last_loc,
     maybe_detect_nan,
     select_top_k_tokens,
 )
@@ -126,13 +130,17 @@ class DecodeVerifyRollbackWorker:
     ):
         del gpu_id, dp_rank, moe_ep_rank, attn_cp_rank, moe_dp_rank, nccl_port
 
-        if server_args.page_size != 1:
-            raise ValueError(
-                "DVR currently requires page_size == 1 because the fixed "
-                "chunk-boundary verify window is not paged yet."
-            )
         if server_args.speculative_eagle_topk != 1:
             raise ValueError("DVR currently supports only chain mode with topk == 1.")
+        if server_args.page_size != 1 and (
+            not server_args.speculative_dvr_chunk_boundary_verify
+            or FLA_CHUNK_SIZE % server_args.page_size != 0
+            or server_args.speculative_num_draft_tokens % server_args.page_size != 0
+        ):
+            raise ValueError(
+                "DVR page_size > 1 requires chunk-boundary verify and page_size "
+                "aligned to both FLA_CHUNK_SIZE and num_draft_tokens."
+            )
         if (
             target_worker.model_runner.hybrid_gdn_config is not None
             and server_args.mamba_track_interval % FLA_CHUNK_SIZE != 0
@@ -236,6 +244,33 @@ class DecodeVerifyRollbackWorker:
     # Self-draft path. DVR uses the target model's decode path as a draft model,
     # but keeps EAGLE-compatible tree/retrieve metadata for verification.
 
+    def _alloc_draft_cache_locs(self, batch: ScheduleBatch) -> torch.Tensor:
+        num_seqs = batch.batch_size()
+        if self.page_size == 1:
+            return alloc_token_slots(
+                batch.tree_cache,
+                num_seqs * self.num_draft_tokens * self.topk,
+            )
+
+        prefix_lens = batch.seq_lens
+        prefix_lens_cpu = batch.seq_lens_cpu
+        end_lens = prefix_lens + self.num_draft_tokens
+        end_lens_cpu = prefix_lens_cpu + self.num_draft_tokens
+        last_loc = get_last_loc(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices,
+            prefix_lens,
+        )
+        return alloc_paged_token_slots_extend(
+            batch.tree_cache,
+            prefix_lens,
+            prefix_lens_cpu,
+            end_lens,
+            end_lens_cpu,
+            last_loc,
+            num_seqs * self.num_draft_tokens * self.topk,
+        )
+
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
         for req in batch.reqs:
@@ -255,10 +290,7 @@ class DecodeVerifyRollbackWorker:
         # Self-draft decodes directly into the slots that target verify will
         # read. Do not allocate a second verify window, or KV ownership and
         # radix-cache rollback stop matching the normal speculative layout.
-        out_cache_loc = alloc_token_slots(
-            batch.tree_cache,
-            num_seqs * self.num_draft_tokens * self.topk,
-        )
+        out_cache_loc = self._alloc_draft_cache_locs(batch)
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -515,6 +547,51 @@ class DecodeVerifyRollbackWorker:
             self.num_draft_tokens, dtype=torch.long, device=device
         )
         return (row_starts[:, None] + draft_offsets[None, :]).reshape(-1)
+
+    def _alloc_padding_locs(self, batch: ScheduleBatch, num_tokens: int):
+        if num_tokens == 0:
+            empty = torch.empty(0, dtype=torch.int64, device=self.device)
+            return empty, empty
+        if self.page_size == 1:
+            locs = alloc_token_slots(batch.tree_cache, num_tokens)
+            return locs, locs
+
+        alloc_len = ((num_tokens + self.page_size - 1) // self.page_size) * self.page_size
+        owned_locs = alloc_token_slots(batch.tree_cache, alloc_len)
+        return owned_locs[:num_tokens], owned_locs
+
+    def _fixed_window_padding_locs(
+        self,
+        batch: ScheduleBatch,
+        last_real_loc: torch.Tensor,
+        num_padding_tokens: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if num_padding_tokens == 0:
+            return None, None
+        if self.page_size == 1:
+            return self._alloc_padding_locs(batch, num_padding_tokens)
+
+        last_real_loc_item = int(last_real_loc.item())
+        page_tail_len = self.page_size - ((last_real_loc_item % self.page_size) + 1)
+        reusable_len = min(num_padding_tokens, page_tail_len)
+        pieces = []
+        if reusable_len > 0:
+            pieces.append(
+                torch.arange(
+                    last_real_loc_item + 1,
+                    last_real_loc_item + 1 + reusable_len,
+                    dtype=torch.long,
+                    device=last_real_loc.device,
+                )
+            )
+
+        remaining = num_padding_tokens - reusable_len
+        owned_locs = None
+        if remaining > 0:
+            used_locs, owned_locs = self._alloc_padding_locs(batch, remaining)
+            pieces.append(used_locs)
+
+        return torch.cat(pieces) if len(pieces) > 1 else pieces[0], owned_locs
 
     @staticmethod
     def _gdn_boundary_and_tail(req) -> Tuple[int, int]:
@@ -782,8 +859,13 @@ class DecodeVerifyRollbackWorker:
         out_cache_locs.append(draft_cache_locs)
         padding_locs = []
         if num_padding_tokens > 0:
-            pad_locs = alloc_token_slots(batch.tree_cache, num_padding_tokens)
-            padding_locs.append(pad_locs)
+            pad_locs, owned_pad_locs = self._fixed_window_padding_locs(
+                batch=batch,
+                last_real_loc=draft_cache_locs[-1],
+                num_padding_tokens=num_padding_tokens,
+            )
+            if owned_pad_locs is not None:
+                padding_locs.append(owned_pad_locs)
             out_cache_locs.append(pad_locs)
 
         return _GDNFixedVerifyRequestWindow(

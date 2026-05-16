@@ -223,7 +223,9 @@ Server command shape:
 - `--speculative-num-steps 15`
 - `--speculative-num-draft-tokens 16`
 - `--speculative-eagle-topk 1`
-- `--page-size 1`
+- `--page-size 1` in the historical test below. Newer chunk-boundary DVR also
+  validates `--page-size 16` when it divides both `FLA_CHUNK_SIZE=64` and
+  `speculative_num_draft_tokens=16`.
 - `--max-running-requests 8`
 - `--attention-backend triton`
 - `--sampling-backend pytorch`

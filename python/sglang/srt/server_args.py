@@ -1075,12 +1075,25 @@ class ServerArgs:
             else False
         )
 
-        if self.page_size not in (None, 1):
+        if self.speculative_num_draft_tokens is None:
+            num_draft_tokens = 16
+        else:
+            num_draft_tokens = self.speculative_num_draft_tokens
+
+        if (
+            self.page_size not in (None, 1)
+            and (
+                FLA_CHUNK_SIZE % self.page_size != 0
+                or num_draft_tokens % self.page_size != 0
+            )
+        ):
             logger.warning(
-                "DVR chunk-boundary verify currently requires page_size=1 "
-                "because the physical verify window is fixed to "
-                "FLA_CHUNK_SIZE+draft tokens. Setting --page-size 1 instead "
-                "of %s.",
+                "DVR chunk-boundary verify supports page_size > 1 only when "
+                "page_size divides both FLA_CHUNK_SIZE=%s and "
+                "speculative_num_draft_tokens=%s. Setting --page-size 1 "
+                "instead of %s.",
+                FLA_CHUNK_SIZE,
+                num_draft_tokens,
                 self.page_size,
             )
             self.page_size = 1
@@ -3083,17 +3096,22 @@ class ServerArgs:
                 raise ValueError("DVR currently does not support DP attention.")
             if self.speculative_draft_model_path is not None:
                 raise ValueError("DVR self draft does not use a draft model path.")
-            if self.page_size != 1:
-                raise ValueError(
-                    "DVR currently requires --page-size 1. The chunk-boundary "
-                    "verify path uses a fixed physical verify window and is not "
-                    "compatible with paged verify slots yet."
-                )
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = 16
                 logger.warning(
                     "speculative_num_draft_tokens is set to 16 by default for DVR. "
                     "You can override this by explicitly setting --speculative-num-draft-tokens."
+                )
+            if self.page_size != 1 and (
+                not self.speculative_dvr_chunk_boundary_verify
+                or FLA_CHUNK_SIZE % self.page_size != 0
+                or self.speculative_num_draft_tokens % self.page_size != 0
+            ):
+                raise ValueError(
+                    "DVR page_size > 1 requires chunk-boundary verify and an "
+                    "aligned configuration: page_size must divide both "
+                    f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE} and "
+                    f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}."
                 )
             if self.speculative_num_steps is None:
                 self.speculative_num_steps = self.speculative_num_draft_tokens - 1

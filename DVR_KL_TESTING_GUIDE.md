@@ -15,7 +15,7 @@ conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
   --speculative-num-steps 15 \
   --speculative-num-draft-tokens 16 \
   --speculative-eagle-topk 1 \
-  --page-size 1 \
+  --page-size 16 \
   --enable-deterministic-inference
 ```
 
@@ -30,7 +30,7 @@ conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
   --speculative-num-draft-tokens 16 \
   --speculative-eagle-topk 1 \
   --speculative-dvr-chunk-boundary-verify \
-  --page-size 1 \
+  --page-size 16 \
   --linear-attn-backend triton \
   --enable-deterministic-inference
 ```
@@ -41,12 +41,12 @@ server-args postprocessing fixes the state-related settings required by DVR:
 `--mamba-ssm-dtype float32`. Passing them explicitly is still fine, but not
 required.
 
-Keep `--page-size 1` for DVR for now. Although the verify path uses a fixed
-`FLA_CHUNK_SIZE + speculative_num_draft_tokens` physical window, page-size 16
-currently makes the actual KV/cache rows shorter than the fixed window
-(`73` vs `80` in the local Qwen3 test), causing both CUDA graph replay and
-no-graph KV writes to fail. This is a physical window / paged-slot integration
-limitation, not an attention causality limitation.
+For DVR chunk-boundary verify, `page_size > 1` is supported when it divides both
+`FLA_CHUNK_SIZE` and `speculative_num_draft_tokens`. The locally validated
+configuration is `FLA_CHUNK_SIZE=64`, `speculative_num_draft_tokens=16`, and
+`--page-size 16`. Other page sizes fall back to `1` unless they satisfy the same
+alignment rule. This is an attention-KV paging constraint; the GDN/Mamba
+checkpoint interval still follows `FLA_CHUNK_SIZE`.
 
 `SGLANG_RETURN_ORIGINAL_LOGPROB=True` is needed by the strict-KL oracle because
 the test compares returned generation logprobs with a full-prefill scoring pass.
@@ -78,7 +78,8 @@ conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
   --speculative-num-steps 15 \
   --speculative-num-draft-tokens 16 \
   --speculative-eagle-topk 1 \
-  --page-size 1 \
+  --speculative-dvr-chunk-boundary-verify \
+  --page-size 16 \
   --mem-fraction-static 0.45 \
   --attention-backend triton \
   --sampling-backend pytorch \

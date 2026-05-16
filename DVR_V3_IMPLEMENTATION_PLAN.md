@@ -64,7 +64,8 @@ Implementation:
 - Make `create_worker()` return `DecodeVerifyRollbackWorker`.
 - Reject overlap scheduling for DVR initially.
 - Require:
-  - `page_size == 1`
+  - `page_size == 1`, or an aligned paged configuration where `page_size`
+    divides both `FLA_CHUNK_SIZE` and `speculative_num_draft_tokens`
   - `speculative_eagle_topk == 1`
   - self-model draft only
 - Do not add a separate deterministic inference override. DVR launch examples
@@ -467,4 +468,3 @@ Before touching GDN optimization, these must already pass:
   keep state indices and write destinations explicit.
 - Radix/prefix cache must stay enabled eventually for RLVR speed; do not solve
   state bugs by permanently disabling radix cache.
-

@@ -128,17 +128,16 @@ behavior-neutral, and independently testable.
 - Parameter postprocessing follow-up
   - DVR chunk-boundary verify now auto-fixes GDN/Mamba state settings to
     `extra_buffer`, `mamba_track_interval=64`, and `mamba_ssm_dtype=float32`.
-  - Tested `page_size=16` on Qwen3 attention-only DVR chunk verify. It still
-    fails with a fixed-window row mismatch (`73` actual rows vs `80` graph/KV
-    rows) in both CUDA graph and no-graph paths, so DVR continues to force
-    `page_size=1` for now.
-  - Validation after forcing `page_size=1` in server-args postprocessing:
+- Page-size follow-up
+  - DVR chunk-boundary verify now supports `page_size=16` for the aligned
+    `FLA_CHUNK_SIZE=64`, `speculative_num_draft_tokens=16`, `topk=1` case.
+  - Draft KV allocation follows EAGLE's topk=1 paged extend layout. Fixed-window
+    padding uses the already-owned page tail after the last real draft token and
+    frees only padding-only pages.
+  - Validation with `page_size=16`:
     - `py_compile` for `server_args.py` and `dvr_worker.py`.
     - `git diff --check`.
-    - Qwen3 attention-only graph, launched with `--page-size 16` and auto-fixed
-      to `1`, bs=2 lengths `17,65,129`: strict KL=0.
-    - Qwen3.5/GDN graph, launched without explicit mamba state flags and with
-      `--page-size 16`, auto-fixed to required settings, bs=2 lengths
-      `65,129,257`: strict KL=0.
-    - Qwen3.5/GDN no-graph with the same auto-fixed launch settings, bs=2
-      lengths `65,129,257`: strict KL=0.
+    - Qwen3 attention-only no-graph, bs=2 lengths `17,65,129`: strict KL=0.
+    - Qwen3 attention-only graph, bs=2 lengths `17,65,129`: strict KL=0.
+    - Qwen3.5/GDN graph, bs=2 lengths `65,129,257`: strict KL=0.
+    - Qwen3.5/GDN no-graph, bs=2 lengths `65,129,257`: strict KL=0.
