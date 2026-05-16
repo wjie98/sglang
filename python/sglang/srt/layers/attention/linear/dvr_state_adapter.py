@@ -1,9 +1,10 @@
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.attention.linear.dvr_state_ops import DVRStateOps
 
 
 @dataclass(frozen=True)
@@ -32,67 +33,6 @@ class DVRGatedForwardContext:
     @property
     def spec_info(self):
         return self.forward_batch.spec_info
-
-
-@dataclass
-class DVRStateKernels:
-    """Linear-state operators used by DVR verification."""
-
-    chunk_scan: Optional[Callable] = None
-    recurrent_state: Optional[Callable] = None
-    chunk_size: int = FLA_CHUNK_SIZE
-
-    def set_ops(self, *, chunk_scan: Callable, recurrent_state: Callable):
-        self.chunk_scan = chunk_scan
-        self.recurrent_state = recurrent_state
-
-    def scan_chunkwise(
-        self,
-        *,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        ssm_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: Optional[torch.Tensor],
-        **kwargs,
-    ) -> tuple:
-        assert self.chunk_scan is not None
-        return self.chunk_scan(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            **kwargs,
-        )
-
-    def rebuild_recurrent_state(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        *,
-        initial_state: torch.Tensor,
-        token_count: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        assert self.recurrent_state is not None
-        return self.recurrent_state(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state=initial_state,
-            token_count=token_count,
-        )
 
 
 @dataclass(frozen=True)
@@ -508,7 +448,7 @@ def select_dvr_draft_suffix(
 
 def run_dvr_chunkwise_verify(
     *,
-    state_ops: DVRStateKernels,
+    state_ops: DVRStateOps,
     state_window: DVRStateInputWindow,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -592,7 +532,7 @@ def run_dvr_chunkwise_verify(
 
 def rebuild_dvr_live_state_grouped(
     *,
-    state_ops: DVRStateKernels,
+    state_ops: DVRStateOps,
     state_window: DVRStateInputWindow,
     temporal_state: torch.Tensor,
     live_indices: torch.Tensor,
@@ -666,7 +606,7 @@ class DVRGatedStateAdapter:
     so a model backend can opt in through a small set of calls.
     """
 
-    kernels: DVRStateKernels
+    ops: DVRStateOps
     chunk_size: int = FLA_CHUNK_SIZE
 
     def has_window(self, state_cache) -> bool:
@@ -748,7 +688,6 @@ class DVRGatedStateAdapter:
         self,
         *,
         context: DVRGatedForwardContext,
-        conv_fn: Callable,
         mixed_qkv: torch.Tensor,
         has_initial_states: torch.Tensor,
     ) -> Optional[torch.Tensor]:
@@ -768,7 +707,7 @@ class DVRGatedStateAdapter:
         ).transpose(1, 2)
         dvr_indices = context.cache_indices[:batch_size].to(torch.long)
         initial_conv_windows = context.conv_states[dvr_indices].clone()
-        mixed_qkv = conv_fn(
+        mixed_qkv = self.ops.run_verify_conv(
             mixed_qkv_linear.transpose(0, 1),
             context.layer.conv_weights,
             context.layer.bias,
@@ -814,7 +753,7 @@ class DVRGatedStateAdapter:
             seq_len=context.seq_len, spec_info=context.spec_info
         )
         return run_dvr_chunkwise_verify(
-            state_ops=self.kernels,
+            state_ops=self.ops,
             state_window=DVRStateInputWindow.from_cache(context.state_cache),
             q=q,
             k=k,
@@ -844,7 +783,6 @@ class DVRGatedStateAdapter:
         self,
         *,
         state_cache,
-        state_scatter: Callable,
         live_indices: torch.Tensor,
         boundary_indices: torch.Tensor,
         verified_tail_lens: torch.Tensor,
@@ -864,7 +802,7 @@ class DVRGatedStateAdapter:
         crossing = commit_plan.crossing
 
         rebuild_dvr_live_state_grouped(
-            state_ops=self.kernels,
+            state_ops=self.ops,
             state_window=state_window,
             temporal_state=state_cache.temporal,
             live_indices=live_indices,
@@ -873,7 +811,7 @@ class DVRGatedStateAdapter:
             token_count=commit_plan.pos_after[~crossing],
         )
 
-        state_scatter(
+        self.ops.scatter_state(
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
             live_indices,
@@ -891,13 +829,13 @@ class DVRGatedStateAdapter:
                 torch.full_like(commit_plan.pos_before, boundary_state_step),
                 torch.full_like(commit_plan.pos_before, -1),
             )
-            state_scatter(
+            self.ops.scatter_state(
                 state_cache.temporal,
                 state_cache.intermediate_ssm,
                 boundary_indices,
                 commit_step,
             )
-            state_scatter(
+            self.ops.scatter_state(
                 state_cache.conv[0],
                 state_cache.intermediate_conv_window[0],
                 boundary_indices,
@@ -913,7 +851,7 @@ class DVRGatedStateAdapter:
                 chunk_size=self.chunk_size,
             )
             rebuild_dvr_live_state_grouped(
-                state_ops=self.kernels,
+                state_ops=self.ops,
                 state_window=state_window,
                 temporal_state=state_cache.temporal,
                 live_indices=live_indices,

@@ -4,44 +4,11 @@ import torch
 
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
-    fused_recurrent_gated_delta_rule_update,
 )
-
-
-def rebuild_varlen(q, k, v, g, beta, initial_state, token_count):
-    max_count = q.shape[1]
-    row_mask = (
-        torch.arange(max_count, device=q.device, dtype=torch.long).unsqueeze(0)
-        < token_count.unsqueeze(1)
-    )
-    row_idx, col_idx = row_mask.nonzero(as_tuple=True)
-    q_packed = q[row_idx, col_idx].unsqueeze(0).contiguous()
-    k_packed = k[row_idx, col_idx].unsqueeze(0).contiguous()
-    v_packed = v[row_idx, col_idx].unsqueeze(0).contiguous()
-    g_packed = g[row_idx, col_idx].unsqueeze(0).contiguous()
-    beta_packed = beta[row_idx, col_idx].unsqueeze(0).contiguous()
-    cu_seqlens = torch.empty(
-        token_count.shape[0] + 1, dtype=torch.int32, device=q.device
-    )
-    cu_seqlens[0] = 0
-    cu_seqlens[1:] = torch.cumsum(token_count.to(torch.int32), dim=0)
-    state_indices = torch.arange(token_count.shape[0], dtype=torch.int32, device=q.device)
-    final_state = initial_state.clone()
-    fused_recurrent_gated_delta_rule_update(
-        q=q_packed,
-        k=k_packed,
-        v=v_packed,
-        g=g_packed,
-        beta=beta_packed,
-        initial_state_source=final_state,
-        initial_state_indices=state_indices,
-        cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=True,
-        disable_state_update=False,
-        disable_output_calculation=True,
-        intermediate_state_indices=state_indices,
-    )
-    return final_state
+from sglang.srt.layers.attention.linear.dvr_state_ops import (
+    rebuild_gdn_state_from_qkvg_beta,
+    rebuild_gdn_state_from_qkvg_beta_triton,
+)
 
 
 def rebuild_reference(q, k, v, g, beta, initial_state, token_count):
@@ -89,12 +56,22 @@ def main():
     )
     token_count = torch.tensor([0, 1, 2, 3, 5, 8, 13, 16], dtype=torch.long, device=args.device)
 
-    actual = rebuild_varlen(q, k, v, g, beta, initial_state, token_count)
+    actual = rebuild_gdn_state_from_qkvg_beta(
+        q, k, v, g, beta, initial_state=initial_state, token_count=token_count
+    )
     expected = rebuild_reference(q, k, v, g, beta, initial_state, token_count)
     max_diff = (actual - expected).abs().max().item()
-    print(f"max_diff={max_diff}")
+    triton_actual = rebuild_gdn_state_from_qkvg_beta_triton(
+        q, k, v, g, beta, initial_state=initial_state, token_count=token_count
+    )
+    triton_max_diff = (triton_actual - actual).abs().max().item()
+    print(f"max_diff={max_diff} triton_max_diff={triton_max_diff}")
     if max_diff != 0.0:
         raise SystemExit(f"DVR recurrent rebuild mismatch: max_diff={max_diff}")
+    if triton_max_diff != 0.0:
+        raise SystemExit(
+            f"DVR triton recurrent rebuild mismatch: max_diff={triton_max_diff}"
+        )
 
 
 if __name__ == "__main__":

@@ -4,10 +4,8 @@ import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.dvr_state_adapter import (
-    DVRGatedStateAdapter,
-    DVRStateKernels,
-)
+from sglang.srt.layers.attention.linear.dvr_state_adapter import DVRGatedStateAdapter
+from sglang.srt.layers.attention.linear.dvr_state_ops import DVRStateOps
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -31,10 +29,6 @@ from sglang.srt.utils.common import rank0_log
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
-    )
-    from sglang.srt.layers.attention.fla.fused_recurrent import (
-        fused_recurrent_gated_delta_rule,
-        fused_recurrent_gated_delta_rule_update,
     )
 else:
     FLA_CHUNK_SIZE = 64
@@ -250,100 +244,6 @@ class GDNKernelDispatcher:
             **kwargs,
         )
 
-    def recurrent_state_from_qkvg_beta(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        *,
-        initial_state: torch.Tensor,
-        token_count: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        if is_cpu():
-            raise NotImplementedError("DVR GDN recurrent post-verify is GPU-only.")
-
-        if token_count is None:
-            _, final_state = fused_recurrent_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-            return final_state.to(initial_state.dtype, copy=False)
-
-        if isinstance(token_count, int):
-            token_count = torch.full(
-                (q.shape[0],), token_count, dtype=torch.long, device=q.device
-            )
-        token_count = token_count.to(device=q.device, dtype=torch.long)
-        if torch.all(token_count == token_count[0]):
-            end = int(token_count[0].item())
-            if end == 0:
-                return initial_state
-            _, final_state = fused_recurrent_gated_delta_rule(
-                q=q[:, :end],
-                k=k[:, :end],
-                v=v[:, :end],
-                g=g[:, :end],
-                beta=beta[:, :end],
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-            return final_state.to(initial_state.dtype, copy=False)
-
-        max_count = q.shape[1]
-        if torch.any(token_count < 0).item() or torch.any(token_count > max_count).item():
-            raise RuntimeError(
-                "Invalid DVR GDN recurrent rebuild length: "
-                f"token_count={token_count.tolist()}, max_count={max_count}."
-            )
-
-        total_tokens = int(token_count.sum().item())
-        if total_tokens == 0:
-            return initial_state
-
-        row_mask = (
-            torch.arange(max_count, device=q.device, dtype=torch.long).unsqueeze(0)
-            < token_count.unsqueeze(1)
-        )
-        row_idx, col_idx = row_mask.nonzero(as_tuple=True)
-        q_packed = q[row_idx, col_idx].unsqueeze(0).contiguous()
-        k_packed = k[row_idx, col_idx].unsqueeze(0).contiguous()
-        v_packed = v[row_idx, col_idx].unsqueeze(0).contiguous()
-        g_packed = g[row_idx, col_idx].unsqueeze(0).contiguous()
-        beta_packed = beta[row_idx, col_idx].unsqueeze(0).contiguous()
-        cu_seqlens = torch.empty(
-            token_count.shape[0] + 1, dtype=torch.int32, device=q.device
-        )
-        cu_seqlens[0] = 0
-        cu_seqlens[1:] = torch.cumsum(token_count.to(torch.int32), dim=0)
-        state_indices = torch.arange(
-            token_count.shape[0], dtype=torch.int32, device=q.device
-        )
-        final_state = initial_state.clone()
-        fused_recurrent_gated_delta_rule_update(
-            q=q_packed,
-            k=k_packed,
-            v=v_packed,
-            g=g_packed,
-            beta=beta_packed,
-            initial_state_source=final_state,
-            initial_state_indices=state_indices,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=True,
-            disable_state_update=False,
-            disable_output_calculation=True,
-            intermediate_state_indices=state_indices,
-        )
-        return final_state.to(initial_state.dtype, copy=False)
-
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
@@ -361,9 +261,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
         self.dvr_state_adapter = DVRGatedStateAdapter(
-            DVRStateKernels(
-                chunk_scan=self.kernel_dispatcher.extend,
-                recurrent_state=self.kernel_dispatcher.recurrent_state_from_qkvg_beta,
+            DVRStateOps.for_gdn(
+                self.kernel_dispatcher,
+                verify_conv=causal_conv1d_fn,
+                state_scatter=fused_mamba_state_scatter_with_mask,
             )
         )
 
@@ -385,7 +286,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return self.dvr_state_adapter.commit_after_verify(
             state_cache=self.req_to_token_pool.get_speculative_mamba2_params_all_layers(),
-            state_scatter=fused_mamba_state_scatter_with_mask,
             live_indices=live_indices,
             boundary_indices=boundary_indices,
             verified_tail_lens=verified_tail_lens,
@@ -517,7 +417,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             dvr_mixed_qkv = self.dvr_state_adapter.maybe_process_target_verify_conv(
                 context=dvr_context,
-                conv_fn=causal_conv1d_fn,
                 mixed_qkv=mixed_qkv,
                 has_initial_states=has_initial_states,
             )
