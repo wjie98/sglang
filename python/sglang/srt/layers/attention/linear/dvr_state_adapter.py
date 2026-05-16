@@ -7,8 +7,8 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 
 
 @dataclass
-class MambaDVRFlaOps:
-    """FLA operators DVR needs from a Mamba-like linear attention backend."""
+class DVRLinearStateOps:
+    """Linear-state operators used by DVR verification."""
 
     chunk_scan: Optional[Callable] = None
     recurrent_state: Optional[Callable] = None
@@ -68,7 +68,7 @@ class MambaDVRFlaOps:
 
 
 @dataclass(frozen=True)
-class MambaDVRQKVGBetaCache:
+class DVRGatedStateInputCache:
     q: Optional[torch.Tensor]
     k: Optional[torch.Tensor]
     v: Optional[torch.Tensor]
@@ -179,39 +179,40 @@ class MambaDVRQKVGBetaCache:
                 cache[slots, :length] = cache[slots, start : start + length].clone()
 
 
-def has_dvr_qkvg_beta_cache(mamba_cache) -> bool:
-    """Return whether a Mamba-like cache exposes DVR's q/k/v/g/beta window."""
+def has_dvr_state_input_cache(mamba_cache) -> bool:
+    """Return whether a cache exposes DVR's rolling state-input window."""
 
-    return MambaDVRQKVGBetaCache.from_mamba_cache(mamba_cache).enabled
+    return DVRGatedStateInputCache.from_mamba_cache(mamba_cache).enabled
 
 
-def check_dvr_qkvg_tail_position(
+def check_dvr_state_input_position(
     *,
     pos_before: torch.Tensor,
     pos_after: torch.Tensor,
     accepted_tokens: torch.Tensor,
-    qkvg_capacity: int,
+    state_input_capacity: int,
 ):
     if (
         torch.any(pos_before < 0).item()
         or torch.any(pos_before >= FLA_CHUNK_SIZE).item()
-        or torch.any(pos_after > qkvg_capacity).item()
+        or torch.any(pos_after > state_input_capacity).item()
     ):
         raise RuntimeError(
-            "Invalid DVR GDN qkvg/beta tail position: "
+            "Invalid DVR GDN state-input tail position: "
             f"pos_before={pos_before.tolist()}, "
             f"accepted_tokens={accepted_tokens.tolist()}, "
-            f"capacity={qkvg_capacity}, chunk_size={FLA_CHUNK_SIZE}."
+            f"capacity={state_input_capacity}, chunk_size={FLA_CHUNK_SIZE}."
         )
 
 
-def check_dvr_accepted_state_steps(
-    *, accepted_state_steps: torch.Tensor, qkvg_capacity: int
+def check_dvr_state_steps(
+    *, accepted_state_steps: torch.Tensor, state_input_capacity: int
 ):
-    if torch.any(accepted_state_steps >= qkvg_capacity).item():
+    if torch.any(accepted_state_steps >= state_input_capacity).item():
         raise RuntimeError(
             "Invalid DVR GDN accepted state step: "
-            f"steps={accepted_state_steps.tolist()}, capacity={qkvg_capacity}."
+            f"steps={accepted_state_steps.tolist()}, "
+            f"capacity={state_input_capacity}."
         )
 
 
@@ -345,10 +346,10 @@ def select_dvr_draft_suffix(
     ).contiguous()
 
 
-def rebuild_mamba_dvr_live_state_grouped(
+def rebuild_dvr_live_state_grouped(
     *,
-    fla_ops: MambaDVRFlaOps,
-    qkvg_beta_cache: MambaDVRQKVGBetaCache,
+    state_ops: DVRLinearStateOps,
+    state_input_cache: DVRGatedStateInputCache,
     temporal_state: torch.Tensor,
     live_indices: torch.Tensor,
     boundary_indices: torch.Tensor,
@@ -359,7 +360,7 @@ def rebuild_mamba_dvr_live_state_grouped(
 
     The live state is consumed by the next self-draft decode, so it should use
     the recurrent semantics of normal decode. Grouping flattens
-    layers x requests and calls the recurrent FLA kernel once per distinct
+    layers x requests and calls the recurrent state kernel once per distinct
     accepted length instead of once per layer/request.
     """
 
@@ -368,7 +369,7 @@ def rebuild_mamba_dvr_live_state_grouped(
 
     state_live_indices = live_indices[req_indices]
     state_boundary_indices = boundary_indices[req_indices]
-    q_cache, k_cache, v_cache, g_cache, beta_cache = qkvg_beta_cache.tensors()
+    q_cache, k_cache, v_cache, g_cache, beta_cache = state_input_cache.tensors()
     num_layers = temporal_state.shape[0]
     num_reqs = state_live_indices.numel()
     token_count = token_count.to(device=temporal_state.device, dtype=torch.long)
@@ -397,7 +398,7 @@ def rebuild_mamba_dvr_live_state_grouped(
         if count == 0:
             continue
         group = (flat_token_count == count).nonzero(as_tuple=True)[0]
-        rebuilt_state[group] = fla_ops.rebuild_recurrent_state(
+        rebuilt_state[group] = state_ops.rebuild_recurrent_state(
             q[group, :count],
             k[group, :count],
             v[group, :count],
