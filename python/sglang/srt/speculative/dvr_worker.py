@@ -38,7 +38,6 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_nan,
     select_top_k_tokens,
 )
-from sglang.srt.speculative.dvr_utils import dvr_runtime_verify_window
 from sglang.srt.utils import is_cuda, next_power_of_2
 
 if is_cuda():
@@ -48,63 +47,10 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class _GDNFixedVerifyWindowState:
-    input_ids: torch.Tensor
-    out_cache_loc: torch.Tensor
-    seq_lens: torch.Tensor
-    seq_lens_cpu: torch.Tensor
-    seq_lens_sum: int
-    draft_token: torch.Tensor
-    positions: torch.Tensor
-    draft_token_num: int
-    num_tokens_per_req: int
-    spec_seq_lens_cpu: torch.Tensor
-    padding_locs: List[torch.Tensor]
-    verified_tail_lens: torch.Tensor
-
-    @classmethod
-    def capture(cls, batch: ScheduleBatch, spec_info: EagleVerifyInput):
-        return cls(
-            input_ids=batch.input_ids,
-            out_cache_loc=batch.out_cache_loc,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            seq_lens_sum=batch.seq_lens_sum,
-            draft_token=spec_info.draft_token,
-            positions=spec_info.positions,
-            draft_token_num=spec_info.draft_token_num,
-            num_tokens_per_req=spec_info.num_tokens_per_req,
-            spec_seq_lens_cpu=spec_info.seq_lens_cpu,
-            padding_locs=[],
-            verified_tail_lens=torch.empty(0, dtype=torch.long),
-        )
-
-    def restore(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
-        batch.input_ids = self.input_ids
-        batch.out_cache_loc = self.out_cache_loc
-        batch.seq_lens = self.seq_lens
-        batch.seq_lens_cpu = self.seq_lens_cpu
-        batch.seq_lens_sum = self.seq_lens_sum
-        spec_info.draft_token = self.draft_token
-        spec_info.positions = self.positions
-        spec_info.draft_token_num = self.draft_token_num
-        spec_info.num_tokens_per_req = self.num_tokens_per_req
-        spec_info.seq_lens_cpu = self.spec_seq_lens_cpu
-
-
-@dataclass
 class _GDNDVRStateContext:
     mamba_cache: Any
     live_indices: torch.Tensor
     boundary_indices: Optional[torch.Tensor] = None
-
-
-@dataclass
-class _GDNFixedVerifyRequestWindow:
-    input_ids: List[int]
-    out_cache_locs: List[torch.Tensor]
-    boundary_len: int
-    padding_locs: List[torch.Tensor]
 
 
 class DecodeVerifyRollbackWorker:
@@ -170,10 +116,6 @@ class DecodeVerifyRollbackWorker:
         self.max_batch_size = target_worker.max_running_requests
         self.num_draft_steps = server_args.speculative_num_steps
         self.num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_chunk_boundary_verify = (
-            server_args.speculative_dvr_chunk_boundary_verify
-        )
-        self.verify_window_size = FLA_CHUNK_SIZE + self.num_draft_tokens
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
@@ -549,74 +491,6 @@ class DecodeVerifyRollbackWorker:
             boundary_indices=boundary_indices,
         )
 
-    # Fixed physical verify window helpers. For GDN, target verify runs over
-    # verified_tail + draft_token + padding_token, whose physical length is
-    # FLA_CHUNK_SIZE + num_draft_tokens even though only the draft rows are
-    # returned to speculative sampling.
-
-    def _fixed_verify_draft_rows(
-        self, verified_tail_lens: torch.Tensor, device: torch.device
-    ) -> torch.Tensor:
-        verified_tail_lens = verified_tail_lens.to(device=device, dtype=torch.long)
-        row_starts = (
-            torch.arange(
-                verified_tail_lens.shape[0], dtype=torch.long, device=device
-            )
-            * self.verify_window_size
-            + verified_tail_lens
-        )
-        draft_offsets = torch.arange(
-            self.num_draft_tokens, dtype=torch.long, device=device
-        )
-        return (row_starts[:, None] + draft_offsets[None, :]).reshape(-1)
-
-    def _alloc_padding_locs(self, batch: ScheduleBatch, num_tokens: int):
-        if num_tokens == 0:
-            empty = torch.empty(0, dtype=torch.int64, device=self.device)
-            return empty, empty
-        if self.page_size == 1:
-            locs = alloc_token_slots(batch.tree_cache, num_tokens)
-            return locs, locs
-
-        alloc_len = (
-            (num_tokens + self.page_size - 1) // self.page_size
-        ) * self.page_size
-        owned_locs = alloc_token_slots(batch.tree_cache, alloc_len)
-        return owned_locs[:num_tokens], owned_locs
-
-    def _fixed_window_padding_locs(
-        self,
-        batch: ScheduleBatch,
-        last_real_loc: torch.Tensor,
-        num_padding_tokens: int,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if num_padding_tokens == 0:
-            return None, None
-        if self.page_size == 1:
-            return self._alloc_padding_locs(batch, num_padding_tokens)
-
-        last_real_loc_item = int(last_real_loc.item())
-        page_tail_len = self.page_size - ((last_real_loc_item % self.page_size) + 1)
-        reusable_len = min(num_padding_tokens, page_tail_len)
-        pieces = []
-        if reusable_len > 0:
-            pieces.append(
-                torch.arange(
-                    last_real_loc_item + 1,
-                    last_real_loc_item + 1 + reusable_len,
-                    dtype=torch.long,
-                    device=last_real_loc.device,
-                )
-            )
-
-        remaining = num_padding_tokens - reusable_len
-        owned_locs = None
-        if remaining > 0:
-            used_locs, owned_locs = self._alloc_padding_locs(batch, remaining)
-            pieces.append(used_locs)
-
-        return torch.cat(pieces) if len(pieces) > 1 else pieces[0], owned_locs
-
     @staticmethod
     def _gdn_boundary_and_tail(req) -> Tuple[int, int]:
         boundary_seqlen = ((req.seqlen - 1) // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
@@ -760,181 +634,6 @@ class DecodeVerifyRollbackWorker:
                 ctx.boundary_indices, ctx.live_indices
             )
         return ctx
-
-    def _prepare_fixed_verify_window(
-        self,
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-        ctx: Optional[_GDNDVRStateContext] = None,
-    ):
-        if (
-            not self.enable_chunk_boundary_verify
-            or batch.forward_mode.is_idle()
-        ):
-            return None
-
-        bs = batch.batch_size()
-        physical_verify_len = self.verify_window_size
-        logical_draft_len = self.num_draft_tokens
-        original = _GDNFixedVerifyWindowState.capture(batch, spec_info)
-
-        draft_tokens = spec_info.draft_token.reshape(
-            bs, logical_draft_len
-        )
-        draft_cache_locs = batch.out_cache_loc.reshape(
-            bs, logical_draft_len
-        )
-        req_to_token = batch.req_to_token_pool.req_to_token
-        verified_tail_lens = self._chunk_boundary_tail_lens(batch, ctx)
-
-        input_ids: List[int] = []
-        out_cache_locs = []
-        boundary_lens = []
-        padding_locs = []
-        for req_i, req in enumerate(batch.reqs):
-            verified_tail_len = int(verified_tail_lens[req_i].item())
-            req_window = self._build_fixed_verify_req_window(
-                batch=batch,
-                spec_info=spec_info,
-                req_i=req_i,
-                req=req,
-                verified_tail_len=verified_tail_len,
-                draft_tokens=draft_tokens[req_i],
-                draft_cache_locs=draft_cache_locs[req_i],
-                req_to_token=req_to_token,
-                logical_draft_len=logical_draft_len,
-                physical_verify_len=physical_verify_len,
-            )
-            input_ids.extend(req_window.input_ids)
-            out_cache_locs.extend(req_window.out_cache_locs)
-            boundary_lens.append(req_window.boundary_len)
-            padding_locs.extend(req_window.padding_locs)
-
-        batch.input_ids = torch.tensor(
-            input_ids, dtype=torch.long, device=spec_info.draft_token.device
-        )
-        batch.out_cache_loc = torch.cat(out_cache_locs).to(
-            device=spec_info.draft_token.device, dtype=original.out_cache_loc.dtype
-        )
-        batch.seq_lens = torch.tensor(
-            boundary_lens, dtype=original.seq_lens.dtype, device=batch.seq_lens.device
-        )
-        batch.seq_lens_cpu = torch.tensor(
-            boundary_lens,
-            dtype=original.seq_lens_cpu.dtype,
-            device=original.seq_lens_cpu.device,
-        )
-        boundary_lens_gpu = batch.seq_lens.to(
-            device=spec_info.positions.device, dtype=spec_info.positions.dtype
-        )
-        position_offsets = torch.arange(
-            physical_verify_len,
-            dtype=spec_info.positions.dtype,
-            device=spec_info.positions.device,
-        )
-        batch.seq_lens_sum = sum(boundary_lens)
-        spec_info.draft_token = batch.input_ids
-        spec_info.positions = (
-            boundary_lens_gpu[:, None] + position_offsets[None, :]
-        ).reshape(-1)
-        spec_info.draft_token_num = physical_verify_len
-        spec_info.num_tokens_per_req = physical_verify_len
-        spec_info.seq_lens_cpu = batch.seq_lens_cpu
-        if ctx is not None:
-            ctx.mamba_cache.dvr_qkvg_beta_pos[:, ctx.live_indices] = 0
-
-        original.padding_locs.extend(padding_locs)
-        original.verified_tail_lens = verified_tail_lens
-        return original
-
-    def _build_fixed_verify_req_window(
-        self,
-        *,
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-        req_i: int,
-        req,
-        verified_tail_len: int,
-        draft_tokens: torch.Tensor,
-        draft_cache_locs: torch.Tensor,
-        req_to_token: torch.Tensor,
-        logical_draft_len: int,
-        physical_verify_len: int,
-    ) -> _GDNFixedVerifyRequestWindow:
-        boundary = (req.seqlen - 1) - verified_tail_len
-        num_real_tokens = verified_tail_len + logical_draft_len
-        num_padding_tokens = physical_verify_len - num_real_tokens
-        if num_padding_tokens < 0:
-            raise RuntimeError(
-                f"DVR GDN verify window overflow: verified={verified_tail_len}, "
-                f"draft={logical_draft_len}, window={physical_verify_len}."
-            )
-
-        # DVR chunk-boundary target verify uses a graphable fixed window:
-        # verified_tail + draft_token + padding_token. The prompt/extend tail is
-        # treated exactly like already accepted DVR tokens, so the rolling window
-        # has one ownership model from prefill through target verify.
-        all_ids = req.origin_input_ids + req.output_ids
-        input_ids = list(all_ids[boundary : boundary + verified_tail_len])
-        input_ids.extend(draft_tokens.tolist())
-        input_ids.extend([0] * num_padding_tokens)
-
-        out_cache_locs = []
-        if verified_tail_len > 0:
-            out_cache_locs.append(
-                req_to_token[
-                    batch.req_pool_indices[req_i],
-                    boundary : boundary + verified_tail_len,
-                ]
-            )
-        out_cache_locs.append(draft_cache_locs)
-        padding_locs = []
-        if num_padding_tokens > 0:
-            pad_locs, owned_pad_locs = self._fixed_window_padding_locs(
-                batch=batch,
-                last_real_loc=draft_cache_locs[-1],
-                num_padding_tokens=num_padding_tokens,
-            )
-            if owned_pad_locs is not None:
-                padding_locs.append(owned_pad_locs)
-            out_cache_locs.append(pad_locs)
-
-        return _GDNFixedVerifyRequestWindow(
-            input_ids=input_ids,
-            out_cache_locs=out_cache_locs,
-            boundary_len=boundary,
-            padding_locs=padding_locs,
-        )
-
-    def _restore_after_fixed_verify_window(
-        self,
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-        logits_output: LogitsProcessorOutput,
-        fixed_window_state,
-        ctx: Optional[_GDNDVRStateContext] = None,
-    ):
-        if fixed_window_state is None:
-            return
-
-        state: _GDNFixedVerifyWindowState = fixed_window_state
-        keep = self._fixed_verify_draft_rows(
-            state.verified_tail_lens, logits_output.next_token_logits.device
-        )
-        logits_output.next_token_logits = logits_output.next_token_logits[keep]
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[keep]
-
-        state.restore(batch, spec_info)
-
-        if state.padding_locs:
-            self.token_to_kv_pool_allocator.free(torch.cat(state.padding_locs))
-
-        ctx = ctx or self._gdn_state_context(batch)
-        if ctx is not None:
-            self._set_gdn_verified_tail_lens(
-                ctx.mamba_cache, ctx.live_indices, state.verified_tail_lens
-            )
 
     # GDN boundary-state lifecycle. The boundary slot is the deterministic
     # chunk-aligned state used as the next target-verify starting point; the live
@@ -1096,25 +795,18 @@ class DecodeVerifyRollbackWorker:
         )
         batch.spec_info = spec_info
         gdn_ctx = self._restore_gdn_boundary_state_for_verify(batch)
-        fixed_window_state = self._prepare_fixed_verify_window(batch, spec_info, gdn_ctx)
 
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
         )
-        with dvr_runtime_verify_window(
-            self.model_runner.attn_backend, spec_info.num_tokens_per_req
-        ):
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True
-            )
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
         maybe_detect_nan(logits_output.next_token_logits, "dvr target verify")
-        self._restore_after_fixed_verify_window(
-            batch, spec_info, logits_output, fixed_window_state, gdn_ctx
-        )
 
         spec_info.hidden_states = logits_output.hidden_states
         verify_output: EagleVerifyOutput = spec_info.verify(

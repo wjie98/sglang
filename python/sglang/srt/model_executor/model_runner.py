@@ -129,7 +129,6 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     DecodeInputBuffers,
-    get_target_verify_graph_num_tokens_per_bs,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -2227,7 +2226,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise RuntimeError("This should not happen")
             else:
                 capture_forward_mode = ForwardMode.TARGET_VERIFY
-                num_tokens_per_bs = get_target_verify_graph_num_tokens_per_bs(self)
+                num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL

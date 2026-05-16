@@ -42,7 +42,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -95,21 +94,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
-
-
-def get_target_verify_graph_num_tokens_per_bs(model_runner: "ModelRunner") -> int:
-    num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
-    if (
-        model_runner.spec_algorithm.is_decode_verify_rollback()
-        and model_runner.server_args.speculative_dvr_chunk_boundary_verify
-    ):
-        # DVR's logical SPS step still verifies only the draft suffix, but the
-        # physical target-verify forward is a chunk-aligned
-        # verified_token + draft_token + padding_token window. CUDA graph input
-        # buffers must be captured with that physical length, otherwise replay
-        # cannot copy the runtime 64+draft tensors into 16-token graph buffers.
-        num_tokens_per_bs += FLA_CHUNK_SIZE
-    return num_tokens_per_bs
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -568,8 +552,8 @@ class CudaGraphRunner:
                 raise RuntimeError("This should not happen")
             else:
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = get_target_verify_graph_num_tokens_per_bs(
-                    self.model_runner
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_num_draft_tokens
                 )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
@@ -994,26 +978,24 @@ class CudaGraphRunner:
         # Attention backend
         from sglang.srt.speculative.dvr_utils import (
             dvr_causal_verify_cuda_graph_metadata,
-            dvr_runtime_verify_window,
         )
 
-        with dvr_runtime_verify_window(attn_backend, self.num_tokens_per_bs):
-            with dvr_causal_verify_cuda_graph_metadata(
-                self.model_runner,
-                attn_backend,
+        with dvr_causal_verify_cuda_graph_metadata(
+            self.model_runner,
+            attn_backend,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+            self.buffers.custom_mask,
+        ):
+            attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
                 forward_batch.forward_mode,
                 forward_batch.spec_info,
-                self.buffers.custom_mask,
-            ):
-                attn_backend.init_forward_metadata_capture_cuda_graph(
-                    bs,
-                    num_tokens,
-                    req_pool_indices,
-                    seq_lens,
-                    encoder_lens,
-                    forward_batch.forward_mode,
-                    forward_batch.spec_info,
-                )
+            )
 
         # Run and capture
         def run_once():
@@ -1043,23 +1025,19 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
-        def run_once_with_dvr_window():
-            with dvr_runtime_verify_window(attn_backend, self.num_tokens_per_bs):
-                return run_once()
-
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
-            run_once_with_dvr_window()
+            run_once()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
         out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once_with_dvr_window
+            graph, get_global_graph_memory_pool(), stream, run_once
         )
 
         return graph, out

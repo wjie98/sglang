@@ -48,31 +48,3 @@ def dvr_causal_verify_cuda_graph_metadata(
                     metadata.custom_mask = None
                 if hasattr(metadata, "mask_indptr"):
                     metadata.mask_indptr = None
-
-
-@contextmanager
-def dvr_runtime_verify_window(attn_backend, num_verify_tokens: int):
-    """Temporarily make full-attention target verify use DVR's fixed window.
-
-    GDN DVR verifies a `CHUNK_SIZE + num_draft_tokens` linear window, while the
-    generic speculative attention backends cache their CLI draft length on the
-    backend object. Keep that generic code untouched and locally override only
-    the full-attention backend for this DVR verify forward.
-    """
-
-    backend = getattr(attn_backend, "full_attn_backend", attn_backend)
-    old_num_draft_tokens = getattr(backend, "num_draft_tokens", None)
-    old_speculative_num_draft_tokens = getattr(
-        backend, "speculative_num_draft_tokens", None
-    )
-    try:
-        if old_num_draft_tokens is not None:
-            backend.num_draft_tokens = num_verify_tokens
-        if old_speculative_num_draft_tokens is not None:
-            backend.speculative_num_draft_tokens = num_verify_tokens
-        yield
-    finally:
-        if old_num_draft_tokens is not None:
-            backend.num_draft_tokens = old_num_draft_tokens
-        if old_speculative_num_draft_tokens is not None:
-            backend.speculative_num_draft_tokens = old_speculative_num_draft_tokens
