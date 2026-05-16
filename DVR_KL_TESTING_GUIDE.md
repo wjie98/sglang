@@ -211,6 +211,12 @@ full-prefill oracle.
 
 ## Suggested Coverage
 
+The reusable batch oracle script lives at:
+
+```bash
+test/srt/test_dvr_batch_kl.py
+```
+
 Run both single-request and batched cases:
 
 - `bs=1`, `max_new_tokens`: `1, 8, 16, 20, 63, 64, 80, 128`
