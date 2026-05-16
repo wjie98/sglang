@@ -2221,9 +2221,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        # Speculative target verification, including DVR, warms/captures a
-        # multi-row TARGET_VERIFY graph rather than the normal decode graph.
-        if self.spec_algorithm.uses_target_verify_forward():
+        if (
+            self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_standalone()
+            or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_decode_verify_rollback()
+        ):
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -2370,9 +2373,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         retrive_cum_len=None,
                         spec_steps=self.server_args.speculative_num_steps,
                         topk=self.server_args.speculative_eagle_topk,
-                        # Use the graph row count selected above so DVR capture
-                        # and replay agree after padding.
-                        draft_token_num=num_tokens_per_bs,
+                        draft_token_num=self.server_args.speculative_num_draft_tokens,
                         capture_hidden_mode=CaptureHiddenMode.FULL,
                         seq_lens_sum=None,
                         seq_lens_cpu=None,

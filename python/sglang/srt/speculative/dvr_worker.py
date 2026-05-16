@@ -23,6 +23,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dvr_draft_cuda_graph_runner import (
+    DVRDraftDecodeCudaGraphRunner,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -127,6 +130,9 @@ class DecodeVerifyRollbackWorker:
         self._gdn_boundary_track_idx = {}
         self._gdn_boundary_backup = None
         self._gdn_live_backup = None
+        self.cuda_graph_runner_for_draft_decode = None
+        if not server_args.disable_cuda_graph:
+            self.cuda_graph_runner_for_draft_decode = DVRDraftDecodeCudaGraphRunner(self)
 
         logger.info(
             "Initialized DVR self-decode worker: num_steps=%s, num_draft_tokens=%s",
@@ -399,7 +405,7 @@ class DecodeVerifyRollbackWorker:
             forward_batch.seq_lens = origin_seq_lens + i + 1
             forward_batch.seq_lens_cpu = origin_seq_lens_cpu + i + 1
             forward_batch.seq_lens_sum = int(forward_batch.seq_lens.sum().item())
-            logits_output = self.model_runner.forward(forward_batch).logits_output
+            logits_output = self._draft_decode_forward(forward_batch)
             maybe_detect_nan(logits_output.next_token_logits, f"dvr draft step {i}")
 
             if not forward_batch.sampling_info.is_all_greedy:
@@ -431,6 +437,17 @@ class DecodeVerifyRollbackWorker:
             torch.stack(draft_probs_list, dim=1) if draft_probs_list else None
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
+
+    def _draft_decode_forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        can_cuda_graph = (
+            self.cuda_graph_runner_for_draft_decode is not None
+            and self.cuda_graph_runner_for_draft_decode.can_run(forward_batch)
+        )
+        if can_cuda_graph:
+            return self.cuda_graph_runner_for_draft_decode.replay(forward_batch)
+
+        forward_batch.can_run_dp_cuda_graph = False
+        return self.model_runner.forward(forward_batch).logits_output
 
     def get_draft_probs(
         self, forward_batch: ForwardBatch, logits: torch.Tensor

@@ -50,14 +50,6 @@ class SpeculativeAlgorithm(Enum):
     def is_decode_verify_rollback(self) -> bool:
         return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
 
-    def uses_target_verify_forward(self) -> bool:
-        return (
-            self.is_eagle()
-            or self.is_standalone()
-            or self.is_ngram()
-            or self.is_decode_verify_rollback()
-        )
-
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 

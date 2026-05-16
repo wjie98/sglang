@@ -65,6 +65,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.speculative.dvr_utils import dvr_causal_verify_cuda_graph_metadata
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -547,10 +548,12 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        # EAGLE/NGRAM/DVR all replay a target-verify forward instead of a
-        # one-token decode graph. DVR is topk=1, but its verify graph still has
-        # `speculative_num_draft_tokens` rows per request.
-        if model_runner.spec_algorithm.uses_target_verify_forward():
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_decode_verify_rollback()
+        ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
             else:
@@ -665,9 +668,9 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
-        # A decode graph and a target-verify graph can have the same batch size
-        # but incompatible metadata and token shape. Reject mode mismatches
-        # before checking batch-size support.
+        # CUDA graph replay must use the same forward mode as capture. Different
+        # modes may share the same bs but have incompatible metadata and token
+        # shapes, e.g. DVR draft DECODE vs target TARGET_VERIFY.
         if forward_batch.forward_mode != self.capture_forward_mode:
             return False
         if self.require_mlp_tp_gather:
@@ -984,10 +987,6 @@ class CudaGraphRunner:
         # Attention backend. DVR chain verify is causal, but cuda-graph metadata
         # construction may still require a temporary custom-mask buffer for
         # shape bookkeeping. The context clears it before capture uses metadata.
-        from sglang.srt.speculative.dvr_utils import (
-            dvr_causal_verify_cuda_graph_metadata,
-        )
-
         with dvr_causal_verify_cuda_graph_metadata(
             self.model_runner,
             attn_backend,
@@ -1137,10 +1136,6 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
-        from sglang.srt.speculative.dvr_utils import (
-            dvr_causal_verify_cuda_graph_metadata,
-        )
-
         with dvr_causal_verify_cuda_graph_metadata(
             self.model_runner,
             attn_backend,
@@ -1215,9 +1210,12 @@ class CudaGraphRunner:
     def get_spec_info(self, num_tokens: int):
         spec_info = None
         if (
-            self.model_runner.spec_algorithm.is_eagle()
-            or self.model_runner.spec_algorithm.is_standalone()
-            or self.model_runner.spec_algorithm.is_decode_verify_rollback()
+            self.capture_forward_mode.is_target_verify()
+            and (
+                self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_decode_verify_rollback()
+            )
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -1234,9 +1232,7 @@ class CudaGraphRunner:
                     retrive_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
-                    # For DVR the graph is captured with the actual verify row
-                    # count, not necessarily the raw server arg after padding.
-                    draft_token_num=self.num_tokens_per_bs,
+                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
