@@ -492,13 +492,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         conv_source = torch.cat([initial_conv_windows, mixed_qkv_reshaped], dim=2)
         state_len = initial_conv_windows.shape[-1]
-        conv_windows = torch.stack(
-            [
-                conv_source[:, :, step + 1 : step + 1 + state_len]
-                for step in range(verify_window_size)
-            ],
-            dim=1,
-        )
+        conv_windows = conv_source.unfold(
+            dimension=2, size=state_len, step=1
+        )[:, :, 1 : verify_window_size + 1].transpose(1, 2)
         intermediate_conv_window_cache[
             intermediate_state_indices[:batch_size].to(torch.long)
         ] = conv_windows
