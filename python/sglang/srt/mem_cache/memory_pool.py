@@ -203,6 +203,32 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
+                if name == "conv":
+                    kwargs[name] = [conv[layer] for conv in v]
+                else:
+                    kwargs[name] = v[layer]
+
+            return type(self)(**kwargs)
+
+        def mem_usage_bytes(self):
+            total = 0
+            for f in dataclasses.fields(self):
+                value = getattr(self, f.name)
+                total += get_tensor_size_bytes(value)
+            return total
+
+    @dataclass(frozen=True, kw_only=True)
+    class SpeculativeState(State):
+        intermediate_ssm: torch.Tensor
+        intermediate_conv_window: List[torch.Tensor]
+        dvr_state_inputs: Optional[Any] = None
+
+        def at_layer_idx(self, layer: int):
+            kwargs = {}
+            # Use fields instead of vars to avoid torch.compile graph break
+            for f in fields(self):
+                name = f.name
+                v = getattr(self, name)
                 if v is None:
                     kwargs[name] = None
                     continue
@@ -224,12 +250,6 @@ class MambaPool:
                 else:
                     total += get_tensor_size_bytes(value)
             return total
-
-    @dataclass(frozen=True, kw_only=True)
-    class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
-        intermediate_conv_window: List[torch.Tensor]
-        dvr_state_inputs: Optional[Any] = None
 
     def __init__(
         self,
