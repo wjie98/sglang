@@ -203,7 +203,7 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
-                if name == "conv":
+                if name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
                 else:
                     kwargs[name] = v[layer]
@@ -211,11 +211,10 @@ class MambaPool:
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
-            total = 0
-            for f in dataclasses.fields(self):
-                value = getattr(self, f.name)
-                total += get_tensor_size_bytes(value)
-            return total
+            return sum(
+                get_tensor_size_bytes(getattr(self, f.name))
+                for f in dataclasses.fields(self)
+            )
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
