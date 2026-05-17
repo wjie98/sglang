@@ -227,15 +227,15 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
-        dvr_q_state_cache: Optional[torch.Tensor] = None
-        dvr_k_state_cache: Optional[torch.Tensor] = None
-        dvr_v_state_cache: Optional[torch.Tensor] = None
-        dvr_g_state_cache: Optional[torch.Tensor] = None
-        dvr_beta_state_cache: Optional[torch.Tensor] = None
-        dvr_qkvg_beta_pos: Optional[torch.Tensor] = None
+        dvr_input_0_cache: Optional[torch.Tensor] = None
+        dvr_input_1_cache: Optional[torch.Tensor] = None
+        dvr_input_2_cache: Optional[torch.Tensor] = None
+        dvr_input_3_cache: Optional[torch.Tensor] = None
+        dvr_input_4_cache: Optional[torch.Tensor] = None
+        dvr_input_pos: Optional[torch.Tensor] = None
 
     @staticmethod
-    def _alloc_dvr_qkvg_beta_cache(
+    def _alloc_dvr_state_input_cache(
         *,
         num_mamba_layers: int,
         size: int,
@@ -244,53 +244,53 @@ class MambaPool:
         conv_dtype: torch.dtype,
         device: str,
     ):
-        dvr_qkvg_beta_cache_len = FLA_CHUNK_SIZE + speculative_num_draft_tokens
-        dvr_q_state_cache = torch.zeros(
+        dvr_state_input_cache_len = FLA_CHUNK_SIZE + speculative_num_draft_tokens
+        dvr_input_0_cache = torch.zeros(
             size=(
                 num_mamba_layers,
                 size + 1,
-                dvr_qkvg_beta_cache_len,
+                dvr_state_input_cache_len,
                 temporal_state_shape[0],
                 temporal_state_shape[1],
             ),
             dtype=conv_dtype,
             device=device,
         )
-        dvr_k_state_cache = torch.zeros_like(dvr_q_state_cache)
-        dvr_v_state_cache = torch.zeros(
+        dvr_input_1_cache = torch.zeros_like(dvr_input_0_cache)
+        dvr_input_2_cache = torch.zeros(
             size=(
                 num_mamba_layers,
                 size + 1,
-                dvr_qkvg_beta_cache_len,
+                dvr_state_input_cache_len,
                 temporal_state_shape[0],
                 temporal_state_shape[2],
             ),
             dtype=conv_dtype,
             device=device,
         )
-        dvr_g_state_cache = torch.zeros(
+        dvr_input_3_cache = torch.zeros(
             size=(
                 num_mamba_layers,
                 size + 1,
-                dvr_qkvg_beta_cache_len,
+                dvr_state_input_cache_len,
                 temporal_state_shape[0],
             ),
             dtype=torch.float32,
             device=device,
         )
-        dvr_beta_state_cache = torch.zeros_like(dvr_g_state_cache)
-        dvr_qkvg_beta_pos = torch.zeros(
+        dvr_input_4_cache = torch.zeros_like(dvr_input_3_cache)
+        dvr_input_pos = torch.zeros(
             size=(num_mamba_layers, size + 1),
             dtype=torch.int32,
             device=device,
         )
         return (
-            dvr_q_state_cache,
-            dvr_k_state_cache,
-            dvr_v_state_cache,
-            dvr_g_state_cache,
-            dvr_beta_state_cache,
-            dvr_qkvg_beta_pos,
+            dvr_input_0_cache,
+            dvr_input_1_cache,
+            dvr_input_2_cache,
+            dvr_input_3_cache,
+            dvr_input_4_cache,
+            dvr_input_pos,
         )
 
     def __init__(
@@ -349,11 +349,11 @@ class MambaPool:
             if speculative_num_draft_tokens is not None:
                 from sglang.srt.server_args import get_global_server_args
 
-                enable_dvr_qkvg_beta_cache = (
+                enable_dvr_state_input_cache = (
                     get_global_server_args().speculative_algorithm
                     == "DECODE_VERIFY_ROLLBACK"
                 )
-                if enable_dvr_qkvg_beta_cache:
+                if enable_dvr_state_input_cache:
                     intermediate_ssm_tokens = 1
                     intermediate_conv_tokens = speculative_num_draft_tokens
                 else:
@@ -389,15 +389,15 @@ class MambaPool:
                     )
                     for conv_shape in conv_state_shape
                 ]
-                if enable_dvr_qkvg_beta_cache:
+                if enable_dvr_state_input_cache:
                     (
-                        dvr_q_state_cache,
-                        dvr_k_state_cache,
-                        dvr_v_state_cache,
-                        dvr_g_state_cache,
-                        dvr_beta_state_cache,
-                        dvr_qkvg_beta_pos,
-                    ) = self._alloc_dvr_qkvg_beta_cache(
+                        dvr_input_0_cache,
+                        dvr_input_1_cache,
+                        dvr_input_2_cache,
+                        dvr_input_3_cache,
+                        dvr_input_4_cache,
+                        dvr_input_pos,
+                    ) = self._alloc_dvr_state_input_cache(
                         num_mamba_layers=num_mamba_layers,
                         size=size,
                         speculative_num_draft_tokens=speculative_num_draft_tokens,
@@ -406,23 +406,23 @@ class MambaPool:
                         device=device,
                     )
                 else:
-                    dvr_q_state_cache = None
-                    dvr_k_state_cache = None
-                    dvr_v_state_cache = None
-                    dvr_g_state_cache = None
-                    dvr_beta_state_cache = None
-                    dvr_qkvg_beta_pos = None
+                    dvr_input_0_cache = None
+                    dvr_input_1_cache = None
+                    dvr_input_2_cache = None
+                    dvr_input_3_cache = None
+                    dvr_input_4_cache = None
+                    dvr_input_pos = None
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
-                    dvr_q_state_cache=dvr_q_state_cache,
-                    dvr_k_state_cache=dvr_k_state_cache,
-                    dvr_v_state_cache=dvr_v_state_cache,
-                    dvr_g_state_cache=dvr_g_state_cache,
-                    dvr_beta_state_cache=dvr_beta_state_cache,
-                    dvr_qkvg_beta_pos=dvr_qkvg_beta_pos,
+                    dvr_input_0_cache=dvr_input_0_cache,
+                    dvr_input_1_cache=dvr_input_1_cache,
+                    dvr_input_2_cache=dvr_input_2_cache,
+                    dvr_input_3_cache=dvr_input_3_cache,
+                    dvr_input_4_cache=dvr_input_4_cache,
+                    dvr_input_pos=dvr_input_pos,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -431,7 +431,7 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                    f"dvr_qkvg_beta_cache size: {sum(get_tensor_size_bytes(t) for t in (dvr_q_state_cache, dvr_k_state_cache, dvr_v_state_cache, dvr_g_state_cache, dvr_beta_state_cache, dvr_qkvg_beta_pos) if t is not None) / GB:.2f}GB "
+                    f"dvr_state_input_cache size: {sum(get_tensor_size_bytes(t) for t in (dvr_input_0_cache, dvr_input_1_cache, dvr_input_2_cache, dvr_input_3_cache, dvr_input_4_cache, dvr_input_pos) if t is not None) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -497,8 +497,8 @@ class MambaPool:
             t.shape[0], need_size, *t.shape[2:]
         )
         t[:, select_index] = z
-        if getattr(self.mamba_cache, "dvr_qkvg_beta_pos", None) is not None:
-            self.mamba_cache.dvr_qkvg_beta_pos[:, select_index] = 0
+        if getattr(self.mamba_cache, "dvr_input_pos", None) is not None:
+            self.mamba_cache.dvr_input_pos[:, select_index] = 0
 
         return select_index
 
@@ -542,12 +542,12 @@ class MambaPool:
             if field in (
                 "intermediate_ssm",
                 "intermediate_conv_window",
-                "dvr_q_state_cache",
-                "dvr_k_state_cache",
-                "dvr_v_state_cache",
-                "dvr_g_state_cache",
-                "dvr_beta_state_cache",
-                "dvr_qkvg_beta_pos",
+                "dvr_input_0_cache",
+                "dvr_input_1_cache",
+                "dvr_input_2_cache",
+                "dvr_input_3_cache",
+                "dvr_input_4_cache",
+                "dvr_input_pos",
             ):
                 continue
             value = getattr(self.mamba_cache, field)
@@ -582,12 +582,12 @@ class MambaPool:
         state_tensors = []
         for field in vars(self.mamba_cache):
             if field in (
-                "dvr_q_state_cache",
-                "dvr_k_state_cache",
-                "dvr_v_state_cache",
-                "dvr_g_state_cache",
-                "dvr_beta_state_cache",
-                "dvr_qkvg_beta_pos",
+                "dvr_input_0_cache",
+                "dvr_input_1_cache",
+                "dvr_input_2_cache",
+                "dvr_input_3_cache",
+                "dvr_input_4_cache",
+                "dvr_input_pos",
             ):
                 continue
             value = getattr(self.mamba_cache, field)

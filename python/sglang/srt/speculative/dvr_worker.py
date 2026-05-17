@@ -519,9 +519,12 @@ class DecodeVerifyRollbackWorker:
     ) -> torch.Tensor:
         ctx = ctx or self._gdn_state_context(batch)
         if ctx is not None:
-            return ctx.mamba_cache.dvr_qkvg_beta_pos[0, ctx.live_indices].to(
-                torch.long
-            )
+            dvr_state_adapter = self._gdn_state_adapter()
+            if dvr_state_adapter is not None:
+                return dvr_state_adapter.tail_lens(
+                    state_cache=ctx.mamba_cache,
+                    live_indices=ctx.live_indices,
+                ).to(torch.long)
         return torch.tensor(
             [self._gdn_boundary_and_tail(req)[1] for req in batch.reqs],
             dtype=torch.long,
@@ -553,12 +556,22 @@ class DecodeVerifyRollbackWorker:
         live_indices: torch.Tensor,
         verified_tail_lens: torch.Tensor,
     ):
-        if getattr(mamba_cache, "dvr_qkvg_beta_pos", None) is None:
+        dvr_state_adapter = self._gdn_state_adapter()
+        if dvr_state_adapter is None:
             return
-        mamba_cache.dvr_qkvg_beta_pos[:, live_indices] = verified_tail_lens.to(
-            device=mamba_cache.dvr_qkvg_beta_pos.device,
-            dtype=mamba_cache.dvr_qkvg_beta_pos.dtype,
-        ).unsqueeze(0)
+        dvr_state_adapter.set_tail_lens(
+            state_cache=mamba_cache,
+            live_indices=live_indices,
+            tail_lens=verified_tail_lens,
+        )
+
+    def _gdn_state_adapter(self):
+        linear_backend = getattr(
+            self.model_runner.attn_backend, "linear_attn_backend", None
+        )
+        if linear_backend is None:
+            return None
+        return getattr(linear_backend, "dvr_state_adapter", None)
 
     def _init_gdn_boundary_for_req(
         self, batch: ScheduleBatch, req, boundary_seqlen: int
@@ -696,17 +709,13 @@ class DecodeVerifyRollbackWorker:
         if accepted_tokens.numel() == 0:
             return
 
-        attn_backend = self.model_runner.attn_backend
-        linear_backend = getattr(attn_backend, "linear_attn_backend", None)
-        if linear_backend is None:
-            return
-        dvr_state_adapter = getattr(linear_backend, "dvr_state_adapter", None)
+        dvr_state_adapter = self._gdn_state_adapter()
         if dvr_state_adapter is None:
             return
         verified_tail_lens = self._chunk_boundary_tail_lens(batch, ctx).to(
             device=ctx.live_indices.device, dtype=torch.long
         )
-        state_cache = linear_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        state_cache = ctx.mamba_cache
         crossing = dvr_state_adapter.commit_after_verify(
             state_cache=state_cache,
             live_indices=ctx.live_indices,
