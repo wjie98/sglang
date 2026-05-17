@@ -32,6 +32,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -241,7 +242,7 @@ class DecodeVerifyRollbackWorker:
         )
 
         batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
         batch.return_hidden_states = False
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
@@ -296,6 +297,7 @@ class DecodeVerifyRollbackWorker:
             self.topk,
             self.num_draft_steps,
             self.num_draft_tokens,
+            tree_mask_mode=TreeMaskMode.QLEN_ONLY,
         )
         draft_tokens = draft_tokens.to(torch.long)
 
@@ -377,7 +379,9 @@ class DecodeVerifyRollbackWorker:
             forward_batch.out_cache_loc = out_cache_loc[i].contiguous()
             forward_batch.seq_lens = origin_seq_lens + i + 1
             forward_batch.seq_lens_cpu = origin_seq_lens_cpu + i + 1
-            forward_batch.seq_lens_sum = int(forward_batch.seq_lens.sum().item())
+            forward_batch.seq_lens_sum = (
+                origin_seq_lens_sum + (i + 1) * forward_batch.batch_size
+            )
             logits_output = self._draft_decode_forward(forward_batch)
             maybe_detect_nan(logits_output.next_token_logits, f"dvr draft step {i}")
 

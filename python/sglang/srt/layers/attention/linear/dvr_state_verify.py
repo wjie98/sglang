@@ -17,62 +17,6 @@ class DVRStateCommitPlan:
     boundary_conv_steps: torch.Tensor
 
 
-def check_dvr_state_input_position(
-    *,
-    pos_before: torch.Tensor,
-    pos_after: torch.Tensor,
-    accepted_tokens: torch.Tensor,
-    window_capacity: int,
-):
-    if (
-        torch.any(pos_before < 0).item()
-        or torch.any(pos_before >= FLA_CHUNK_SIZE).item()
-        or torch.any(pos_after > window_capacity).item()
-    ):
-        raise RuntimeError(
-            "Invalid DVR linear-state input tail position: "
-            f"pos_before={pos_before.tolist()}, "
-            f"accepted_tokens={accepted_tokens.tolist()}, "
-            f"capacity={window_capacity}, chunk_size={FLA_CHUNK_SIZE}."
-        )
-
-
-def check_dvr_state_steps(
-    *, accepted_window_steps: torch.Tensor, window_capacity: int
-):
-    if torch.any(accepted_window_steps >= window_capacity).item():
-        raise RuntimeError(
-            "Invalid DVR linear-state accepted step: "
-            f"steps={accepted_window_steps.tolist()}, "
-            f"capacity={window_capacity}."
-        )
-
-
-def check_dvr_conv_steps(
-    *,
-    accepted_steps: torch.Tensor,
-    boundary_steps: torch.Tensor,
-    crossing: torch.Tensor,
-    conv_capacity: int,
-):
-    if torch.any(accepted_steps >= conv_capacity).item():
-        raise RuntimeError(
-            "Invalid DVR linear-state accepted conv step: "
-            f"steps={accepted_steps.tolist()}, capacity={conv_capacity}."
-        )
-    if crossing.any():
-        crossing_boundary_steps = boundary_steps[crossing]
-        if (
-            torch.any(crossing_boundary_steps < 0).item()
-            or torch.any(crossing_boundary_steps >= conv_capacity).item()
-        ):
-            raise RuntimeError(
-                "Invalid DVR linear-state boundary conv step: "
-                f"steps={crossing_boundary_steps.tolist()}, "
-                f"capacity={conv_capacity}."
-            )
-
-
 def build_dvr_state_commit_plan(
     *,
     verified_tail_lens: torch.Tensor,
@@ -85,25 +29,9 @@ def build_dvr_state_commit_plan(
 ) -> DVRStateCommitPlan:
     pos_before = verified_tail_lens.to(device=device, dtype=torch.long)
     pos_after = pos_before + accepted_tokens
-    check_dvr_state_input_position(
-        pos_before=pos_before,
-        pos_after=pos_after,
-        accepted_tokens=accepted_tokens,
-        window_capacity=window_capacity,
-    )
     crossing = pos_after >= chunk_size
     accepted_window_steps = pos_before + accepted_steps
-    check_dvr_state_steps(
-        accepted_window_steps=accepted_window_steps,
-        window_capacity=window_capacity,
-    )
     boundary_conv_steps = chunk_size - 1 - pos_before
-    check_dvr_conv_steps(
-        accepted_steps=accepted_steps,
-        boundary_steps=boundary_conv_steps,
-        crossing=crossing,
-        conv_capacity=conv_capacity,
-    )
     return DVRStateCommitPlan(
         pos_before=pos_before,
         pos_after=pos_after,
@@ -348,21 +276,15 @@ def rebuild_dvr_live_state_grouped(
         token_count.unsqueeze(0).expand(num_layers, -1).reshape(-1).contiguous()
     )
 
-    rebuilt_state = initial_state.clone()
-    for count in torch.unique(flat_token_count).tolist():
-        count = int(count)
-        if count == 0:
-            continue
-        group = (flat_token_count == count).nonzero(as_tuple=True)[0]
-        rebuilt_state[group] = state_ops.rebuild_recurrent_state(
-            q[group, :count],
-            k[group, :count],
-            v[group, :count],
-            g[group, :count],
-            beta[group, :count],
-            initial_state=initial_state[group],
-            token_count=count,
-        )
+    rebuilt_state = state_ops.rebuild_recurrent_state(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
+        token_count=flat_token_count,
+    )
 
     temporal_state[:, state_live_indices] = rebuilt_state.reshape(
         num_layers, num_reqs, *rebuilt_state.shape[1:]

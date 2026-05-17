@@ -118,11 +118,6 @@ def rebuild_gdn_state_from_qkvg_beta_triton(
 
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[-1]
-    if torch.any(token_count < 0).item() or torch.any(token_count > T).item():
-        raise RuntimeError(
-            "Invalid DVR GDN recurrent rebuild length: "
-            f"token_count={token_count.tolist()}, max_count={T}."
-        )
     BK = triton.next_power_of_2(K)
     BV = min(triton.next_power_of_2(V), 8)
     if triton.cdiv(K, BK) != 1:
@@ -185,33 +180,7 @@ def rebuild_gdn_state_from_qkvg_beta(
             (q.shape[0],), token_count, dtype=torch.long, device=q.device
         )
     token_count = token_count.to(device=q.device, dtype=torch.long)
-    if torch.all(token_count == token_count[0]):
-        end = int(token_count[0].item())
-        if end == 0:
-            return initial_state
-        _, final_state = fused_recurrent_gated_delta_rule(
-            q=q[:, :end],
-            k=k[:, :end],
-            v=v[:, :end],
-            g=g[:, :end],
-            beta=beta[:, :end],
-            initial_state=initial_state,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-        )
-        return final_state.to(initial_state.dtype, copy=False)
-
     max_count = q.shape[1]
-    if torch.any(token_count < 0).item() or torch.any(token_count > max_count).item():
-        raise RuntimeError(
-            "Invalid DVR GDN recurrent rebuild length: "
-            f"token_count={token_count.tolist()}, max_count={max_count}."
-        )
-
-    total_tokens = int(token_count.sum().item())
-    if total_tokens == 0:
-        return initial_state
-
     row_mask = (
         torch.arange(max_count, device=q.device, dtype=torch.long).unsqueeze(0)
         < token_count.unsqueeze(1)

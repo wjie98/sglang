@@ -179,22 +179,29 @@ class DVRStateInputWindow:
         *,
         live_indices: torch.Tensor,
         crossing: torch.Tensor,
-        new_pos: torch.Tensor,
         chunk_size: int = FLA_CHUNK_SIZE,
     ):
-        crossing_idx = crossing.nonzero(as_tuple=True)[0]
-        crossing_slots = live_indices[crossing_idx]
-        if crossing_slots.numel() == 0:
+        tail_capacity = self.capacity - chunk_size
+        if tail_capacity <= 0:
             return
 
-        tail_capacity = self.capacity - chunk_size
-        tail_len = min(int(new_pos[crossing_idx].max().item()), tail_capacity)
-        if tail_len > 0:
-            self.shift_suffix(
-                slots=crossing_slots,
-                start=chunk_size,
-                length=tail_len,
-            )
+        has_layer_dim = self.pos is not None and self.pos.dim() == 2
+        mask = crossing.to(torch.bool)
+        for cache in self.tensors():
+            if has_layer_dim:
+                dst = cache[:, live_indices, :tail_capacity]
+                src = cache[:, live_indices, chunk_size : chunk_size + tail_capacity]
+                mask_shape = (1, -1) + (1,) * (dst.dim() - 2)
+                cache[:, live_indices, :tail_capacity] = torch.where(
+                    mask.view(mask_shape), src, dst
+                )
+            else:
+                dst = cache[live_indices, :tail_capacity]
+                src = cache[live_indices, chunk_size : chunk_size + tail_capacity]
+                mask_shape = (-1,) + (1,) * (dst.dim() - 1)
+                cache[live_indices, :tail_capacity] = torch.where(
+                    mask.view(mask_shape), src, dst
+                )
 
     def write_extend_tail(
         self,
@@ -210,6 +217,7 @@ class DVRStateInputWindow:
         beta: torch.Tensor,
         chunk_size: int = FLA_CHUNK_SIZE,
     ):
+        src_base = 0
         for req_i, (prefix_len, extend_len) in enumerate(
             zip(extend_prefix_lens_cpu, extend_seq_lens_cpu, strict=True)
         ):
@@ -219,14 +227,16 @@ class DVRStateInputWindow:
             dst = cache_indices[req_i].to(torch.long)
             self.set_tail_lens(indices=dst, value=num_verified_tokens)
             if num_verified_tokens == 0:
+                src_base += extend_len
                 continue
 
             write_start = max(prefix_len, boundary)
             write_end = seq_len
             if write_start >= write_end:
+                src_base += extend_len
                 continue
 
-            src_start = int(query_start_loc[req_i].item()) + (write_start - prefix_len)
+            src_start = src_base + (write_start - prefix_len)
             src_end = src_start + (write_end - write_start)
             cols = torch.arange(
                 write_start - boundary,
@@ -243,6 +253,7 @@ class DVRStateInputWindow:
                 g=g[src_start:src_end],
                 beta=beta[src_start:src_end],
             )
+            src_base += extend_len
 
 
 def allocate_dvr_state_input_cache(

@@ -299,16 +299,6 @@ class DVRGatedStateAdapter:
         )
         crossing = commit_plan.crossing
 
-        rebuild_dvr_live_state_grouped(
-            state_ops=self.ops,
-            state_window=state_window,
-            temporal_state=state_cache.temporal,
-            live_indices=live_indices,
-            boundary_indices=boundary_indices,
-            req_indices=(~crossing).nonzero(as_tuple=True)[0],
-            token_count=commit_plan.pos_after[~crossing],
-        )
-
         self.ops.scatter_state(
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
@@ -316,50 +306,48 @@ class DVRGatedStateAdapter:
             accepted_steps,
         )
 
-        if crossing.any():
-            boundary_state_step = (
-                0
-                if state_cache.intermediate_ssm.shape[2] == 1
-                else self.chunk_size - 1
-            )
-            commit_step = torch.where(
-                crossing,
-                torch.full_like(commit_plan.pos_before, boundary_state_step),
-                torch.full_like(commit_plan.pos_before, -1),
-            )
-            self.ops.scatter_state(
-                state_cache.temporal,
-                state_cache.intermediate_ssm,
-                boundary_indices,
-                commit_step,
-            )
-            self.ops.scatter_state(
-                state_cache.conv[0],
-                state_cache.intermediate_conv_window[0],
-                boundary_indices,
-                torch.where(crossing, commit_plan.boundary_conv_steps, commit_step),
-            )
+        boundary_state_step = (
+            0 if state_cache.intermediate_ssm.shape[2] == 1 else self.chunk_size - 1
+        )
+        no_commit_step = torch.full_like(commit_plan.pos_before, -1)
+        commit_step = torch.where(
+            crossing,
+            torch.full_like(commit_plan.pos_before, boundary_state_step),
+            no_commit_step,
+        )
+        self.ops.scatter_state(
+            state_cache.temporal,
+            state_cache.intermediate_ssm,
+            boundary_indices,
+            commit_step,
+        )
+        self.ops.scatter_state(
+            state_cache.conv[0],
+            state_cache.intermediate_conv_window[0],
+            boundary_indices,
+            torch.where(crossing, commit_plan.boundary_conv_steps, no_commit_step),
+        )
 
-            new_pos = commit_plan.pos_after - self.chunk_size
-            crossing_idx = crossing.nonzero(as_tuple=True)[0]
-            state_window.shift_after_boundary(
-                live_indices=live_indices,
-                crossing=crossing,
-                new_pos=new_pos,
-                chunk_size=self.chunk_size,
-            )
-            rebuild_dvr_live_state_grouped(
-                state_ops=self.ops,
-                state_window=state_window,
-                temporal_state=state_cache.temporal,
-                live_indices=live_indices,
-                boundary_indices=boundary_indices,
-                req_indices=crossing_idx,
-                token_count=new_pos[crossing_idx],
-            )
-            pos_after = torch.where(crossing, new_pos, commit_plan.pos_after)
-        else:
-            pos_after = commit_plan.pos_after
+        new_pos = commit_plan.pos_after - self.chunk_size
+        pos_after = torch.where(crossing, new_pos, commit_plan.pos_after)
+        state_window.shift_after_boundary(
+            live_indices=live_indices,
+            crossing=crossing,
+            chunk_size=self.chunk_size,
+        )
+        rebuild_dvr_live_state_grouped(
+            state_ops=self.ops,
+            state_window=state_window,
+            temporal_state=state_cache.temporal,
+            live_indices=live_indices,
+            boundary_indices=boundary_indices,
+            req_indices=torch.arange(
+                live_indices.shape[0],
+                dtype=torch.long,
+                device=live_indices.device,
+            ),
+            token_count=pos_after,
+        )
 
         state_window.set_tail_lens(
             indices=live_indices, value=pos_after.to(torch.int32)
