@@ -447,8 +447,6 @@ class MambaPool:
             ):
                 continue
             value = getattr(self.mamba_cache, field)
-            if value is None:
-                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -482,8 +480,6 @@ class MambaPool:
             ):
                 continue
             value = getattr(self.mamba_cache, field)
-            if value is None:
-                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
