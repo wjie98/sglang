@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
@@ -251,6 +251,58 @@ class DVRStateInputWindow:
                 g=g[src_start:src_end],
                 beta=beta[src_start:src_end],
             )
+
+
+def allocate_dvr_state_input_cache(
+    *,
+    num_layers: int,
+    num_slots: int,
+    num_draft_tokens: int,
+    temporal_state_shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device: str,
+) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """Allocate q/k/v/g/beta scratch inputs used by DVR linear-state adapters."""
+
+    window_len = FLA_CHUNK_SIZE + num_draft_tokens
+    q_input = torch.zeros(
+        size=(
+            num_layers,
+            num_slots,
+            window_len,
+            temporal_state_shape[0],
+            temporal_state_shape[1],
+        ),
+        dtype=dtype,
+        device=device,
+    )
+    state_inputs = [
+        q_input,
+        torch.zeros_like(q_input),
+        torch.zeros(
+            size=(
+                num_layers,
+                num_slots,
+                window_len,
+                temporal_state_shape[0],
+                temporal_state_shape[2],
+            ),
+            dtype=dtype,
+            device=device,
+        ),
+        torch.zeros(
+            size=(num_layers, num_slots, window_len, temporal_state_shape[0]),
+            dtype=torch.float32,
+            device=device,
+        ),
+    ]
+    state_inputs.append(torch.zeros_like(state_inputs[-1]))
+    tail_lens = torch.zeros(
+        size=(num_layers, num_slots),
+        dtype=torch.int32,
+        device=device,
+    )
+    return state_inputs, tail_lens
 
 
 def has_dvr_state_window(state_cache) -> bool:

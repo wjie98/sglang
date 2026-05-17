@@ -99,3 +99,26 @@ Additional validation after this tightening:
   `maxdiff=0.0`, `kl=0.0`, `ALL_OK True`.
 - Qwen3-0.6B cuda graph, `max_new=17,65,129,257`: all cases
   `maxdiff=0.0`, `kl=0.0`, `ALL_OK True`.
+
+## Adapter-Owned Scratch Layout
+
+One remaining leak was that `memory_pool.py` still spelled out the exact
+q/k/v/g/beta scratch tensor shapes. That made the memory pool aware of GDN/DVR
+storage details.
+
+Follow-up cleanup:
+
+- Moved q/k/v/g/beta scratch allocation into
+  `allocate_dvr_state_input_cache(...)` in `dvr_state_adapter.py`.
+- `memory_pool.py` now only decides whether the DVR scratch cache is needed and
+  stores the returned tensors in `SpeculativeState`.
+- `get_global_server_args` is imported at module scope in `memory_pool.py`;
+  the local import inside `MambaPool.__init__` was removed.
+
+Validation:
+
+- `git diff --check` passed.
+- `py_compile` passed for `memory_pool.py`, `dvr_state_adapter.py`, and
+  `dvr_worker.py`.
+- `test/manual/dvr/test_dvr_gdn_recurrent_state.py` returned
+  `max_diff=0.0 triton_max_diff=0.0`.

@@ -45,7 +45,9 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.attention.linear.dvr_state_adapter import (
+    allocate_dvr_state_input_cache,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -55,6 +57,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -280,8 +283,6 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
-                from sglang.srt.server_args import get_global_server_args
-
                 enable_dvr_state_input_cache = (
                     get_global_server_args().speculative_algorithm
                     == "DECODE_VERIFY_ROLLBACK"
@@ -323,48 +324,15 @@ class MambaPool:
                     for conv_shape in conv_state_shape
                 ]
                 if enable_dvr_state_input_cache:
-                    dvr_state_input_len = FLA_CHUNK_SIZE + speculative_num_draft_tokens
-                    dvr_q_input = torch.zeros(
-                        size=(
-                            num_mamba_layers,
-                            size + 1,
-                            dvr_state_input_len,
-                            temporal_state_shape[0],
-                            temporal_state_shape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device=device,
-                    )
-                    dvr_state_inputs = [
-                        dvr_q_input,
-                        torch.zeros_like(dvr_q_input),
-                        torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                size + 1,
-                                dvr_state_input_len,
-                                temporal_state_shape[0],
-                                temporal_state_shape[2],
-                            ),
+                    dvr_state_inputs, dvr_state_input_tail_lens = (
+                        allocate_dvr_state_input_cache(
+                            num_layers=num_mamba_layers,
+                            num_slots=size + 1,
+                            num_draft_tokens=speculative_num_draft_tokens,
+                            temporal_state_shape=temporal_state_shape,
                             dtype=conv_dtype,
                             device=device,
-                        ),
-                        torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                size + 1,
-                                dvr_state_input_len,
-                                temporal_state_shape[0],
-                            ),
-                            dtype=torch.float32,
-                            device=device,
-                        ),
-                    ]
-                    dvr_state_inputs.append(torch.zeros_like(dvr_state_inputs[-1]))
-                    dvr_state_input_tail_lens = torch.zeros(
-                        size=(num_mamba_layers, size + 1),
-                        dtype=torch.int32,
-                        device=device,
+                        )
                     )
                 else:
                     dvr_state_inputs = None
