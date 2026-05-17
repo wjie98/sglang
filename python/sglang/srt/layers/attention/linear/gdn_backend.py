@@ -513,6 +513,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
+            # DVR reuses ordinary extend/prefill q/k/v/g/beta for the
+            # unclosed chunk tail. This is only a cache copy; the recurrent
+            # state update above remains the single source of live state.
             self.dvr_state_adapter.cache_extend_state_inputs_from_forward(
                 layer=layer,
                 forward_batch=forward_batch,
@@ -527,16 +540,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 v=value,
                 g=g,
                 beta=beta,
-            )
-            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
             )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
