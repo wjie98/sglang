@@ -701,6 +701,41 @@ class DVRGatedStateAdapter:
             chunk_size=self.chunk_size,
         )
 
+    def cache_extend_state_inputs_from_forward(
+        self,
+        *,
+        layer,
+        forward_batch,
+        state_cache,
+        cache_indices: torch.Tensor,
+        query_start_loc: Optional[torch.Tensor],
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        seq_len: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ):
+        self.cache_extend_state_inputs(
+            context=self.make_forward_context(
+                layer=layer,
+                forward_batch=forward_batch,
+                state_cache=state_cache,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                seq_len=seq_len,
+            ),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+        )
+
     def process_target_verify_conv(
         self,
         *,
