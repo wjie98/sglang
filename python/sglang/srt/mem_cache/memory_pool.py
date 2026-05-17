@@ -45,7 +45,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.linear.dvr_state_adapter import (
+from sglang.srt.layers.attention.linear.dvr_state_cache import (
     allocate_dvr_state_input_cache,
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz

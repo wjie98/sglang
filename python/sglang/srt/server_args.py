@@ -1056,20 +1056,8 @@ class ServerArgs:
             )
 
     def _handle_dvr_defaults(self):
-        if self.speculative_algorithm != "DECODE_VERIFY_ROLLBACK":
+        if not self._is_dvr_enabled():
             return
-
-        hf_architectures = self.get_model_config().hf_config.architectures or []
-        is_gdn_model = (
-            hf_architectures[0]
-            in [
-                "Qwen3NextForCausalLM",
-                "Qwen3_5MoeForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-            ]
-            if hf_architectures
-            else False
-        )
 
         normalized_page_size = self._normalize_dvr_chunk_page_size(self.page_size)
         if normalized_page_size != self.page_size:
@@ -1083,19 +1071,19 @@ class ServerArgs:
             )
             self.page_size = normalized_page_size
 
-        if not is_gdn_model:
+        if not self._is_dvr_gated_linear_state_model():
             return
 
         if self.mamba_scheduler_strategy != "extra_buffer":
             logger.warning(
-                "DVR for GDN requires mamba extra_buffer "
+                "DVR for gated linear-state models requires mamba extra_buffer "
                 "state tracking. Setting --mamba-scheduler-strategy extra_buffer."
             )
             self.mamba_scheduler_strategy = "extra_buffer"
 
         if self.mamba_track_interval != FLA_CHUNK_SIZE:
             logger.warning(
-                "DVR for GDN requires mamba_track_interval "
+                "DVR for gated linear-state models requires mamba_track_interval "
                 "to match FLA_CHUNK_SIZE=%s. Larger intervals may still be "
                 "chunk-size multiples, but the current extra_buffer prefill path "
                 "keeps only one tracked checkpoint and can miss the first "
@@ -1107,10 +1095,32 @@ class ServerArgs:
 
         if self.mamba_ssm_dtype != "float32":
             logger.warning(
-                "DVR for GDN requires fp32 Mamba/GDN SSM "
+                "DVR for gated linear-state models requires fp32 recurrent "
                 "states. Setting --mamba-ssm-dtype float32."
             )
             self.mamba_ssm_dtype = "float32"
+
+    def _is_dvr_enabled(self):
+        return self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK"
+
+    def _is_dvr_gated_linear_state_model(self):
+        from sglang.srt.configs import (
+            JetNemotronConfig,
+            JetVLMConfig,
+            Qwen3_5Config,
+            Qwen3_5MoeConfig,
+            Qwen3NextConfig,
+        )
+
+        config = self.get_model_config().hf_config.get_text_config()
+        return isinstance(
+            config,
+            Qwen3NextConfig
+            | Qwen3_5Config
+            | Qwen3_5MoeConfig
+            | JetNemotronConfig
+            | JetVLMConfig,
+        )
 
     @staticmethod
     def _normalize_dvr_chunk_page_size(page_size: Optional[int]) -> Optional[int]:
@@ -1135,7 +1145,7 @@ class ServerArgs:
         )
 
     def _handle_dvr_speculative_decoding(self):
-        assert self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK"
+        assert self._is_dvr_enabled()
         if not self.device.startswith("cuda"):
             raise ValueError("DVR currently only supports CUDA device.")
         if self.enable_dp_attention:
@@ -1220,7 +1230,7 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_piecewise_cuda_graph(self):
-        if self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK":
+        if self._is_dvr_enabled():
             if self.enforce_piecewise_cuda_graph:
                 logger.warning(
                     "DVR does not support piecewise CUDA graph. Setting "
@@ -3307,7 +3317,7 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
-        if self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK":
+        if self._is_dvr_enabled():
             self._handle_dvr_speculative_decoding()
 
     def _handle_load_format(self):

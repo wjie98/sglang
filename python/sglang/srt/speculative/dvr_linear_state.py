@@ -19,7 +19,7 @@ class DVRLinearStateContext:
 class DVRLinearStateLifecycle:
     """Manage chunk-boundary state for DVR linear-state layers.
 
-    The current implementation is backed by SGLang's Mamba/GDN state cache and
+    The current implementation is backed by SGLang's linear-state cache and
     ping-pong prefill checkpoints. Keeping it outside `dvr_worker.py` prevents
     the speculative control flow from depending on those backend details.
     """
@@ -38,7 +38,7 @@ class DVRLinearStateLifecycle:
             return
         if self.server_args.mamba_track_interval != FLA_CHUNK_SIZE:
             raise ValueError(
-                "DVR GDN requires mamba_track_interval to match "
+                "DVR linear-state verify requires mamba_track_interval to match "
                 f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, got "
                 f"{self.server_args.mamba_track_interval}. Multiples larger than "
                 "FLA_CHUNK_SIZE can miss the latest chunk boundary from the "
@@ -46,7 +46,9 @@ class DVRLinearStateLifecycle:
                 "only one tracked prefill checkpoint."
             )
         if self.server_args.mamba_ssm_dtype != "float32":
-            raise ValueError("DVR GDN requires fp32 Mamba/GDN SSM state storage.")
+            raise ValueError(
+                "DVR linear-state verify requires fp32 recurrent state storage."
+            )
 
     def prepare_for_draft(self, batch: ScheduleBatch):
         self.ensure_boundary_state(batch)
@@ -113,7 +115,7 @@ class DVRLinearStateLifecycle:
         if not self.has_dvr_state(batch):
             return None
         assert self.server_args.mamba_track_interval == FLA_CHUNK_SIZE, (
-            "DVR GDN target verify must start from FLA chunk boundaries. "
+            "DVR linear-state target verify must start from FLA chunk boundaries. "
             "The current prefill tracker only guarantees the latest boundary "
             "when mamba_track_interval equals FLA_CHUNK_SIZE."
         )
@@ -122,12 +124,12 @@ class DVRLinearStateLifecycle:
         ).to(torch.long)
         state_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         assert state_cache.temporal.dtype == torch.float32, (
-            "DVR GDN requires fp32 temporal state checkpoints. bf16/fp16 "
+            "DVR linear-state verify requires fp32 temporal state checkpoints. bf16/fp16 "
             "checkpoints round the chunkwise scan state and can diverge from "
             "full prefill across chunks."
         )
         assert state_cache.intermediate_ssm.dtype == torch.float32, (
-            "DVR GDN requires fp32 intermediate prefill states."
+            "DVR linear-state verify requires fp32 intermediate prefill states."
         )
         boundary_indices = None
         if require_boundary:
@@ -181,7 +183,7 @@ class DVRLinearStateLifecycle:
         last_track_seqlen = req.mamba_last_track_seqlen
         if last_track_seqlen is not None and last_track_seqlen > 0:
             assert last_track_seqlen % FLA_CHUNK_SIZE == 0, (
-                "DVR GDN must not reuse non-chunk-boundary Mamba checkpoints."
+                "DVR linear-state verify must not reuse non-chunk-boundary checkpoints."
             )
         if boundary_seqlen <= 0:
             return None
@@ -239,7 +241,7 @@ class DVRLinearStateLifecycle:
         if boundary_seqlen == 0:
             return dst
         raise RuntimeError(
-            "DVR GDN could not find a chunk-aligned prefill checkpoint "
+            "DVR linear-state verify could not find a chunk-aligned prefill checkpoint "
             f"for boundary {boundary_seqlen}. mamba_track_interval must be "
             f"aligned to FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, and ordinary prefill "
             "must materialize that checkpoint before DVR target verify starts."
