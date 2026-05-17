@@ -519,9 +519,14 @@ class DecodeVerifyRollbackWorker:
     ) -> torch.Tensor:
         ctx = ctx or self._gdn_state_context(batch)
         if ctx is not None:
-            state_inputs = getattr(ctx.mamba_cache, "dvr_state_inputs", None)
-            if state_inputs is not None:
-                return state_inputs.get_tail_lens(ctx.live_indices).to(torch.long)
+            dvr_state_adapter = self._gdn_state_adapter()
+            if dvr_state_adapter is not None:
+                tail_lens = dvr_state_adapter.state_input_tail_lens(
+                    state_cache=ctx.mamba_cache,
+                    live_indices=ctx.live_indices,
+                )
+                if tail_lens is not None:
+                    return tail_lens.to(torch.long)
         return torch.tensor(
             [self._gdn_boundary_and_tail(req)[1] for req in batch.reqs],
             dtype=torch.long,
@@ -553,10 +558,14 @@ class DecodeVerifyRollbackWorker:
         live_indices: torch.Tensor,
         verified_tail_lens: torch.Tensor,
     ):
-        state_inputs = getattr(mamba_cache, "dvr_state_inputs", None)
-        if state_inputs is None:
+        dvr_state_adapter = self._gdn_state_adapter()
+        if dvr_state_adapter is None:
             return
-        state_inputs.set_tail_lens(live_indices, verified_tail_lens)
+        dvr_state_adapter.set_state_input_tail_lens(
+            state_cache=mamba_cache,
+            live_indices=live_indices,
+            tail_lens=verified_tail_lens,
+        )
 
     def _gdn_state_adapter(self):
         linear_backend = getattr(

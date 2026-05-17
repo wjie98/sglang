@@ -206,7 +206,10 @@ class MambaPool:
                 if name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
                 elif name == "dvr_state_inputs":
-                    kwargs[name] = v.layer_view(layer)
+                    kwargs[name] = MambaPool.DVRStateInputCache(
+                        tensors=tuple(t[layer] for t in v.tensors),
+                        tail_lens=v.tail_lens[layer],
+                    )
                 else:
                     kwargs[name] = v[layer]
 
@@ -218,8 +221,10 @@ class MambaPool:
                 value = getattr(self, f.name)
                 if value is None:
                     continue
-                if hasattr(value, "mem_usage_bytes"):
-                    total += value.mem_usage_bytes()
+                if isinstance(value, MambaPool.DVRStateInputCache):
+                    total += get_tensor_size_bytes(
+                        list(value.tensors)
+                    ) + get_tensor_size_bytes(value.tail_lens)
                 else:
                     total += get_tensor_size_bytes(value)
             return total
@@ -234,52 +239,6 @@ class MambaPool:
     class DVRStateInputCache:
         tensors: Tuple[torch.Tensor, ...]
         tail_lens: torch.Tensor
-
-        @property
-        def enabled(self) -> bool:
-            return len(self.tensors) > 0
-
-        @property
-        def capacity(self) -> int:
-            assert self.enabled
-            first = self.tensors[0]
-            return first.shape[2] if first.dim() >= 5 else first.shape[1]
-
-        def mem_usage_bytes(self) -> int:
-            return get_tensor_size_bytes(list(self.tensors)) + get_tensor_size_bytes(
-                self.tail_lens
-            )
-
-        def layer_view(self, layer: int):
-            return type(self)(
-                tensors=tuple(t[layer] for t in self.tensors),
-                tail_lens=self.tail_lens[layer],
-            )
-
-        def get_tail_lens(self, indices: torch.Tensor) -> torch.Tensor:
-            indices = indices.to(device=self.tail_lens.device, dtype=torch.long)
-            if self.tail_lens.dim() == 2:
-                return self.tail_lens[0, indices]
-            return self.tail_lens[indices]
-
-        def set_tail_lens(
-            self, indices: torch.Tensor, value: Union[int, torch.Tensor]
-        ):
-            indices = indices.to(device=self.tail_lens.device, dtype=torch.long)
-            value = torch.as_tensor(
-                value, device=self.tail_lens.device, dtype=self.tail_lens.dtype
-            )
-            if self.tail_lens.dim() == 2:
-                self.tail_lens[:, indices] = value
-            else:
-                self.tail_lens[indices] = value
-
-        def reset(self, indices: torch.Tensor):
-            indices = indices.to(device=self.tail_lens.device, dtype=torch.long)
-            if self.tail_lens.dim() == 2:
-                self.tail_lens[:, indices] = 0
-            else:
-                self.tail_lens[indices] = 0
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
@@ -463,7 +422,7 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                    f"dvr_state_input_cache size: {(dvr_state_inputs.mem_usage_bytes() if dvr_state_inputs is not None else 0) / GB:.2f}GB "
+                    f"dvr_state_input_cache size: {(get_tensor_size_bytes(list(dvr_state_inputs.tensors)) + get_tensor_size_bytes(dvr_state_inputs.tail_lens) if dvr_state_inputs is not None else 0) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -530,7 +489,7 @@ class MambaPool:
         )
         t[:, select_index] = z
         if getattr(self.mamba_cache, "dvr_state_inputs", None) is not None:
-            self.mamba_cache.dvr_state_inputs.reset(select_index)
+            self.mamba_cache.dvr_state_inputs.tail_lens[:, select_index] = 0
 
         return select_index
 

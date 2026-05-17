@@ -621,6 +621,26 @@ class DVRGatedStateAdapter:
     def is_verify_enabled(self, *, state_cache, is_target_verify: bool) -> bool:
         return is_target_verify and self.has_window(state_cache)
 
+    def state_input_tail_lens(
+        self, *, state_cache, live_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        state_window = DVRStateInputWindow.from_cache(state_cache)
+        if not state_window.enabled:
+            return None
+        return state_window.tail_lens(indices=live_indices)
+
+    def set_state_input_tail_lens(
+        self,
+        *,
+        state_cache,
+        live_indices: torch.Tensor,
+        tail_lens: torch.Tensor,
+    ):
+        state_window = DVRStateInputWindow.from_cache(state_cache)
+        if not state_window.enabled:
+            return
+        state_window.set_tail_lens(indices=live_indices, value=tail_lens)
+
     def make_forward_context(
         self,
         *,
