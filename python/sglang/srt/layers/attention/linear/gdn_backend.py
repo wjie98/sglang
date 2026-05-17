@@ -344,6 +344,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
     ):
+        # DVR target verify must use the same chunkwise scan path as prefill,
+        # while still restoring/exporting conv and recurrent state around the
+        # speculative window. Keep that flow separate from the EAGLE-style
+        # recurrent target-verify branch below.
         seq_len = mixed_qkv.shape[0]
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
@@ -404,6 +408,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        # The generic target-verify branch below is recurrent and suitable for
+        # tree/EAGLE verify. DVR needs chunkwise prefill-equivalent verify, so
+        # it exits early through the adapter-managed path.
         if self.dvr_state_adapter.is_verify_enabled(
             state_cache=mamba_cache_params, is_target_verify=is_target_verify
         ):
