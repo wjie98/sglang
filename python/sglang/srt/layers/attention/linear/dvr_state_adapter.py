@@ -46,13 +46,17 @@ class DVRStateInputWindow:
 
     @classmethod
     def from_cache(cls, state_cache):
+        cache = getattr(state_cache, "dvr_state_inputs", None)
+        if cache is None:
+            return cls(q=None, k=None, v=None, g=None, beta=None, pos=None)
+        q, k, v, g, beta = cache.tensors
         return cls(
-            q=getattr(state_cache, "dvr_input_0_cache", None),
-            k=getattr(state_cache, "dvr_input_1_cache", None),
-            v=getattr(state_cache, "dvr_input_2_cache", None),
-            g=getattr(state_cache, "dvr_input_3_cache", None),
-            beta=getattr(state_cache, "dvr_input_4_cache", None),
-            pos=getattr(state_cache, "dvr_input_pos", None),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            pos=cache.tail_lens,
         )
 
     @property
@@ -616,23 +620,6 @@ class DVRGatedStateAdapter:
 
     def is_verify_enabled(self, *, state_cache, is_target_verify: bool) -> bool:
         return is_target_verify and self.has_window(state_cache)
-
-    def tail_lens(self, *, state_cache, live_indices: torch.Tensor) -> torch.Tensor:
-        return DVRStateInputWindow.from_cache(state_cache).tail_lens(
-            indices=live_indices
-        )
-
-    def set_tail_lens(
-        self,
-        *,
-        state_cache,
-        live_indices: torch.Tensor,
-        tail_lens: torch.Tensor,
-    ):
-        DVRStateInputWindow.from_cache(state_cache).set_tail_lens(
-            indices=live_indices,
-            value=tail_lens,
-        )
 
     def make_forward_context(
         self,
