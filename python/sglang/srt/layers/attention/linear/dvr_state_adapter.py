@@ -696,6 +696,10 @@ class DVRGatedStateAdapter:
     ops: DVRStateOps
     chunk_size: int = FLA_CHUNK_SIZE
 
+    @classmethod
+    def for_gdn(cls, kernel_dispatcher) -> "DVRGatedStateAdapter":
+        return cls(DVRStateOps.for_gdn(kernel_dispatcher))
+
     def has_window(self, state_cache) -> bool:
         return has_dvr_state_window(state_cache)
 

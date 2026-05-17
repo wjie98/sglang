@@ -262,15 +262,19 @@ class DVRStateOps:
     def for_gdn(
         cls,
         kernel_dispatcher,
-        *,
-        verify_conv: Callable,
-        state_scatter: Callable,
     ) -> "DVRStateOps":
+        from sglang.srt.layers.attention.mamba.causal_conv1d import (
+            causal_conv1d_fn,
+        )
+        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+            fused_mamba_state_scatter_with_mask,
+        )
+
         return cls(
             chunk_scan=kernel_dispatcher.extend,
             recurrent_state=rebuild_gdn_state_from_qkvg_beta_triton,
-            verify_conv=verify_conv,
-            state_scatter=state_scatter,
+            verify_conv=causal_conv1d_fn,
+            state_scatter=fused_mamba_state_scatter_with_mask,
             chunk_size=FLA_CHUNK_SIZE,
         )
 

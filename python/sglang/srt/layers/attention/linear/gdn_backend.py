@@ -5,7 +5,6 @@ import torch
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.dvr_state_adapter import DVRGatedStateAdapter
-from sglang.srt.layers.attention.linear.dvr_state_ops import DVRStateOps
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -13,11 +12,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_prefill_backend,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    causal_conv1d_fn,
     causal_conv1d_update,
-)
-from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-    fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -260,13 +255,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        self.dvr_state_adapter = DVRGatedStateAdapter(
-            DVRStateOps.for_gdn(
-                self.kernel_dispatcher,
-                verify_conv=causal_conv1d_fn,
-                state_scatter=fused_mamba_state_scatter_with_mask,
-            )
-        )
+        self.dvr_state_adapter = DVRGatedStateAdapter.for_gdn(self.kernel_dispatcher)
 
     def forward_decode(
         self,
