@@ -87,8 +87,6 @@ _is_fp8_fnuz = is_fp8_fnuz()
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
-    if hasattr(t, "mem_usage_bytes"):
-        return t.mem_usage_bytes()
     return np.prod(t.shape) * t.dtype.itemsize
 
 
@@ -246,7 +244,10 @@ class MambaPool:
                 value = getattr(self, f.name)
                 if value is None:
                     continue
-                total += get_tensor_size_bytes(value)
+                if hasattr(value, "mem_usage_bytes"):
+                    total += value.mem_usage_bytes()
+                else:
+                    total += get_tensor_size_bytes(value)
             return total
 
     def __init__(
@@ -368,7 +369,7 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                    f"dvr_state_input_cache size: {(get_tensor_size_bytes(dvr_state_inputs) if dvr_state_inputs is not None else 0) / GB:.2f}GB "
+                    f"dvr_state_input_cache size: {(dvr_state_inputs.mem_usage_bytes() if dvr_state_inputs is not None else 0) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
