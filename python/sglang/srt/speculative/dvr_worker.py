@@ -652,11 +652,15 @@ class DecodeVerifyRollbackWorker:
             return None
         assert ctx.boundary_indices is not None
         if self._gdn_boundary_backup is not None:
+            dvr_state_adapter = self._gdn_state_adapter()
+            assert dvr_state_adapter is not None
             # Draft decode mutates the live recurrent slot. DVR target verify
             # needs the chunk-boundary SSM state for chunkwise scan, but the
             # draft-start conv state for producing q/k/v on the draft suffix.
-            batch.req_to_token_pool.mamba_pool.restore_state(
-                self._gdn_boundary_backup, ctx.boundary_indices
+            dvr_state_adapter.restore_recurrent_state(
+                state_cache=ctx.mamba_cache,
+                backup=self._gdn_boundary_backup,
+                indices=ctx.boundary_indices,
             )
             ctx.mamba_cache.temporal[:, ctx.live_indices] = (
                 self._gdn_boundary_backup.temporal.to(
@@ -687,11 +691,15 @@ class DecodeVerifyRollbackWorker:
             self._gdn_live_backup = None
             return
         assert ctx.boundary_indices is not None
-        self._gdn_boundary_backup = batch.req_to_token_pool.mamba_pool.backup_state(
-            ctx.boundary_indices
+        dvr_state_adapter = self._gdn_state_adapter()
+        assert dvr_state_adapter is not None
+        self._gdn_boundary_backup = dvr_state_adapter.backup_recurrent_state(
+            state_cache=ctx.mamba_cache,
+            indices=ctx.boundary_indices,
         )
-        self._gdn_live_backup = batch.req_to_token_pool.mamba_pool.backup_state(
-            ctx.live_indices
+        self._gdn_live_backup = dvr_state_adapter.backup_recurrent_state(
+            state_cache=ctx.mamba_cache,
+            indices=ctx.live_indices,
         )
 
     def _commit_gdn_state_after_verify(

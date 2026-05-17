@@ -203,13 +203,8 @@ class MambaPool:
                 if v is None:
                     kwargs[name] = None
                     continue
-                if name in ("conv", "intermediate_conv_window"):
+                if name in ("conv", "intermediate_conv_window", "dvr_state_inputs"):
                     kwargs[name] = [conv[layer] for conv in v]
-                elif name == "dvr_state_inputs":
-                    kwargs[name] = MambaPool.DVRStateInputCache(
-                        tensors=tuple(t[layer] for t in v.tensors),
-                        tail_lens=v.tail_lens[layer],
-                    )
                 else:
                     kwargs[name] = v[layer]
 
@@ -221,85 +216,15 @@ class MambaPool:
                 value = getattr(self, f.name)
                 if value is None:
                     continue
-                if isinstance(value, MambaPool.DVRStateInputCache):
-                    total += get_tensor_size_bytes(
-                        list(value.tensors)
-                    ) + get_tensor_size_bytes(value.tail_lens)
-                else:
-                    total += get_tensor_size_bytes(value)
+                total += get_tensor_size_bytes(value)
             return total
-
-    @dataclass(frozen=True, kw_only=True)
-    class StateBackup:
-        conv: List[torch.Tensor]
-        temporal: torch.Tensor
-        indices: torch.Tensor
-
-    @dataclass(frozen=True, kw_only=True)
-    class DVRStateInputCache:
-        tensors: Tuple[torch.Tensor, ...]
-        tail_lens: torch.Tensor
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
-        dvr_state_inputs: Optional[DVRStateInputCache] = None
-
-    @staticmethod
-    def _alloc_dvr_state_input_cache(
-        *,
-        num_mamba_layers: int,
-        size: int,
-        speculative_num_draft_tokens: int,
-        temporal_state_shape: Tuple[int, ...],
-        conv_dtype: torch.dtype,
-        device: str,
-    ):
-        dvr_state_input_cache_len = FLA_CHUNK_SIZE + speculative_num_draft_tokens
-        q_cache = torch.zeros(
-            size=(
-                num_mamba_layers,
-                size + 1,
-                dvr_state_input_cache_len,
-                temporal_state_shape[0],
-                temporal_state_shape[1],
-            ),
-            dtype=conv_dtype,
-            device=device,
-        )
-        k_cache = torch.zeros_like(q_cache)
-        v_cache = torch.zeros(
-            size=(
-                num_mamba_layers,
-                size + 1,
-                dvr_state_input_cache_len,
-                temporal_state_shape[0],
-                temporal_state_shape[2],
-            ),
-            dtype=conv_dtype,
-            device=device,
-        )
-        g_cache = torch.zeros(
-            size=(
-                num_mamba_layers,
-                size + 1,
-                dvr_state_input_cache_len,
-                temporal_state_shape[0],
-            ),
-            dtype=torch.float32,
-            device=device,
-        )
-        beta_cache = torch.zeros_like(g_cache)
-        tail_lens = torch.zeros(
-            size=(num_mamba_layers, size + 1),
-            dtype=torch.int32,
-            device=device,
-        )
-        return MambaPool.DVRStateInputCache(
-            tensors=(q_cache, k_cache, v_cache, g_cache, beta_cache),
-            tail_lens=tail_lens,
-        )
+        dvr_state_inputs: Optional[List[torch.Tensor]] = None
+        dvr_state_input_tail_lens: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -398,22 +323,59 @@ class MambaPool:
                     for conv_shape in conv_state_shape
                 ]
                 if enable_dvr_state_input_cache:
-                    dvr_state_inputs = self._alloc_dvr_state_input_cache(
-                        num_mamba_layers=num_mamba_layers,
-                        size=size,
-                        speculative_num_draft_tokens=speculative_num_draft_tokens,
-                        temporal_state_shape=temporal_state_shape,
-                        conv_dtype=conv_dtype,
+                    dvr_state_input_len = FLA_CHUNK_SIZE + speculative_num_draft_tokens
+                    dvr_q_input = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            size + 1,
+                            dvr_state_input_len,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                        ),
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    dvr_state_inputs = [
+                        dvr_q_input,
+                        torch.zeros_like(dvr_q_input),
+                        torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                size + 1,
+                                dvr_state_input_len,
+                                temporal_state_shape[0],
+                                temporal_state_shape[2],
+                            ),
+                            dtype=conv_dtype,
+                            device=device,
+                        ),
+                        torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                size + 1,
+                                dvr_state_input_len,
+                                temporal_state_shape[0],
+                            ),
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                    ]
+                    dvr_state_inputs.append(torch.zeros_like(dvr_state_inputs[-1]))
+                    dvr_state_input_tail_lens = torch.zeros(
+                        size=(num_mamba_layers, size + 1),
+                        dtype=torch.int32,
                         device=device,
                     )
                 else:
                     dvr_state_inputs = None
+                    dvr_state_input_tail_lens = None
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
                     dvr_state_inputs=dvr_state_inputs,
+                    dvr_state_input_tail_lens=dvr_state_input_tail_lens,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -422,7 +384,7 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                    f"dvr_state_input_cache size: {(get_tensor_size_bytes(list(dvr_state_inputs.tensors)) + get_tensor_size_bytes(dvr_state_inputs.tail_lens) if dvr_state_inputs is not None else 0) / GB:.2f}GB "
+                    f"dvr_state_input_cache size: {(get_tensor_size_bytes(dvr_state_inputs) + get_tensor_size_bytes(dvr_state_input_tail_lens) if dvr_state_inputs is not None else 0) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -446,27 +408,6 @@ class MambaPool:
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
 
-    def backup_state(self, indices: torch.Tensor) -> StateBackup:
-        indices = indices.to(device=self.device, dtype=torch.long)
-        return self.StateBackup(
-            conv=[conv[:, indices].clone() for conv in self.mamba_cache.conv],
-            temporal=self.mamba_cache.temporal[:, indices].clone(),
-            indices=indices.clone(),
-        )
-
-    def restore_state(
-        self,
-        backup: StateBackup,
-        indices: Optional[torch.Tensor] = None,
-    ):
-        dst_indices = backup.indices if indices is None else indices
-        dst_indices = dst_indices.to(device=self.device, dtype=torch.long)
-        for conv, saved_conv in zip(self.mamba_cache.conv, backup.conv):
-            conv[:, dst_indices] = saved_conv.to(conv.dtype, copy=False)
-        self.mamba_cache.temporal[:, dst_indices] = backup.temporal.to(
-            self.mamba_cache.temporal.dtype, copy=False
-        )
-
     def available_size(self):
         return len(self.free_slots)
 
@@ -488,8 +429,11 @@ class MambaPool:
             t.shape[0], need_size, *t.shape[2:]
         )
         t[:, select_index] = z
-        if getattr(self.mamba_cache, "dvr_state_inputs", None) is not None:
-            self.mamba_cache.dvr_state_inputs.tail_lens[:, select_index] = 0
+        if (
+            isinstance(self.mamba_cache, self.SpeculativeState)
+            and self.mamba_cache.dvr_state_input_tail_lens is not None
+        ):
+            self.mamba_cache.dvr_state_input_tail_lens[:, select_index] = 0
 
         return select_index
 
@@ -534,6 +478,7 @@ class MambaPool:
                 "intermediate_ssm",
                 "intermediate_conv_window",
                 "dvr_state_inputs",
+                "dvr_state_input_tail_lens",
             ):
                 continue
             value = getattr(self.mamba_cache, field)
@@ -569,6 +514,7 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             if field in (
                 "dvr_state_inputs",
+                "dvr_state_input_tail_lens",
             ):
                 continue
             value = getattr(self.mamba_cache, field)

@@ -36,6 +36,13 @@ class DVRGatedForwardContext:
 
 
 @dataclass(frozen=True)
+class DVRRecurrentStateBackup:
+    conv: Tuple[torch.Tensor, ...]
+    temporal: torch.Tensor
+    indices: torch.Tensor
+
+
+@dataclass(frozen=True)
 class DVRStateInputWindow:
     q: Optional[torch.Tensor]
     k: Optional[torch.Tensor]
@@ -46,17 +53,18 @@ class DVRStateInputWindow:
 
     @classmethod
     def from_cache(cls, state_cache):
-        cache = getattr(state_cache, "dvr_state_inputs", None)
-        if cache is None:
+        inputs = getattr(state_cache, "dvr_state_inputs", None)
+        tail_lens = getattr(state_cache, "dvr_state_input_tail_lens", None)
+        if inputs is None or tail_lens is None:
             return cls(q=None, k=None, v=None, g=None, beta=None, pos=None)
-        q, k, v, g, beta = cache.tensors
+        q, k, v, g, beta = inputs
         return cls(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
-            pos=cache.tail_lens,
+            pos=tail_lens,
         )
 
     @property
@@ -640,6 +648,31 @@ class DVRGatedStateAdapter:
         if not state_window.enabled:
             return
         state_window.set_tail_lens(indices=live_indices, value=tail_lens)
+
+    def backup_recurrent_state(
+        self, *, state_cache, indices: torch.Tensor
+    ) -> DVRRecurrentStateBackup:
+        indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
+        return DVRRecurrentStateBackup(
+            conv=tuple(conv[:, indices].clone() for conv in state_cache.conv),
+            temporal=state_cache.temporal[:, indices].clone(),
+            indices=indices.clone(),
+        )
+
+    def restore_recurrent_state(
+        self,
+        *,
+        state_cache,
+        backup: DVRRecurrentStateBackup,
+        indices: Optional[torch.Tensor] = None,
+    ):
+        dst_indices = backup.indices if indices is None else indices
+        dst_indices = dst_indices.to(device=state_cache.temporal.device, dtype=torch.long)
+        for conv, saved_conv in zip(state_cache.conv, backup.conv, strict=True):
+            conv[:, dst_indices] = saved_conv.to(conv.dtype, copy=False)
+        state_cache.temporal[:, dst_indices] = backup.temporal.to(
+            state_cache.temporal.dtype, copy=False
+        )
 
     def make_forward_context(
         self,

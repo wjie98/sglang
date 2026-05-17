@@ -54,3 +54,48 @@ Validation:
   `maxdiff=0.0`, `kl=0.0`, `ALL_OK True`.
 - Qwen3.5-0.8B cuda graph, `max_new=17,65,129,257`: all cases
   `maxdiff=0.0`, `kl=0.0`, `ALL_OK True`.
+
+## Final Tightening
+
+The follow-up cleanup removes the remaining DVR-specific behavior from
+`MambaPool` while keeping the allocation layout unchanged.
+
+- `memory_pool.py`
+  - Removed the nested `DVRStateInputCache` wrapper.
+  - Removed `_alloc_dvr_state_input_cache`; q/k/v/g/beta tensors are allocated
+    inline next to the existing speculative Mamba state tensors.
+  - Stores DVR state inputs as `List[torch.Tensor]` plus a separate
+    `dvr_state_input_tail_lens` tensor.
+  - Removed `backup_state(...)` and `restore_state(...)`; recurrent state
+    backup is no longer a memory-pool API.
+  - Keeps only the required lifecycle hook: reset DVR tail lengths when slots
+    are allocated.
+  - Skips `dvr_state_inputs` and `dvr_state_input_tail_lens` in contiguous
+    buffer and state-dimension checks. These tensors are DVR scratch inputs,
+    not live recurrent states; their window dimension is not the tensor-parallel
+    state dimension.
+- `dvr_state_adapter.py`
+  - Reads the plain q/k/v/g/beta tensor list from the state cache.
+  - Owns `backup_recurrent_state(...)` and `restore_recurrent_state(...)` for
+    DVR recurrent slot switching.
+- `dvr_worker.py`
+  - Restores and backs up GDN boundary/live recurrent states through the DVR
+    adapter, not through `MambaPool`.
+
+Additional validation after this tightening:
+
+- `py_compile` passed for `memory_pool.py`, `dvr_state_adapter.py`,
+  `dvr_worker.py`, `gdn_backend.py`, and
+  `test/manual/dvr/test_dvr_gdn_recurrent_state.py`.
+- `git diff --check` passed.
+- Old symbols/calls are gone:
+  `_alloc_dvr_state_input_cache`, `DVRStateInputCache`,
+  `mamba_pool.backup_state`, `mamba_pool.restore_state`.
+- `test/manual/dvr/test_dvr_gdn_recurrent_state.py` returned
+  `max_diff=0.0 triton_max_diff=0.0`.
+- Qwen3.5-0.8B no-graph, `max_new=17,65,129`: all cases
+  `maxdiff=0.0`, `kl=0.0`, `ALL_OK True`.
+- Qwen3.5-0.8B cuda graph, `max_new=17,65,129,257`: all cases
+  `maxdiff=0.0`, `kl=0.0`, `ALL_OK True`.
+- Qwen3-0.6B cuda graph, `max_new=17,65,129,257`: all cases
+  `maxdiff=0.0`, `kl=0.0`, `ALL_OK True`.
