@@ -304,16 +304,24 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
-                enable_dvr_state_input_cache = (
+                if (
                     get_global_server_args().speculative_algorithm
                     == "DECODE_VERIFY_ROLLBACK"
-                )
-                if enable_dvr_state_input_cache:
+                ):
                     intermediate_ssm_tokens = 1
                     intermediate_conv_tokens = speculative_num_draft_tokens
+                    dvr_state_inputs = allocate_dvr_state_input_cache(
+                        num_layers=num_mamba_layers,
+                        num_slots=size + 1,
+                        num_draft_tokens=speculative_num_draft_tokens,
+                        temporal_state_shape=temporal_state_shape,
+                        dtype=conv_dtype,
+                        device=device,
+                    )
                 else:
                     intermediate_ssm_tokens = speculative_num_draft_tokens
                     intermediate_conv_tokens = speculative_num_draft_tokens
+                    dvr_state_inputs = None
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
@@ -344,17 +352,6 @@ class MambaPool:
                     )
                     for conv_shape in conv_state_shape
                 ]
-                if enable_dvr_state_input_cache:
-                    dvr_state_inputs = allocate_dvr_state_input_cache(
-                        num_layers=num_mamba_layers,
-                        num_slots=size + 1,
-                        num_draft_tokens=speculative_num_draft_tokens,
-                        temporal_state_shape=temporal_state_shape,
-                        dtype=conv_dtype,
-                        device=device,
-                    )
-                else:
-                    dvr_state_inputs = None
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
