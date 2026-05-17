@@ -533,15 +533,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # DVR reuses ordinary extend/prefill q/k/v/g/beta for the
             # unclosed chunk tail. This is only a cache copy; the recurrent
             # state update above remains the single source of live state.
-            self.dvr_state_adapter.cache_extend_state_inputs_from_forward(
-                layer=layer,
+            self.dvr_state_adapter.cache_extend_tail_from_forward(
                 forward_batch=forward_batch,
                 state_cache=mamba_cache_params,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-                conv_states=conv_states,
-                ssm_states=ssm_states,
-                seq_len=seq_len,
                 q=query,
                 k=key,
                 v=value,

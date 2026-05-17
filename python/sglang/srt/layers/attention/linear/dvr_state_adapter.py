@@ -326,12 +326,6 @@ def allocate_dvr_state_input_cache(
     return DVRStateInputCache(tensors=tuple(state_inputs), tail_lens=tail_lens)
 
 
-def has_dvr_state_window(state_cache) -> bool:
-    """Return whether a cache exposes DVR's rolling state-input window."""
-
-    return DVRStateInputWindow.from_cache(state_cache).enabled
-
-
 def check_dvr_state_input_position(
     *,
     pos_before: torch.Tensor,
@@ -700,11 +694,8 @@ class DVRGatedStateAdapter:
     def for_gdn(cls, kernel_dispatcher) -> "DVRGatedStateAdapter":
         return cls(DVRStateOps.for_gdn(kernel_dispatcher))
 
-    def has_window(self, state_cache) -> bool:
-        return has_dvr_state_window(state_cache)
-
     def is_verify_enabled(self, *, state_cache, is_target_verify: bool) -> bool:
-        return is_target_verify and self.has_window(state_cache)
+        return is_target_verify and DVRStateInputWindow.from_cache(state_cache).enabled
 
     def state_input_tail_lens(
         self, *, state_cache, live_indices: torch.Tensor
@@ -797,24 +788,26 @@ class DVRGatedStateAdapter:
             device=forward_batch.input_ids.device,
         )
 
-    def cache_extend_state_inputs(
+    def cache_extend_tail_from_forward(
         self,
         *,
-        context: DVRGatedForwardContext,
+        forward_batch,
+        state_cache,
+        cache_indices: torch.Tensor,
+        query_start_loc: Optional[torch.Tensor],
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
     ):
-        state_window = DVRStateInputWindow.from_cache(context.state_cache)
+        state_window = DVRStateInputWindow.from_cache(state_cache)
         if not state_window.enabled:
             return
-        forward_batch = context.forward_batch
         if (
             forward_batch.extend_prefix_lens_cpu is None
             or forward_batch.extend_seq_lens_cpu is None
-            or context.query_start_loc is None
+            or query_start_loc is None
         ):
             return
 
@@ -825,8 +818,8 @@ class DVRGatedStateAdapter:
         beta = beta.reshape(-1, beta.shape[-1])
 
         state_window.write_extend_tail(
-            cache_indices=context.cache_indices,
-            query_start_loc=context.query_start_loc,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             q=q,
@@ -835,41 +828,6 @@ class DVRGatedStateAdapter:
             g=g,
             beta=beta,
             chunk_size=self.chunk_size,
-        )
-
-    def cache_extend_state_inputs_from_forward(
-        self,
-        *,
-        layer,
-        forward_batch,
-        state_cache,
-        cache_indices: torch.Tensor,
-        query_start_loc: Optional[torch.Tensor],
-        conv_states: torch.Tensor,
-        ssm_states: torch.Tensor,
-        seq_len: int,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-    ):
-        self.cache_extend_state_inputs(
-            context=self.make_forward_context(
-                layer=layer,
-                forward_batch=forward_batch,
-                state_cache=state_cache,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                conv_states=conv_states,
-                ssm_states=ssm_states,
-                seq_len=seq_len,
-            ),
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
         )
 
     def process_target_verify_conv(
