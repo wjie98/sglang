@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 
@@ -43,6 +43,28 @@ class DVRRecurrentStateBackup:
 
 
 @dataclass(frozen=True)
+class DVRStateInputCache:
+    """q/k/v/g/beta scratch cache plus rolling-window lengths for DVR verify."""
+
+    tensors: Tuple[torch.Tensor, ...]
+    tail_lens: torch.Tensor
+
+    def __getitem__(self, layer: int) -> "DVRStateInputCache":
+        return DVRStateInputCache(
+            tensors=tuple(tensor[layer] for tensor in self.tensors),
+            tail_lens=self.tail_lens[layer],
+        )
+
+    def reset(self, indices: torch.Tensor):
+        self.tail_lens[:, indices] = 0
+
+    def mem_usage_bytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self.tensors) + (
+            self.tail_lens.numel() * self.tail_lens.element_size()
+        )
+
+
+@dataclass(frozen=True)
 class DVRStateInputWindow:
     q: Optional[torch.Tensor]
     k: Optional[torch.Tensor]
@@ -53,18 +75,17 @@ class DVRStateInputWindow:
 
     @classmethod
     def from_cache(cls, state_cache):
-        inputs = getattr(state_cache, "dvr_state_inputs", None)
-        tail_lens = getattr(state_cache, "dvr_state_input_tail_lens", None)
-        if inputs is None or tail_lens is None:
+        cache = getattr(state_cache, "dvr_state_inputs", None)
+        if cache is None:
             return cls(q=None, k=None, v=None, g=None, beta=None, pos=None)
-        q, k, v, g, beta = inputs
+        q, k, v, g, beta = cache.tensors
         return cls(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
-            pos=tail_lens,
+            pos=cache.tail_lens,
         )
 
     @property
@@ -261,7 +282,7 @@ def allocate_dvr_state_input_cache(
     temporal_state_shape: Tuple[int, ...],
     dtype: torch.dtype,
     device: str,
-) -> Tuple[List[torch.Tensor], torch.Tensor]:
+) -> DVRStateInputCache:
     """Allocate q/k/v/g/beta scratch inputs used by DVR linear-state adapters."""
 
     window_len = FLA_CHUNK_SIZE + num_draft_tokens
@@ -302,7 +323,7 @@ def allocate_dvr_state_input_cache(
         dtype=torch.int32,
         device=device,
     )
-    return state_inputs, tail_lens
+    return DVRStateInputCache(tensors=tuple(state_inputs), tail_lens=tail_lens)
 
 
 def has_dvr_state_window(state_cache) -> bool:

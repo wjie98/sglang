@@ -122,3 +122,28 @@ Validation:
   `dvr_worker.py`.
 - `test/manual/dvr/test_dvr_gdn_recurrent_state.py` returned
   `max_diff=0.0 triton_max_diff=0.0`.
+
+## Unified State Input Cache Object
+
+The separate `dvr_state_inputs` and `dvr_state_input_tail_lens` fields were
+merged into one adapter-owned `DVRStateInputCache`.
+
+- `DVRStateInputCache` stores both q/k/v/g/beta tensors and rolling tail
+  lengths.
+- It implements `__getitem__(layer)` so the existing memory-pool layer slicing
+  path can treat it like other layer-indexed state.
+- It exposes `reset(indices)` for slot allocation and `mem_usage_bytes()` for
+  memory accounting.
+- `memory_pool.py` no longer imports or checks the concrete cache type. It uses
+  normal indexing for layer views and duck-typed `mem_usage_bytes()` for memory
+  accounting.
+- The standalone `dvr_state_input_tail_lens` field was removed from
+  `SpeculativeState`.
+
+Validation:
+
+- `git diff --check` passed.
+- `py_compile` passed for `memory_pool.py`, `dvr_state_adapter.py`, and
+  `dvr_worker.py`.
+- `test/manual/dvr/test_dvr_gdn_recurrent_state.py` returned
+  `max_diff=0.0 triton_max_diff=0.0`.
