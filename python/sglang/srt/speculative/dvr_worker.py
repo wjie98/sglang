@@ -4,7 +4,6 @@ import logging
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -385,11 +384,11 @@ class DecodeVerifyRollbackWorker:
             logits_output = self._draft_decode_forward(forward_batch)
             maybe_detect_nan(logits_output.next_token_logits, f"dvr draft step {i}")
 
+            next_token_ids = self.model_runner.sample(logits_output, forward_batch)
             if not forward_batch.sampling_info.is_all_greedy:
                 draft_probs_list.append(
                     self.get_draft_probs(forward_batch, logits_output.next_token_logits)
                 )
-            next_token_ids = self.model_runner.sample(logits_output, forward_batch)
             topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
             topk_p = torch.ones(
                 (topk_index.shape[0], self.topk),
@@ -427,10 +426,20 @@ class DecodeVerifyRollbackWorker:
         return self.model_runner.forward(forward_batch).logits_output
 
     def get_draft_probs(
-        self, forward_batch: ForwardBatch, logits: torch.Tensor
+        self, forward_batch: ForwardBatch, probs: torch.Tensor
     ) -> torch.Tensor:
+        # model_runner.sample() mutates next_token_logits into the probability
+        # tensor used by the sampler. Build draft_probs from that tensor so
+        # logit bias, grammar/custom processors, temperature, and draft
+        # sampling stay on the same distribution.
         sampling_info = forward_batch.sampling_info
-        probs = F.softmax(logits / sampling_info.temperatures, dim=-1)
+        if (
+            self.model_runner.sampler.use_log_softmax_logprob
+            and not sampling_info.need_top_p_sampling
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_min_p_sampling
+        ):
+            probs = torch.softmax(probs, dim=-1)
         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
         if sampling_info.need_top_p_sampling:
             probs = top_p_renorm_prob(probs, sampling_info.top_ps)
