@@ -1809,18 +1809,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
         prefix_len = len(req.prefix_indices)
         end_len = prefix_len + req.extend_input_len
-        is_dvr = server_args.speculative_algorithm == "DECODE_VERIFY_ROLLBACK"
-        track_base_len = 0 if is_dvr else prefix_len
-        track_len = end_len - track_base_len
         mamba_track_seqlen_aligned = (
-            track_base_len
-            + (track_len // mamba_cache_chunk_size) * mamba_cache_chunk_size
+            prefix_len
+            + (req.extend_input_len // mamba_cache_chunk_size)
+            * mamba_cache_chunk_size
         )
-        mask = (
-            mamba_track_seqlen_aligned > prefix_len
-            if is_dvr
-            else req.extend_input_len >= mamba_cache_chunk_size
-        )
+        mask = req.extend_input_len >= mamba_cache_chunk_size
+        is_dvr = server_args.speculative_algorithm == "DECODE_VERIFY_ROLLBACK"
+        if is_dvr:
+            mamba_track_seqlen_aligned = (
+                end_len // mamba_cache_chunk_size
+            ) * mamba_cache_chunk_size
+            mask = mamba_track_seqlen_aligned > prefix_len
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
@@ -1844,8 +1844,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
             # by _force_track_h()
             mamba_track_fla_chunk_aligned = (
-                track_base_len + (track_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+                prefix_len + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
             )
+            if is_dvr:
+                mamba_track_fla_chunk_aligned = (
+                    end_len // FLA_CHUNK_SIZE
+                ) * FLA_CHUNK_SIZE
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
