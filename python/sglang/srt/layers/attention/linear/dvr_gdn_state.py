@@ -239,7 +239,6 @@ class DVRGDNStateInputWindow(DVRStateInputWindow):
         self,
         *,
         indices: torch.Tensor,
-        query_start_loc: torch.Tensor,
         extend_prefix_lens_cpu,
         extend_seq_lens_cpu,
         q: torch.Tensor,

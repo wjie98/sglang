@@ -82,16 +82,6 @@ class DVRStateInputWindow:
     def read_window(self, *, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return tuple(tensor[indices] for tensor in self.tensors())
 
-    def shift_suffix(self, *, slots: torch.Tensor, start: int, length: int):
-        if length <= 0 or slots.numel() == 0:
-            return
-        has_layer_dim = self.pos is not None and self.pos.dim() == 2
-        for cache in self.tensors():
-            if has_layer_dim:
-                cache[:, slots, :length] = cache[:, slots, start : start + length].clone()
-            else:
-                cache[slots, :length] = cache[slots, start : start + length].clone()
-
     def shift_after_boundary(
         self,
         *,
@@ -126,9 +116,9 @@ class DVRStateInputWindow:
 class DVRStateInputCache:
     """Base DVR rolling state-input cache.
 
-    `memory_pool` owns allocation and reset. Adapters consume `window()` views
-    and do not need to know whether a concrete cache stores q/k/v/g/beta or a
-    different model-family input set.
+    `memory_pool` owns allocation. Adapters consume `window()` views and do not
+    need to know whether a concrete cache stores q/k/v/g/beta or a different
+    model-family input set.
     """
 
     tensors: Tuple[torch.Tensor, ...]
@@ -163,9 +153,6 @@ class DVRStateInputCache:
             tensors=tuple(tensor[layer] for tensor in self.tensors),
             tail_lens=self.tail_lens[layer],
         )
-
-    def reset(self, indices: torch.Tensor):
-        self.tail_lens[:, indices] = 0
 
     def mem_usage_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self.tensors) + (

@@ -233,7 +233,6 @@ class DVRGatedStateAdapter:
         *,
         forward_batch,
         state_cache,
-        query_start_loc: Optional[torch.Tensor],
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -246,7 +245,6 @@ class DVRGatedStateAdapter:
         if (
             forward_batch.extend_prefix_lens_cpu is None
             or forward_batch.extend_seq_lens_cpu is None
-            or query_start_loc is None
         ):
             return
 
@@ -262,7 +260,6 @@ class DVRGatedStateAdapter:
 
         state_window.write_extend_tail(
             indices=state_input_indices,
-            query_start_loc=query_start_loc,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             q=q,

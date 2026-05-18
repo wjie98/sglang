@@ -538,7 +538,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.dvr_state_adapter.cache_extend_tail_from_forward(
                 forward_batch=forward_batch,
                 state_cache=mamba_cache_params,
-                query_start_loc=query_start_loc,
                 q=query,
                 k=key,
                 v=value,

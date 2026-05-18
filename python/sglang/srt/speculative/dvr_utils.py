@@ -231,69 +231,6 @@ if triton is not None:
             tl.store(predicts + last_index, final_token)
 
 
-def _chain_speculative_sampling_torch(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    uniform_samples: torch.Tensor,
-    uniform_samples_for_final_sampling: torch.Tensor,
-    target_probs: torch.Tensor,
-    draft_probs: torch.Tensor,
-) -> None:
-    batch_size, num_slots = candidates.shape
-    for bid in range(batch_size):
-        root_index = retrive_index[bid, 0]
-        if root_index < 0 or root_index >= predicts.numel():
-            accept_token_num[bid] = 0
-            continue
-        accept_index[bid, 0] = root_index
-        last_index = root_index
-        prob_row = 0
-        num_accepted = 0
-        all_accepted = True
-
-        for step in range(1, num_slots):
-            draft_token = candidates[bid, step]
-            if draft_token < 0 or draft_token >= target_probs.shape[-1]:
-                all_accepted = False
-                break
-            p = target_probs[bid, prob_row, draft_token]
-            q = draft_probs[bid, prob_row, draft_token]
-            next_index = retrive_index[bid, step]
-            if (
-                uniform_samples[bid, step - 1] * q < p
-                and 0 <= next_index < predicts.numel()
-                and num_accepted + 1 < accept_index.shape[1]
-            ):
-                predicts[last_index] = draft_token
-                num_accepted += 1
-                prob_row = step
-                last_index = next_index
-                accept_index[bid, num_accepted] = last_index
-            else:
-                all_accepted = False
-                break
-
-        accept_token_num[bid] = num_accepted
-        final_probs = target_probs[bid, prob_row]
-        if not all_accepted:
-            final_probs = torch.clamp(final_probs - draft_probs[bid, prob_row], min=0)
-
-        norm = final_probs.sum()
-        if norm <= 0:
-            final_token = torch.argmax(target_probs[bid, prob_row])
-        else:
-            cdf = torch.cumsum(final_probs, dim=0)
-            final_token = torch.searchsorted(
-                cdf, uniform_samples_for_final_sampling[bid] * norm, right=True
-            )
-            final_token = torch.clamp(final_token, max=final_probs.numel() - 1)
-
-        predicts[last_index] = final_token.to(predicts.dtype)
-
-
 def chain_speculative_sampling(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -321,43 +258,11 @@ def chain_speculative_sampling(
     del retrive_next_token, retrive_next_sibling
     del threshold_single, threshold_acc, deterministic
 
-    if triton is not None and candidates.is_cuda and target_probs.is_cuda:
-        batch_size, num_slots = candidates.shape
-        _chain_speculative_sampling_kernel[(batch_size,)](
-            predicts,
-            accept_index,
-            accept_token_num,
-            candidates,
-            retrive_index,
-            uniform_samples,
-            uniform_samples_for_final_sampling,
-            target_probs,
-            draft_probs,
-            candidates.stride(0),
-            candidates.stride(1),
-            accept_index.stride(0),
-            accept_index.stride(1),
-            retrive_index.stride(0),
-            retrive_index.stride(1),
-            uniform_samples.stride(0),
-            uniform_samples.stride(1),
-            target_probs.stride(0),
-            target_probs.stride(1),
-            target_probs.stride(2),
-            draft_probs.stride(0),
-            draft_probs.stride(1),
-            draft_probs.stride(2),
-            NUM_SLOTS=num_slots,
-            ACCEPT_COLS=accept_index.shape[1],
-            PREDICT_NUMEL=predicts.numel(),
-            TARGET_ROWS=target_probs.shape[1],
-            DRAFT_ROWS=draft_probs.shape[1],
-            VOCAB_SIZE=target_probs.shape[-1],
-            BLOCK_V=4096,
-        )
-        return
+    if triton is None or not (candidates.is_cuda and target_probs.is_cuda):
+        raise RuntimeError("DVR chain speculative sampling requires Triton CUDA.")
 
-    _chain_speculative_sampling_torch(
+    batch_size, num_slots = candidates.shape
+    _chain_speculative_sampling_kernel[(batch_size,)](
         predicts,
         accept_index,
         accept_token_num,
@@ -367,4 +272,25 @@ def chain_speculative_sampling(
         uniform_samples_for_final_sampling,
         target_probs,
         draft_probs,
+        candidates.stride(0),
+        candidates.stride(1),
+        accept_index.stride(0),
+        accept_index.stride(1),
+        retrive_index.stride(0),
+        retrive_index.stride(1),
+        uniform_samples.stride(0),
+        uniform_samples.stride(1),
+        target_probs.stride(0),
+        target_probs.stride(1),
+        target_probs.stride(2),
+        draft_probs.stride(0),
+        draft_probs.stride(1),
+        draft_probs.stride(2),
+        NUM_SLOTS=num_slots,
+        ACCEPT_COLS=accept_index.shape[1],
+        PREDICT_NUMEL=predicts.numel(),
+        TARGET_ROWS=target_probs.shape[1],
+        DRAFT_ROWS=draft_probs.shape[1],
+        VOCAB_SIZE=target_probs.shape[-1],
+        BLOCK_V=4096,
     )
