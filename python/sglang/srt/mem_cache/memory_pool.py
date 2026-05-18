@@ -45,9 +45,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.linear.dvr_state_cache import (
-    allocate_dvr_state_input_cache,
-)
+from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputCache
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -310,7 +308,7 @@ class MambaPool:
                 ):
                     intermediate_ssm_tokens = 1
                     intermediate_conv_tokens = speculative_num_draft_tokens
-                    dvr_state_inputs = allocate_dvr_state_input_cache(
+                    dvr_state_inputs = DVRStateInputCache.for_gdn(
                         num_layers=num_mamba_layers,
                         num_slots=size + 1,
                         num_draft_tokens=speculative_num_draft_tokens,

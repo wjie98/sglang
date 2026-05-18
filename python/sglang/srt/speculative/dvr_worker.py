@@ -22,7 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dvr_draft_cuda_graph_runner import (
+from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
@@ -571,6 +571,9 @@ class DecodeVerifyRollbackWorker:
                 batch=batch,
                 accepted_tokens=accepted_tokens,
                 accepted_steps=accepted_steps,
+                accepted_tokens_cpu=[
+                    x + 1 for x in verify_output.accept_length_per_req_cpu
+                ],
                 ctx=linear_state_ctx,
             )
         if batch.return_logprob:

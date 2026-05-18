@@ -76,6 +76,8 @@ if triton is not None:
         draft_probs,
         stride_cand_b: tl.constexpr,
         stride_cand_s: tl.constexpr,
+        stride_acc_b: tl.constexpr,
+        stride_acc_s: tl.constexpr,
         stride_idx_b: tl.constexpr,
         stride_idx_s: tl.constexpr,
         stride_uni_b: tl.constexpr,
@@ -87,43 +89,70 @@ if triton is not None:
         stride_dp_s: tl.constexpr,
         stride_dp_v: tl.constexpr,
         NUM_SLOTS: tl.constexpr,
+        ACCEPT_COLS: tl.constexpr,
+        PREDICT_NUMEL: tl.constexpr,
+        TARGET_ROWS: tl.constexpr,
+        DRAFT_ROWS: tl.constexpr,
         VOCAB_SIZE: tl.constexpr,
         BLOCK_V: tl.constexpr,
     ):
         bid = tl.program_id(0)
         cand_base = candidates + bid * stride_cand_b
+        accept_base = accept_index + bid * stride_acc_b
         index_base = retrive_index + bid * stride_idx_b
         uniform_base = uniform_samples + bid * stride_uni_b
 
         prob_row = 0
         root_index = tl.load(index_base)
-        tl.store(accept_index + bid * stride_idx_b, root_index)
+        valid_last = (root_index >= 0) & (root_index < PREDICT_NUMEL)
+        if (ACCEPT_COLS > 0) and valid_last:
+            tl.store(accept_base, root_index)
         last_index = root_index
         num_accepted = 0
         step = 1
         continue_verifying = 1
-        while (step < NUM_SLOTS) and (continue_verifying == 1):
+        while (step < NUM_SLOTS) and (continue_verifying == 1) and valid_last:
             draft_token = tl.load(cand_base + step * stride_cand_s)
-            target_prob = tl.load(
-                target_probs
-                + bid * stride_tp_b
-                + prob_row * stride_tp_s
-                + draft_token * stride_tp_v
+            next_index = tl.load(index_base + step * stride_idx_s)
+            valid_token = (
+                (draft_token >= 0)
+                & (draft_token < VOCAB_SIZE)
+                & (prob_row < TARGET_ROWS)
             )
-            draft_prob = tl.load(
-                draft_probs
-                + bid * stride_dp_b
-                + prob_row * stride_dp_s
-                + draft_token * stride_dp_v
-            )
-            coin = tl.load(uniform_base + (step - 1) * stride_uni_s)
-            if coin * draft_prob < target_prob:
+            if valid_token:
+                target_prob = tl.load(
+                    target_probs
+                    + bid * stride_tp_b
+                    + prob_row * stride_tp_s
+                    + draft_token * stride_tp_v
+                )
+                valid_draft_row = prob_row < DRAFT_ROWS
+                draft_prob = tl.load(
+                    draft_probs
+                    + bid * stride_dp_b
+                    + prob_row * stride_dp_s
+                    + draft_token * stride_dp_v,
+                    mask=valid_draft_row,
+                    other=0.0,
+                )
+                coin = tl.load(uniform_base + (step - 1) * stride_uni_s)
+                can_accept = (
+                    valid_draft_row
+                    & (next_index >= 0)
+                    & (next_index < PREDICT_NUMEL)
+                    & ((num_accepted + 1) < ACCEPT_COLS)
+                    & (coin * draft_prob < target_prob)
+                )
+            else:
+                can_accept = False
+
+            if can_accept:
                 tl.store(predicts + last_index, draft_token)
                 num_accepted += 1
                 prob_row = step
-                last_index = tl.load(index_base + step * stride_idx_s)
+                last_index = next_index
                 tl.store(
-                    accept_index + bid * stride_idx_b + num_accepted * stride_idx_s,
+                    accept_base + num_accepted * stride_acc_s,
                     last_index,
                 )
                 step += 1
@@ -137,60 +166,69 @@ if triton is not None:
         draft_base = draft_probs + bid * stride_dp_b + prob_row * stride_dp_s
 
         norm_sum = 0.0
-        for v_start in range(0, VOCAB_SIZE, BLOCK_V):
-            offsets = v_start + tl.arange(0, BLOCK_V)
-            mask = offsets < VOCAB_SIZE
-            target_val = tl.load(
-                target_base + offsets * stride_tp_v, mask=mask, other=0.0
-            )
-            if all_accepted:
-                residual_val = target_val
-            else:
-                draft_val = tl.load(
-                    draft_base + offsets * stride_dp_v, mask=mask, other=0.0
-                )
-                residual_val = tl.maximum(target_val - draft_val, 0.0)
-            norm_sum += tl.sum(residual_val)
-
-        final_token = VOCAB_SIZE - 1
-        if norm_sum <= 0.0:
-            best_val = -float("inf")
+        if valid_last and (prob_row < TARGET_ROWS):
             for v_start in range(0, VOCAB_SIZE, BLOCK_V):
                 offsets = v_start + tl.arange(0, BLOCK_V)
                 mask = offsets < VOCAB_SIZE
                 target_val = tl.load(
-                    target_base + offsets * stride_tp_v, mask=mask, other=-float("inf")
+                    target_base + offsets * stride_tp_v, mask=mask, other=0.0
                 )
-                block_best = tl.max(target_val, axis=0)
-                if block_best > best_val:
-                    best_val = block_best
-                    final_token = v_start + tl.argmax(target_val, axis=0)
-        else:
-            target_u = tl.load(uniform_samples_for_final_sampling + bid) * norm_sum
-            cdf = 0.0
-            found = 0
-            for v_start in range(0, VOCAB_SIZE, BLOCK_V):
-                if found == 0:
+                if all_accepted:
+                    residual_val = target_val
+                else:
+                    draft_val = tl.load(
+                        draft_base + offsets * stride_dp_v,
+                        mask=mask & (prob_row < DRAFT_ROWS),
+                        other=0.0,
+                    )
+                    residual_val = tl.maximum(target_val - draft_val, 0.0)
+                norm_sum += tl.sum(residual_val)
+
+            final_token = VOCAB_SIZE - 1
+            if norm_sum <= 0.0:
+                best_val = -float("inf")
+                for v_start in range(0, VOCAB_SIZE, BLOCK_V):
                     offsets = v_start + tl.arange(0, BLOCK_V)
                     mask = offsets < VOCAB_SIZE
                     target_val = tl.load(
-                        target_base + offsets * stride_tp_v, mask=mask, other=0.0
+                        target_base + offsets * stride_tp_v,
+                        mask=mask,
+                        other=-float("inf"),
                     )
-                    if all_accepted:
-                        residual_val = target_val
-                    else:
-                        draft_val = tl.load(
-                            draft_base + offsets * stride_dp_v, mask=mask, other=0.0
+                    block_best = tl.max(target_val, axis=0)
+                    if block_best > best_val:
+                        best_val = block_best
+                        final_token = v_start + tl.argmax(target_val, axis=0)
+            else:
+                target_u = tl.load(uniform_samples_for_final_sampling + bid) * norm_sum
+                cdf = 0.0
+                found = 0
+                for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+                    if found == 0:
+                        offsets = v_start + tl.arange(0, BLOCK_V)
+                        mask = offsets < VOCAB_SIZE
+                        target_val = tl.load(
+                            target_base + offsets * stride_tp_v, mask=mask, other=0.0
                         )
-                        residual_val = tl.maximum(target_val - draft_val, 0.0)
-                    block_cdf = cdf + tl.cumsum(residual_val, axis=0)
-                    matched = block_cdf > target_u
-                    if tl.max(matched, axis=0):
-                        final_token = v_start + tl.argmax(matched.to(tl.int32), axis=0)
-                        found = 1
-                    cdf += tl.sum(residual_val)
+                        if all_accepted:
+                            residual_val = target_val
+                        else:
+                            draft_val = tl.load(
+                                draft_base + offsets * stride_dp_v,
+                                mask=mask & (prob_row < DRAFT_ROWS),
+                                other=0.0,
+                            )
+                            residual_val = tl.maximum(target_val - draft_val, 0.0)
+                        block_cdf = cdf + tl.cumsum(residual_val, axis=0)
+                        matched = block_cdf > target_u
+                        if tl.max(matched, axis=0):
+                            final_token = v_start + tl.argmax(
+                                matched.to(tl.int32), axis=0
+                            )
+                            found = 1
+                        cdf += tl.sum(residual_val)
 
-        tl.store(predicts + last_index, final_token)
+            tl.store(predicts + last_index, final_token)
 
 
 def _chain_speculative_sampling_torch(
@@ -207,6 +245,9 @@ def _chain_speculative_sampling_torch(
     batch_size, num_slots = candidates.shape
     for bid in range(batch_size):
         root_index = retrive_index[bid, 0]
+        if root_index < 0 or root_index >= predicts.numel():
+            accept_token_num[bid] = 0
+            continue
         accept_index[bid, 0] = root_index
         last_index = root_index
         prob_row = 0
@@ -215,13 +256,21 @@ def _chain_speculative_sampling_torch(
 
         for step in range(1, num_slots):
             draft_token = candidates[bid, step]
+            if draft_token < 0 or draft_token >= target_probs.shape[-1]:
+                all_accepted = False
+                break
             p = target_probs[bid, prob_row, draft_token]
             q = draft_probs[bid, prob_row, draft_token]
-            if uniform_samples[bid, step - 1] * q < p:
+            next_index = retrive_index[bid, step]
+            if (
+                uniform_samples[bid, step - 1] * q < p
+                and 0 <= next_index < predicts.numel()
+                and num_accepted + 1 < accept_index.shape[1]
+            ):
                 predicts[last_index] = draft_token
                 num_accepted += 1
                 prob_row = step
-                last_index = retrive_index[bid, step]
+                last_index = next_index
                 accept_index[bid, num_accepted] = last_index
             else:
                 all_accepted = False
@@ -238,7 +287,7 @@ def _chain_speculative_sampling_torch(
         else:
             cdf = torch.cumsum(final_probs, dim=0)
             final_token = torch.searchsorted(
-                cdf, uniform_samples_for_final_sampling[bid] * norm
+                cdf, uniform_samples_for_final_sampling[bid] * norm, right=True
             )
             final_token = torch.clamp(final_token, max=final_probs.numel() - 1)
 
@@ -286,6 +335,8 @@ def chain_speculative_sampling(
             draft_probs,
             candidates.stride(0),
             candidates.stride(1),
+            accept_index.stride(0),
+            accept_index.stride(1),
             retrive_index.stride(0),
             retrive_index.stride(1),
             uniform_samples.stride(0),
@@ -297,6 +348,10 @@ def chain_speculative_sampling(
             draft_probs.stride(1),
             draft_probs.stride(2),
             NUM_SLOTS=num_slots,
+            ACCEPT_COLS=accept_index.shape[1],
+            PREDICT_NUMEL=predicts.numel(),
+            TARGET_ROWS=target_probs.shape[1],
+            DRAFT_ROWS=draft_probs.shape[1],
             VOCAB_SIZE=target_probs.shape[-1],
             BLOCK_V=4096,
         )

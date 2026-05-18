@@ -51,6 +51,7 @@ elif is_cpu():
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -239,6 +240,7 @@ class GDNKernelDispatcher:
             **kwargs,
         )
 
+
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
@@ -411,7 +413,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # The generic target-verify branch below is recurrent and suitable for
         # tree/EAGLE verify. DVR needs chunkwise prefill-equivalent verify, so
         # it exits early through the adapter-managed path.
-        if self.dvr_state_adapter.is_verify_enabled(
+        if self.dvr_state_adapter.is_dvr_target_verify(
             state_cache=mamba_cache_params, is_target_verify=is_target_verify
         ):
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)

@@ -94,9 +94,6 @@ def chunk_fwd_kernel_o(
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
-        # `h` may be stored in fp32 when the state pool is fp32 so DVR can reuse
-        # chunk boundary checkpoints without bf16 rounding. The output path still
-        # follows the original activation dtype for the matmul.
         b_o += tl.dot(b_q, tl.trans(b_h.to(b_q.dtype)))
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)

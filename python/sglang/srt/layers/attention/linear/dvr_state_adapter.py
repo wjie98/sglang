@@ -1,20 +1,28 @@
+"""Adapter boundary between model backends and DVR linear-state lifecycle.
+
+External callers:
+- gdn_backend enters process_target_verify_* during TARGET_VERIFY.
+- dvr_linear_state uses backup/restore/commit methods around draft and verify.
+"""
+
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.attention.linear.dvr_state_cache import (
+from sglang.srt.layers.attention.linear.dvr_state import (
     DVRRecurrentStateBackup,
     DVRStateInputWindow,
+    DVRStateOps,
 )
-from sglang.srt.layers.attention.linear.dvr_state_ops import DVRStateOps
 from sglang.srt.layers.attention.linear.dvr_state_verify import (
-    build_dvr_state_commit_plan,
     rebuild_dvr_live_state_grouped,
     run_dvr_chunkwise_verify,
     write_dvr_conv_windows,
 )
+
+__all__ = ["DVRGatedStateAdapter"]
 
 
 @dataclass(frozen=True)
@@ -52,7 +60,7 @@ class DVRGatedStateAdapter:
     def for_gdn(cls, kernel_dispatcher) -> "DVRGatedStateAdapter":
         return cls(DVRStateOps.for_gdn(kernel_dispatcher))
 
-    def is_verify_enabled(self, *, state_cache, is_target_verify: bool) -> bool:
+    def is_dvr_target_verify(self, *, state_cache, is_target_verify: bool) -> bool:
         return is_target_verify and DVRStateInputWindow.from_cache(state_cache).enabled
 
     def state_input_tail_lens(
@@ -75,7 +83,23 @@ class DVRGatedStateAdapter:
             return
         state_window.set_tail_lens(indices=live_indices, value=tail_lens)
 
-    def backup_recurrent_state(
+    def validate_state_cache(self, *, state_cache):
+        assert state_cache.temporal.dtype == torch.float32, (
+            "DVR linear-state verify requires fp32 temporal state checkpoints. "
+            "bf16/fp16 checkpoints round the chunkwise scan state and can "
+            "diverge from full prefill across chunks."
+        )
+        assert state_cache.intermediate_ssm.dtype == torch.float32, (
+            "DVR linear-state verify requires fp32 intermediate prefill states."
+        )
+
+    def zero_recurrent_state(self, *, state_cache, indices: torch.Tensor):
+        indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
+        for conv in state_cache.conv:
+            conv[:, indices] = 0
+        state_cache.temporal[:, indices] = 0
+
+    def _backup_recurrent_state(
         self, *, state_cache, indices: torch.Tensor
     ) -> DVRRecurrentStateBackup:
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
@@ -85,7 +109,7 @@ class DVRGatedStateAdapter:
             indices=indices.clone(),
         )
 
-    def restore_recurrent_state(
+    def _restore_recurrent_state(
         self,
         *,
         state_cache,
@@ -99,6 +123,50 @@ class DVRGatedStateAdapter:
         state_cache.temporal[:, dst_indices] = backup.temporal.to(
             state_cache.temporal.dtype, copy=False
         )
+
+    def backup_verify_recurrent_states(
+        self,
+        *,
+        state_cache,
+        boundary_indices: torch.Tensor,
+        live_indices: torch.Tensor,
+    ) -> Tuple[DVRRecurrentStateBackup, DVRRecurrentStateBackup]:
+        return (
+            self._backup_recurrent_state(
+                state_cache=state_cache, indices=boundary_indices
+            ),
+            self._backup_recurrent_state(state_cache=state_cache, indices=live_indices),
+        )
+
+    def prepare_recurrent_state_for_verify(
+        self,
+        *,
+        state_cache,
+        live_indices: torch.Tensor,
+        boundary_indices: torch.Tensor,
+        boundary_backup: Optional[DVRRecurrentStateBackup],
+        live_backup: Optional[DVRRecurrentStateBackup],
+    ):
+        if boundary_backup is None:
+            state_cache.temporal[:, live_indices] = state_cache.temporal[
+                :, boundary_indices
+            ]
+            return
+
+        # Draft decode mutates the live recurrent slot. DVR target verify needs
+        # the chunk-boundary SSM state for chunkwise scan, but the draft-start
+        # conv state for producing q/k/v on the draft suffix.
+        self._restore_recurrent_state(
+            state_cache=state_cache,
+            backup=boundary_backup,
+            indices=boundary_indices,
+        )
+        state_cache.temporal[:, live_indices] = boundary_backup.temporal.to(
+            state_cache.temporal.dtype, copy=False
+        )
+        if live_backup is not None:
+            for conv, saved_conv in zip(state_cache.conv, live_backup.conv, strict=True):
+                conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)
 
     def make_forward_context(
         self,
@@ -122,28 +190,6 @@ class DVRGatedStateAdapter:
             ssm_states=ssm_states,
             seq_len=seq_len,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
-        )
-
-    @staticmethod
-    def verify_shape(*, seq_len: int, spec_info) -> Tuple[int, int]:
-        draft_token_num = spec_info.draft_token_num
-        return seq_len // draft_token_num, draft_token_num
-
-    def target_verify_shape(
-        self, context: DVRGatedForwardContext
-    ) -> Tuple[int, int]:
-        return self.verify_shape(
-            seq_len=context.seq_len, spec_info=context.spec_info
-        )
-
-    def target_verify_has_initial_states(
-        self, context: DVRGatedForwardContext
-    ) -> torch.Tensor:
-        batch_size, _ = self.target_verify_shape(context)
-        forward_batch = context.forward_batch
-        return (forward_batch.seq_lens[:batch_size] > 0).to(
-            dtype=torch.bool,
-            device=forward_batch.input_ids.device,
         )
 
     def cache_extend_tail_from_forward(
@@ -196,12 +242,17 @@ class DVRGatedStateAdapter:
     ) -> torch.Tensor:
         """Run DVR draft conv and export absolute-offset conv windows."""
 
-        assert self.is_verify_enabled(
+        assert self.is_dvr_target_verify(
             state_cache=context.state_cache, is_target_verify=context.is_target_verify
         )
 
-        batch_size, draft_token_num = self.target_verify_shape(context)
-        has_initial_states = self.target_verify_has_initial_states(context)
+        draft_token_num = context.spec_info.draft_token_num
+        batch_size = context.seq_len // draft_token_num
+        forward_batch = context.forward_batch
+        has_initial_states = (forward_batch.seq_lens[:batch_size] > 0).to(
+            dtype=torch.bool,
+            device=forward_batch.input_ids.device,
+        )
         mixed_qkv_linear = mixed_qkv
         mixed_qkv_reshaped = mixed_qkv_linear.view(
             batch_size, draft_token_num, -1
@@ -245,11 +296,12 @@ class DVRGatedStateAdapter:
         g: torch.Tensor,
         beta: torch.Tensor,
     ) -> torch.Tensor:
-        assert self.is_verify_enabled(
+        assert self.is_dvr_target_verify(
             state_cache=context.state_cache, is_target_verify=context.is_target_verify
         )
 
-        batch_size, draft_token_num = self.target_verify_shape(context)
+        draft_token_num = context.spec_info.draft_token_num
+        batch_size = context.seq_len // draft_token_num
         return run_dvr_chunkwise_verify(
             state_ops=self.ops,
             state_window=DVRStateInputWindow.from_cache(context.state_cache),
@@ -288,16 +340,9 @@ class DVRGatedStateAdapter:
         accepted_steps: torch.Tensor,
     ) -> torch.Tensor:
         state_window = DVRStateInputWindow.from_cache(state_cache)
-        commit_plan = build_dvr_state_commit_plan(
-            verified_tail_lens=verified_tail_lens,
-            accepted_tokens=accepted_tokens,
-            accepted_steps=accepted_steps,
-            window_capacity=state_window.capacity,
-            conv_capacity=state_cache.intermediate_conv_window[0].shape[2],
-            device=live_indices.device,
-            chunk_size=self.chunk_size,
-        )
-        crossing = commit_plan.crossing
+        pos_before = verified_tail_lens.to(device=live_indices.device, dtype=torch.long)
+        pos_after = pos_before + accepted_tokens
+        crossing = pos_after >= self.chunk_size
 
         self.ops.scatter_state(
             state_cache.conv[0],
@@ -309,10 +354,10 @@ class DVRGatedStateAdapter:
         boundary_state_step = (
             0 if state_cache.intermediate_ssm.shape[2] == 1 else self.chunk_size - 1
         )
-        no_commit_step = torch.full_like(commit_plan.pos_before, -1)
+        no_commit_step = torch.full_like(pos_before, -1)
         commit_step = torch.where(
             crossing,
-            torch.full_like(commit_plan.pos_before, boundary_state_step),
+            torch.full_like(pos_before, boundary_state_step),
             no_commit_step,
         )
         self.ops.scatter_state(
@@ -325,11 +370,11 @@ class DVRGatedStateAdapter:
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
             boundary_indices,
-            torch.where(crossing, commit_plan.boundary_conv_steps, no_commit_step),
+            torch.where(crossing, self.chunk_size - 1 - pos_before, no_commit_step),
         )
 
-        new_pos = commit_plan.pos_after - self.chunk_size
-        pos_after = torch.where(crossing, new_pos, commit_plan.pos_after)
+        new_pos = pos_after - self.chunk_size
+        pos_after = torch.where(crossing, new_pos, pos_after)
         state_window.shift_after_boundary(
             live_indices=live_indices,
             crossing=crossing,

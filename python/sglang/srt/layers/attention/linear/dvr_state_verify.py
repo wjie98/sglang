@@ -1,44 +1,17 @@
-from dataclasses import dataclass
+"""Fixed-window DVR verify helpers for gated linear-state layers.
+
+Called by dvr_state_adapter only. The helpers build the chunk commit plan, run
+chunkwise verify, export boundary state/conv windows, and rebuild live
+recurrent state for the next self-draft decode.
+"""
+
 from typing import Optional
 
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.attention.linear.dvr_state_cache import DVRStateInputWindow
-from sglang.srt.layers.attention.linear.dvr_state_ops import DVRStateOps
-
-
-@dataclass(frozen=True)
-class DVRStateCommitPlan:
-    pos_before: torch.Tensor
-    pos_after: torch.Tensor
-    crossing: torch.Tensor
-    accepted_window_steps: torch.Tensor
-    boundary_conv_steps: torch.Tensor
-
-
-def build_dvr_state_commit_plan(
-    *,
-    verified_tail_lens: torch.Tensor,
-    accepted_tokens: torch.Tensor,
-    accepted_steps: torch.Tensor,
-    window_capacity: int,
-    conv_capacity: int,
-    device: torch.device,
-    chunk_size: int = FLA_CHUNK_SIZE,
-) -> DVRStateCommitPlan:
-    pos_before = verified_tail_lens.to(device=device, dtype=torch.long)
-    pos_after = pos_before + accepted_tokens
-    crossing = pos_after >= chunk_size
-    accepted_window_steps = pos_before + accepted_steps
-    boundary_conv_steps = chunk_size - 1 - pos_before
-    return DVRStateCommitPlan(
-        pos_before=pos_before,
-        pos_after=pos_after,
-        crossing=crossing,
-        accepted_window_steps=accepted_window_steps,
-        boundary_conv_steps=boundary_conv_steps,
-    )
+from sglang.srt.layers.attention.linear.dvr_gdn_state import DVRGDNStateInputWindow
+from sglang.srt.layers.attention.linear.dvr_state import DVRStateOps
 
 
 def write_dvr_chunk_boundary_state(
@@ -50,6 +23,16 @@ def write_dvr_chunk_boundary_state(
     verify_window_size: int,
     chunk_size: int = FLA_CHUNK_SIZE,
 ):
+    """Copy the first chunk-boundary state exported by chunkwise scan.
+
+    DVR verifies a fixed physical window of `CHUNK_SIZE + draft_tokens`. Only
+    the state at the first `CHUNK_SIZE` boundary can become the next deterministic
+    prefill-equivalent checkpoint. The chunkwise kernel returns `h` in two
+    layouts depending on whether the input is graph-friendly equal length or
+    packed variable length; this helper normalizes both layouts and writes a
+    single boundary state into the speculative state cache.
+    """
+
     if h is None or h.shape[1] <= 1:
         return
 
@@ -78,19 +61,6 @@ def write_dvr_chunk_boundary_state(
     ] = boundary_state.to(intermediate_state_cache.dtype)
 
 
-def build_dvr_conv_windows(
-    *,
-    initial_conv_windows: torch.Tensor,
-    mixed_qkv_reshaped: torch.Tensor,
-    verify_window_size: int,
-) -> torch.Tensor:
-    conv_source = torch.cat([initial_conv_windows, mixed_qkv_reshaped], dim=2)
-    state_len = initial_conv_windows.shape[-1]
-    return conv_source.unfold(
-        dimension=2, size=state_len, step=1
-    )[:, :, 1 : verify_window_size + 1].transpose(1, 2)
-
-
 def write_dvr_conv_windows(
     *,
     intermediate_conv_window_cache: torch.Tensor,
@@ -99,11 +69,20 @@ def write_dvr_conv_windows(
     mixed_qkv_reshaped: torch.Tensor,
     verify_window_size: int,
 ):
-    conv_windows = build_dvr_conv_windows(
-        initial_conv_windows=initial_conv_windows,
-        mixed_qkv_reshaped=mixed_qkv_reshaped,
-        verify_window_size=verify_window_size,
-    )
+    """Export per-token conv windows for later live-state commits.
+
+    The GDN short convolution is part of the recurrent state lifecycle. During
+    DVR verify we rebuild conv windows from the verified input sequence:
+    previous conv state + current verify-window inputs. The resulting windows
+    are indexed by accepted draft step, matching the normal EAGLE/mamba state
+    scatter path.
+    """
+
+    conv_source = torch.cat([initial_conv_windows, mixed_qkv_reshaped], dim=2)
+    state_len = initial_conv_windows.shape[-1]
+    conv_windows = conv_source.unfold(
+        dimension=2, size=state_len, step=1
+    )[:, :, 1 : verify_window_size + 1].transpose(1, 2)
     rows = (
         intermediate_state_indices[: initial_conv_windows.shape[0]]
         .to(torch.long)
@@ -128,6 +107,13 @@ def select_dvr_draft_suffix(
     num_v_heads: int,
     head_v_dim: int,
 ) -> torch.Tensor:
+    """Select the newly drafted suffix from a physical chunk+draft output.
+
+    The chunkwise scan computes outputs for the whole physical window. The
+    verifier should only consume logits for the draft tokens, whose columns are
+    offset by the already-verified tail length of each request.
+    """
+
     core_attn_out = core_attn_out.view(
         batch_size, verify_window_size, num_v_heads, head_v_dim
     )
@@ -149,7 +135,7 @@ def select_dvr_draft_suffix(
 def run_dvr_chunkwise_verify(
     *,
     state_ops: DVRStateOps,
-    state_window: DVRStateInputWindow,
+    state_window: DVRGDNStateInputWindow,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -171,9 +157,12 @@ def run_dvr_chunkwise_verify(
 ) -> torch.Tensor:
     """Run DVR's fixed chunk+draft linear-state verify window.
 
-    Backends provide state-input tensors and kernels; the adapter owns the DVR
-    rolling-window mechanics and only returns the draft suffix consumed by the
-    normal target-verify path.
+    The GDN backend passes only the draft-token q/k/v/g/beta rows produced by
+    this forward. DVR first appends those rows to the rolling window, then runs
+    chunkwise scan over the full `CHUNK_SIZE + draft_tokens` physical window so
+    the verify path uses the same scan semantics as deterministic prefill. The
+    function caches the chunk-boundary state for post-accept commits and returns
+    only the draft suffix, preserving the ordinary target-verify logits shape.
     """
 
     indices = cache_indices[:batch_size].to(torch.long)
@@ -233,7 +222,7 @@ def run_dvr_chunkwise_verify(
 def rebuild_dvr_live_state_grouped(
     *,
     state_ops: DVRStateOps,
-    state_window: DVRStateInputWindow,
+    state_window: DVRGDNStateInputWindow,
     temporal_state: torch.Tensor,
     live_indices: torch.Tensor,
     boundary_indices: torch.Tensor,

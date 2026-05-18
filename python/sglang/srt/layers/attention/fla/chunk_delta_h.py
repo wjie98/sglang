@@ -302,10 +302,6 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    # Keep chunk boundary states in the same dtype as the state pool. DVR relies
-    # on these checkpoints as the next verify window's initial state; if the FLA
-    # scan accumulates in fp32 but materializes `h` as bf16, the next chunk starts
-    # from a rounded state and diverges from full prefill after multiple chunks.
     h_dtype = initial_state.dtype if initial_state is not None else k.dtype
     h = torch.empty(B, NT, H, V, K, dtype=h_dtype, device=k.device)
 
