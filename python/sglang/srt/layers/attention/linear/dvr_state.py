@@ -95,7 +95,7 @@ class DVRStateInputWindow:
     def shift_after_boundary(
         self,
         *,
-        live_indices: torch.Tensor,
+        indices: torch.Tensor,
         crossing: torch.Tensor,
         chunk_size: int = FLA_CHUNK_SIZE,
     ):
@@ -107,17 +107,17 @@ class DVRStateInputWindow:
         mask = crossing.to(torch.bool)
         for cache in self.tensors():
             if has_layer_dim:
-                dst = cache[:, live_indices, :tail_capacity]
-                src = cache[:, live_indices, chunk_size : chunk_size + tail_capacity]
+                dst = cache[:, indices, :tail_capacity]
+                src = cache[:, indices, chunk_size : chunk_size + tail_capacity]
                 mask_shape = (1, -1) + (1,) * (dst.dim() - 2)
-                cache[:, live_indices, :tail_capacity] = torch.where(
+                cache[:, indices, :tail_capacity] = torch.where(
                     mask.view(mask_shape), src, dst
                 )
             else:
-                dst = cache[live_indices, :tail_capacity]
-                src = cache[live_indices, chunk_size : chunk_size + tail_capacity]
+                dst = cache[indices, :tail_capacity]
+                src = cache[indices, chunk_size : chunk_size + tail_capacity]
                 mask_shape = (-1,) + (1,) * (dst.dim() - 1)
-                cache[live_indices, :tail_capacity] = torch.where(
+                cache[indices, :tail_capacity] = torch.where(
                     mask.view(mask_shape), src, dst
                 )
 

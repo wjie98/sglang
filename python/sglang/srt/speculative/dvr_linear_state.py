@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 class DVRLinearStateContext:
     state_cache: Any
     state_adapter: Any
+    state_input_indices: torch.Tensor
     live_indices: torch.Tensor
     boundary_indices: Optional[torch.Tensor] = None
 
@@ -99,7 +100,7 @@ class DVRLinearStateLifecycle:
         ]
         verified_tail_lens = ctx.state_adapter.state_input_tail_lens(
             state_cache=ctx.state_cache,
-            live_indices=ctx.live_indices,
+            state_input_indices=ctx.state_input_indices,
         )
         if verified_tail_lens is None:
             verified_tail_lens = torch.tensor(
@@ -112,6 +113,7 @@ class DVRLinearStateLifecycle:
         )
         ctx.state_adapter.commit_after_verify(
             state_cache=ctx.state_cache,
+            state_input_indices=ctx.state_input_indices,
             live_indices=ctx.live_indices,
             boundary_indices=ctx.boundary_indices,
             verified_tail_lens=verified_tail_lens,
@@ -155,6 +157,10 @@ class DVRLinearStateLifecycle:
         live_indices = batch.req_to_token_pool.get_mamba_indices(
             batch.req_pool_indices
         ).to(torch.long)
+        state_input_indices = batch.req_pool_indices.to(
+            device=live_indices.device, dtype=torch.long
+        )
+        state_input_indices = state_input_indices + 1
         state_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         state_adapter.validate_state_cache(state_cache=state_cache)
         boundary_indices = None
@@ -170,6 +176,7 @@ class DVRLinearStateLifecycle:
         return DVRLinearStateContext(
             state_cache=state_cache,
             state_adapter=state_adapter,
+            state_input_indices=state_input_indices,
             live_indices=live_indices,
             boundary_indices=boundary_indices,
         )
@@ -273,7 +280,7 @@ class DVRLinearStateLifecycle:
         for i, req in enumerate(batch.reqs):
             if req.rid not in self.boundary_seqlen:
                 boundary_seqlen, verified_tail_len = self.boundary_and_tail(req)
-                reset_pos_indices.append(ctx.live_indices[i])
+                reset_pos_indices.append(ctx.state_input_indices[i])
                 reset_pos_values.append(verified_tail_len)
                 zero_dst_idx = self.init_boundary_for_req(batch, req, boundary_seqlen)
                 if zero_dst_idx is not None:
@@ -288,7 +295,7 @@ class DVRLinearStateLifecycle:
         if reset_pos_indices:
             ctx.state_adapter.set_state_input_tail_lens(
                 state_cache=ctx.state_cache,
-                live_indices=torch.stack(reset_pos_indices),
+                state_input_indices=torch.stack(reset_pos_indices),
                 tail_lens=torch.tensor(reset_pos_values, device=ctx.live_indices.device),
             )
 

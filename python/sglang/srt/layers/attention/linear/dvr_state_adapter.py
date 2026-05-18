@@ -70,6 +70,15 @@ class DVRGatedForwardContext:
         # Slot 0 is the shared dummy mamba slot used by padded graph rows.
         return torch.where(valid_mask, indices, torch.zeros_like(indices)), valid_mask
 
+    def safe_state_input_indices(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        indices = self.forward_batch.req_pool_indices[: self.graph_batch_size].to(
+            device=self.cache_indices.device, dtype=torch.long
+        )
+        indices = indices + 1
+        valid_mask = self.valid_request_mask()
+        # Slot 0 is the shared dummy DVR state-input slot used by padded graph rows.
+        return torch.where(valid_mask, indices, torch.zeros_like(indices)), valid_mask
+
 
 @dataclass
 class DVRGatedStateAdapter:
@@ -91,24 +100,24 @@ class DVRGatedStateAdapter:
         return is_target_verify and DVRStateInputWindow.from_cache(state_cache).enabled
 
     def state_input_tail_lens(
-        self, *, state_cache, live_indices: torch.Tensor
+        self, *, state_cache, state_input_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
         state_window = DVRStateInputWindow.from_cache(state_cache)
         if not state_window.enabled:
             return None
-        return state_window.tail_lens(indices=live_indices)
+        return state_window.tail_lens(indices=state_input_indices)
 
     def set_state_input_tail_lens(
         self,
         *,
         state_cache,
-        live_indices: torch.Tensor,
+        state_input_indices: torch.Tensor,
         tail_lens: torch.Tensor,
     ):
         state_window = DVRStateInputWindow.from_cache(state_cache)
         if not state_window.enabled:
             return
-        state_window.set_tail_lens(indices=live_indices, value=tail_lens)
+        state_window.set_tail_lens(indices=state_input_indices, value=tail_lens)
 
     def validate_state_cache(self, *, state_cache):
         assert state_cache.temporal.dtype == torch.float32, (
@@ -224,7 +233,6 @@ class DVRGatedStateAdapter:
         *,
         forward_batch,
         state_cache,
-        cache_indices: torch.Tensor,
         query_start_loc: Optional[torch.Tensor],
         q: torch.Tensor,
         k: torch.Tensor,
@@ -247,9 +255,13 @@ class DVRGatedStateAdapter:
         v = v.reshape(v.shape[1], v.shape[2], v.shape[3])
         g = g.reshape(-1, g.shape[-1])
         beta = beta.reshape(-1, beta.shape[-1])
+        state_input_indices = forward_batch.req_pool_indices.to(
+            device=q.device, dtype=torch.long
+        )
+        state_input_indices = state_input_indices + 1
 
         state_window.write_extend_tail(
-            cache_indices=cache_indices,
+            indices=state_input_indices,
             query_start_loc=query_start_loc,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
@@ -333,8 +345,9 @@ class DVRGatedStateAdapter:
         draft_token_num = context.draft_token_num
         batch_size = context.graph_batch_size
         dvr_indices, valid_mask = context.safe_cache_indices()
+        state_input_indices, _ = context.safe_state_input_indices()
         state_window = DVRStateInputWindow.from_cache(context.state_cache)
-        tail_lens = state_window.tail_lens(indices=dvr_indices).to(torch.long)
+        tail_lens = state_window.tail_lens(indices=state_input_indices).to(torch.long)
         tail_lens = torch.where(
             valid_mask,
             tail_lens.clamp(min=0, max=self.chunk_size),
@@ -350,6 +363,7 @@ class DVRGatedStateAdapter:
             beta=beta,
             ssm_states=context.ssm_states,
             cache_indices=dvr_indices,
+            state_input_indices=state_input_indices,
             tail_lens=tail_lens,
             intermediate_state_cache=context.state_cache.intermediate_ssm,
             intermediate_state_indices=torch.arange(
@@ -372,6 +386,7 @@ class DVRGatedStateAdapter:
         self,
         *,
         state_cache,
+        state_input_indices: torch.Tensor,
         live_indices: torch.Tensor,
         boundary_indices: torch.Tensor,
         verified_tail_lens: torch.Tensor,
@@ -415,7 +430,7 @@ class DVRGatedStateAdapter:
         new_pos = pos_after - self.chunk_size
         pos_after = torch.where(crossing, new_pos, pos_after)
         state_window.shift_after_boundary(
-            live_indices=live_indices,
+            indices=state_input_indices,
             crossing=crossing,
             chunk_size=self.chunk_size,
         )
@@ -423,6 +438,7 @@ class DVRGatedStateAdapter:
             state_ops=self.ops,
             state_window=state_window,
             temporal_state=state_cache.temporal,
+            state_input_indices=state_input_indices,
             live_indices=live_indices,
             boundary_indices=boundary_indices,
             req_indices=torch.arange(
@@ -434,6 +450,6 @@ class DVRGatedStateAdapter:
         )
 
         state_window.set_tail_lens(
-            indices=live_indices, value=pos_after.to(torch.int32)
+            indices=state_input_indices, value=pos_after.to(torch.int32)
         )
         return crossing

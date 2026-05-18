@@ -310,7 +310,7 @@ class MambaPool:
                     intermediate_conv_tokens = speculative_num_draft_tokens
                     dvr_state_inputs = DVRStateInputCache.for_gdn(
                         num_layers=num_mamba_layers,
-                        num_slots=size + 1,
+                        num_slots=spec_state_size + 1,
                         num_draft_tokens=speculative_num_draft_tokens,
                         temporal_state_shape=temporal_state_shape,
                         dtype=conv_dtype,
@@ -409,11 +409,6 @@ class MambaPool:
             t.shape[0], need_size, *t.shape[2:]
         )
         t[:, select_index] = z
-        if (
-            isinstance(self.mamba_cache, self.SpeculativeState)
-            and self.mamba_cache.dvr_state_inputs is not None
-        ):
-            self.mamba_cache.dvr_state_inputs.reset(select_index)
 
         return select_index
 

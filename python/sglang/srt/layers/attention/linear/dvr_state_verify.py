@@ -143,6 +143,7 @@ def run_dvr_chunkwise_verify(
     beta: torch.Tensor,
     ssm_states: torch.Tensor,
     cache_indices: torch.Tensor,
+    state_input_indices: torch.Tensor,
     intermediate_state_cache: torch.Tensor,
     intermediate_state_indices: torch.Tensor,
     batch_size: int,
@@ -167,15 +168,14 @@ def run_dvr_chunkwise_verify(
     """
 
     indices = cache_indices[:batch_size].to(torch.long)
+    input_indices = state_input_indices[:batch_size].to(torch.long)
     if tail_lens is None:
-        tail_lens = state_window.tail_lens(indices=indices).to(torch.long)
+        tail_lens = state_window.tail_lens(indices=input_indices).to(torch.long)
     else:
-        tail_lens = tail_lens[:batch_size].to(
-            device=indices.device, dtype=torch.long
-        )
+        tail_lens = tail_lens[:batch_size].to(device=indices.device, dtype=torch.long)
     tail_lens = tail_lens.clamp(min=0, max=chunk_size)
     state_window.write_draft_rows(
-        indices=indices,
+        indices=input_indices,
         col_start=tail_lens,
         q=q,
         k=k,
@@ -193,7 +193,7 @@ def run_dvr_chunkwise_verify(
     )
     verify_window_size = chunk_size + draft_token_num
     q_window, k_window, v_window, g_window, beta_window = state_window.read_window(
-        indices=indices
+        indices=input_indices
     )
     core_attn_out, _, h = state_ops.scan_chunkwise(
         q=q_window,
@@ -231,6 +231,7 @@ def rebuild_dvr_live_state_grouped(
     state_ops: DVRStateOps,
     state_window: DVRGDNStateInputWindow,
     temporal_state: torch.Tensor,
+    state_input_indices: torch.Tensor,
     live_indices: torch.Tensor,
     boundary_indices: torch.Tensor,
     req_indices: torch.Tensor,
@@ -247,6 +248,7 @@ def rebuild_dvr_live_state_grouped(
     if req_indices.numel() == 0:
         return
 
+    state_input_req_indices = state_input_indices[req_indices]
     state_live_indices = live_indices[req_indices]
     state_boundary_indices = boundary_indices[req_indices]
     q_cache, k_cache, v_cache, g_cache, beta_cache = state_window.tensors()
@@ -254,11 +256,11 @@ def rebuild_dvr_live_state_grouped(
     num_reqs = state_live_indices.numel()
     token_count = token_count.to(device=temporal_state.device, dtype=torch.long)
 
-    q = q_cache[:, state_live_indices]
-    k = k_cache[:, state_live_indices]
-    v = v_cache[:, state_live_indices]
-    g = g_cache[:, state_live_indices]
-    beta = beta_cache[:, state_live_indices]
+    q = q_cache[:, state_input_req_indices]
+    k = k_cache[:, state_input_req_indices]
+    v = v_cache[:, state_input_req_indices]
+    g = g_cache[:, state_input_req_indices]
+    beta = beta_cache[:, state_input_req_indices]
     initial_state = temporal_state[:, state_boundary_indices]
 
     flat_shape = (num_layers * num_reqs,)

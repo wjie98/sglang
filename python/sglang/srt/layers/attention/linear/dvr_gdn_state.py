@@ -238,7 +238,7 @@ class DVRGDNStateInputWindow(DVRStateInputWindow):
     def write_extend_tail(
         self,
         *,
-        cache_indices: torch.Tensor,
+        indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         extend_prefix_lens_cpu,
         extend_seq_lens_cpu,
@@ -256,7 +256,7 @@ class DVRGDNStateInputWindow(DVRStateInputWindow):
             seq_len = prefix_len + extend_len
             boundary = (seq_len // chunk_size) * chunk_size
             num_verified_tokens = seq_len - boundary
-            dst = cache_indices[req_i].to(torch.long)
+            dst = indices[req_i].to(torch.long)
             self.set_tail_lens(indices=dst, value=num_verified_tokens)
             if num_verified_tokens == 0:
                 src_base += extend_len
@@ -274,7 +274,7 @@ class DVRGDNStateInputWindow(DVRStateInputWindow):
                 write_start - boundary,
                 write_end - boundary,
                 dtype=torch.long,
-                device=cache_indices.device,
+                device=indices.device,
             )
             self.write_tail(
                 dst=dst,
