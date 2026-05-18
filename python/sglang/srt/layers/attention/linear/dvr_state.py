@@ -148,6 +148,13 @@ class DVRStateInputCache:
             device=device,
         )
 
+    @classmethod
+    def is_enabled_for_current_server_args(cls) -> bool:
+        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.speculative.dvr_server_args import is_dvr_enabled
+
+        return is_dvr_enabled(get_global_server_args())
+
     def __getitem__(self, layer: int) -> "DVRStateInputCache":
         return type(self)(
             tensors=tuple(tensor[layer] for tensor in self.tensors),

@@ -984,16 +984,22 @@ class CudaGraphRunner:
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-        # Attention backend. DVR chain verify is causal, but cuda-graph metadata
-        # construction may still require a temporary custom-mask buffer for
-        # shape bookkeeping. The context clears it before capture uses metadata.
-        with dvr_causal_verify_cuda_graph_metadata(
-            self.model_runner,
-            attn_backend,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-            self.buffers.custom_mask,
+        metadata_context = empty_context()
+        if (
+            self.model_runner.spec_algorithm.is_decode_verify_rollback()
+            and forward_batch.forward_mode.is_target_verify()
         ):
+            # DVR chain verify is causal, but cuda-graph metadata construction
+            # may still require a temporary custom-mask buffer for shape
+            # bookkeeping. The context clears it before capture uses metadata.
+            metadata_context = dvr_causal_verify_cuda_graph_metadata(
+                self.model_runner,
+                attn_backend,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+                self.buffers.custom_mask,
+            )
+        with metadata_context:
             attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -1134,20 +1140,27 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
-        # Attention backend. Keep DVR target-verify replay on the causal path
-        # even though the shared graph buffers include a custom-mask tensor.
+        # Attention backend
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
-        with dvr_causal_verify_cuda_graph_metadata(
-            self.model_runner,
-            attn_backend,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            buffers.custom_mask,
+        metadata_context = empty_context()
+        if (
+            self.model_runner.spec_algorithm.is_decode_verify_rollback()
+            and self.capture_forward_mode.is_target_verify()
         ):
+            # Keep DVR target-verify replay on the causal path even though the
+            # shared graph buffers include a custom-mask tensor.
+            metadata_context = dvr_causal_verify_cuda_graph_metadata(
+                self.model_runner,
+                attn_backend,
+                self.capture_forward_mode,
+                forward_batch.spec_info,
+                buffers.custom_mask,
+            )
+        with metadata_context:
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
                 buffers.req_pool_indices[:bs],

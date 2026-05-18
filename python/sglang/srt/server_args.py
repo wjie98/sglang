@@ -32,6 +32,11 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.speculative.dvr_server_args import (
+    handle_dvr_defaults,
+    handle_dvr_speculative_decoding,
+    is_dvr_enabled,
+)
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -981,7 +986,7 @@ class ServerArgs:
             #       [overlap, non-overlap]
             self.mamba_scheduler_strategy = "no_buffer"
 
-        self._handle_dvr_defaults()
+        handle_dvr_defaults(self)
 
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
@@ -1055,153 +1060,6 @@ class ServerArgs:
                 revision=self.speculative_draft_model_revision or "main",
             )
 
-    def _handle_dvr_defaults(self):
-        if not self._is_dvr_enabled():
-            return
-
-        normalized_page_size = self._normalize_dvr_chunk_page_size(self.page_size)
-        if normalized_page_size != self.page_size:
-            logger.warning(
-                "DVR requires page_size to be no larger "
-                "than and divide FLA_CHUNK_SIZE=%s. Setting --page-size %s "
-                "instead of %s.",
-                FLA_CHUNK_SIZE,
-                normalized_page_size,
-                self.page_size,
-            )
-            self.page_size = normalized_page_size
-
-        if not self._is_dvr_gated_linear_state_model():
-            return
-
-        if self.page_size != FLA_CHUNK_SIZE:
-            logger.warning(
-                "DVR for gated linear-state models requires page_size to match "
-                "FLA_CHUNK_SIZE=%s so radix prefixes and chunkwise verify "
-                "checkpoints share the same boundary. Setting --page-size %s.",
-                FLA_CHUNK_SIZE,
-                FLA_CHUNK_SIZE,
-            )
-            self.page_size = FLA_CHUNK_SIZE
-
-        if self.mamba_scheduler_strategy != "extra_buffer":
-            logger.warning(
-                "DVR for gated linear-state models requires mamba extra_buffer "
-                "state tracking. Setting --mamba-scheduler-strategy extra_buffer."
-            )
-            self.mamba_scheduler_strategy = "extra_buffer"
-
-        if self.mamba_track_interval != FLA_CHUNK_SIZE:
-            logger.warning(
-                "DVR for gated linear-state models requires mamba_track_interval "
-                "to match FLA_CHUNK_SIZE=%s. Larger intervals may still be "
-                "chunk-size multiples, but the current extra_buffer prefill path "
-                "keeps only one tracked checkpoint and can miss the first "
-                "prefill's last chunk boundary. Setting --mamba-track-interval %s.",
-                FLA_CHUNK_SIZE,
-                FLA_CHUNK_SIZE,
-            )
-            self.mamba_track_interval = FLA_CHUNK_SIZE
-
-        if self.mamba_ssm_dtype != "float32":
-            logger.warning(
-                "DVR for gated linear-state models requires fp32 recurrent "
-                "states. Setting --mamba-ssm-dtype float32."
-            )
-            self.mamba_ssm_dtype = "float32"
-
-    def _is_dvr_enabled(self):
-        return self.speculative_algorithm == "DECODE_VERIFY_ROLLBACK"
-
-    def _is_dvr_gated_linear_state_model(self):
-        from sglang.srt.configs import (
-            JetNemotronConfig,
-            JetVLMConfig,
-            Qwen3_5Config,
-            Qwen3_5MoeConfig,
-            Qwen3NextConfig,
-        )
-
-        config = self.get_model_config().hf_config.get_text_config()
-        return isinstance(
-            config,
-            Qwen3NextConfig
-            | Qwen3_5Config
-            | Qwen3_5MoeConfig
-            | JetNemotronConfig
-            | JetVLMConfig,
-        )
-
-    @staticmethod
-    def _normalize_dvr_chunk_page_size(page_size: Optional[int]) -> Optional[int]:
-        if page_size in (None, 1):
-            return page_size
-        if page_size <= 0:
-            return page_size
-
-        aligned = 1 << (min(page_size, FLA_CHUNK_SIZE).bit_length() - 1)
-        while FLA_CHUNK_SIZE % aligned != 0:
-            aligned //= 2
-        return aligned
-
-    def _validate_dvr_page_size(self):
-        if self.page_size == 1:
-            return
-        if self.page_size <= FLA_CHUNK_SIZE and FLA_CHUNK_SIZE % self.page_size == 0:
-            return
-        raise ValueError(
-            "DVR page_size > 1 requires page_size to be no larger than and divide "
-            f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}."
-        )
-
-    def _handle_dvr_speculative_decoding(self):
-        assert self._is_dvr_enabled()
-        if not self.device.startswith("cuda"):
-            raise ValueError("DVR currently only supports CUDA device.")
-        if self.enable_dp_attention:
-            raise ValueError("DVR currently does not support DP attention.")
-        if self.disaggregation_mode != "null":
-            raise ValueError("DVR currently does not support disaggregation mode.")
-        if self.speculative_draft_model_path is not None:
-            raise ValueError("DVR self draft does not use a draft model path.")
-
-        if self.speculative_num_draft_tokens is None:
-            self.speculative_num_draft_tokens = 16
-            logger.warning(
-                "speculative_num_draft_tokens is set to 16 by default for DVR. "
-                "You can override this by explicitly setting "
-                "--speculative-num-draft-tokens."
-            )
-
-        self._validate_dvr_page_size()
-
-        if self.speculative_num_steps is None:
-            self.speculative_num_steps = self.speculative_num_draft_tokens - 1
-        elif self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
-            logger.warning(
-                "speculative_num_draft_tokens is adjusted to "
-                "speculative_num_steps + 1 for DVR chain mode."
-            )
-            self.speculative_num_draft_tokens = self.speculative_num_steps + 1
-
-        if self.speculative_eagle_topk is None:
-            self.speculative_eagle_topk = 1
-        elif self.speculative_eagle_topk != 1:
-            raise ValueError("DVR currently supports only chain mode with topk == 1.")
-
-        if self.max_running_requests is None:
-            self.max_running_requests = 48
-            logger.warning(
-                "Max running requests is reset to 48 for DVR. You can override "
-                "this by explicitly setting --max-running-requests."
-            )
-
-        self.disable_overlap_schedule = True
-        self.enable_mixed_chunk = False
-        logger.warning(
-            "Overlap scheduler and mixed chunked prefill are disabled for DVR."
-        )
-
     def _handle_hpu_backends(self):
         if self.device == "hpu":
             self.attention_backend = "torch_native"
@@ -1240,17 +1098,6 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_piecewise_cuda_graph(self):
-        if self._is_dvr_enabled():
-            if self.enforce_piecewise_cuda_graph:
-                logger.warning(
-                    "DVR does not support piecewise CUDA graph. Setting "
-                    "--disable-piecewise-cuda-graph and ignoring "
-                    "--enforce-piecewise-cuda-graph."
-                )
-            self.enforce_piecewise_cuda_graph = False
-            self.disable_piecewise_cuda_graph = True
-            return
-
         # Skip auto-disable when enforce flag is set (for testing)
         if self.enforce_piecewise_cuda_graph:
             self.disable_piecewise_cuda_graph = False
@@ -3327,8 +3174,8 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
-        if self._is_dvr_enabled():
-            self._handle_dvr_speculative_decoding()
+        if is_dvr_enabled(self):
+            handle_dvr_speculative_decoding(self)
 
     def _handle_load_format(self):
         if (

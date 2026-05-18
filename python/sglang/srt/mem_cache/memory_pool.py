@@ -55,7 +55,6 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -302,10 +301,7 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
-                if (
-                    get_global_server_args().speculative_algorithm
-                    == "DECODE_VERIFY_ROLLBACK"
-                ):
+                if DVRStateInputCache.is_enabled_for_current_server_args():
                     intermediate_ssm_tokens = 1
                     intermediate_conv_tokens = speculative_num_draft_tokens
                     dvr_state_inputs = DVRStateInputCache.for_gdn(
