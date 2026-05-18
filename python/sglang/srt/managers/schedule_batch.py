@@ -1805,22 +1805,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        server_args = get_global_server_args()
-        mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
-        prefix_len = len(req.prefix_indices)
-        end_len = prefix_len + req.extend_input_len
-        mamba_track_seqlen_aligned = (
-            prefix_len
-            + (req.extend_input_len // mamba_cache_chunk_size)
-            * mamba_cache_chunk_size
-        )
+        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
-        is_dvr = server_args.speculative_algorithm == "DECODE_VERIFY_ROLLBACK"
-        if is_dvr:
-            mamba_track_seqlen_aligned = (
-                end_len // mamba_cache_chunk_size
-            ) * mamba_cache_chunk_size
-            mask = mamba_track_seqlen_aligned > prefix_len
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
@@ -1834,22 +1820,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # otherwise retrieved from h (i.e. unaligned).
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = end_len
+            mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
 
             # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
+            mamba_track_seqlen_aligned = (
+                len(req.prefix_indices)
+                + (req.extend_input_len // mamba_cache_chunk_size)
+                * mamba_cache_chunk_size
+            )
 
             # mamba_track_fla_chunk_aligned is the aligned seqlen based on FLA_CHUNK_SIZE
             # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
             # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
             # by _force_track_h()
             mamba_track_fla_chunk_aligned = (
-                prefix_len + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+                len(req.prefix_indices)
+                + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
             )
-            if is_dvr:
-                mamba_track_fla_chunk_aligned = (
-                    end_len // FLA_CHUNK_SIZE
-                ) * FLA_CHUNK_SIZE
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
@@ -1864,10 +1852,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - prefix_len
+                    req.mamba_branching_seqlen - len(req.prefix_indices)
                 ) % mamba_cache_chunk_size == 0
                 if (
-                    req.mamba_branching_seqlen > prefix_len
+                    req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):

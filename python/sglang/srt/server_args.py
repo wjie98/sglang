@@ -1074,6 +1074,16 @@ class ServerArgs:
         if not self._is_dvr_gated_linear_state_model():
             return
 
+        if self.page_size != FLA_CHUNK_SIZE:
+            logger.warning(
+                "DVR for gated linear-state models requires page_size to match "
+                "FLA_CHUNK_SIZE=%s so radix prefixes and chunkwise verify "
+                "checkpoints share the same boundary. Setting --page-size %s.",
+                FLA_CHUNK_SIZE,
+                FLA_CHUNK_SIZE,
+            )
+            self.page_size = FLA_CHUNK_SIZE
+
         if self.mamba_scheduler_strategy != "extra_buffer":
             logger.warning(
                 "DVR for gated linear-state models requires mamba extra_buffer "
