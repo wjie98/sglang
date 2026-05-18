@@ -1120,6 +1120,11 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if (
+            self.capture_forward_mode.is_target_verify()
+            and self.model_runner.spec_algorithm.is_decode_verify_rollback()
+        ):
+            buffers.num_token_non_padded.fill_(raw_num_token)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,

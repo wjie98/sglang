@@ -43,6 +43,33 @@ class DVRGatedForwardContext:
     def spec_info(self):
         return self.forward_batch.spec_info
 
+    @property
+    def draft_token_num(self) -> int:
+        return self.spec_info.draft_token_num
+
+    @property
+    def graph_batch_size(self) -> int:
+        return self.seq_len // self.draft_token_num
+
+    def valid_request_mask(self) -> torch.Tensor:
+        batch_size = self.graph_batch_size
+        device = self.cache_indices.device
+        rows = torch.arange(batch_size, dtype=torch.long, device=device)
+        num_token_non_padded = self.forward_batch.num_token_non_padded
+        if num_token_non_padded is None:
+            return torch.ones(batch_size, dtype=torch.bool, device=device)
+        if torch.is_tensor(num_token_non_padded):
+            num_token_non_padded = num_token_non_padded.to(
+                device=device, dtype=torch.long
+            )
+        return rows * self.draft_token_num < num_token_non_padded
+
+    def safe_cache_indices(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        indices = self.cache_indices[: self.graph_batch_size].to(torch.long)
+        valid_mask = self.valid_request_mask()
+        # Slot 0 is the shared dummy mamba slot used by padded graph rows.
+        return torch.where(valid_mask, indices, torch.zeros_like(indices)), valid_mask
+
 
 @dataclass
 class DVRGatedStateAdapter:
@@ -246,18 +273,21 @@ class DVRGatedStateAdapter:
             state_cache=context.state_cache, is_target_verify=context.is_target_verify
         )
 
-        draft_token_num = context.spec_info.draft_token_num
-        batch_size = context.seq_len // draft_token_num
+        draft_token_num = context.draft_token_num
+        batch_size = context.graph_batch_size
         forward_batch = context.forward_batch
+        dvr_indices, valid_mask = context.safe_cache_indices()
         has_initial_states = (forward_batch.seq_lens[:batch_size] > 0).to(
             dtype=torch.bool,
             device=forward_batch.input_ids.device,
+        )
+        has_initial_states = has_initial_states & valid_mask.to(
+            device=has_initial_states.device
         )
         mixed_qkv_linear = mixed_qkv
         mixed_qkv_reshaped = mixed_qkv_linear.view(
             batch_size, draft_token_num, -1
         ).transpose(1, 2)
-        dvr_indices = context.cache_indices[:batch_size].to(torch.long)
         initial_conv_windows = context.conv_states[dvr_indices].clone()
         mixed_qkv = self.ops.run_verify_conv(
             mixed_qkv_linear.transpose(0, 1),
@@ -300,18 +330,27 @@ class DVRGatedStateAdapter:
             state_cache=context.state_cache, is_target_verify=context.is_target_verify
         )
 
-        draft_token_num = context.spec_info.draft_token_num
-        batch_size = context.seq_len // draft_token_num
+        draft_token_num = context.draft_token_num
+        batch_size = context.graph_batch_size
+        dvr_indices, valid_mask = context.safe_cache_indices()
+        state_window = DVRStateInputWindow.from_cache(context.state_cache)
+        tail_lens = state_window.tail_lens(indices=dvr_indices).to(torch.long)
+        tail_lens = torch.where(
+            valid_mask,
+            tail_lens.clamp(min=0, max=self.chunk_size),
+            torch.zeros_like(tail_lens),
+        )
         return run_dvr_chunkwise_verify(
             state_ops=self.ops,
-            state_window=DVRStateInputWindow.from_cache(context.state_cache),
+            state_window=state_window,
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
             ssm_states=context.ssm_states,
-            cache_indices=context.cache_indices,
+            cache_indices=dvr_indices,
+            tail_lens=tail_lens,
             intermediate_state_cache=context.state_cache.intermediate_ssm,
             intermediate_state_indices=torch.arange(
                 context.cache_indices.shape[0],

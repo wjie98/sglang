@@ -154,6 +154,7 @@ def run_dvr_chunkwise_verify(
     num_v_heads: int,
     head_v_dim: int,
     chunk_size: int = FLA_CHUNK_SIZE,
+    tail_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run DVR's fixed chunk+draft linear-state verify window.
 
@@ -166,7 +167,13 @@ def run_dvr_chunkwise_verify(
     """
 
     indices = cache_indices[:batch_size].to(torch.long)
-    tail_lens = state_window.tail_lens(indices=indices).to(torch.long)
+    if tail_lens is None:
+        tail_lens = state_window.tail_lens(indices=indices).to(torch.long)
+    else:
+        tail_lens = tail_lens[:batch_size].to(
+            device=indices.device, dtype=torch.long
+        )
+    tail_lens = tail_lens.clamp(min=0, max=chunk_size)
     state_window.write_draft_rows(
         indices=indices,
         col_start=tail_lens,

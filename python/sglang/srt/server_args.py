@@ -1074,15 +1074,6 @@ class ServerArgs:
         if not self._is_dvr_gated_linear_state_model():
             return
 
-        if not self.disable_cuda_graph_padding:
-            logger.warning(
-                "DVR for gated linear-state models uses per-request recurrent "
-                "state windows during target verify. CUDA graph batch padding "
-                "would create padded rows without valid DVR state ownership. "
-                "Setting --disable-cuda-graph-padding."
-            )
-            self.disable_cuda_graph_padding = True
-
         if self.mamba_scheduler_strategy != "extra_buffer":
             logger.warning(
                 "DVR for gated linear-state models requires mamba extra_buffer "
