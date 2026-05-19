@@ -25,12 +25,16 @@ def dvr_causal_verify_cuda_graph_metadata(
     """
 
     old_custom_mask = getattr(spec_info, "custom_mask", None)
-    should_clear = (
+    should_clear_custom_mask = (
         model_runner.spec_algorithm.is_decode_verify_rollback()
         and forward_mode.is_target_verify()
         and spec_info is not None
     )
-    if should_clear and old_custom_mask is None and fallback_custom_mask is not None:
+    if (
+        should_clear_custom_mask
+        and old_custom_mask is None
+        and fallback_custom_mask is not None
+    ):
         # DVR target verify is a topk=1 chain, so the real attention mask is
         # causal and `custom_mask` should stay None. Some cuda-graph metadata
         # builders still read `spec_info.custom_mask.shape` before producing
@@ -40,7 +44,7 @@ def dvr_causal_verify_cuda_graph_metadata(
     try:
         yield
     finally:
-        if should_clear:
+        if should_clear_custom_mask:
             spec_info.custom_mask = old_custom_mask
             backends = [attn_backend]
             full_attn_backend = getattr(attn_backend, "full_attn_backend", None)

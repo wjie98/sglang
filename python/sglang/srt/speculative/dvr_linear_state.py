@@ -354,7 +354,7 @@ class DVRLinearStateLifecycle:
         if ctx is None:
             return []
         replay_tasks = []
-        zero_dst = []
+        zero_boundary_indices = []
         reset_pos_indices = []
         reset_pos_values = []
         for i, req in enumerate(batch.reqs):
@@ -362,19 +362,19 @@ class DVRLinearStateLifecycle:
                 boundary_seqlen, verified_tail_len = self.boundary_and_tail(req)
                 reset_pos_indices.append(ctx.state_input_indices[i])
                 reset_pos_values.append(verified_tail_len)
-                zero_dst_idx, replay_task = self.init_boundary_for_req(
+                zero_boundary_idx, replay_task = self.init_boundary_for_req(
                     batch, req, boundary_seqlen, ctx.live_indices[i]
                 )
-                if zero_dst_idx is not None:
-                    zero_dst.append(zero_dst_idx)
+                if zero_boundary_idx is not None:
+                    zero_boundary_indices.append(zero_boundary_idx)
                 if replay_task is not None:
                     replay_tasks.append(replay_task)
-        if zero_dst:
-            dst = torch.stack(zero_dst).to(
+        if zero_boundary_indices:
+            boundary_indices_to_zero = torch.stack(zero_boundary_indices).to(
                 device=ctx.live_indices.device, dtype=torch.long
             )
             ctx.state_adapter.zero_recurrent_state(
-                state_cache=ctx.state_cache, indices=dst
+                state_cache=ctx.state_cache, indices=boundary_indices_to_zero
             )
         if reset_pos_indices:
             ctx.state_adapter.set_state_input_tail_lens(

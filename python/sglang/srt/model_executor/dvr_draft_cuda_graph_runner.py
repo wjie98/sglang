@@ -41,13 +41,9 @@ class DVRDraftDecodeCudaGraphRunner:
         model_runner = dvr_worker.model_runner
         with _dvr_draft_decode_graph_capture(model_runner):
             self.runner = CudaGraphRunner(model_runner)
-        self.hit_count = 0
-        self.total_count = 0
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         return self.runner.can_run(forward_batch)
 
     def replay(self, forward_batch: ForwardBatch):
-        self.total_count += 1
-        self.hit_count += 1
         return self.runner.replay(forward_batch)

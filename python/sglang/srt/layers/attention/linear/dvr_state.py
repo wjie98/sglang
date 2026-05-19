@@ -39,13 +39,13 @@ class DVRStateInputWindow:
     """
 
     inputs: Optional[Tuple[torch.Tensor, ...]]
-    pos: Optional[torch.Tensor]
+    tail_lens_tensor: Optional[torch.Tensor]
 
     @classmethod
     def from_cache(cls, state_cache) -> "DVRStateInputWindow":
-        cache = getattr(state_cache, "dvr_state_inputs", None)
+        cache = getattr(state_cache, "dvr_state_input_cache", None)
         if cache is None:
-            return cls(inputs=None, pos=None)
+            return cls(inputs=None, tail_lens_tensor=None)
         return cache.window()
 
     @property
@@ -64,20 +64,24 @@ class DVRStateInputWindow:
         return tensors[0].shape[2] if tensors[0].dim() >= 5 else tensors[0].shape[1]
 
     def tail_lens(self, *, indices: torch.Tensor) -> torch.Tensor:
-        assert self.pos is not None
-        indices = indices.to(device=self.pos.device, dtype=torch.long)
-        if self.pos.dim() == 2:
-            return self.pos[0, indices]
-        return self.pos[indices]
+        assert self.tail_lens_tensor is not None
+        indices = indices.to(device=self.tail_lens_tensor.device, dtype=torch.long)
+        if self.tail_lens_tensor.dim() == 2:
+            return self.tail_lens_tensor[0, indices]
+        return self.tail_lens_tensor[indices]
 
     def set_tail_lens(self, *, indices: torch.Tensor, value: Union[int, torch.Tensor]):
-        assert self.pos is not None
-        indices = indices.to(device=self.pos.device, dtype=torch.long)
-        value = torch.as_tensor(value, device=self.pos.device, dtype=self.pos.dtype)
-        if self.pos.dim() == 2:
-            self.pos[:, indices] = value
+        assert self.tail_lens_tensor is not None
+        indices = indices.to(device=self.tail_lens_tensor.device, dtype=torch.long)
+        value = torch.as_tensor(
+            value,
+            device=self.tail_lens_tensor.device,
+            dtype=self.tail_lens_tensor.dtype,
+        )
+        if self.tail_lens_tensor.dim() == 2:
+            self.tail_lens_tensor[:, indices] = value
         else:
-            self.pos[indices] = value
+            self.tail_lens_tensor[indices] = value
 
     def read_window(self, *, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return tuple(tensor[indices] for tensor in self.tensors())
@@ -86,15 +90,17 @@ class DVRStateInputWindow:
         self,
         *,
         indices: torch.Tensor,
-        crossing: torch.Tensor,
+        crosses_chunk_boundary: torch.Tensor,
         chunk_size: int = FLA_CHUNK_SIZE,
     ):
         tail_capacity = self.capacity - chunk_size
         if tail_capacity <= 0:
             return
 
-        has_layer_dim = self.pos is not None and self.pos.dim() == 2
-        mask = crossing.to(torch.bool)
+        has_layer_dim = (
+            self.tail_lens_tensor is not None and self.tail_lens_tensor.dim() == 2
+        )
+        mask = crosses_chunk_boundary.to(torch.bool)
         for cache in self.tensors():
             if has_layer_dim:
                 dst = cache[:, indices, :tail_capacity]
@@ -167,7 +173,9 @@ class DVRStateInputCache:
         )
 
     def window(self) -> DVRStateInputWindow:
-        return DVRStateInputWindow(inputs=self.tensors, pos=self.tail_lens)
+        return DVRStateInputWindow(
+            inputs=self.tensors, tail_lens_tensor=self.tail_lens
+        )
 
 
 @dataclass

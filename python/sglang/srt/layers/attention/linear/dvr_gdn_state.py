@@ -343,17 +343,19 @@ class DVRGDNStateInputCache(DVRStateInputCache):
         return cls(tensors=tuple(state_inputs), tail_lens=tail_lens)
 
     def window(self) -> DVRGDNStateInputWindow:
-        return DVRGDNStateInputWindow(inputs=self.tensors, pos=self.tail_lens)
+        return DVRGDNStateInputWindow(
+            inputs=self.tensors, tail_lens_tensor=self.tail_lens
+        )
 
 
 @dataclass
 class DVRGDNStateOps(DVRStateOps):
     """GDN concrete operator bundle for DVR state replay."""
 
-    chunk_scan: Optional[Callable] = None
-    recurrent_state: Optional[Callable] = None
-    verify_conv: Optional[Callable] = None
-    state_scatter: Optional[Callable] = None
+    chunkwise_scan_fn: Optional[Callable] = None
+    rebuild_recurrent_state_fn: Optional[Callable] = None
+    verify_conv_fn: Optional[Callable] = None
+    state_scatter_fn: Optional[Callable] = None
 
     @classmethod
     def create(cls, kernel_dispatcher) -> "DVRGDNStateOps":
@@ -366,10 +368,10 @@ class DVRGDNStateOps(DVRStateOps):
 
         return cls(
             chunk_size=FLA_CHUNK_SIZE,
-            chunk_scan=kernel_dispatcher.extend,
-            recurrent_state=_rebuild_gdn_state_from_qkvg_beta_triton,
-            verify_conv=causal_conv1d_fn,
-            state_scatter=fused_mamba_state_scatter_with_mask,
+            chunkwise_scan_fn=kernel_dispatcher.extend,
+            rebuild_recurrent_state_fn=_rebuild_gdn_state_from_qkvg_beta_triton,
+            verify_conv_fn=causal_conv1d_fn,
+            state_scatter_fn=fused_mamba_state_scatter_with_mask,
         )
 
     def scan_chunkwise(
@@ -385,8 +387,8 @@ class DVRGDNStateOps(DVRStateOps):
         query_start_loc: Optional[torch.Tensor],
         **kwargs,
     ) -> tuple:
-        assert self.chunk_scan is not None
-        return self.chunk_scan(
+        assert self.chunkwise_scan_fn is not None
+        return self.chunkwise_scan_fn(
             q=q,
             k=k,
             v=v,
@@ -409,8 +411,8 @@ class DVRGDNStateOps(DVRStateOps):
         initial_state: torch.Tensor,
         token_count: Optional[Union[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        assert self.recurrent_state is not None
-        return self.recurrent_state(
+        assert self.rebuild_recurrent_state_fn is not None
+        return self.rebuild_recurrent_state_fn(
             q,
             k,
             v,
@@ -421,9 +423,9 @@ class DVRGDNStateOps(DVRStateOps):
         )
 
     def run_verify_conv(self, *args, **kwargs):
-        assert self.verify_conv is not None
-        return self.verify_conv(*args, **kwargs)
+        assert self.verify_conv_fn is not None
+        return self.verify_conv_fn(*args, **kwargs)
 
     def scatter_state(self, *args, **kwargs):
-        assert self.state_scatter is not None
-        return self.state_scatter(*args, **kwargs)
+        assert self.state_scatter_fn is not None
+        return self.state_scatter_fn(*args, **kwargs)

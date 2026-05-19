@@ -311,22 +311,22 @@ class DecodeVerifyRollbackWorker:
                     ),
                 )
 
-            copy_src = [
+            replay_source_indices = [
                 task.source_state_indices.reshape(-1)
                 for task in tasks
                 if task.source_state_indices is not None and task.source_seqlen > 0
             ]
-            copy_dst = [
+            replay_live_indices = [
                 task.live_idx
                 for task in tasks
                 if task.source_state_indices is not None and task.source_seqlen > 0
             ]
-            if copy_src:
+            if replay_source_indices:
                 batch.req_to_token_pool.mamba_pool.copy_from(
-                    torch.cat(copy_src).to(
+                    torch.cat(replay_source_indices).to(
                         device=ctx.live_indices.device, dtype=torch.long
                     ),
-                    torch.stack(copy_dst).to(
+                    torch.stack(replay_live_indices).to(
                         device=ctx.live_indices.device, dtype=torch.long
                     ),
                 )
@@ -460,7 +460,7 @@ class DecodeVerifyRollbackWorker:
         )
 
         (
-            tree_mask,
+            _tree_mask,
             positions,
             retrive_index,
             retrive_next_token,
@@ -643,32 +643,9 @@ class DecodeVerifyRollbackWorker:
         if accepted_tokens.numel() == 0:
             return accepted_tokens, accepted_tokens
 
-        accepted_indices_offset = torch.arange(
-            0,
-            len(batch.seq_lens) * batch.spec_info.draft_token_num,
-            step=batch.spec_info.draft_token_num,
-            dtype=torch.long,
-            device=device,
-        )
-
-        if (
-            batch.spec_info.topk > 1
-            and verify_output.accepted_indices.shape[0] > 0
-        ):
-            accepted_starts = torch.cat(
-                [
-                    torch.zeros(1, dtype=torch.long, device=device),
-                    torch.cumsum(accepted_tokens, dim=0)[:-1],
-                ]
-            )
-            accepted_steps = (
-                verify_output.accepted_indices[
-                    accepted_starts + accepted_tokens - 1
-                ].to(device=device, dtype=torch.long)
-                - accepted_indices_offset
-            )
-        else:
-            accepted_steps = accepted_tokens - 1
+        # DVR enforces topk=1 chain verify, so the accepted draft step is just
+        # the last accepted token's offset in each fixed verify window.
+        accepted_steps = accepted_tokens - 1
         return accepted_tokens, accepted_steps
 
     def _select_accepted_verify_outputs(

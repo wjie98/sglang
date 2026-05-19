@@ -248,7 +248,7 @@ def rebuild_dvr_live_state_grouped(
     if req_indices.numel() == 0:
         return
 
-    state_input_req_indices = state_input_indices[req_indices]
+    selected_state_input_indices = state_input_indices[req_indices]
     state_live_indices = live_indices[req_indices]
     state_boundary_indices = boundary_indices[req_indices]
     q_cache, k_cache, v_cache, g_cache, beta_cache = state_window.tensors()
@@ -256,11 +256,11 @@ def rebuild_dvr_live_state_grouped(
     num_reqs = state_live_indices.numel()
     token_count = token_count.to(device=temporal_state.device, dtype=torch.long)
 
-    q = q_cache[:, state_input_req_indices]
-    k = k_cache[:, state_input_req_indices]
-    v = v_cache[:, state_input_req_indices]
-    g = g_cache[:, state_input_req_indices]
-    beta = beta_cache[:, state_input_req_indices]
+    q = q_cache[:, selected_state_input_indices]
+    k = k_cache[:, selected_state_input_indices]
+    v = v_cache[:, selected_state_input_indices]
+    g = g_cache[:, selected_state_input_indices]
+    beta = beta_cache[:, selected_state_input_indices]
     initial_state = temporal_state[:, state_boundary_indices]
 
     flat_shape = (num_layers * num_reqs,)

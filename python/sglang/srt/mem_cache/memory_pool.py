@@ -217,7 +217,7 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
-        dvr_state_inputs: Optional[Any] = None
+        dvr_state_input_cache: Optional[Any] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -304,7 +304,7 @@ class MambaPool:
                 if DVRStateInputCache.is_enabled_for_current_server_args():
                     intermediate_ssm_tokens = 1
                     intermediate_conv_tokens = speculative_num_draft_tokens
-                    dvr_state_inputs = DVRStateInputCache.for_gdn(
+                    dvr_state_input_cache = DVRStateInputCache.for_gdn(
                         num_layers=num_mamba_layers,
                         num_slots=spec_state_size + 1,
                         num_draft_tokens=speculative_num_draft_tokens,
@@ -315,7 +315,7 @@ class MambaPool:
                 else:
                     intermediate_ssm_tokens = speculative_num_draft_tokens
                     intermediate_conv_tokens = speculative_num_draft_tokens
-                    dvr_state_inputs = None
+                    dvr_state_input_cache = None
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
@@ -351,7 +351,7 @@ class MambaPool:
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
-                    dvr_state_inputs=dvr_state_inputs,
+                    dvr_state_input_cache=dvr_state_input_cache,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -360,7 +360,7 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                    f"dvr_state_input_cache size: {(dvr_state_inputs.mem_usage_bytes() if dvr_state_inputs is not None else 0) / GB:.2f}GB "
+                    f"dvr_state_input_cache size: {(dvr_state_input_cache.mem_usage_bytes() if dvr_state_input_cache is not None else 0) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -448,7 +448,7 @@ class MambaPool:
             if field in (
                 "intermediate_ssm",
                 "intermediate_conv_window",
-                "dvr_state_inputs",
+                "dvr_state_input_cache",
             ):
                 continue
             value = getattr(self.mamba_cache, field)
@@ -481,7 +481,7 @@ class MambaPool:
         state_tensors = []
         for field in vars(self.mamba_cache):
             if field in (
-                "dvr_state_inputs",
+                "dvr_state_input_cache",
             ):
                 continue
             value = getattr(self.mamba_cache, field)

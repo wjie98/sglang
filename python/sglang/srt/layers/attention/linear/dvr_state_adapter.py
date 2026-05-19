@@ -48,11 +48,11 @@ class DVRGatedForwardContext:
         return self.spec_info.draft_token_num
 
     @property
-    def graph_batch_size(self) -> int:
+    def verify_batch_size(self) -> int:
         return self.seq_len // self.draft_token_num
 
     def valid_request_mask(self) -> torch.Tensor:
-        batch_size = self.graph_batch_size
+        batch_size = self.verify_batch_size
         device = self.cache_indices.device
         rows = torch.arange(batch_size, dtype=torch.long, device=device)
         num_token_non_padded = self.forward_batch.num_token_non_padded
@@ -64,14 +64,14 @@ class DVRGatedForwardContext:
             )
         return rows * self.draft_token_num < num_token_non_padded
 
-    def safe_cache_indices(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        indices = self.cache_indices[: self.graph_batch_size].to(torch.long)
+    def padded_cache_indices(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        indices = self.cache_indices[: self.verify_batch_size].to(torch.long)
         valid_mask = self.valid_request_mask()
         # Slot 0 is the shared dummy mamba slot used by padded graph rows.
         return torch.where(valid_mask, indices, torch.zeros_like(indices)), valid_mask
 
-    def safe_state_input_indices(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        indices = self.forward_batch.req_pool_indices[: self.graph_batch_size].to(
+    def padded_state_input_indices(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        indices = self.forward_batch.req_pool_indices[: self.verify_batch_size].to(
             device=self.cache_indices.device, dtype=torch.long
         )
         indices = indices + 1
@@ -301,9 +301,9 @@ class DVRGatedStateAdapter:
         )
 
         draft_token_num = context.draft_token_num
-        batch_size = context.graph_batch_size
+        batch_size = context.verify_batch_size
         forward_batch = context.forward_batch
-        dvr_indices, valid_mask = context.safe_cache_indices()
+        dvr_indices, valid_mask = context.padded_cache_indices()
         has_initial_states = (forward_batch.seq_lens[:batch_size] > 0).to(
             dtype=torch.bool,
             device=forward_batch.input_ids.device,
@@ -358,9 +358,9 @@ class DVRGatedStateAdapter:
         )
 
         draft_token_num = context.draft_token_num
-        batch_size = context.graph_batch_size
-        dvr_indices, valid_mask = context.safe_cache_indices()
-        state_input_indices, _ = context.safe_state_input_indices()
+        batch_size = context.verify_batch_size
+        dvr_indices, valid_mask = context.padded_cache_indices()
+        state_input_indices, _ = context.padded_state_input_indices()
         state_window = DVRStateInputWindow.from_cache(context.state_cache)
         tail_lens = state_window.tail_lens(indices=state_input_indices).to(torch.long)
         tail_lens = torch.where(
@@ -409,9 +409,11 @@ class DVRGatedStateAdapter:
         accepted_steps: torch.Tensor,
     ) -> torch.Tensor:
         state_window = DVRStateInputWindow.from_cache(state_cache)
-        pos_before = verified_tail_lens.to(device=live_indices.device, dtype=torch.long)
-        pos_after = pos_before + accepted_tokens
-        crossing = pos_after >= self.chunk_size
+        tail_lens_before = verified_tail_lens.to(
+            device=live_indices.device, dtype=torch.long
+        )
+        tail_lens_after = tail_lens_before + accepted_tokens
+        crosses_chunk_boundary = tail_lens_after >= self.chunk_size
 
         self.ops.scatter_state(
             state_cache.conv[0],
@@ -423,10 +425,10 @@ class DVRGatedStateAdapter:
         boundary_state_step = (
             0 if state_cache.intermediate_ssm.shape[2] == 1 else self.chunk_size - 1
         )
-        no_commit_step = torch.full_like(pos_before, -1)
+        no_commit_step = torch.full_like(tail_lens_before, -1)
         commit_step = torch.where(
-            crossing,
-            torch.full_like(pos_before, boundary_state_step),
+            crosses_chunk_boundary,
+            torch.full_like(tail_lens_before, boundary_state_step),
             no_commit_step,
         )
         self.ops.scatter_state(
@@ -439,14 +441,20 @@ class DVRGatedStateAdapter:
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
             boundary_indices,
-            torch.where(crossing, self.chunk_size - 1 - pos_before, no_commit_step),
+            torch.where(
+                crosses_chunk_boundary,
+                self.chunk_size - 1 - tail_lens_before,
+                no_commit_step,
+            ),
         )
 
-        new_pos = pos_after - self.chunk_size
-        pos_after = torch.where(crossing, new_pos, pos_after)
+        new_tail_lens = tail_lens_after - self.chunk_size
+        tail_lens_after = torch.where(
+            crosses_chunk_boundary, new_tail_lens, tail_lens_after
+        )
         state_window.shift_after_boundary(
             indices=state_input_indices,
-            crossing=crossing,
+            crosses_chunk_boundary=crosses_chunk_boundary,
             chunk_size=self.chunk_size,
         )
         rebuild_dvr_live_state_grouped(
@@ -461,10 +469,10 @@ class DVRGatedStateAdapter:
                 dtype=torch.long,
                 device=live_indices.device,
             ),
-            token_count=pos_after,
+            token_count=tail_lens_after,
         )
 
         state_window.set_tail_lens(
-            indices=state_input_indices, value=pos_after.to(torch.int32)
+            indices=state_input_indices, value=tail_lens_after.to(torch.int32)
         )
-        return crossing
+        return crosses_chunk_boundary
