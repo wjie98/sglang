@@ -709,13 +709,18 @@ class MambaRadixCache(BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later.
         # NOTE: this is needed for both page_size == 1 and page_size > 1
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]
         )
         req.cache_protected_len = len(new_indices)
-        req.mamba_last_track_seqlen = None
+        if not (
+            self.enable_mamba_extra_buffer
+            and get_global_server_args().speculative_algorithm
+            == "DECODE_VERIFY_ROLLBACK"
+        ):
+            req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
 
     def pretty_print(self) -> None:

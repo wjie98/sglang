@@ -223,20 +223,36 @@ class DVRLinearStateLifecycle:
     def materialize_radix_boundary_for_req(
         self, batch: ScheduleBatch, req, boundary_seqlen: int, dst: torch.Tensor
     ) -> bool:
-        last_node = getattr(req, "last_node", None)
-        mamba_value = getattr(last_node, "mamba_value", None)
-        if mamba_value is None:
+        node = self.find_radix_boundary_node(req, boundary_seqlen)
+        if node is None:
             return False
-
-        cached_prefix_len = len(req.prefix_indices)
-        cache_protected_len = getattr(req, "cache_protected_len", cached_prefix_len)
-        if boundary_seqlen not in (cached_prefix_len, cache_protected_len):
-            return False
+        mamba_value = node.mamba_value
 
         batch.req_to_token_pool.mamba_pool.copy_from(
             mamba_value.reshape(-1), dst.reshape(-1)
         )
         return True
+
+    @staticmethod
+    def radix_node_seqlen(node) -> int:
+        seqlen = 0
+        while node is not None:
+            key = getattr(node, "key", None)
+            if key is not None:
+                seqlen += len(key)
+            node = getattr(node, "parent", None)
+        return seqlen
+
+    def find_radix_boundary_node(self, req, boundary_seqlen: int):
+        node = getattr(req, "last_node", None)
+        while node is not None:
+            if (
+                getattr(node, "mamba_value", None) is not None
+                and self.radix_node_seqlen(node) == boundary_seqlen
+            ):
+                return node
+            node = getattr(node, "parent", None)
+        return None
 
     def init_boundary_for_req(
         self, batch: ScheduleBatch, req, boundary_seqlen: int
@@ -261,11 +277,17 @@ class DVRLinearStateLifecycle:
         ):
             self.set_boundary_checkpoint(batch, req, boundary_track_idx)
             return None
+        cached_prefix_len = len(req.prefix_indices)
+        cache_protected_len = getattr(req, "cache_protected_len", cached_prefix_len)
         raise RuntimeError(
             "DVR linear-state verify could not find a chunk-aligned prefill checkpoint "
             f"for boundary {boundary_seqlen}. mamba_track_interval must be "
             f"aligned to FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, and ordinary prefill "
-            "must materialize that checkpoint before DVR target verify starts."
+            "must materialize that checkpoint before DVR target verify starts. "
+            f"req_seqlen={req.seqlen}, cached_prefix_len={cached_prefix_len}, "
+            f"cache_protected_len={cache_protected_len}, "
+            f"mamba_last_track_seqlen={req.mamba_last_track_seqlen}, "
+            f"mamba_branching_seqlen={req.mamba_branching_seqlen}."
         )
 
     def ensure_boundary_state(
