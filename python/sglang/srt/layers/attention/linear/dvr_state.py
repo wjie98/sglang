@@ -4,7 +4,7 @@ This module intentionally knows only the DVR lifecycle:
 
 - a rolling input window stores the unclosed chunk tail plus new draft tokens;
 - an ops object provides chunkwise verify, recurrent rebuild, conv, and scatter;
-- model-family details are supplied by small subclasses such as GDN.
+- model-family details are supplied by small concrete caches/ops such as GDN.
 """
 
 from dataclasses import dataclass
@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 
 __all__ = [
     "DVRRecurrentStateBackup",
+    "DVRStateInputs",
     "DVRStateInputCache",
     "DVRStateInputWindow",
     "DVRStateOps",
@@ -30,22 +31,124 @@ class DVRRecurrentStateBackup:
 
 
 @dataclass(frozen=True)
-class DVRStateInputWindow:
-    """Base rolling-window view over DVR state inputs.
+class DVRStateInputs:
+    """Model-family state-input tensors stored inside a DVR rolling window."""
 
-    Subclasses attach model-family names and writers. The base implementation
-    keeps the common slot/length mechanics so future KDA/Mamba-style adapters
-    do not need to reimplement shifting and tail-length bookkeeping.
+    values: Tuple[torch.Tensor, ...]
+
+    @classmethod
+    def from_tensors(cls, tensors: Tuple[torch.Tensor, ...]) -> "DVRStateInputs":
+        return cls(values=tuple(tensors))
+
+    def tensors(self) -> Tuple[torch.Tensor, ...]:
+        return self.values
+
+    def select(self, indices: torch.Tensor) -> "DVRStateInputs":
+        return type(self).from_tensors(tuple(tensor[indices] for tensor in self.values))
+
+    def select_all_layers(self, indices: torch.Tensor) -> "DVRStateInputs":
+        return type(self).from_tensors(
+            tuple(tensor[:, indices] for tensor in self.values)
+        )
+
+    def select_token_range(self, start: int, end: int) -> "DVRStateInputs":
+        return type(self).from_tensors(
+            tuple(tensor[start:end] for tensor in self.values)
+        )
+
+    def flatten_leading_dims(
+        self, flat_dim: int, *, keep_from_dim: int
+    ) -> "DVRStateInputs":
+        return type(self).from_tensors(
+            tuple(
+                tensor.reshape(flat_dim, *tensor.shape[keep_from_dim:])
+                for tensor in self.values
+            )
+        )
+
+    def write_rows(
+        self,
+        state_window: "DVRStateInputWindow",
+        *,
+        indices: torch.Tensor,
+        cols: torch.Tensor,
+    ):
+        state_window.write_rows(indices=indices, cols=cols, values=self)
+
+    def write_draft_rows(
+        self,
+        state_window: "DVRStateInputWindow",
+        *,
+        indices: torch.Tensor,
+        col_start: torch.Tensor,
+        draft_token_num: int,
+    ):
+        cols = (
+            torch.arange(draft_token_num, dtype=torch.long, device=indices.device)
+            .unsqueeze(0)
+            .add(col_start.to(torch.long).unsqueeze(1))
+        )
+        rows = indices.unsqueeze(1).expand(-1, draft_token_num)
+        self.write_rows(state_window, indices=rows, cols=cols)
+
+    def write_extend_tail(
+        self,
+        state_window: "DVRStateInputWindow",
+        *,
+        indices: torch.Tensor,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        chunk_size: int = FLA_CHUNK_SIZE,
+    ):
+        src_base = 0
+        for req_i, (prefix_len, extend_len) in enumerate(
+            zip(extend_prefix_lens_cpu, extend_seq_lens_cpu, strict=True)
+        ):
+            seq_len = prefix_len + extend_len
+            boundary = (seq_len // chunk_size) * chunk_size
+            num_verified_tokens = seq_len - boundary
+            dst = indices[req_i].to(torch.long)
+            state_window.set_tail_lens(indices=dst, value=num_verified_tokens)
+            if num_verified_tokens == 0:
+                src_base += extend_len
+                continue
+
+            write_start = max(prefix_len, boundary)
+            write_end = seq_len
+            if write_start >= write_end:
+                src_base += extend_len
+                continue
+
+            src_start = src_base + (write_start - prefix_len)
+            src_end = src_start + (write_end - write_start)
+            cols = torch.arange(
+                write_start - boundary,
+                write_end - boundary,
+                dtype=torch.long,
+                device=indices.device,
+            )
+            self.select_token_range(src_start, src_end).write_rows(
+                state_window, indices=dst, cols=cols
+            )
+            src_base += extend_len
+
+
+@dataclass(frozen=True)
+class DVRStateInputWindow:
+    """Rolling-window view over DVR linear-state inputs.
+
+    The window owns only slot, tail length, and shift mechanics. Model-family
+    data layouts such as GDN q/k/v/g/beta live in small state-input wrappers.
     """
 
-    inputs: Optional[Tuple[torch.Tensor, ...]]
-    tail_lens_tensor: Optional[torch.Tensor]
+    inputs: Optional[DVRStateInputs]
+    tail_lens_cache: Optional[torch.Tensor]
 
     @classmethod
     def from_cache(cls, state_cache) -> "DVRStateInputWindow":
         cache = getattr(state_cache, "dvr_state_input_cache", None)
         if cache is None:
-            return cls(inputs=None, tail_lens_tensor=None)
+            return cls(inputs=None, tail_lens_cache=None)
         return cache.window()
 
     @property
@@ -54,7 +157,7 @@ class DVRStateInputWindow:
 
     def tensors(self) -> Tuple[torch.Tensor, ...]:
         assert self.inputs is not None
-        return self.inputs
+        return self.inputs.tensors()
 
     @property
     def capacity(self) -> int:
@@ -64,27 +167,42 @@ class DVRStateInputWindow:
         return tensors[0].shape[2] if tensors[0].dim() >= 5 else tensors[0].shape[1]
 
     def tail_lens(self, *, indices: torch.Tensor) -> torch.Tensor:
-        assert self.tail_lens_tensor is not None
-        indices = indices.to(device=self.tail_lens_tensor.device, dtype=torch.long)
-        if self.tail_lens_tensor.dim() == 2:
-            return self.tail_lens_tensor[0, indices]
-        return self.tail_lens_tensor[indices]
+        assert self.tail_lens_cache is not None
+        indices = indices.to(device=self.tail_lens_cache.device, dtype=torch.long)
+        if self.tail_lens_cache.dim() == 2:
+            return self.tail_lens_cache[0, indices]
+        return self.tail_lens_cache[indices]
 
     def set_tail_lens(self, *, indices: torch.Tensor, value: Union[int, torch.Tensor]):
-        assert self.tail_lens_tensor is not None
-        indices = indices.to(device=self.tail_lens_tensor.device, dtype=torch.long)
+        assert self.tail_lens_cache is not None
+        indices = indices.to(device=self.tail_lens_cache.device, dtype=torch.long)
         value = torch.as_tensor(
             value,
-            device=self.tail_lens_tensor.device,
-            dtype=self.tail_lens_tensor.dtype,
+            device=self.tail_lens_cache.device,
+            dtype=self.tail_lens_cache.dtype,
         )
-        if self.tail_lens_tensor.dim() == 2:
-            self.tail_lens_tensor[:, indices] = value
+        if self.tail_lens_cache.dim() == 2:
+            self.tail_lens_cache[:, indices] = value
         else:
-            self.tail_lens_tensor[indices] = value
+            self.tail_lens_cache[indices] = value
 
-    def read_window(self, *, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        return tuple(tensor[indices] for tensor in self.tensors())
+    def read_window(self, *, indices: torch.Tensor) -> DVRStateInputs:
+        assert self.inputs is not None
+        return self.inputs.select(indices)
+
+    def read_all_layers_window(self, *, indices: torch.Tensor) -> DVRStateInputs:
+        assert self.inputs is not None
+        return self.inputs.select_all_layers(indices)
+
+    def write_rows(
+        self,
+        *,
+        indices: torch.Tensor,
+        cols: torch.Tensor,
+        values: DVRStateInputs,
+    ):
+        for cache, value in zip(self.tensors(), values.tensors(), strict=True):
+            cache[indices, cols] = value
 
     def shift_after_boundary(
         self,
@@ -98,7 +216,7 @@ class DVRStateInputWindow:
             return
 
         has_layer_dim = (
-            self.tail_lens_tensor is not None and self.tail_lens_tensor.dim() == 2
+            self.tail_lens_cache is not None and self.tail_lens_cache.dim() == 2
         )
         mask = crosses_chunk_boundary.to(torch.bool)
         for cache in self.tensors():
@@ -130,37 +248,6 @@ class DVRStateInputCache:
     tensors: Tuple[torch.Tensor, ...]
     tail_lens: torch.Tensor
 
-    @classmethod
-    def for_gdn(
-        cls,
-        *,
-        num_layers: int,
-        num_slots: int,
-        num_draft_tokens: int,
-        temporal_state_shape: Tuple[int, ...],
-        dtype: torch.dtype,
-        device: str,
-    ) -> "DVRStateInputCache":
-        from sglang.srt.layers.attention.linear.dvr_gdn_state import (
-            DVRGDNStateInputCache,
-        )
-
-        return DVRGDNStateInputCache.create(
-            num_layers=num_layers,
-            num_slots=num_slots,
-            num_draft_tokens=num_draft_tokens,
-            temporal_state_shape=temporal_state_shape,
-            dtype=dtype,
-            device=device,
-        )
-
-    @classmethod
-    def is_enabled_for_current_server_args(cls) -> bool:
-        from sglang.srt.server_args import get_global_server_args
-        from sglang.srt.speculative.dvr_server_args import is_dvr_enabled
-
-        return is_dvr_enabled(get_global_server_args())
-
     def __getitem__(self, layer: int) -> "DVRStateInputCache":
         return type(self)(
             tensors=tuple(tensor[layer] for tensor in self.tensors),
@@ -172,9 +259,12 @@ class DVRStateInputCache:
             self.tail_lens.numel() * self.tail_lens.element_size()
         )
 
+    def state_inputs(self) -> DVRStateInputs:
+        return DVRStateInputs.from_tensors(self.tensors)
+
     def window(self) -> DVRStateInputWindow:
         return DVRStateInputWindow(
-            inputs=self.tensors, tail_lens_tensor=self.tail_lens
+            inputs=self.state_inputs(), tail_lens_cache=self.tail_lens
         )
 
 
@@ -188,21 +278,15 @@ class DVRStateOps:
 
     chunk_size: int = FLA_CHUNK_SIZE
 
-    @classmethod
-    def for_gdn(cls, kernel_dispatcher) -> "DVRStateOps":
-        from sglang.srt.layers.attention.linear.dvr_gdn_state import DVRGDNStateOps
-
-        return DVRGDNStateOps.create(kernel_dispatcher)
-
-    def scan_chunkwise(self, **kwargs) -> tuple:
+    def scan_chunkwise(self, *, state_inputs: DVRStateInputs, **kwargs) -> tuple:
         raise NotImplementedError
 
     def rebuild_recurrent_state(
         self,
-        *args,
+        state_inputs: DVRStateInputs,
+        *,
         initial_state: torch.Tensor,
         token_count: Optional[Union[int, torch.Tensor]] = None,
-        **kwargs,
     ) -> torch.Tensor:
         raise NotImplementedError
 

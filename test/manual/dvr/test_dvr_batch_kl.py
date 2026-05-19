@@ -30,6 +30,11 @@ Operational notes learned while debugging DVR:
   multi-chunk state commits.
 - --warm-cache is useful for checking radix-cache compatibility on the DVR
   generation path. The oracle is still flushed unless --no-flush-oracle is set.
+- Generation requests use logprob_start_len=-1. Setting logprob_start_len=0
+  asks SGLang to return full prompt logprobs and intentionally limits prefix
+  matching to length 0, so cached_tokens will stay 0 even when radix cache works.
+  The oracle still uses logprob_start_len=0 because it must score the whole
+  prompt+output sequence with a true full-prefill pass.
 
 Example:
 
@@ -234,7 +239,7 @@ def request_for_case(case: Case, params: Dict[str, Any]) -> Dict[str, Any]:
         "sampling_params": params,
         "return_logprob": True,
         "return_text_in_logprobs": False,
-        "logprob_start_len": 0,
+        "logprob_start_len": -1,
     }
     if case.input_ids is not None:
         payload["input_ids"] = case.input_ids
@@ -286,7 +291,7 @@ def generate_batch(
             "sampling_params": params,
             "return_logprob": True,
             "return_text_in_logprobs": False,
-            "logprob_start_len": 0,
+            "logprob_start_len": -1,
         }
         if group[0].input_ids is not None:
             payload["input_ids"] = [case.input_ids for case in group]

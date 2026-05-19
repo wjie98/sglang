@@ -94,16 +94,16 @@ class DVRLinearStateLifecycle:
         self,
         *,
         batch: ScheduleBatch,
-        accepted_tokens: torch.Tensor,
+        accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
-        accepted_tokens_cpu,
+        accepted_token_counts_cpu,
         ctx: Optional[DVRLinearStateContext] = None,
     ):
         ctx = ctx or self.state_context(batch, require_boundary=True)
         if ctx is None:
             return
         assert ctx.boundary_indices is not None
-        if accepted_tokens.numel() == 0:
+        if accepted_token_counts.numel() == 0:
             return
 
         # EAGLE verify has already appended accepted tokens to req.output_ids.
@@ -112,7 +112,7 @@ class DVRLinearStateLifecycle:
         verified_tail_lens_cpu = [
             req.seqlen - accepted_token_num - 1 - self.boundary_seqlen[req.rid]
             for req, accepted_token_num in zip(
-                batch.reqs, accepted_tokens_cpu, strict=True
+                batch.reqs, accepted_token_counts_cpu, strict=True
             )
         ]
         verified_tail_lens = ctx.state_adapter.state_input_tail_lens(
@@ -134,12 +134,12 @@ class DVRLinearStateLifecycle:
             live_indices=ctx.live_indices,
             boundary_indices=ctx.boundary_indices,
             verified_tail_lens=verified_tail_lens,
-            accepted_tokens=accepted_tokens,
+            accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
         )
 
         for req, verified_tail_len, accepted_token_num in zip(
-            batch.reqs, verified_tail_lens_cpu, accepted_tokens_cpu, strict=True
+            batch.reqs, verified_tail_lens_cpu, accepted_token_counts_cpu, strict=True
         ):
             if verified_tail_len + accepted_token_num >= FLA_CHUNK_SIZE:
                 self.boundary_seqlen[req.rid] += FLA_CHUNK_SIZE

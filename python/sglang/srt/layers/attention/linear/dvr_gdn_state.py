@@ -1,4 +1,4 @@
-"""GDN-specific DVR state inputs and operators."""
+"""GDN-specific DVR state-input cache allocation and operators."""
 
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Union
@@ -8,15 +8,15 @@ import torch
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (
+    DVRStateInputs,
     DVRStateInputCache,
-    DVRStateInputWindow,
     DVRStateOps,
 )
 from sglang.srt.utils import is_cpu
 
 __all__ = [
+    "DVRGDNStateInputs",
     "DVRGDNStateInputCache",
-    "DVRGDNStateInputWindow",
     "DVRGDNStateOps",
 ]
 
@@ -128,8 +128,6 @@ def _rebuild_gdn_state_from_qkvg_beta_triton(
     HV, V = v.shape[2], v.shape[-1]
     BK = triton.next_power_of_2(K)
     BV = min(triton.next_power_of_2(V), 8)
-    if triton.cdiv(K, BK) != 1:
-        raise ValueError(f"DVR GDN recurrent rebuild only supports NK=1, K={K}.")
 
     final_state = torch.empty_like(initial_state)
     grid = (triton.cdiv(V, BV), B * HV)
@@ -158,51 +156,39 @@ def _rebuild_gdn_state_from_qkvg_beta_triton(
 
 
 @dataclass(frozen=True)
-class DVRGDNStateInputWindow(DVRStateInputWindow):
-    """GDN rolling input window storing q/k/v/g/beta rows."""
+class DVRGDNStateInputs(DVRStateInputs):
+    """Interpret a generic DVR state-input tuple as GDN q/k/v/g/beta tensors."""
+
+    @classmethod
+    def from_tensors(cls, tensors: Tuple[torch.Tensor, ...]) -> "DVRGDNStateInputs":
+        tensors = tuple(tensors)
+        assert len(tensors) == 5
+        return cls(values=tensors)
 
     @property
     def q(self) -> torch.Tensor:
-        return self.tensors()[0]
+        return self.values[0]
 
     @property
     def k(self) -> torch.Tensor:
-        return self.tensors()[1]
+        return self.values[1]
 
     @property
     def v(self) -> torch.Tensor:
-        return self.tensors()[2]
+        return self.values[2]
 
     @property
     def g(self) -> torch.Tensor:
-        return self.tensors()[3]
+        return self.values[3]
 
     @property
     def beta(self) -> torch.Tensor:
-        return self.tensors()[4]
+        return self.values[4]
 
-    def write_tail(
-        self,
+    @classmethod
+    def from_draft_rows(
+        cls,
         *,
-        dst: torch.Tensor,
-        cols: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-    ):
-        self.q[dst, cols] = q
-        self.k[dst, cols] = k
-        self.v[dst, cols] = v
-        self.g[dst, cols] = g
-        self.beta[dst, cols] = beta
-
-    def write_draft_rows(
-        self,
-        *,
-        indices: torch.Tensor,
-        col_start: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -216,75 +202,36 @@ class DVRGDNStateInputWindow(DVRStateInputWindow):
         head_k_dim: int,
         num_v_heads: int,
         head_v_dim: int,
-    ):
-        cols = (
-            torch.arange(draft_token_num, dtype=torch.long, device=indices.device)
-            .unsqueeze(0)
-            .add(col_start.to(torch.long).unsqueeze(1))
+    ) -> "DVRGDNStateInputs":
+        return cls.from_tensors(
+            (
+                q.reshape(batch_size, draft_token_num, num_q_heads, head_q_dim),
+                k.reshape(batch_size, draft_token_num, num_k_heads, head_k_dim),
+                v.reshape(batch_size, draft_token_num, num_v_heads, head_v_dim),
+                g.reshape(batch_size, draft_token_num, num_v_heads),
+                beta.reshape(batch_size, draft_token_num, num_v_heads),
+            )
         )
-        rows = indices.unsqueeze(1).expand(-1, draft_token_num)
-        self.q[rows, cols] = q.reshape(
-            batch_size, draft_token_num, num_q_heads, head_q_dim
-        )
-        self.k[rows, cols] = k.reshape(
-            batch_size, draft_token_num, num_k_heads, head_k_dim
-        )
-        self.v[rows, cols] = v.reshape(
-            batch_size, draft_token_num, num_v_heads, head_v_dim
-        )
-        self.g[rows, cols] = g.reshape(batch_size, draft_token_num, num_v_heads)
-        self.beta[rows, cols] = beta.reshape(batch_size, draft_token_num, num_v_heads)
 
-    def write_extend_tail(
-        self,
+    @classmethod
+    def from_extend_forward(
+        cls,
         *,
-        indices: torch.Tensor,
-        extend_prefix_lens_cpu,
-        extend_seq_lens_cpu,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        chunk_size: int = FLA_CHUNK_SIZE,
-    ):
-        src_base = 0
-        for req_i, (prefix_len, extend_len) in enumerate(
-            zip(extend_prefix_lens_cpu, extend_seq_lens_cpu, strict=True)
-        ):
-            seq_len = prefix_len + extend_len
-            boundary = (seq_len // chunk_size) * chunk_size
-            num_verified_tokens = seq_len - boundary
-            dst = indices[req_i].to(torch.long)
-            self.set_tail_lens(indices=dst, value=num_verified_tokens)
-            if num_verified_tokens == 0:
-                src_base += extend_len
-                continue
-
-            write_start = max(prefix_len, boundary)
-            write_end = seq_len
-            if write_start >= write_end:
-                src_base += extend_len
-                continue
-
-            src_start = src_base + (write_start - prefix_len)
-            src_end = src_start + (write_end - write_start)
-            cols = torch.arange(
-                write_start - boundary,
-                write_end - boundary,
-                dtype=torch.long,
-                device=indices.device,
+    ) -> "DVRGDNStateInputs":
+        return cls.from_tensors(
+            (
+                q.reshape(q.shape[1], q.shape[2], q.shape[3]),
+                k.reshape(k.shape[1], k.shape[2], k.shape[3]),
+                v.reshape(v.shape[1], v.shape[2], v.shape[3]),
+                g.reshape(-1, g.shape[-1]),
+                beta.reshape(-1, beta.shape[-1]),
             )
-            self.write_tail(
-                dst=dst,
-                cols=cols,
-                q=q[src_start:src_end],
-                k=k[src_start:src_end],
-                v=v[src_start:src_end],
-                g=g[src_start:src_end],
-                beta=beta[src_start:src_end],
-            )
-            src_base += extend_len
+        )
 
 
 @dataclass(frozen=True)
@@ -342,10 +289,8 @@ class DVRGDNStateInputCache(DVRStateInputCache):
         )
         return cls(tensors=tuple(state_inputs), tail_lens=tail_lens)
 
-    def window(self) -> DVRGDNStateInputWindow:
-        return DVRGDNStateInputWindow(
-            inputs=self.tensors, tail_lens_tensor=self.tail_lens
-        )
+    def state_inputs(self) -> DVRGDNStateInputs:
+        return DVRGDNStateInputs.from_tensors(self.tensors)
 
 
 @dataclass
@@ -377,23 +322,20 @@ class DVRGDNStateOps(DVRStateOps):
     def scan_chunkwise(
         self,
         *,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        state_inputs: DVRStateInputs,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: Optional[torch.Tensor],
         **kwargs,
     ) -> tuple:
         assert self.chunkwise_scan_fn is not None
+        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
         return self.chunkwise_scan_fn(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
+            q=state_inputs.q,
+            k=state_inputs.k,
+            v=state_inputs.v,
+            g=state_inputs.g,
+            beta=state_inputs.beta,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
@@ -402,22 +344,19 @@ class DVRGDNStateOps(DVRStateOps):
 
     def rebuild_recurrent_state(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        state_inputs: DVRStateInputs,
         *,
         initial_state: torch.Tensor,
         token_count: Optional[Union[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
         assert self.rebuild_recurrent_state_fn is not None
+        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
         return self.rebuild_recurrent_state_fn(
-            q,
-            k,
-            v,
-            g,
-            beta,
+            state_inputs.q,
+            state_inputs.k,
+            state_inputs.v,
+            state_inputs.g,
+            state_inputs.beta,
             initial_state=initial_state,
             token_count=token_count,
         )

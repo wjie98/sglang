@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.dvr_gdn_state import DVRGDNStateInputs
 from sglang.srt.layers.attention.linear.dvr_state_adapter import DVRGatedStateAdapter
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -365,7 +366,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         mixed_qkv = self.dvr_state_adapter.process_target_verify_conv(
             context=dvr_context,
-            mixed_qkv=mixed_qkv,
+            conv_input=mixed_qkv,
         )
 
         query, key, value = torch.split(
@@ -379,13 +380,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-        return self.dvr_state_adapter.process_target_verify_state(
-            context=dvr_context,
+        draft_state_inputs = DVRGDNStateInputs.from_draft_rows(
             q=query,
             k=key,
             v=value,
             g=g,
             beta=beta,
+            batch_size=dvr_context.verify_batch_size,
+            draft_token_num=dvr_context.draft_token_num,
+            num_q_heads=layer.num_q_heads,
+            head_q_dim=layer.head_q_dim,
+            num_k_heads=layer.num_k_heads,
+            head_k_dim=layer.head_k_dim,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
+        )
+        return self.dvr_state_adapter.process_target_verify_state(
+            context=dvr_context,
+            draft_state_inputs=draft_state_inputs,
         )
 
     def forward_extend(
@@ -535,14 +547,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # DVR reuses ordinary extend/prefill q/k/v/g/beta for the
             # unclosed chunk tail. This is only a cache copy; the recurrent
             # state update above remains the single source of live state.
-            self.dvr_state_adapter.cache_extend_tail_from_forward(
+            self.dvr_state_adapter.cache_extend_tail_from_state_inputs(
                 forward_batch=forward_batch,
                 state_cache=mamba_cache_params,
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
+                state_inputs=DVRGDNStateInputs.from_extend_forward(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                ),
             )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:

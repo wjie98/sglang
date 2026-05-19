@@ -567,7 +567,9 @@ class DecodeVerifyRollbackWorker:
             next_token_ids = self.model_runner.sample(logits_output, forward_batch)
             if not forward_batch.sampling_info.is_all_greedy:
                 draft_probs_list.append(
-                    self.get_draft_probs(forward_batch, logits_output.next_token_logits)
+                    self.get_draft_sampling_probs(
+                        forward_batch, logits_output.next_token_logits
+                    )
                 )
             topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
             topk_p = torch.ones(
@@ -605,8 +607,8 @@ class DecodeVerifyRollbackWorker:
         forward_batch.can_run_dp_cuda_graph = False
         return self.model_runner.forward(forward_batch).logits_output
 
-    def get_draft_probs(
-        self, forward_batch: ForwardBatch, probs: torch.Tensor
+    def get_draft_sampling_probs(
+        self, forward_batch: ForwardBatch, sampling_probs: torch.Tensor
     ) -> torch.Tensor:
         # model_runner.sample() mutates next_token_logits into the probability
         # tensor used by the sampler. Build draft_probs from that tensor so
@@ -619,34 +621,36 @@ class DecodeVerifyRollbackWorker:
             and not sampling_info.need_top_k_sampling
             and not sampling_info.need_min_p_sampling
         ):
-            probs = torch.softmax(probs, dim=-1)
-        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+            sampling_probs = torch.softmax(sampling_probs, dim=-1)
+        sampling_probs = top_k_renorm_prob(sampling_probs, sampling_info.top_ks)
         if sampling_info.need_top_p_sampling:
-            probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-        return probs
+            sampling_probs = top_p_renorm_prob(sampling_probs, sampling_info.top_ps)
+        return sampling_probs
 
     # Accepted-token and verify-output helpers. These intentionally stay close
     # to EAGLE's postprocess contract so scheduler/radix-cache ownership remains
     # compatible with normal speculative decoding.
 
-    def _accepted_token_metadata(
+    def _accepted_token_counts_and_steps(
         self,
-        batch: ScheduleBatch,
         verify_output: EagleVerifyOutput,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        accepted_tokens = torch.tensor(
-            [x + 1 for x in verify_output.accept_length_per_req_cpu],
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        accepted_token_counts_cpu = [
+            x + 1 for x in verify_output.accept_length_per_req_cpu
+        ]
+        accepted_token_counts = torch.tensor(
+            accepted_token_counts_cpu,
             dtype=torch.long,
             device=device,
         )
-        if accepted_tokens.numel() == 0:
-            return accepted_tokens, accepted_tokens
+        if accepted_token_counts.numel() == 0:
+            return accepted_token_counts, accepted_token_counts, accepted_token_counts_cpu
 
         # DVR enforces topk=1 chain verify, so the accepted draft step is just
         # the last accepted token's offset in each fixed verify window.
-        accepted_steps = accepted_tokens - 1
-        return accepted_tokens, accepted_steps
+        accepted_steps = accepted_token_counts - 1
+        return accepted_token_counts, accepted_steps, accepted_token_counts_cpu
 
     def _select_accepted_verify_outputs(
         self,
@@ -730,16 +734,18 @@ class DecodeVerifyRollbackWorker:
 
         self._select_accepted_verify_outputs(logits_output, verify_output)
         if linear_state_ctx is not None:
-            accepted_tokens, accepted_steps = self._accepted_token_metadata(
-                batch, verify_output, linear_state_ctx.live_indices.device
+            (
+                accepted_token_counts,
+                accepted_steps,
+                accepted_token_counts_cpu,
+            ) = self._accepted_token_counts_and_steps(
+                verify_output, linear_state_ctx.live_indices.device
             )
             self.linear_state.commit_after_verify(
                 batch=batch,
-                accepted_tokens=accepted_tokens,
+                accepted_token_counts=accepted_token_counts,
                 accepted_steps=accepted_steps,
-                accepted_tokens_cpu=[
-                    x + 1 for x in verify_output.accept_length_per_req_cpu
-                ],
+                accepted_token_counts_cpu=accepted_token_counts_cpu,
                 ctx=linear_state_ctx,
             )
         if batch.return_logprob:
