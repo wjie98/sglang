@@ -46,7 +46,7 @@ class DVRLinearStateLifecycle:
         self.validate_args()
 
     def validate_args(self):
-        if self.model_runner.hybrid_gdn_config is None:
+        if self.state_adapter() is None:
             return
         if self.server_args.mamba_track_interval != FLA_CHUNK_SIZE:
             raise ValueError(
@@ -142,21 +142,20 @@ class DVRLinearStateLifecycle:
             batch.reqs, verified_tail_lens_cpu, accepted_token_counts_cpu, strict=True
         ):
             if verified_tail_len + accepted_token_num >= FLA_CHUNK_SIZE:
-                self.boundary_seqlen[req.rid] += FLA_CHUNK_SIZE
-                req.mamba_last_track_seqlen = self.boundary_seqlen[req.rid]
-                req.mamba_next_track_idx = self.mamba_other_track_idx(
-                    batch, self.boundary_track_idx[req.rid]
+                new_boundary_seqlen = self.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
+                self.boundary_seqlen[req.rid] = new_boundary_seqlen
+                ctx.state_adapter.set_request_boundary_checkpoint(
+                    batch=batch,
+                    req=req,
+                    track_idx=self.boundary_track_idx[req.rid],
+                    boundary_seqlen=new_boundary_seqlen,
                 )
         self.boundary_backup = None
         self.live_backup = None
 
     def has_dvr_state(self, batch: ScheduleBatch) -> bool:
-        return (
-            self.model_runner.hybrid_gdn_config is not None
-            and hasattr(batch.req_to_token_pool, "get_mamba_indices")
-            and batch.batch_size() > 0
-            and all(req.mamba_ping_pong_track_buffer is not None for req in batch.reqs)
-        )
+        state_adapter = self.state_adapter()
+        return state_adapter is not None and state_adapter.has_dvr_state(batch=batch)
 
     def sync_active_reqs(self, batch: ScheduleBatch):
         active_rids = {req.rid for req in batch.reqs}
@@ -181,35 +180,27 @@ class DVRLinearStateLifecycle:
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
     ) -> Optional[DVRLinearStateContext]:
-        if not self.has_dvr_state(batch):
-            return None
         state_adapter = self.state_adapter()
-        if state_adapter is None:
+        if state_adapter is None or not state_adapter.has_dvr_state(batch=batch):
             return None
         assert self.server_args.mamba_track_interval == FLA_CHUNK_SIZE, (
             "DVR linear-state target verify must start from FLA chunk boundaries. "
             "The current prefill tracker only guarantees the latest boundary "
             "when mamba_track_interval equals FLA_CHUNK_SIZE."
         )
-        live_indices = batch.req_to_token_pool.get_mamba_indices(
-            batch.req_pool_indices
-        ).to(torch.long)
-        state_input_indices = batch.req_pool_indices.to(
-            device=live_indices.device, dtype=torch.long
+        live_indices = state_adapter.get_live_indices(batch=batch)
+        state_input_indices = state_adapter.get_state_input_indices(
+            batch=batch, device=live_indices.device
         )
-        state_input_indices = state_input_indices + 1
-        state_cache = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        state_cache = state_adapter.get_state_cache(batch=batch)
         state_adapter.validate_state_cache(state_cache=state_cache)
         boundary_indices = None
         if require_boundary:
-            boundary_indices = torch.stack(
-                [
-                    req.mamba_ping_pong_track_buffer[
-                        self.boundary_track_idx[req.rid]
-                    ]
-                    for req in batch.reqs
-                ]
-            ).to(device=live_indices.device, dtype=torch.long)
+            boundary_indices = state_adapter.get_boundary_indices(
+                batch=batch,
+                boundary_track_idx_by_rid=self.boundary_track_idx,
+                device=live_indices.device,
+            )
         return DVRLinearStateContext(
             state_cache=state_cache,
             state_adapter=state_adapter,
@@ -224,24 +215,14 @@ class DVRLinearStateLifecycle:
         verified_tail_len = (req.seqlen - 1) - boundary_seqlen
         return boundary_seqlen, verified_tail_len
 
-    def mamba_other_track_idx(self, batch: ScheduleBatch, track_idx: int) -> int:
-        return batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
-
     def current_prefill_checkpoint_track_idx(
-        self, batch: ScheduleBatch, req
+        self, batch: ScheduleBatch, req, state_adapter
     ) -> Optional[int]:
         boundary_seqlen, _ = self.boundary_and_tail(req)
         assert boundary_seqlen % FLA_CHUNK_SIZE == 0
-        last_track_seqlen = req.mamba_last_track_seqlen
-        if last_track_seqlen is not None and last_track_seqlen > 0:
-            assert last_track_seqlen % FLA_CHUNK_SIZE == 0, (
-                "DVR linear-state verify must not reuse non-chunk-boundary checkpoints."
-            )
-        if boundary_seqlen <= 0:
-            return None
-        if last_track_seqlen != boundary_seqlen:
-            return None
-        return self.mamba_other_track_idx(batch, req.mamba_next_track_idx)
+        return state_adapter.get_current_prefill_checkpoint_track_idx(
+            batch=batch, req=req, boundary_seqlen=boundary_seqlen
+        )
 
     def state_adapter(self):
         linear_backend = getattr(
@@ -251,58 +232,39 @@ class DVRLinearStateLifecycle:
             return None
         return getattr(linear_backend, "dvr_state_adapter", None)
 
-    def set_boundary_checkpoint(self, batch: ScheduleBatch, req, track_idx: int):
+    def set_boundary_checkpoint(
+        self,
+        batch: ScheduleBatch,
+        req,
+        track_idx: int,
+        state_adapter,
+        boundary_seqlen: Optional[int] = None,
+    ):
         self.boundary_track_idx[req.rid] = track_idx
-        self.boundary_seqlen[req.rid], _ = self.boundary_and_tail(req)
-        req.mamba_last_track_seqlen = self.boundary_seqlen[req.rid]
-        req.mamba_next_track_idx = self.mamba_other_track_idx(batch, track_idx)
+        if boundary_seqlen is None:
+            boundary_seqlen, _ = self.boundary_and_tail(req)
+        self.boundary_seqlen[req.rid] = boundary_seqlen
+        state_adapter.set_request_boundary_checkpoint(
+            batch=batch,
+            req=req,
+            track_idx=track_idx,
+            boundary_seqlen=boundary_seqlen,
+        )
 
     def materialize_radix_boundary_for_req(
-        self, batch: ScheduleBatch, req, boundary_seqlen: int, dst: torch.Tensor
+        self,
+        batch: ScheduleBatch,
+        req,
+        boundary_seqlen: int,
+        dst: torch.Tensor,
+        state_adapter,
     ) -> bool:
-        node = self.find_exact_radix_boundary_node(req, boundary_seqlen)
-        if node is None:
-            return False
-        mamba_value = node.mamba_value
-
-        batch.req_to_token_pool.mamba_pool.copy_from(
-            mamba_value.reshape(-1), dst.reshape(-1)
+        node = state_adapter.find_exact_radix_boundary_node(
+            req=req, boundary_seqlen=boundary_seqlen
         )
-        return True
-
-    @staticmethod
-    def radix_node_seqlen(node) -> int:
-        seqlen = 0
-        while node is not None:
-            key = getattr(node, "key", None)
-            if key is not None:
-                seqlen += len(key)
-            node = getattr(node, "parent", None)
-        return seqlen
-
-    def find_exact_radix_boundary_node(self, req, boundary_seqlen: int):
-        node = getattr(req, "last_node", None)
-        while node is not None:
-            if (
-                getattr(node, "mamba_value", None) is not None
-                and self.radix_node_seqlen(node) == boundary_seqlen
-            ):
-                return node
-            node = getattr(node, "parent", None)
-        return None
-
-    def find_nearest_radix_state_node(self, req, boundary_seqlen: int):
-        node = getattr(req, "last_node", None)
-        while node is not None:
-            node_seqlen = self.radix_node_seqlen(node)
-            if (
-                getattr(node, "mamba_value", None) is not None
-                and node_seqlen < boundary_seqlen
-                and node_seqlen % FLA_CHUNK_SIZE == 0
-            ):
-                return node, node_seqlen
-            node = getattr(node, "parent", None)
-        return None, 0
+        return state_adapter.copy_boundary_state_from_radix_node(
+            batch=batch, node=node, dst_indices=dst
+        )
 
     def init_boundary_for_req(
         self,
@@ -310,39 +272,51 @@ class DVRLinearStateLifecycle:
         req,
         boundary_seqlen: int,
         live_idx: torch.Tensor,
+        state_adapter,
     ) -> Tuple[Optional[torch.Tensor], Optional[DVRBoundaryReplayTask]]:
         assert boundary_seqlen % FLA_CHUNK_SIZE == 0
-        checkpoint_track_idx = self.current_prefill_checkpoint_track_idx(batch, req)
+        checkpoint_track_idx = self.current_prefill_checkpoint_track_idx(
+            batch, req, state_adapter
+        )
         if checkpoint_track_idx is not None:
             # Normal prefill already wrote the chunk-aligned state into the
             # ping-pong checkpoint buffer. Reuse that slot instead of copying
             # from the live decode slot, which may no longer hold the
             # deterministic prefill checkpoint.
-            self.set_boundary_checkpoint(batch, req, checkpoint_track_idx)
+            self.set_boundary_checkpoint(
+                batch,
+                req,
+                checkpoint_track_idx,
+                state_adapter,
+                boundary_seqlen,
+            )
             return None, None
 
-        boundary_track_idx = req.mamba_next_track_idx
-        dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
+        boundary_track_idx, dst = state_adapter.reserve_boundary_checkpoint(req=req)
         if boundary_seqlen == 0:
-            self.set_boundary_checkpoint(batch, req, boundary_track_idx)
+            self.set_boundary_checkpoint(
+                batch, req, boundary_track_idx, state_adapter, boundary_seqlen
+            )
             return dst, None
         if self.materialize_radix_boundary_for_req(
-            batch, req, boundary_seqlen, dst
+            batch, req, boundary_seqlen, dst, state_adapter
         ):
-            self.set_boundary_checkpoint(batch, req, boundary_track_idx)
+            self.set_boundary_checkpoint(
+                batch, req, boundary_track_idx, state_adapter, boundary_seqlen
+            )
             return None, None
 
-        source_node, source_seqlen = self.find_nearest_radix_state_node(
-            req, boundary_seqlen
+        source_node, source_seqlen = state_adapter.find_nearest_radix_state_node(
+            req=req, boundary_seqlen=boundary_seqlen
         )
-        self.set_boundary_checkpoint(batch, req, boundary_track_idx)
+        self.set_boundary_checkpoint(
+            batch, req, boundary_track_idx, state_adapter, boundary_seqlen
+        )
         return None, DVRBoundaryReplayTask(
             req=req,
             source_seqlen=source_seqlen,
             boundary_seqlen=boundary_seqlen,
-            source_state_indices=(
-                source_node.mamba_value if source_node is not None else None
-            ),
+            source_state_indices=state_adapter.radix_node_state_indices(source_node),
             boundary_track_idx=boundary_track_idx,
             live_idx=live_idx,
         )
@@ -363,7 +337,11 @@ class DVRLinearStateLifecycle:
                 reset_pos_indices.append(ctx.state_input_indices[i])
                 reset_pos_values.append(verified_tail_len)
                 zero_boundary_idx, replay_task = self.init_boundary_for_req(
-                    batch, req, boundary_seqlen, ctx.live_indices[i]
+                    batch,
+                    req,
+                    boundary_seqlen,
+                    ctx.live_indices[i],
+                    ctx.state_adapter,
                 )
                 if zero_boundary_idx is not None:
                     zero_boundary_indices.append(zero_boundary_idx)

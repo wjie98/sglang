@@ -322,11 +322,12 @@ class DecodeVerifyRollbackWorker:
                 if task.source_state_indices is not None and task.source_seqlen > 0
             ]
             if replay_source_indices:
-                batch.req_to_token_pool.mamba_pool.copy_from(
-                    torch.cat(replay_source_indices).to(
+                ctx.state_adapter.copy_state_indices(
+                    batch=batch,
+                    src_indices=torch.cat(replay_source_indices).to(
                         device=ctx.live_indices.device, dtype=torch.long
                     ),
-                    torch.stack(replay_live_indices).to(
+                    dst_indices=torch.stack(replay_live_indices).to(
                         device=ctx.live_indices.device, dtype=torch.long
                     ),
                 )
@@ -358,12 +359,11 @@ class DecodeVerifyRollbackWorker:
             if not input_ids:
                 return
 
-            boundary_indices = torch.stack(
-                [
-                    task.req.mamba_ping_pong_track_buffer[task.boundary_track_idx]
-                    for task in tasks
-                ]
-            ).to(device=device, dtype=torch.long)
+            boundary_indices = ctx.state_adapter.get_boundary_indices_for_reqs(
+                reqs=[task.req for task in tasks],
+                track_indices=[task.boundary_track_idx for task in tasks],
+                device=device,
+            )
             replay_batch = ModelWorkerBatch(
                 forward_mode=ForwardMode.EXTEND,
                 input_ids=torch.tensor(input_ids, dtype=torch.int64, device=device),
