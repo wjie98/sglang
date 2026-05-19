@@ -160,6 +160,24 @@ class DVRGatedStateAdapter:
             state_cache.temporal.dtype, copy=False
         )
 
+    def backup_recurrent_state(
+        self, *, state_cache, indices: torch.Tensor
+    ) -> DVRRecurrentStateBackup:
+        return self._backup_recurrent_state(state_cache=state_cache, indices=indices)
+
+    def restore_recurrent_state(
+        self,
+        *,
+        state_cache,
+        backup: DVRRecurrentStateBackup,
+        indices: Optional[torch.Tensor] = None,
+    ):
+        self._restore_recurrent_state(
+            state_cache=state_cache,
+            backup=backup,
+            indices=indices,
+        )
+
     def backup_verify_recurrent_states(
         self,
         *,

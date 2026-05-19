@@ -8,7 +8,7 @@ import torch
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import (
@@ -24,7 +24,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
-from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
+from sglang.srt.speculative.dvr_linear_state import (
+    DVRBoundaryReplayTask,
+    DVRLinearStateLifecycle,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -254,6 +257,158 @@ class DecodeVerifyRollbackWorker:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+    def _replay_linear_state_boundaries(
+        self, batch: ScheduleBatch, tasks: List[DVRBoundaryReplayTask]
+    ):
+        if not tasks:
+            return
+
+        ctx = self.linear_state.state_context(batch)
+        if ctx is None:
+            return
+
+        device = batch.device
+        live_indices = torch.stack([task.live_idx for task in tasks]).to(
+            device=ctx.live_indices.device, dtype=torch.long
+        )
+        live_backup = ctx.state_adapter.backup_recurrent_state(
+            state_cache=ctx.state_cache,
+            indices=live_indices,
+        )
+
+        try:
+            zero_live_indices = [
+                task.live_idx
+                for task in tasks
+                if task.source_mamba_value is None or task.source_seqlen == 0
+            ]
+            if zero_live_indices:
+                ctx.state_adapter.zero_recurrent_state(
+                    state_cache=ctx.state_cache,
+                    indices=torch.stack(zero_live_indices).to(
+                        device=ctx.live_indices.device, dtype=torch.long
+                    ),
+                )
+
+            copy_src = [
+                task.source_mamba_value.reshape(-1)
+                for task in tasks
+                if task.source_mamba_value is not None and task.source_seqlen > 0
+            ]
+            copy_dst = [
+                task.live_idx
+                for task in tasks
+                if task.source_mamba_value is not None and task.source_seqlen > 0
+            ]
+            if copy_src:
+                batch.req_to_token_pool.mamba_pool.copy_from(
+                    torch.cat(copy_src).to(
+                        device=ctx.live_indices.device, dtype=torch.long
+                    ),
+                    torch.stack(copy_dst).to(
+                        device=ctx.live_indices.device, dtype=torch.long
+                    ),
+                )
+
+            reqs = [task.req for task in tasks]
+            input_ids = []
+            out_cache_locs = []
+            prefix_lens = []
+            extend_lens = []
+            seq_lens = []
+            for task in tasks:
+                token_ids = task.req.origin_input_ids + task.req.output_ids
+                if len(token_ids) < task.boundary_seqlen:
+                    token_ids = task.req.fill_ids
+                replay_token_ids = token_ids[
+                    task.source_seqlen : task.boundary_seqlen
+                ]
+                input_ids.extend(replay_token_ids)
+                out_cache_locs.append(
+                    batch.req_to_token_pool.req_to_token[
+                        task.req.req_pool_idx,
+                        task.source_seqlen : task.boundary_seqlen,
+                    ].to(torch.long)
+                )
+                prefix_lens.append(task.source_seqlen)
+                extend_lens.append(task.boundary_seqlen - task.source_seqlen)
+                seq_lens.append(task.boundary_seqlen)
+
+            if not input_ids:
+                return
+
+            boundary_indices = torch.stack(
+                [
+                    task.req.mamba_ping_pong_track_buffer[task.boundary_track_idx]
+                    for task in tasks
+                ]
+            ).to(device=device, dtype=torch.long)
+            replay_batch = ModelWorkerBatch(
+                forward_mode=ForwardMode.EXTEND,
+                input_ids=torch.tensor(input_ids, dtype=torch.int64, device=device),
+                req_pool_indices=torch.tensor(
+                    [req.req_pool_idx for req in reqs],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                seq_lens=torch.tensor(seq_lens, dtype=torch.int64, device=device),
+                out_cache_loc=torch.cat(out_cache_locs).to(device=device),
+                seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
+                seq_lens_sum=sum(seq_lens),
+                return_logprob=False,
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
+                global_num_tokens=None,
+                global_num_tokens_for_logprob=None,
+                is_extend_in_batch=False,
+                all_extend_in_batch=False,
+                can_run_dp_cuda_graph=False,
+                tbo_split_seq_index=None,
+                global_forward_mode=None,
+                extend_num_tokens=len(input_ids),
+                extend_seq_lens=extend_lens,
+                extend_prefix_lens=prefix_lens,
+                extend_logprob_start_lens=prefix_lens,
+                extend_input_logprob_token_ids=None,
+                multimodal_inputs=[req.multimodal_inputs for req in reqs],
+                encoder_cached=None,
+                encoder_lens=None,
+                encoder_lens_cpu=None,
+                encoder_out_cache_loc=None,
+                lora_ids=[req.lora_id for req in reqs],
+                sampling_info=None,
+                orig_seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                input_embeds=None,
+                ne_token_table=None,
+                token_type_ids=None,
+                spec_algorithm=batch.spec_algorithm,
+                spec_info=None,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                hicache_consumer_index=-1,
+                dimensions=None,
+                is_prefill_only=True,
+                dllm_block_offsets=None,
+                dllm_config=None,
+                reqs=reqs,
+                has_grammar=False,
+                return_hidden_states_before_norm=False,
+                mamba_track_indices=boundary_indices,
+                mamba_track_mask=torch.ones(
+                    len(tasks), dtype=torch.bool, device=device
+                ),
+                mamba_track_seqlens=torch.tensor(
+                    seq_lens, dtype=torch.int64, device=device
+                ),
+            )
+            forward_batch = ForwardBatch.init_new(replay_batch, self.model_runner)
+            self.model_runner.forward(forward_batch)
+        finally:
+            ctx.state_adapter.restore_recurrent_state(
+                state_cache=ctx.state_cache,
+                backup=live_backup,
+                indices=live_indices,
+            )
+
     def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -263,7 +418,11 @@ class DecodeVerifyRollbackWorker:
                 self.num_draft_tokens,
             )
 
-        self.linear_state.prepare_for_draft(batch)
+        replay_tasks = self.linear_state.prepare_for_draft(batch)
+        if replay_tasks:
+            self._replay_linear_state_boundaries(batch, replay_tasks)
+            self.linear_state.restore_tail_lens_after_replay(batch, replay_tasks)
+        self.linear_state.finish_prepare_for_draft(batch)
         self._draft_preprocess_decode(batch)
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)

@@ -1848,14 +1848,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.mamba_next_track_idx
                 )
             )
-            # Generic extra_buffer tracks the radix branching point so later
-            # requests can fork from it. DVR instead needs the latest completed
-            # FLA chunk boundary for target verify; older branch states remain
-            # recoverable from radix ancestors.
-            if (
-                req.mamba_branching_seqlen is not None
-                and not self.spec_algorithm.is_decode_verify_rollback()
-            ):
+            if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
