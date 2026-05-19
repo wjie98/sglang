@@ -257,6 +257,27 @@ class DecodeVerifyRollbackWorker:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+    @staticmethod
+    def _request_token_ids_for_replay(req, boundary_seqlen: int):
+        if getattr(req, "multimodal_inputs", None) is not None:
+            raise RuntimeError(
+                "DVR boundary fallback replay does not support multimodal inputs yet."
+            )
+
+        token_ids = req.origin_input_ids + req.output_ids
+        if len(token_ids) >= boundary_seqlen:
+            return token_ids
+
+        fill_ids = getattr(req, "fill_ids", None)
+        if fill_ids is not None and len(fill_ids) >= boundary_seqlen:
+            return fill_ids
+
+        raise RuntimeError(
+            "DVR boundary fallback replay cannot reconstruct the verified prefix: "
+            f"rid={req.rid}, available_tokens={len(token_ids)}, "
+            f"boundary_seqlen={boundary_seqlen}."
+        )
+
     def _replay_linear_state_boundaries(
         self, batch: ScheduleBatch, tasks: List[DVRBoundaryReplayTask]
     ):
@@ -280,7 +301,7 @@ class DecodeVerifyRollbackWorker:
             zero_live_indices = [
                 task.live_idx
                 for task in tasks
-                if task.source_mamba_value is None or task.source_seqlen == 0
+                if task.source_state_indices is None or task.source_seqlen == 0
             ]
             if zero_live_indices:
                 ctx.state_adapter.zero_recurrent_state(
@@ -291,14 +312,14 @@ class DecodeVerifyRollbackWorker:
                 )
 
             copy_src = [
-                task.source_mamba_value.reshape(-1)
+                task.source_state_indices.reshape(-1)
                 for task in tasks
-                if task.source_mamba_value is not None and task.source_seqlen > 0
+                if task.source_state_indices is not None and task.source_seqlen > 0
             ]
             copy_dst = [
                 task.live_idx
                 for task in tasks
-                if task.source_mamba_value is not None and task.source_seqlen > 0
+                if task.source_state_indices is not None and task.source_seqlen > 0
             ]
             if copy_src:
                 batch.req_to_token_pool.mamba_pool.copy_from(
@@ -317,9 +338,9 @@ class DecodeVerifyRollbackWorker:
             extend_lens = []
             seq_lens = []
             for task in tasks:
-                token_ids = task.req.origin_input_ids + task.req.output_ids
-                if len(token_ids) < task.boundary_seqlen:
-                    token_ids = task.req.fill_ids
+                token_ids = self._request_token_ids_for_replay(
+                    task.req, task.boundary_seqlen
+                )
                 replay_token_ids = token_ids[
                     task.source_seqlen : task.boundary_seqlen
                 ]
@@ -506,7 +527,7 @@ class DecodeVerifyRollbackWorker:
         origin_seq_lens_cpu = forward_batch.seq_lens_cpu.clone()
         origin_seq_lens_sum = forward_batch.seq_lens_sum
         origin_spec_info = forward_batch.spec_info
-        origin_positions = forward_batch.positions
+        origin_positions = forward_batch.positions.clone()
         origin_out_cache_loc = forward_batch.out_cache_loc
         forward_batch.spec_info = None
 
@@ -559,7 +580,7 @@ class DecodeVerifyRollbackWorker:
         forward_batch.seq_lens_cpu = origin_seq_lens_cpu
         forward_batch.seq_lens_sum = origin_seq_lens_sum
         forward_batch.spec_info = origin_spec_info
-        forward_batch.positions = origin_positions
+        forward_batch.positions.copy_(origin_positions)
         forward_batch.out_cache_loc = origin_out_cache_loc
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(

@@ -23,7 +23,7 @@ class DVRBoundaryReplayTask:
     req: Any
     source_seqlen: int
     boundary_seqlen: int
-    source_mamba_value: Optional[torch.Tensor]
+    source_state_indices: Optional[torch.Tensor]
     boundary_track_idx: int
     live_idx: torch.Tensor
 
@@ -63,6 +63,7 @@ class DVRLinearStateLifecycle:
             )
 
     def prepare_for_draft(self, batch: ScheduleBatch) -> List[DVRBoundaryReplayTask]:
+        self.sync_active_reqs(batch)
         return self.ensure_boundary_state(batch)
 
     def finish_prepare_for_draft(self, batch: ScheduleBatch):
@@ -156,6 +157,26 @@ class DVRLinearStateLifecycle:
             and batch.batch_size() > 0
             and all(req.mamba_ping_pong_track_buffer is not None for req in batch.reqs)
         )
+
+    def sync_active_reqs(self, batch: ScheduleBatch):
+        active_rids = {req.rid for req in batch.reqs}
+        for rid in list(self.boundary_seqlen):
+            if rid not in active_rids:
+                self.boundary_seqlen.pop(rid, None)
+                self.boundary_track_idx.pop(rid, None)
+
+        for req in batch.reqs:
+            recorded_boundary = self.boundary_seqlen.get(req.rid)
+            if recorded_boundary is None:
+                continue
+            current_boundary, _ = self.boundary_and_tail(req)
+            if (
+                req.rid not in self.boundary_track_idx
+                or recorded_boundary != current_boundary
+                or recorded_boundary % FLA_CHUNK_SIZE != 0
+            ):
+                self.boundary_seqlen.pop(req.rid, None)
+                self.boundary_track_idx.pop(req.rid, None)
 
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
@@ -319,7 +340,7 @@ class DVRLinearStateLifecycle:
             req=req,
             source_seqlen=source_seqlen,
             boundary_seqlen=boundary_seqlen,
-            source_mamba_value=(
+            source_state_indices=(
                 source_node.mamba_value if source_node is not None else None
             ),
             boundary_track_idx=boundary_track_idx,

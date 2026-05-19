@@ -104,6 +104,14 @@ def handle_dvr_speculative_decoding(server_args):
         )
         server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
+    if server_args.speculative_num_draft_tokens <= 0:
+        raise ValueError("DVR requires speculative_num_draft_tokens to be positive.")
+    if server_args.speculative_num_draft_tokens > FLA_CHUNK_SIZE:
+        raise ValueError(
+            "DVR currently commits at most one FLA chunk boundary per verify. "
+            f"Please set --speculative-num-draft-tokens <= {FLA_CHUNK_SIZE}."
+        )
+
     if server_args.speculative_eagle_topk is None:
         server_args.speculative_eagle_topk = 1
     elif server_args.speculative_eagle_topk != 1:
