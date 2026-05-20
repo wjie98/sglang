@@ -5,6 +5,7 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (
@@ -23,6 +24,36 @@ __all__ = [
 if not is_cpu():
     import triton
     import triton.language as tl
+
+
+def _infer_gdn_state_input_shapes(
+    state_shape: Mamba2StateShape,
+) -> Tuple[int, int, int, int]:
+    """Infer local q/k and v cache dimensions from existing Mamba2 metadata.
+
+    GDN's recurrent state is shaped by value heads, but the state-input cache
+    stores q/k using key groups. Mamba2StateShape does not store n_groups
+    directly, so keep this DVR-local by inverting the conv_dim formula used by
+    Mamba2StateShape.create():
+      conv_dim = intermediate_size + 2 * padded_n_groups * state_size.
+    """
+    local_value_heads, value_head_dim, key_head_dim = state_shape.temporal
+    key_group_width = 2 * state_shape.state_size
+    assert key_group_width > 0
+    assert state_shape.conv_dim >= state_shape.intermediate_size
+    assert (
+        state_shape.conv_dim - state_shape.intermediate_size
+    ) % key_group_width == 0
+
+    padded_num_key_groups = (
+        state_shape.conv_dim - state_shape.intermediate_size
+    ) // key_group_width
+    assert local_value_heads > 0
+    assert state_shape.num_heads % local_value_heads == 0
+    tp_world_size = state_shape.num_heads // local_value_heads
+    assert padded_num_key_groups % tp_world_size == 0
+    local_key_heads = padded_num_key_groups // tp_world_size
+    return local_key_heads, key_head_dim, local_value_heads, value_head_dim
 
 
 if not is_cpu():
@@ -245,18 +276,24 @@ class DVRGDNStateInputCache(DVRStateInputCache):
         num_layers: int,
         num_slots: int,
         num_draft_tokens: int,
-        temporal_state_shape: Tuple[int, ...],
+        state_shape: Mamba2StateShape,
         dtype: torch.dtype,
         device: str,
     ) -> "DVRGDNStateInputCache":
+        (
+            local_key_heads,
+            key_head_dim,
+            local_value_heads,
+            value_head_dim,
+        ) = _infer_gdn_state_input_shapes(state_shape)
         window_len = FLA_CHUNK_SIZE + num_draft_tokens
         q_input = torch.zeros(
             size=(
                 num_layers,
                 num_slots,
                 window_len,
-                temporal_state_shape[0],
-                temporal_state_shape[1],
+                local_key_heads,
+                key_head_dim,
             ),
             dtype=dtype,
             device=device,
@@ -269,14 +306,14 @@ class DVRGDNStateInputCache(DVRStateInputCache):
                     num_layers,
                     num_slots,
                     window_len,
-                    temporal_state_shape[0],
-                    temporal_state_shape[2],
+                    local_value_heads,
+                    value_head_dim,
                 ),
                 dtype=dtype,
                 device=device,
             ),
             torch.zeros(
-                size=(num_layers, num_slots, window_len, temporal_state_shape[0]),
+                size=(num_layers, num_slots, window_len, local_value_heads),
                 dtype=torch.float32,
                 device=device,
             ),

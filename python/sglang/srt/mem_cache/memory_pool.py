@@ -314,7 +314,7 @@ class MambaPool:
                         num_layers=num_mamba_layers,
                         num_slots=spec_state_size + 1,
                         num_draft_tokens=speculative_num_draft_tokens,
-                        temporal_state_shape=temporal_state_shape,
+                        state_shape=cache_params.shape,
                         dtype=conv_dtype,
                         device=device,
                     )
