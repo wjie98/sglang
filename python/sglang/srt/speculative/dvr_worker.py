@@ -23,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
+    dvr_self_draft_nondeterministic_decode,
 )
 from sglang.srt.speculative.dvr_linear_state import (
     DVRBoundaryReplayTask,
@@ -604,8 +605,13 @@ class DecodeVerifyRollbackWorker:
         if can_cuda_graph:
             return self.cuda_graph_runner_for_draft_decode.replay(forward_batch)
 
-        forward_batch.can_run_dp_cuda_graph = False
-        return self.model_runner.forward(forward_batch).logits_output
+        with dvr_self_draft_nondeterministic_decode(
+            self.model_runner,
+            disable_batch_invariant_ops=True,
+            clear_kernel_config_caches=True,
+        ):
+            forward_batch.can_run_dp_cuda_graph = False
+            return self.model_runner.forward(forward_batch).logits_output
 
     def get_draft_sampling_probs(
         self, forward_batch: ForwardBatch, sampling_probs: torch.Tensor
