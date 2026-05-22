@@ -69,27 +69,32 @@ def _clear_determinism_sensitive_kernel_caches():
 
 
 @contextmanager
-def dvr_self_draft_nondeterministic_decode(
+def dvr_self_draft_decode_context(
     model_runner,
     *,
+    graph_capture: bool = False,
     disable_batch_invariant_ops: bool = False,
     clear_kernel_config_caches: bool = False,
 ):
-    """Run DVR self-draft forward with normal non-deterministic decode kernels.
+    """Temporarily switch the target runner into DVR self-draft decode mode.
 
-    DVR verifies proposed draft tokens with the target path afterwards, so only
-    TARGET_VERIFY needs batch-invariant deterministic kernels. Keeping this
-    override local to self-draft capture/replay preserves the deterministic
-    verifier while allowing the proposal step to use the faster decode kernels.
+    DVR verifies proposals with the deterministic target path afterwards, so the
+    provisional self-draft path can use normal decode kernels, avoid
+    batch-invariant linear ops, and skip mamba prefix tracking during graph capture.
+    All mutations are restored before target verify runs.
     """
 
     patched_attrs = []
+    global_server_args = get_global_server_args()
 
     def patch_attr(obj, attr_name, value):
         if obj is None or not hasattr(obj, attr_name):
             return
         patched_attrs.append((obj, attr_name, getattr(obj, attr_name)))
         setattr(obj, attr_name, value)
+
+    def skip_init_cuda_graph_state(*args, **kwargs):
+        return None
 
     env_override = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False)
     env_override.__enter__()
@@ -99,10 +104,25 @@ def dvr_self_draft_nondeterministic_decode(
             _clear_determinism_sensitive_kernel_caches()
 
         patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
-        patch_attr(get_global_server_args(), "enable_deterministic_inference", False)
+        patch_attr(global_server_args, "enable_deterministic_inference", False)
 
         for backend in _iter_attention_backends(model_runner.attn_backend):
             patch_attr(backend, "enable_deterministic", False)
+
+        if graph_capture:
+            # The target runner already initialized attention backend graph
+            # buffers for TARGET_VERIFY. Capture DVR self-draft as ordinary
+            # DECODE without reinitializing those shared buffers.
+            patch_attr(model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE)
+            patch_attr(
+                model_runner.attn_backend,
+                "init_cuda_graph_state",
+                skip_init_cuda_graph_state,
+            )
+            # Provisional self-draft tokens must not update mamba prefix-cache
+            # tracking slots. DVR commits verified recurrent state after verify.
+            patch_attr(model_runner.server_args, "mamba_scheduler_strategy", "no_buffer")
+            patch_attr(global_server_args, "mamba_scheduler_strategy", "no_buffer")
 
         with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
             yield
@@ -112,44 +132,6 @@ def dvr_self_draft_nondeterministic_decode(
         if clear_kernel_config_caches:
             _clear_determinism_sensitive_kernel_caches()
         env_override.__exit__(None, None, None)
-
-
-@contextmanager
-def _dvr_draft_decode_graph_capture(model_runner):
-    original_spec_algorithm = model_runner.spec_algorithm
-    original_init_cuda_graph_state = model_runner.attn_backend.init_cuda_graph_state
-    original_mamba_scheduler_strategy = (
-        model_runner.server_args.mamba_scheduler_strategy
-    )
-    global_server_args = get_global_server_args()
-    original_global_mamba_scheduler_strategy = (
-        global_server_args.mamba_scheduler_strategy
-    )
-
-    def skip_init_cuda_graph_state(*args, **kwargs):
-        return None
-
-    # The target model's main runner has already initialized attention backend
-    # graph buffers for the larger TARGET_VERIFY graph. Capture the DVR self
-    # draft graph as an ordinary decode graph without reinitializing those
-    # shared backend buffers.
-    model_runner.spec_algorithm = SpeculativeAlgorithm.NONE
-    model_runner.attn_backend.init_cuda_graph_state = skip_init_cuda_graph_state
-    # DVR self-draft tokens are provisional and must not update mamba prefix-cache
-    # tracking slots. The verified state is committed by DVR after target verify.
-    model_runner.server_args.mamba_scheduler_strategy = "no_buffer"
-    global_server_args.mamba_scheduler_strategy = "no_buffer"
-    try:
-        yield
-    finally:
-        global_server_args.mamba_scheduler_strategy = (
-            original_global_mamba_scheduler_strategy
-        )
-        model_runner.server_args.mamba_scheduler_strategy = (
-            original_mamba_scheduler_strategy
-        )
-        model_runner.attn_backend.init_cuda_graph_state = original_init_cuda_graph_state
-        model_runner.spec_algorithm = original_spec_algorithm
 
 
 class DVRDraftDecodeCudaGraphRunner:
@@ -163,10 +145,9 @@ class DVRDraftDecodeCudaGraphRunner:
     def __init__(self, dvr_worker):
         self.dvr_worker = dvr_worker
         model_runner = dvr_worker.model_runner
-        with _dvr_draft_decode_graph_capture(
-            model_runner
-        ), dvr_self_draft_nondeterministic_decode(
+        with dvr_self_draft_decode_context(
             model_runner,
+            graph_capture=True,
             disable_batch_invariant_ops=True,
             clear_kernel_config_caches=True,
         ):
@@ -176,5 +157,5 @@ class DVRDraftDecodeCudaGraphRunner:
         return self.runner.can_run(forward_batch)
 
     def replay(self, forward_batch: ForwardBatch):
-        with dvr_self_draft_nondeterministic_decode(self.dvr_worker.model_runner):
+        with dvr_self_draft_decode_context(self.dvr_worker.model_runner):
             return self.runner.replay(forward_batch)

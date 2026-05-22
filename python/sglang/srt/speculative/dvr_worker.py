@@ -23,7 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
-    dvr_self_draft_nondeterministic_decode,
+    dvr_self_draft_decode_context,
 )
 from sglang.srt.speculative.dvr_linear_state import (
     DVRBoundaryReplayTask,
@@ -647,7 +647,7 @@ class DecodeVerifyRollbackWorker:
         if can_cuda_graph:
             return self.cuda_graph_runner_for_draft_decode.replay(forward_batch)
 
-        with dvr_self_draft_nondeterministic_decode(
+        with dvr_self_draft_decode_context(
             self.model_runner,
             disable_batch_invariant_ops=True,
             clear_kernel_config_caches=True,
