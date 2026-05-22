@@ -118,6 +118,39 @@ class DecodeVerifyRollbackWorker:
             self.num_draft_tokens,
         )
 
+    def _dummy_hidden_states(self, num_tokens: int, device=None) -> torch.Tensor:
+        """Keep EAGLE indexing contracts without storing real DVR hidden states.
+
+        DVR self-draft only needs accepted token ids for the next decode step.
+        A zero-width tensor can still be indexed by accepted token positions, but
+        avoids materializing [tokens, hidden_size] activations in target verify.
+        """
+
+        return torch.empty(
+            (num_tokens, 0),
+            dtype=self.model_config.dtype,
+            device=device or self.device,
+        )
+
+    def _use_dummy_draft_hidden_states(self, draft_input: EagleDraftInput):
+        """Normalize DVR draft input hidden states to the zero-width placeholder."""
+
+        if (
+            draft_input.hidden_states is not None
+            and draft_input.hidden_states.shape[-1] == 0
+        ):
+            return
+        if draft_input.hidden_states is not None:
+            num_tokens = draft_input.hidden_states.shape[0]
+            device = draft_input.hidden_states.device
+        elif draft_input.verified_id is not None:
+            num_tokens = draft_input.verified_id.shape[0]
+            device = draft_input.verified_id.device
+        else:
+            num_tokens = 0
+            device = self.device
+        draft_input.hidden_states = self._dummy_hidden_states(num_tokens, device=device)
+
     def __getattr__(self, name):
         return getattr(self.target_worker, name)
 
@@ -153,7 +186,7 @@ class DecodeVerifyRollbackWorker:
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, bool]:
         model_worker_batch = batch.get_model_worker_batch()
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
@@ -161,7 +194,13 @@ class DecodeVerifyRollbackWorker:
         )
         topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
         batch.spec_info = EagleDraftInput(
-            hidden_states=logits_output.hidden_states,
+            hidden_states=(
+                logits_output.hidden_states
+                if logits_output.hidden_states is not None
+                else self._dummy_hidden_states(
+                    next_token_ids.shape[0], device=next_token_ids.device
+                )
+            ),
             verified_id=next_token_ids,
             topk_p=torch.ones(
                 (next_token_ids.shape[0], self.topk),
@@ -247,12 +286,15 @@ class DecodeVerifyRollbackWorker:
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
         batch.return_hidden_states = False
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.hidden_size,
+            hidden_size=0,
             dtype=self.model_config.dtype,
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -496,7 +538,7 @@ class DecodeVerifyRollbackWorker:
             spec_steps=self.num_draft_steps,
             topk=self.topk,
             draft_token_num=self.num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             draft_probs=draft_probs,
@@ -678,6 +720,7 @@ class DecodeVerifyRollbackWorker:
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = verify_output.draft_input
+        self._use_dummy_draft_hidden_states(batch.spec_info)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
         if batch.forward_mode.is_idle():
             return
@@ -729,7 +772,14 @@ class DecodeVerifyRollbackWorker:
         )
         maybe_detect_nan(logits_output.next_token_logits, "dvr target verify")
 
-        spec_info.hidden_states = logits_output.hidden_states
+        spec_info.hidden_states = (
+            logits_output.hidden_states
+            if logits_output.hidden_states is not None
+            else self._dummy_hidden_states(
+                spec_info.draft_token.numel(),
+                device=logits_output.next_token_logits.device,
+            )
+        )
         verify_output: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,

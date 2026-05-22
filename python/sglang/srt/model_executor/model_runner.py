@@ -2379,7 +2379,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         spec_steps=self.server_args.speculative_num_steps,
                         topk=self.server_args.speculative_eagle_topk,
                         draft_token_num=self.server_args.speculative_num_draft_tokens,
-                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        capture_hidden_mode=(
+                            CaptureHiddenMode.NULL
+                            if self.spec_algorithm.is_decode_verify_rollback()
+                            else CaptureHiddenMode.FULL
+                        ),
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )

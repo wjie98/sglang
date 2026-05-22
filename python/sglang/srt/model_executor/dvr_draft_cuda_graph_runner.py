@@ -118,6 +118,13 @@ def dvr_self_draft_nondeterministic_decode(
 def _dvr_draft_decode_graph_capture(model_runner):
     original_spec_algorithm = model_runner.spec_algorithm
     original_init_cuda_graph_state = model_runner.attn_backend.init_cuda_graph_state
+    original_mamba_scheduler_strategy = (
+        model_runner.server_args.mamba_scheduler_strategy
+    )
+    global_server_args = get_global_server_args()
+    original_global_mamba_scheduler_strategy = (
+        global_server_args.mamba_scheduler_strategy
+    )
 
     def skip_init_cuda_graph_state(*args, **kwargs):
         return None
@@ -128,9 +135,19 @@ def _dvr_draft_decode_graph_capture(model_runner):
     # shared backend buffers.
     model_runner.spec_algorithm = SpeculativeAlgorithm.NONE
     model_runner.attn_backend.init_cuda_graph_state = skip_init_cuda_graph_state
+    # DVR self-draft tokens are provisional and must not update mamba prefix-cache
+    # tracking slots. The verified state is committed by DVR after target verify.
+    model_runner.server_args.mamba_scheduler_strategy = "no_buffer"
+    global_server_args.mamba_scheduler_strategy = "no_buffer"
     try:
         yield
     finally:
+        global_server_args.mamba_scheduler_strategy = (
+            original_global_mamba_scheduler_strategy
+        )
+        model_runner.server_args.mamba_scheduler_strategy = (
+            original_mamba_scheduler_strategy
+        )
         model_runner.attn_backend.init_cuda_graph_state = original_init_cuda_graph_state
         model_runner.spec_algorithm = original_spec_algorithm
 
