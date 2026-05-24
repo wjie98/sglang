@@ -3590,11 +3590,13 @@ class ServerArgs:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
                     if is_dvr_enabled(self) and not self.disable_custom_all_reduce:
+                        self.disable_custom_all_reduce = True
                         logger.warning(
                             "NCCL_ALGO is set to 'allreduce:tree' for "
-                            "deterministic inference when TP size > 1. DVR keeps "
-                            "custom all reduce enabled so the communicator can "
-                            "use the faster path when supported by the hardware."
+                            "deterministic inference when TP size > 1. Custom "
+                            "all reduce is disabled for deterministic prefill "
+                            "and verify; DVR may initialize it only for "
+                            "self-draft decode CUDA graph capture."
                         )
                     else:
                         self.disable_custom_all_reduce = True

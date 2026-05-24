@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
+from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -68,6 +69,61 @@ def _clear_determinism_sensitive_kernel_caches():
     should_enable_swap_ab.cache_clear()
 
 
+def _custom_all_reduce_is_ready(ca_comm) -> bool:
+    return hasattr(ca_comm, "world_size") and (
+        hasattr(ca_comm, "_ptr") or hasattr(ca_comm, "obj")
+    )
+
+
+def _ensure_decode_custom_all_reduce_comm(group):
+    ca_comm = getattr(group, "ca_comm", None)
+    if ca_comm is None and getattr(group, "world_size", 1) > 1:
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            dispatch_custom_allreduce,
+        )
+
+        try:
+            ca_comm = dispatch_custom_allreduce()(
+                group=group.cpu_group,
+                device=group.device,
+            )
+        except Exception:
+            ca_comm = None
+        group.ca_comm = ca_comm
+
+    if ca_comm is None or not _custom_all_reduce_is_ready(ca_comm):
+        return None
+
+    if hasattr(ca_comm, "full_nvlink") and not ca_comm.full_nvlink:
+        ca_comm.disabled = True
+        if hasattr(ca_comm, "original_disabled"):
+            ca_comm.original_disabled = True
+        return None
+
+    ca_comm.disabled = True
+    if hasattr(ca_comm, "original_disabled"):
+        ca_comm.original_disabled = True
+    return ca_comm
+
+
+def _iter_decode_custom_all_reduce_comms(model_runner):
+    candidate_groups = [getattr(model_runner, "tp_group", None)]
+    for get_group in (get_moe_ep_group, get_moe_tp_group):
+        try:
+            candidate_groups.append(get_group())
+        except AssertionError:
+            pass
+
+    seen = set()
+    for group in candidate_groups:
+        if group is None or id(group) in seen:
+            continue
+        seen.add(id(group))
+        ca_comm = _ensure_decode_custom_all_reduce_comm(group)
+        if ca_comm is not None:
+            yield ca_comm
+
+
 @contextmanager
 def dvr_self_draft_decode_context(
     model_runner,
@@ -110,6 +166,10 @@ def dvr_self_draft_decode_context(
             patch_attr(backend, "enable_deterministic", False)
 
         if graph_capture:
+            # Custom all-reduce is unsafe for deterministic DVR prefill/verify,
+            # but the self-draft decode graph can capture it for speed.
+            for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
+                patch_attr(ca_comm, "disabled", False)
             # The target runner already initialized attention backend graph
             # buffers for TARGET_VERIFY. Capture DVR self-draft as ordinary
             # DECODE without reinitializing those shared buffers.
