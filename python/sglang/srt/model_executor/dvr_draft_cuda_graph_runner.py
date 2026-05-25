@@ -23,12 +23,23 @@ def _iter_attention_backends(attn_backend):
         seen.add(id(backend))
         yield backend
 
-        for attr_name in ("decode_backend", "prefill_backend", "linear_attn_backend"):
+        for attr_name in (
+            "decode_backend",
+            "prefill_backend",
+            "full_attn_backend",
+            "linear_attn_backend",
+            "primary",
+        ):
             stack.append(getattr(backend, attr_name, None))
 
-        for attr_name in ("attn_backends", "backends"):
+        for attr_name in ("attn_backend_list", "attn_backends", "backends", "children"):
             for child in getattr(backend, attr_name, None) or ():
                 stack.append(child)
+
+        # PDMUX keeps per-stream decode backends on model_runner as
+        # decode_attn_backend_group, outside this backend object tree. DVR does
+        # not patch that path yet because current DVR validation does not use
+        # PDMUX, and swapping those graph states needs separate testing.
 
 
 @contextmanager
