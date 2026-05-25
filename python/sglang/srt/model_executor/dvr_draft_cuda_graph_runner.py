@@ -69,6 +69,33 @@ def _clear_determinism_sensitive_kernel_caches():
     should_enable_swap_ab.cache_clear()
 
 
+def _patch_self_draft_decode_backend_defaults(backend, patch_attr):
+    """Undo init-time deterministic decode knobs for DVR self-draft only.
+
+    Prefill and verify still run through the deterministic target path. The
+    self-draft decode graph is provisional and verified afterwards, so it should
+    use the same decode heuristics as normal non-deterministic serving whenever
+    the deterministic choice was baked into a backend field at init time.
+    """
+
+    if getattr(backend, "fa_impl_ver", None) == 3:
+        # FA3 stores deterministic num_splits at backend init time.
+        # DVR self-draft decode should use the normal decode heuristic.
+        patch_attr(backend, "num_splits", 0)
+
+    if backend.__class__.__name__ == "NativeSparseAttnBackend":
+        # NSA mirrors FA3's deterministic split policy for FlashMLA-style dense
+        # attention. The self-draft decode path should keep split selection
+        # heuristic-driven, while deterministic verify keeps the original value.
+        patch_attr(backend, "num_splits", 0)
+
+    if hasattr(backend, "decode_split_tile_size"):
+        # FlashInfer deterministic mode fixes decode split size and disables
+        # CUDA graph KV split. Restore normal decode planning for self-draft.
+        patch_attr(backend, "decode_split_tile_size", None)
+        patch_attr(backend, "disable_cuda_graph_kv_split", False)
+
+
 def _custom_all_reduce_is_ready(ca_comm) -> bool:
     return hasattr(ca_comm, "world_size") and (
         hasattr(ca_comm, "_ptr") or hasattr(ca_comm, "obj")
@@ -164,10 +191,7 @@ def dvr_self_draft_decode_context(
 
         for backend in _iter_attention_backends(model_runner.attn_backend):
             patch_attr(backend, "enable_deterministic", False)
-            if getattr(backend, "fa_impl_ver", None) == 3:
-                # FA3 stores deterministic num_splits at backend init time.
-                # DVR self-draft decode should use the normal decode heuristic.
-                patch_attr(backend, "num_splits", 0)
+            _patch_self_draft_decode_backend_defaults(backend, patch_attr)
 
         if graph_capture:
             # Custom all-reduce is unsafe for deterministic DVR prefill/verify,
