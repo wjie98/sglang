@@ -164,6 +164,10 @@ def dvr_self_draft_decode_context(
 
         for backend in _iter_attention_backends(model_runner.attn_backend):
             patch_attr(backend, "enable_deterministic", False)
+            if getattr(backend, "fa_impl_ver", None) == 3:
+                # FA3 stores deterministic num_splits at backend init time.
+                # DVR self-draft decode should use the normal decode heuristic.
+                patch_attr(backend, "num_splits", 0)
 
         if graph_capture:
             # Custom all-reduce is unsafe for deterministic DVR prefill/verify,
