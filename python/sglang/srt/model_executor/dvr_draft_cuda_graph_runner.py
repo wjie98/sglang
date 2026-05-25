@@ -10,7 +10,32 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+_BACKEND_CHILD_ATTRS = (
+    "decode_backend",
+    "prefill_backend",
+    "full_attn_backend",
+    "linear_attn_backend",
+    "primary",
+)
+_BACKEND_CHILD_LIST_ATTRS = (
+    "attn_backend_list",
+    "attn_backends",
+    "backends",
+    "children",
+)
+
+
 def _iter_attention_backends(attn_backend):
+    """Yield a backend tree rooted at model_runner.attn_backend.
+
+    Attention backends may be wrapped by HybridAttnBackend, HybridLinearAttnBackend,
+    multi-step speculative containers, or TBO. DVR self-draft decode needs to patch
+    the real full-attention backend inside those wrappers, not just the top-level
+    object. PDMUX is intentionally excluded because its per-stream decode backends
+    live on model_runner.decode_attn_backend_group, outside this object tree, and
+    that graph-state path needs separate validation.
+    """
+
     if attn_backend is None:
         return
 
@@ -23,23 +48,12 @@ def _iter_attention_backends(attn_backend):
         seen.add(id(backend))
         yield backend
 
-        for attr_name in (
-            "decode_backend",
-            "prefill_backend",
-            "full_attn_backend",
-            "linear_attn_backend",
-            "primary",
-        ):
+        for attr_name in _BACKEND_CHILD_ATTRS:
             stack.append(getattr(backend, attr_name, None))
 
-        for attr_name in ("attn_backend_list", "attn_backends", "backends", "children"):
+        for attr_name in _BACKEND_CHILD_LIST_ATTRS:
             for child in getattr(backend, attr_name, None) or ():
                 stack.append(child)
-
-        # PDMUX keeps per-stream decode backends on model_runner as
-        # decode_attn_backend_group, outside this backend object tree. DVR does
-        # not patch that path yet because current DVR validation does not use
-        # PDMUX, and swapping those graph states needs separate testing.
 
 
 @contextmanager
@@ -80,6 +94,15 @@ def _clear_determinism_sensitive_kernel_caches():
     should_enable_swap_ab.cache_clear()
 
 
+def _uses_init_time_deterministic_num_splits(backend) -> bool:
+    # FA3 and NSA store deterministic split policy at backend init time. FA4 is
+    # deliberately excluded because FA4 CUDA graph does not support num_splits=0.
+    return (
+        getattr(backend, "fa_impl_ver", None) == 3
+        or backend.__class__.__name__ == "NativeSparseAttnBackend"
+    )
+
+
 def _patch_self_draft_decode_backend_defaults(backend, patch_attr):
     """Undo init-time deterministic decode knobs for DVR self-draft only.
 
@@ -89,15 +112,7 @@ def _patch_self_draft_decode_backend_defaults(backend, patch_attr):
     the deterministic choice was baked into a backend field at init time.
     """
 
-    if getattr(backend, "fa_impl_ver", None) == 3:
-        # FA3 stores deterministic num_splits at backend init time.
-        # DVR self-draft decode should use the normal decode heuristic.
-        patch_attr(backend, "num_splits", 0)
-
-    if backend.__class__.__name__ == "NativeSparseAttnBackend":
-        # NSA mirrors FA3's deterministic split policy for FlashMLA-style dense
-        # attention. The self-draft decode path should keep split selection
-        # heuristic-driven, while deterministic verify keeps the original value.
+    if _uses_init_time_deterministic_num_splits(backend):
         patch_attr(backend, "num_splits", 0)
 
     if hasattr(backend, "decode_split_tile_size"):
@@ -220,7 +235,9 @@ def dvr_self_draft_decode_context(
             )
             # Provisional self-draft tokens must not update mamba prefix-cache
             # tracking slots. DVR commits verified recurrent state after verify.
-            patch_attr(model_runner.server_args, "mamba_scheduler_strategy", "no_buffer")
+            patch_attr(
+                model_runner.server_args, "mamba_scheduler_strategy", "no_buffer"
+            )
             patch_attr(global_server_args, "mamba_scheduler_strategy", "no_buffer")
 
         with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
