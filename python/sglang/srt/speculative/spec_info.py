@@ -51,7 +51,11 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return (
+            self.is_eagle()
+            or self.is_standalone()
+            or self.is_decode_verify_rollback()
+        )
 
     def create_worker(
         self, server_args: ServerArgs
@@ -107,9 +111,11 @@ class SpeculativeAlgorithm(Enum):
             return NGRAMWorker
         elif self.is_decode_verify_rollback():
             if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                from sglang.srt.speculative.dvr_worker_v2 import (
+                    DecodeVerifyRollbackWorkerV2,
                 )
+
+                return DecodeVerifyRollbackWorkerV2
 
             from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 

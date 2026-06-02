@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
@@ -127,9 +128,19 @@ def handle_dvr_speculative_decoding(server_args):
             "this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
+    if envs.SGLANG_ENABLE_SPEC_V2.get():
+        server_args.disable_overlap_schedule = False
+        logger.warning(
+            "Spec v2 is enabled for DVR and overlap schedule is turned on."
+        )
+    else:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap scheduler is disabled for DVR. Set "
+            "SGLANG_ENABLE_SPEC_V2=True to use the experimental DVR spec v2 path."
+        )
     server_args.enable_mixed_chunk = False
-    logger.warning("Overlap scheduler and mixed chunked prefill are disabled for DVR.")
+    logger.warning("Mixed chunked prefill is disabled for DVR.")
 
 
 def _is_dvr_gated_linear_state_model(server_args):

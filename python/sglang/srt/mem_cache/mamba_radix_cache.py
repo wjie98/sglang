@@ -529,6 +529,7 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
+        mamba_ping_pong_track_buffer_to_keep = None
 
         if is_insert:
             cache_len = (
@@ -538,53 +539,66 @@ class MambaRadixCache(BasePrefixCache):
             )
             if cache_len is None:
                 cache_len = 0
-            if cache_len != len(token_ids):
+            invalid_tracked_checkpoint = self.enable_mamba_extra_buffer and (
+                cache_len > len(token_ids)
+                or (self.page_size != 1 and cache_len % self.page_size != 0)
+            )
+            if invalid_tracked_checkpoint:
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[req.cache_protected_len :]
+                )
+                mamba_exist = True
+            elif cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
 
-            if self.page_size != 1:
-                page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-                page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
-                    dtype=torch.int64, copy=True
-                )
-            else:
-                page_aligned_len = len(kv_indices)
-                page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            if not invalid_tracked_checkpoint:
+                if self.page_size != 1:
+                    page_aligned_len = (
+                        len(kv_indices) // self.page_size * self.page_size
+                    )
+                    page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                        dtype=torch.int64, copy=True
+                    )
+                else:
+                    page_aligned_len = len(kv_indices)
+                    page_aligned_kv_indices = kv_indices.to(
+                        dtype=torch.int64, copy=True
+                    )
 
-            assert (
-                cache_len == page_aligned_len
-            ), f"It is required {cache_len=}, {page_aligned_len=}, {kv_committed_len=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
+                assert (
+                    cache_len == page_aligned_len
+                ), f"It is required {cache_len=}, {page_aligned_len=}, {kv_committed_len=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
 
-            # Radix Cache takes one ref in memory pool
-            # insert the token_ids and kv_indices into the radix tree
-            if self.enable_mamba_extra_buffer:
-                mamba_ping_pong_track_buffer_to_keep = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
+                # Radix Cache takes one ref in memory pool
+                # insert the token_ids and kv_indices into the radix tree
+                if self.enable_mamba_extra_buffer:
+                    mamba_ping_pong_track_buffer_to_keep = (
+                        self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                            req.mamba_next_track_idx
+                        )
+                    )
+                    mamba_value = (
+                        req.mamba_ping_pong_track_buffer[
+                            mamba_ping_pong_track_buffer_to_keep
+                        ]
+                        .unsqueeze(-1)
+                        .clone()
+                    )
+                else:
+                    mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+
+                result = self.insert(
+                    InsertParams(
+                        key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                        value=page_aligned_kv_indices,
+                        mamba_value=mamba_value,
+                        prev_prefix_len=req.cache_protected_len,
                     )
                 )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[
-                        mamba_ping_pong_track_buffer_to_keep
-                    ]
-                    .unsqueeze(-1)
-                    .clone()
-                )
-            else:
-                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
-                mamba_ping_pong_track_buffer_to_keep = None
-
-            result = self.insert(
-                InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
-                    value=page_aligned_kv_indices,
-                    mamba_value=mamba_value,
-                    prev_prefix_len=req.cache_protected_len,
-                )
-            )
-            mamba_exist = result.mamba_exist
+                mamba_exist = result.mamba_exist
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
@@ -626,6 +640,19 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        if self.enable_mamba_extra_buffer:
+            # The tracked Mamba checkpoint must correspond to an already
+            # materialized page-aligned prefix. Under overlap scheduling,
+            # prefill output processing can observe a speculative/next tracking
+            # boundary before the request has actually written that many token
+            # slots. In that case, do not insert a mismatched Mamba state into
+            # the radix tree; keep the live request-local indices instead.
+            if cache_len > len(token_ids) or (
+                self.page_size != 1 and cache_len % self.page_size != 0
+            ):
+                req.mamba_last_track_seqlen = None
+                return _skip_cache_unfinished_req(req)
+
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
         if self.page_size != 1:
