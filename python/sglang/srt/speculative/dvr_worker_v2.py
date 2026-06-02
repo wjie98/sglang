@@ -521,12 +521,15 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     self.linear_state.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
                 )
                 self.linear_state.boundary_seqlen[req.rid] = new_boundary_seqlen
-                ctx.state_adapter.set_request_boundary_checkpoint(
-                    batch=batch,
-                    req=req,
-                    track_idx=self.linear_state.boundary_track_idx[req.rid],
-                    boundary_seqlen=new_boundary_seqlen,
-                )
+                # Overlap scheduling processes accepted output tokens after the
+                # worker returns. Keep the newly written boundary state pending
+                # until scheduler output processing has materialized those
+                # tokens in req.output_ids, otherwise radix cache can observe a
+                # checkpoint beyond the committed token prefix.
+                req.dvr_pending_mamba_track_idx = self.linear_state.boundary_track_idx[
+                    req.rid
+                ]
+                req.dvr_pending_mamba_track_seqlen = new_boundary_seqlen
         self.linear_state.boundary_backup = None
         self.linear_state.live_backup = None
 

@@ -231,6 +231,11 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                        if (
+                            batch.is_spec_v2
+                            and batch.spec_algorithm.is_decode_verify_rollback()
+                        ):
+                            req.dvr_skip_mamba_radix_unfinished_insert = True
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
@@ -613,6 +618,9 @@ class SchedulerOutputProcessorMixin:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
             if batch.spec_algorithm.is_decode_verify_rollback():
+                if batch.is_spec_v2:
+                    req.dvr_skip_mamba_radix_finished_insert = True
+                    self._commit_dvr_pending_mamba_checkpoint(req, batch)
                 # DVR commits chunk-aligned Mamba/GDN checkpoints in its worker
                 # from the verified chunkwise-scan state. The generic
                 # speculative update below only knows accepted lengths, so it
@@ -646,6 +654,30 @@ class SchedulerOutputProcessorMixin:
                     req.mamba_last_track_seqlen = (
                         actual_seq_len // mamba_track_interval * mamba_track_interval
                     )
+
+    def _commit_dvr_pending_mamba_checkpoint(
+        self: Scheduler,
+        req: Req,
+        batch: ScheduleBatch,
+    ) -> None:
+        pending_seqlen = req.dvr_pending_mamba_track_seqlen
+        pending_track_idx = req.dvr_pending_mamba_track_idx
+        if pending_seqlen is None or pending_track_idx is None:
+            return
+
+        materialized_len = len(req.origin_input_ids) + len(req.output_ids)
+        page_size = getattr(self.tree_cache, "page_size", 1)
+        if pending_seqlen > materialized_len or (
+            page_size != 1 and pending_seqlen % page_size != 0
+        ):
+            return
+
+        req.mamba_last_track_seqlen = pending_seqlen
+        req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+            pending_track_idx
+        )
+        req.dvr_pending_mamba_track_idx = None
+        req.dvr_pending_mamba_track_seqlen = None
 
     def _process_input_token_logprobs(
         self: Scheduler, req: Req, input_token_logprobs: List

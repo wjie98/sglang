@@ -280,13 +280,23 @@ class DVRLinearStateLifecycle:
         )
         if checkpoint_track_idx is not None:
             # Normal prefill already wrote the chunk-aligned state into the
-            # ping-pong checkpoint buffer. Reuse that slot instead of copying
-            # from the live decode slot, which may no longer hold the
-            # deterministic prefill checkpoint.
+            # ping-pong checkpoint buffer. DVR verify mutates its boundary
+            # slot after every accepted chunk, so copy-on-write the prefill
+            # checkpoint into the request's next writable ping-pong slot before
+            # registering it as the DVR boundary.
+            boundary_track_idx, dst = state_adapter.reserve_boundary_checkpoint(
+                req=req
+            )
+            src = req.mamba_ping_pong_track_buffer[checkpoint_track_idx]
+            state_adapter.copy_state_indices(
+                batch=batch,
+                src_indices=src.unsqueeze(0),
+                dst_indices=dst.unsqueeze(0),
+            )
             self.set_boundary_checkpoint(
                 batch,
                 req,
-                checkpoint_track_idx,
+                boundary_track_idx,
                 state_adapter,
                 boundary_seqlen,
             )

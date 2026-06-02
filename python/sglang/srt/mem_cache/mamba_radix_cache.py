@@ -517,6 +517,12 @@ class MambaRadixCache(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
+        if getattr(req, "dvr_skip_mamba_radix_finished_insert", False):
+            # DVR spec v2 keeps post-verify Mamba checkpoints request-local.
+            # Prefill/unfinished-cache entries are still reusable, but the
+            # generated suffix must not be inserted into radix until the
+            # generated-prefix Mamba checkpoint ownership is fully proven.
+            is_insert = False
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -640,6 +646,12 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+        if getattr(req, "dvr_skip_mamba_radix_unfinished_insert", False):
+            # DVR spec v2 keeps overlap-prefill Mamba checkpoints local until
+            # the cache insertion point is proven to observe a committed,
+            # immutable checkpoint. Keep prefix indices for scheduling, but do
+            # not publish this Mamba state into radix.
+            return _skip_cache_unfinished_req(req)
         if self.enable_mamba_extra_buffer:
             # The tracked Mamba checkpoint must correspond to an already
             # materialized page-aligned prefix. Under overlap scheduling,

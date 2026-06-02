@@ -673,6 +673,10 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        self.dvr_pending_mamba_track_idx: Optional[int] = None
+        self.dvr_pending_mamba_track_seqlen: Optional[int] = None
+        self.dvr_skip_mamba_radix_unfinished_insert: bool = False
+        self.dvr_skip_mamba_radix_finished_insert: bool = False
 
         # Check finish
         self.tokenizer = None
@@ -1208,6 +1212,10 @@ class Req(ReqDllmMixin):
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.dvr_pending_mamba_track_idx = None
+        self.dvr_pending_mamba_track_seqlen = None
+        self.dvr_skip_mamba_radix_unfinished_insert = False
+        self.dvr_skip_mamba_radix_finished_insert = False
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
