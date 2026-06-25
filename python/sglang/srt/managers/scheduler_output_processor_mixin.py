@@ -230,15 +230,32 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        if (
+                    else:
+                        should_cache_unfinished = (
+                            not batch.decoding_reqs
+                            or req not in batch.decoding_reqs
+                        )
+                        is_dvr_spec_v2 = (
                             batch.is_spec_v2
                             and batch.spec_algorithm.is_decode_verify_rollback()
-                        ):
-                            req.dvr_skip_mamba_radix_unfinished_insert = True
-                        self.tree_cache.cache_unfinished_req(req)
-                        if self.enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                        )
+                        if is_dvr_spec_v2 and not should_cache_unfinished:
+                            scheduled_extend_len = (
+                                batch.extend_lens[i]
+                                if batch.extend_lens is not None
+                                else req.extend_input_len
+                            )
+                            should_cache_unfinished = scheduled_extend_len > 1
+                        if should_cache_unfinished:
+                            if is_dvr_spec_v2:
+                                self._set_mamba_radix_cache_insert_snapshot(
+                                    req, batch, i
+                                )
+                            self.tree_cache.cache_unfinished_req(req)
+                            if self.enable_hisparse:
+                                self.hisparse_coordinator.admit_request_into_staging(
+                                    req
+                                )
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -620,7 +637,7 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_decode_verify_rollback():
                 if batch.is_spec_v2:
                     req.dvr_skip_mamba_radix_finished_insert = True
-                    self._commit_dvr_pending_mamba_checkpoint(req, batch)
+                    self._commit_dvr_pending_mamba_checkpoint(req, batch, result, i)
                 # DVR commits chunk-aligned Mamba/GDN checkpoints in its worker
                 # from the verified chunkwise-scan state. The generic
                 # speculative update below only knows accepted lengths, so it
@@ -659,9 +676,15 @@ class SchedulerOutputProcessorMixin:
         self: Scheduler,
         req: Req,
         batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        i: int,
     ) -> None:
-        pending_seqlen = req.dvr_pending_mamba_track_seqlen
-        pending_track_idx = req.dvr_pending_mamba_track_idx
+        pending_seqlen = None
+        pending_track_idx = None
+        if result.dvr_pending_mamba_track_seqlens is not None:
+            pending_seqlen = result.dvr_pending_mamba_track_seqlens[i]
+        if result.dvr_pending_mamba_track_indices is not None:
+            pending_track_idx = result.dvr_pending_mamba_track_indices[i]
         if pending_seqlen is None or pending_track_idx is None:
             return
 
@@ -678,6 +701,27 @@ class SchedulerOutputProcessorMixin:
         )
         req.dvr_pending_mamba_track_idx = None
         req.dvr_pending_mamba_track_seqlen = None
+
+    @staticmethod
+    def _set_mamba_radix_cache_insert_snapshot(
+        req: Req,
+        batch: ScheduleBatch,
+        i: int,
+    ) -> None:
+        req.mamba_radix_cache_insert_indices = None
+        req.mamba_radix_cache_insert_seqlen = None
+        if (
+            batch.mamba_track_mask is None
+            or batch.mamba_track_indices is None
+            or batch.mamba_track_cache_seqlens is None
+        ):
+            return
+        if not bool(batch.mamba_track_mask[i].item()):
+            return
+        req.mamba_radix_cache_insert_indices = batch.mamba_track_indices[i].reshape(1)
+        req.mamba_radix_cache_insert_seqlen = int(
+            batch.mamba_track_cache_seqlens[i].item()
+        )
 
     def _process_input_token_logprobs(
         self: Scheduler, req: Req, input_token_logprobs: List

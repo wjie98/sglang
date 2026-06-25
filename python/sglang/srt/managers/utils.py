@@ -47,6 +47,12 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # DVR spec v2 checkpoint metadata captured on the forward stream. Output
+    # processing uses this snapshot after copy_done instead of reading mutable
+    # Req fields that may already belong to a later overlap iteration.
+    dvr_pending_mamba_track_indices: Optional[List[Optional[int]]] = None
+    dvr_pending_mamba_track_seqlens: Optional[List[Optional[int]]] = None
+
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[RoutedExpertsOutput] = None
 

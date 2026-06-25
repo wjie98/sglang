@@ -284,12 +284,16 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         )
         new_seq_lens = scheduler_seq_lens + accept_lens
 
+        pending_track_indices = None
+        pending_track_seqlens = None
         if linear_state_ctx is not None:
-            self._commit_linear_state_after_verify_v2(
-                batch=batch,
-                accepted_token_counts=accept_lens.to(torch.long),
-                accepted_steps=(accept_lens - 1).to(torch.long),
-                ctx=linear_state_ctx,
+            pending_track_indices, pending_track_seqlens = (
+                self._commit_linear_state_after_verify_v2(
+                    batch=batch,
+                    accepted_token_counts=accept_lens.to(torch.long),
+                    accepted_steps=(accept_lens - 1).to(torch.long),
+                    ctx=linear_state_ctx,
+                )
             )
 
         verify_done = torch.get_device_module(self.device).Event()
@@ -335,6 +339,8 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             can_run_cuda_graph=batch_result.can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
+            dvr_pending_mamba_track_indices=pending_track_indices,
+            dvr_pending_mamba_track_seqlens=pending_track_seqlens,
             routed_experts_output=batch_result.routed_experts_output,
         )
 
@@ -474,8 +480,10 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         accepted_steps: torch.Tensor,
         ctx,
     ):
+        pending_track_indices = [None] * len(batch.reqs)
+        pending_track_seqlens = [None] * len(batch.reqs)
         if accepted_token_counts.numel() == 0:
-            return
+            return pending_track_indices, pending_track_seqlens
 
         accepted_token_counts_cpu = accepted_token_counts.cpu().tolist()
         seq_lens_cpu = (
@@ -510,11 +518,13 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             accepted_steps=accepted_steps,
         )
 
-        for req, verified_tail_len, accepted_token_num in zip(
-            batch.reqs,
-            pre_verify_tail_lens_cpu,
-            accepted_token_counts_cpu,
-            strict=True,
+        for i, (req, verified_tail_len, accepted_token_num) in enumerate(
+            zip(
+                batch.reqs,
+                pre_verify_tail_lens_cpu,
+                accepted_token_counts_cpu,
+                strict=True,
+            )
         ):
             if verified_tail_len + accepted_token_num >= FLA_CHUNK_SIZE:
                 new_boundary_seqlen = (
@@ -526,12 +536,15 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 # until scheduler output processing has materialized those
                 # tokens in req.output_ids, otherwise radix cache can observe a
                 # checkpoint beyond the committed token prefix.
-                req.dvr_pending_mamba_track_idx = self.linear_state.boundary_track_idx[
+                pending_track_indices[i] = self.linear_state.boundary_track_idx[
                     req.rid
                 ]
+                pending_track_seqlens[i] = new_boundary_seqlen
+                req.dvr_pending_mamba_track_idx = pending_track_indices[i]
                 req.dvr_pending_mamba_track_seqlen = new_boundary_seqlen
         self.linear_state.boundary_backup = None
         self.linear_state.live_backup = None
+        return pending_track_indices, pending_track_seqlens
 
     def _compute_spec_v2_logprobs(
         self,

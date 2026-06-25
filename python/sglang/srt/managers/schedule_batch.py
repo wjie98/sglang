@@ -675,8 +675,9 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen: Optional[int] = None
         self.dvr_pending_mamba_track_idx: Optional[int] = None
         self.dvr_pending_mamba_track_seqlen: Optional[int] = None
-        self.dvr_skip_mamba_radix_unfinished_insert: bool = False
         self.dvr_skip_mamba_radix_finished_insert: bool = False
+        self.mamba_radix_cache_insert_indices: Optional[torch.Tensor] = None
+        self.mamba_radix_cache_insert_seqlen: Optional[int] = None
 
         # Check finish
         self.tokenizer = None
@@ -1214,8 +1215,9 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.dvr_pending_mamba_track_idx = None
         self.dvr_pending_mamba_track_seqlen = None
-        self.dvr_skip_mamba_radix_unfinished_insert = False
         self.dvr_skip_mamba_radix_finished_insert = False
+        self.mamba_radix_cache_insert_indices = None
+        self.mamba_radix_cache_insert_seqlen = None
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
@@ -1355,6 +1357,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # Page-aligned checkpoint seqlens published to radix cache. This is
+    # separate from mamba_track_seqlens, which may be shifted by _force_track_h
+    # for backend state extraction.
+    mamba_track_cache_seqlens: torch.Tensor = None  # shape: [b], int64
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1633,6 +1639,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        use_dvr_mamba_radix_snapshot = (
+            self.is_spec_v2 and self.spec_algorithm.is_decode_verify_rollback()
+        )
+        mamba_track_cache_seqlens_cpu = (
+            [] if use_dvr_mamba_radix_snapshot else None
+        )
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1693,6 +1705,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_mask_cpu,
                     mamba_track_indices_cpu,
                     mamba_track_seqlens_cpu,
+                    mamba_track_cache_seqlens_cpu,
                 )
 
             if self.return_logprob:
@@ -1785,6 +1798,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
+            self.mamba_track_cache_seqlens = None
+            if use_dvr_mamba_radix_snapshot:
+                self.mamba_track_cache_seqlens = torch.tensor(
+                    mamba_track_cache_seqlens_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -1801,6 +1821,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu: List[bool],
         mamba_track_indices_cpu: List[int],
         mamba_track_seqlens_cpu: List[int],
+        mamba_track_cache_seqlens_cpu: Optional[List[int]],
     ):
         def _force_track_h(i: int) -> int:
             assert i % FLA_CHUNK_SIZE == 0
@@ -1820,6 +1841,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         )
         mamba_track_seqlen = -1
+        mamba_track_cache_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
             # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
@@ -1873,7 +1895,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+            mamba_track_cache_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
+        if mamba_track_cache_seqlens_cpu is not None:
+            mamba_track_cache_seqlens_cpu.append(mamba_track_cache_seqlen)
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
@@ -2248,6 +2273,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_cache_seqlens = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -2303,6 +2329,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_cache_seqlens = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -2416,19 +2443,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
-            decoding_reqs=self.decoding_reqs,
+            decoding_reqs=(
+                self.decoding_reqs[:] if self.decoding_reqs is not None else None
+            ),
             spec_algorithm=self.spec_algorithm,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             all_extend_in_batch=self.all_extend_in_batch,
             is_extend_in_batch=self.is_extend_in_batch,
+            extend_lens=self.extend_lens[:] if self.extend_lens is not None else None,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_cache_seqlens=self.mamba_track_cache_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
         )
