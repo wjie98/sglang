@@ -244,6 +244,33 @@ class MambaPool:
         intermediate_conv_window: List[torch.Tensor]
         dvr_state_input_cache: Optional[Any] = None
 
+        def at_layer_idx(self, layer: int):
+            kwargs = {}
+            # Use fields instead of vars to avoid torch.compile graph break.
+            for f in fields(self):
+                name = f.name
+                v = getattr(self, name)
+                if v is None:
+                    kwargs[name] = None
+                elif name in ("conv", "intermediate_conv_window"):
+                    kwargs[name] = [conv[layer] for conv in v]
+                else:
+                    kwargs[name] = v[layer]
+
+            return type(self)(**kwargs)
+
+        def mem_usage_bytes(self):
+            total = 0
+            for f in dataclasses.fields(self):
+                value = getattr(self, f.name)
+                if value is None:
+                    continue
+                if hasattr(value, "mem_usage_bytes"):
+                    total += value.mem_usage_bytes()
+                else:
+                    total += get_tensor_size_bytes(value)
+            return total
+
     def __init__(
         self,
         *,

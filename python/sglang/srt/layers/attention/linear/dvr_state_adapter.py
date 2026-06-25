@@ -75,7 +75,6 @@ class DVRGatedForwardContext:
         indices = self.forward_batch.req_pool_indices[: self.verify_batch_size].to(
             device=self.cache_indices.device, dtype=torch.long
         )
-        indices = indices + 1
         valid_mask = self.valid_request_mask()
         # Slot 0 is the shared dummy DVR state-input slot used by padded graph rows.
         return torch.where(valid_mask, indices, torch.zeros_like(indices)), valid_mask
@@ -122,7 +121,7 @@ class DVRGatedStateAdapter:
     def get_state_input_indices(
         self, *, batch, device: torch.device
     ) -> torch.Tensor:
-        return batch.req_pool_indices.to(device=device, dtype=torch.long) + 1
+        return batch.req_pool_indices.to(device=device, dtype=torch.long)
 
     def get_boundary_indices(
         self,
@@ -409,7 +408,6 @@ class DVRGatedStateAdapter:
         state_input_indices = forward_batch.req_pool_indices.to(
             device=input_tensors[0].device, dtype=torch.long
         )
-        state_input_indices = state_input_indices + 1
 
         state_inputs.write_extend_tail(
             state_window,

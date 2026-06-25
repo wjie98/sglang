@@ -26,6 +26,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     dvr_self_draft_decode_context,
 )
+from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
 from sglang.srt.speculative.dvr_linear_state import (
     DVRBoundaryReplayTask,
     DVRLinearStateLifecycle,
@@ -48,6 +49,28 @@ if is_cuda():
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 logger = logging.getLogger(__name__)
+
+
+class DVRVerifyInput(EagleVerifyInput):
+    """DVR verify input with classic chain speculative sampling.
+
+    Shared EAGLE verification is target-only. DVR self-draft records the draft
+    sampling distribution and must use the chain accept/reject kernel to keep
+    the generated distribution and acceptance rate aligned with the reference
+    branch.
+    """
+
+    def _sampling_fn_and_draft_probs(self, target_probs: torch.Tensor, batch):
+        if self.draft_probs is None:
+            return super()._sampling_fn_and_draft_probs(target_probs, batch)
+        return chain_speculative_sampling, self.draft_probs
+
+    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
+        if not graph_runner.capture_forward_mode.is_target_verify():
+            return
+        # The generic num_token_non_padded slot is enabled only for EP. GDN DVR
+        # verify also needs the raw token count to mask padded graph rows.
+        graph_runner.buffers.num_token_non_padded.fill_(raw_num_token)
 
 
 class DecodeVerifyRollbackWorker:
@@ -102,7 +125,10 @@ class DecodeVerifyRollbackWorker:
             model_runner=self.model_runner,
         )
         self.cuda_graph_runner_for_draft_decode = None
-        if not server_args.disable_cuda_graph:
+        if (
+            not server_args.disable_cuda_graph
+            and not server_args.disable_draft_cuda_graph
+        ):
             self.cuda_graph_runner_for_draft_decode = DVRDraftDecodeCudaGraphRunner(self)
 
         logger.info(
@@ -125,6 +151,11 @@ class DecodeVerifyRollbackWorker:
             device=device or self.device,
         )
 
+    def _draft_anchor_tokens(self, draft_input: EagleDraftInput) -> torch.Tensor:
+        """Return per-request token ids that seed the next DVR self-draft step."""
+
+        return draft_input.bonus_tokens
+
     def _use_dummy_draft_hidden_states(self, draft_input: EagleDraftInput):
         """Normalize DVR draft input hidden states to the zero-width placeholder."""
 
@@ -136,9 +167,10 @@ class DecodeVerifyRollbackWorker:
         if draft_input.hidden_states is not None:
             num_tokens = draft_input.hidden_states.shape[0]
             device = draft_input.hidden_states.device
-        elif draft_input.verified_id is not None:
-            num_tokens = draft_input.verified_id.shape[0]
-            device = draft_input.verified_id.device
+        elif self._draft_anchor_tokens(draft_input) is not None:
+            anchor_tokens = self._draft_anchor_tokens(draft_input)
+            num_tokens = anchor_tokens.shape[0]
+            device = anchor_tokens.device
         else:
             num_tokens = 0
             device = self.device
@@ -161,7 +193,7 @@ class DecodeVerifyRollbackWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -169,9 +201,9 @@ class DecodeVerifyRollbackWorker:
         logits_output, verify_output, can_run_cuda_graph = self.verify(batch, spec_info)
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=verify_output.verified_id,
-            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
-            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            next_token_ids=verify_output.accept_tokens,
+            num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
+            num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
@@ -193,7 +225,7 @@ class DecodeVerifyRollbackWorker:
                     next_token_ids.shape[0], device=next_token_ids.device
                 )
             ),
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             topk_p=torch.ones(
                 (next_token_ids.shape[0], self.topk),
                 dtype=torch.float32,
@@ -249,7 +281,7 @@ class DecodeVerifyRollbackWorker:
             # Keep draft sampling close to normal autoregressive decode by
             # accounting for the anchor token before sampling following tokens.
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                spec_info.verified_id.to(torch.int64)
+                self._draft_anchor_tokens(spec_info).to(torch.int64)
             )
 
         # Self-draft decodes directly into the slots that target verify will
@@ -506,7 +538,7 @@ class DecodeVerifyRollbackWorker:
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            self._draft_anchor_tokens(spec_info),
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -519,7 +551,7 @@ class DecodeVerifyRollbackWorker:
         )
         draft_tokens = draft_tokens.to(torch.long)
 
-        return EagleVerifyInput(
+        return DVRVerifyInput(
             draft_token=draft_tokens,
             # DVR uses topk=1 chain verify. The tree builder is still reused
             # for token order/retrieve metadata, but attention itself should
@@ -557,7 +589,7 @@ class DecodeVerifyRollbackWorker:
         draft_probs_list: List[torch.Tensor] = []
         scores = None
         topk_p = None
-        topk_index = spec_info.verified_id
+        topk_index = self._draft_anchor_tokens(spec_info)
         empty_hidden_states = torch.empty(
             (0, 0), dtype=torch.float32, device=topk_index.device
         )
@@ -645,6 +677,7 @@ class DecodeVerifyRollbackWorker:
 
         with dvr_self_draft_decode_context(
             self.model_runner,
+            disable_model_runner_graph=True,
             disable_batch_invariant_ops=True,
             clear_kernel_config_caches=True,
         ):
@@ -681,7 +714,7 @@ class DecodeVerifyRollbackWorker:
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
         accepted_token_counts_cpu = [
-            x + 1 for x in verify_output.accept_length_per_req_cpu
+            x + 1 for x in verify_output.num_correct_drafts_per_req_cpu
         ]
         accepted_token_counts = torch.tensor(
             accepted_token_counts_cpu,
@@ -702,35 +735,57 @@ class DecodeVerifyRollbackWorker:
         verify_output: EagleVerifyOutput,
     ):
         logits_output.next_token_logits = logits_output.next_token_logits[
-            verify_output.accepted_indices
+            verify_output.accept_indices
         ]
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[
-                verify_output.accepted_indices
+                verify_output.accept_indices
             ]
 
     def _prepare_next_draft_after_verify(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
+        draft_extend_input = verify_output.draft_extend_input
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = verify_output.draft_input
-        self._use_dummy_draft_hidden_states(batch.spec_info)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-        if batch.forward_mode.is_idle():
+        if (
+            batch.forward_mode.is_idle()
+            or draft_extend_input.input_ids is None
+            or draft_extend_input.input_ids.numel() == 0
+        ):
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=batch.device,
+                hidden_size=0,
+                dtype=self.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
             return
 
-        accept_end = torch.cumsum(batch.spec_info.accept_length + 1, dim=0) - 1
-        batch.spec_info.verified_id = batch.spec_info.verified_id[accept_end]
-        # Keep the next-draft inputs in the same compatibility shape as EAGLE.
-        batch.spec_info.topk_index = batch.spec_info.verified_id.to(torch.long).unsqueeze(
-            -1
+        num_accept_tokens_cpu = draft_extend_input.num_accept_tokens_cpu
+        num_accept_tokens = torch.tensor(
+            num_accept_tokens_cpu,
+            dtype=torch.long,
+            device=draft_extend_input.input_ids.device,
         )
-        batch.spec_info.topk_p = torch.zeros(
-            (batch.spec_info.verified_id.shape[0], self.topk),
+        accept_end = torch.cumsum(num_accept_tokens, dim=0) - 1
+        bonus_tokens = draft_extend_input.input_ids[accept_end]
+        batch.spec_info = EagleDraftInput(
+            hidden_states=self._dummy_hidden_states(
+                bonus_tokens.shape[0], device=bonus_tokens.device
+            ),
+            bonus_tokens=bonus_tokens,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+        # Keep the next-draft inputs in the same compatibility shape as EAGLE.
+        batch.spec_info.topk_index = bonus_tokens.to(torch.long).unsqueeze(-1)
+        batch.spec_info.topk_p = torch.ones(
+            (bonus_tokens.shape[0], self.topk),
             dtype=torch.float32,
-            device=batch.spec_info.verified_id.device,
+            device=bonus_tokens.device,
         )
 
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,

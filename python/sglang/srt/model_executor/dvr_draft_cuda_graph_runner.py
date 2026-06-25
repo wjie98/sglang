@@ -83,15 +83,25 @@ def _clear_determinism_sensitive_kernel_caches():
     # cache keys do not include that state. Clear them around self-draft graph
     # capture/fallback so target-verify deterministic choices cannot leak into
     # the non-deterministic draft path, and vice versa.
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
         get_moe_configs,
     )
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
         should_enable_swap_ab,
     )
 
     get_moe_configs.cache_clear()
     should_enable_swap_ab.cache_clear()
+
+    try:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+            should_enable_swap_ab as legacy_should_enable_swap_ab,
+        )
+    except ImportError:
+        legacy_should_enable_swap_ab = None
+
+    if legacy_should_enable_swap_ab is not None:
+        legacy_should_enable_swap_ab.cache_clear()
 
 
 def _uses_init_time_deterministic_num_splits(backend) -> bool:
@@ -182,6 +192,7 @@ def dvr_self_draft_decode_context(
     model_runner,
     *,
     graph_capture: bool = False,
+    disable_model_runner_graph: bool = False,
     disable_batch_invariant_ops: bool = False,
     clear_kernel_config_caches: bool = False,
 ):
@@ -214,6 +225,8 @@ def dvr_self_draft_decode_context(
 
         patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
         patch_attr(global_server_args, "enable_deterministic_inference", False)
+        if disable_model_runner_graph:
+            patch_attr(model_runner, "graph_runner", None)
 
         for backend in _iter_attention_backends(model_runner.attn_backend):
             patch_attr(backend, "enable_deterministic", False)

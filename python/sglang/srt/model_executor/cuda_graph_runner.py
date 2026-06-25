@@ -1148,7 +1148,10 @@ class CudaGraphRunner:
             padded_num_tokens=bs * self.num_tokens_per_bs,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-
+        if hasattr(forward_batch.spec_info, "prepare_cuda_graph_replay_buffers"):
+            forward_batch.spec_info.prepare_cuda_graph_replay_buffers(
+                self, raw_num_token
+            )
         if (
             self.model_runner.spec_algorithm.is_dflash()
             and self.model_runner.is_draft_worker

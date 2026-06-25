@@ -19,7 +19,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
-from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
+from sglang.srt.speculative.dvr_worker import (
+    DVRVerifyInput,
+    DecodeVerifyRollbackWorker,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -60,6 +63,11 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
     def draft_worker(self):
         return self
 
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        return None
+
     def _ensure_model_worker_batch_compat(self, batch: ScheduleBatch):
         """Attach ScheduleBatch-like fields used by DVR linear-state helpers."""
 
@@ -98,17 +106,17 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             return
 
         spec_info = batch.spec_info
-        verified_id = getattr(spec_info, "verified_id", None)
-        if verified_id is None or verified_id.numel() == 0:
-            yield
-            return
-
+        bonus_tokens = getattr(spec_info, "bonus_tokens", None)
+        if bonus_tokens is None or bonus_tokens.numel() == 0:
+            bonus_tokens = torch.zeros(
+                len(batch.reqs), dtype=torch.int32, device=batch.seq_lens.device
+            )
         seq_lens_cpu = (
             batch.seq_lens_cpu.tolist()
             if batch.seq_lens_cpu is not None
             else batch.seq_lens.detach().cpu().tolist()
         )
-        verified_ids = verified_id.detach().cpu().tolist()
+        verified_ids = bonus_tokens.detach().cpu().tolist()
         appended_counts = []
         for req, seq_len, token_id in zip(
             batch.reqs, seq_lens_cpu, verified_ids, strict=True
@@ -128,11 +136,14 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     req.output_ids.pop()
 
     def forward_batch_generation(
-        self, model_worker_batch: ScheduleBatch
+        self, model_worker_batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
         batch = self._ensure_model_worker_batch_compat(model_worker_batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            return self.forward_target_extend_v2(batch)
+            batch_result = self.forward_target_extend_v2(batch)
+            if on_publish is not None:
+                on_publish(batch_result.new_seq_lens)
+            return batch_result
 
         if batch.spec_info is None:
             batch.spec_info = EagleDraftInput.create_idle_input(
@@ -145,27 +156,30 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
 
         verify_input = self.draft_v2(batch)
         batch.spec_info = verify_input
-        return self.verify_v2(batch, verify_input)
+        batch_result = self.verify_v2(batch, verify_input)
+        if on_publish is not None:
+            on_publish(batch_result.new_seq_lens)
+        return batch_result
 
     def forward_target_extend_v2(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         batch.capture_hidden_mode = CaptureHiddenMode.NULL
         batch_result = self.target_worker.forward_batch_generation(batch)
+        batch_result.new_seq_lens = batch.seq_lens
         next_token_ids = batch_result.next_token_ids
         topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
         batch_result.next_draft_input = EagleDraftInput(
             hidden_states=self._dummy_hidden_states(
                 next_token_ids.shape[0], device=next_token_ids.device
             ),
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             topk_p=torch.ones(
                 (next_token_ids.shape[0], self.topk),
                 dtype=torch.float32,
                 device=next_token_ids.device,
             ),
             topk_index=topk_index,
-            new_seq_lens=batch.seq_lens,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -179,7 +193,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         penalizer_orchestrator = batch.sampling_info.penalizer_orchestrator
         if penalizer_orchestrator is not None and penalizer_orchestrator.is_required:
             penalizer_orchestrator.cumulate_output_tokens(
-                spec_info.verified_id.to(torch.int64)
+                self._draft_anchor_tokens(spec_info).to(torch.int64)
             )
 
         batch.out_cache_loc = self._draft_cache_locs_from_req_to_token(batch)
@@ -225,7 +239,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            self._draft_anchor_tokens(spec_info),
             parent_list,
             top_scores_index,
             draft_tokens.to(torch.long),
@@ -237,7 +251,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             tree_mask_mode=TreeMaskMode.QLEN_ONLY,
         )
 
-        return EagleVerifyInput(
+        return DVRVerifyInput(
             draft_token=draft_tokens.to(torch.long),
             custom_mask=None,
             positions=positions,
@@ -319,15 +333,13 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             hidden_states=self._dummy_hidden_states(
                 verified_id.shape[0], device=verified_id.device
             ),
-            verified_id=verified_id,
+            bonus_tokens=verified_id,
             topk_p=torch.ones(
                 (verified_id.shape[0], self.topk),
                 dtype=torch.float32,
                 device=verified_id.device,
             ),
             topk_index=verified_id.to(torch.long).unsqueeze(-1),
-            new_seq_lens=new_seq_lens,
-            verify_done=verify_done,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -339,6 +351,8 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             can_run_cuda_graph=batch_result.can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
+            speculative_num_draft_tokens=self.num_draft_tokens,
             dvr_pending_mamba_track_indices=pending_track_indices,
             dvr_pending_mamba_track_seqlens=pending_track_seqlens,
             routed_experts_output=batch_result.routed_experts_output,
@@ -405,9 +419,9 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 accept_index=accept_index,
                 accept_token_num=accept_lens,
                 candidates=candidates,
-                retrive_index=spec_info.retrieve_index,
-                retrive_next_token=spec_info.retrieve_next_token,
-                retrive_next_sibling=spec_info.retrieve_next_sibling,
+                retrieve_index=spec_info.retrieve_index,
+                retrieve_next_token=spec_info.retrieve_next_token,
+                retrieve_next_sibling=spec_info.retrieve_next_sibling,
                 target_predict=target_predict,
                 topk=self.topk,
             )
@@ -557,12 +571,13 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         max_accept = self.num_draft_steps + 1
         device = predict.device
 
-        flat_output_idx = self._spec_v2_compact_output_indices(
+        compact_output_idx = self._spec_v2_compact_output_indices(
             accept_index=accept_index,
             max_accept=max_accept,
             device=device,
         ).reshape(-1)
-        gathered_logits = logits_output.next_token_logits[flat_output_idx]
+        flat_accept_idx = accept_index.clamp_min(0).long().reshape(-1)
+        gathered_logits = logits_output.next_token_logits[flat_accept_idx]
 
         if (
             batch.sampling_info.is_all_greedy
@@ -572,17 +587,19 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 gathered_logits, dim=-1
             )
         else:
-            temperatures = torch.repeat_interleave(
-                batch.sampling_info.temperatures,
-                max_accept,
-                dim=0,
-            )
+            temperatures = batch.sampling_info.temperatures[
+                flat_accept_idx // self.num_draft_tokens
+            ]
             gathered_logprobs = torch.nn.functional.log_softmax(
                 gathered_logits / temperatures, dim=-1
             )
         gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
 
-        accepted_token_ids = predict[flat_output_idx]
+        # Spec v2 output processing emits DVR tokens from the compact per-req
+        # prefix of `predict`, while the correct target-model logprob row is
+        # identified by `accept_index`. These differ as soon as a chain rejects
+        # and samples the bonus token from the residual distribution.
+        accepted_token_ids = predict[compact_output_idx]
         token_logprobs = gathered_logprobs[
             torch.arange(bs * max_accept, device=device),
             accepted_token_ids.long(),

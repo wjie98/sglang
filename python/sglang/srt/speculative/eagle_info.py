@@ -97,6 +97,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
+    def _sampling_fn_and_draft_probs(self, target_probs: torch.Tensor, batch):
+        """Return the verify sampling kernel and draft distribution.
+
+        Standard EAGLE verification is target-only. Algorithms with an
+        explicit chain draft distribution can override this without adding
+        algorithm-specific branches to the shared verifier.
+        """
+
+        return tree_speculative_sampling_target_only, torch.zeros(
+            target_probs.shape, dtype=torch.float32, device=batch.device
+        )
+
+    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
+        """Optionally adjust graph-resident replay buffers before graph replay."""
+
+        return None
+
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
         return cls(
@@ -377,8 +394,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 
-            draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device=batch.device
+            sampling_fn, draft_probs = self._sampling_fn_and_draft_probs(
+                target_probs, batch
             )
 
             # coins for rejection sampling
@@ -389,7 +406,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device=batch.device
             )
-            tree_speculative_sampling_target_only(
+            sampling_fn(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=num_correct_drafts,  # mutable

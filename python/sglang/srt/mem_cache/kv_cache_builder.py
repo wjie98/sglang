@@ -54,6 +54,11 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
+    if spec_algorithm.is_decode_verify_rollback():
+        # DVR self-draft reuses the target model runner and target KV pool. There
+        # is no independent draft KV pool to register for disaggregation/HiCache.
+        return None, None
+
     # V2 (EAGLE family) nests the runner under `.draft_worker`; DFLASH /
     # FROZEN_KV_MTP expose `.model_runner` directly.
     if spec_algorithm.supports_spec_v2():

@@ -2497,6 +2497,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_spec_v2(self):
         # Whether the V2 worker/schema is used. Independent of overlap: the
         # non-overlap path also drives the V2 worker, just synchronously.
+        if self.spec_algorithm.is_decode_verify_rollback():
+            return self.enable_overlap
         return self.spec_algorithm.supports_spec_v2()
 
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
