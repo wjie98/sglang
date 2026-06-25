@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -27,21 +27,20 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
-    PostProcessWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -55,7 +54,7 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import MemoryPoolConfig
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +86,7 @@ class BaseTpWorker(ABC):
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
-    def get_memory_pool(self):
+    def get_memory_pool(self) -> Tuple[ReqToTokenPool, BaseTokenToKVPoolAllocator]:
         return (
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
@@ -143,37 +142,9 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names,
-            recv_req.dtypes,
-            recv_req.shapes,
-            recv_req.group_name,
-            recv_req.load_format,
-        )
-        return success, message
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-
-        monkey_patch_torch_reductions()
-        success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            ),
-            load_format=recv_req.load_format,
-        )
-        return success, message
-
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
-        return success, message
-
-    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
-        """Perform optional post-processing on the updated model weights (e.g., Marlin conversion)."""
-        success, message = self.model_runner.post_process_weights(recv_req)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -193,19 +164,23 @@ class BaseTpWorker(ABC):
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ):
-        # The LoRA code handles TP sharding internally using slice_lora_a_weights
-        # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
+        # TP sharding for LoRA happens inside the lora module (see
+        # lora/layers.py:46-49 and mem_pool.py:437-440). Each TP rank
+        # deserializes its own producer's bytes — same convention as
+        # ``update_weights_from_tensor`` above. One producer per one
+        # consumer means the CUDA-IPC ref counter on the producer's
+        # bucket drops cleanly each cycle.
+        monkey_patch_torch_reductions()
+        serialized = recv_req.serialized_named_tensors[self.tp_rank]
         if recv_req.load_format == "flattened_bucket":
-            flattened_data = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_tensors
-            )
+            flattened_data = MultiprocessingSerializer.deserialize(serialized)
             bucket = FlattenedTensorBucket(
                 flattened_tensor=flattened_data["flattened_tensor"],
                 metadata=flattened_data["metadata"],
             )
             tensors = dict(bucket.reconstruct_tensors())
         else:
-            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+            tensors = MultiprocessingSerializer.deserialize(serialized)
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
@@ -214,11 +189,24 @@ class BaseTpWorker(ABC):
         )
         return result
 
-    def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch).logits_output
-        embeddings = logits_output.embeddings
-        return embeddings
+    def load_lora_adapter_from_distributed(
+        self, recv_req: LoadLoRAAdapterFromDistributedReqInput
+    ):
+        result = self.model_runner.load_lora_adapter_from_distributed(
+            recv_req.to_ref(),
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.config_dict,
+            recv_req.group_name,
+            recv_req.added_tokens_config,
+        )
+        return result
+
+    def forward_batch_embedding(self, batch: ScheduleBatch):
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        output = self.model_runner.forward(forward_batch).logits_output
+        return output  # Returns EmbeddingPoolerOutput
 
 
 class TpModelWorker(BaseTpWorker):
@@ -256,9 +244,10 @@ class TpModelWorker(BaseTpWorker):
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.memory_pool_config = memory_pool_config
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
+        # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
+        self.memory_pool_config = memory_pool_config
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -280,6 +269,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -288,6 +278,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
         self.device = self.model_runner.device
 
@@ -406,6 +397,18 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> "ModelRunner":
         return self._model_runner
 
+    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+        # All (role, ModelRunner) pairs this worker contributes to a weight update.
+        # The target (is_draft_worker=False) yields its own runner under the empty
+        # role; a draft worker yields its draft runner(s).
+        if not self.is_draft_worker:
+            return [("", self.model_runner)]
+        if self.model_runner_list:
+            return [
+                (f"draft_step_{i}", r) for i, r in enumerate(self.model_runner_list)
+            ]
+        return [("draft", self.model_runner)]
+
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
 
@@ -449,24 +452,24 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
+        batch: Optional[ScheduleBatch],
         forward_batch: Optional[ForwardBatch] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
-        skip_attn_backend_init=False,
+        skip_attn_backend_init: Optional[bool] = None,  # deprecated
     ) -> GenerationBatchResult:
-        # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
-        #               which requires preparing replay to always be in this function
-
-        # Get forward batch from model worker batch
-        if model_worker_batch is not None:
+        # Get forward batch from schedule batch
+        if batch is not None:
             # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+            self.set_hicache_consumer(batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+
+        # Deprecated kwarg: pre-planners mark the batch themselves now.
+        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
@@ -475,7 +478,6 @@ class TpModelWorker(BaseTpWorker):
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
@@ -483,16 +485,17 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
+                indexer_topk_output=out.indexer_topk_output,
             )
 
             if is_verify:
-                # Skip sampling and return logits for target forward
+                # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
             if (
                 self.enable_overlap
                 and not self.enable_spec
-                and model_worker_batch.sampling_info.grammars is not None
+                and forward_batch.sampling_info.grammars is not None
             ):
 
                 def sample_batch_func():
@@ -504,7 +507,7 @@ class TpModelWorker(BaseTpWorker):
                 batch_result.delay_sample_func = sample_batch_func
                 return batch_result
 
-            if not model_worker_batch.is_prefill_only:
+            if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
@@ -513,17 +516,17 @@ class TpModelWorker(BaseTpWorker):
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
                 batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
+                    len(forward_batch.seq_lens),
                     dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
+                    device=forward_batch.input_ids.device,
                 )
                 if (
-                    model_worker_batch.return_logprob
+                    forward_batch.return_logprob
                     and logits_output.next_token_logits is not None
                 ):
                     # NOTE: Compute logprobs without full sampling
                     self.model_runner.compute_logprobs_only(
-                        logits_output, model_worker_batch
+                        logits_output, forward_batch
                     )
 
             return batch_result
@@ -531,7 +534,6 @@ class TpModelWorker(BaseTpWorker):
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
@@ -542,19 +544,17 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:
-            model_worker_batch = batch.get_model_worker_batch()
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
             batch.split_forward_batch = forward_batch
-            batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
-        else:
-            model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
 
         out = self.model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         if logits_output:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            next_token_ids = self.model_runner.sample(
+                logits_output, batch.split_forward_batch
+            )
         else:
             next_token_ids = None
         batch_result = GenerationBatchResult(

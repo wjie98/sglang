@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_prefill_backend,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn,
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -26,8 +27,11 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
-else:
-    FLA_CHUNK_SIZE = 64
+
+if is_cuda():
+    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
+
+MAX_FUSED_QKV_SPLIT_DIM = 8192
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -63,6 +67,7 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
 
+        cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
@@ -72,7 +77,8 @@ class GDNKernelDispatcher:
                 CuteDSLGDNKernel,
             )
 
-            self.decode_kernel = CuteDSLGDNKernel()
+            cutedsl_kernel = CuteDSLGDNKernel()
+            self.decode_kernel = cutedsl_kernel
         elif decode_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -88,10 +94,26 @@ class GDNKernelDispatcher:
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_cutedsl():
-            raise ValueError(
-                "CuTe DSL backend only supports decode, not prefill. "
-                "Use --linear-attn-prefill-backend triton instead."
-            )
+            if not is_cuda():
+                raise ValueError("GDN CuTe DSL backend requires CUDA")
+            # Reuse the CuteDSL kernel if already created for decode
+            if cutedsl_kernel is None:
+                from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
+                    CuteDSLGDNKernel,
+                )
+
+                cutedsl_kernel = CuteDSLGDNKernel()
+            # The CuteDSL prefill kernel only exists on SM100+ (Blackwell).
+            # On SM90 (Hopper) fall back to Triton so users can pick
+            # `cutedsl` uniformly across hardware.
+            if cutedsl_kernel.supports_prefill:
+                self.extend_kernel = cutedsl_kernel
+            else:
+                rank0_log(
+                    "CuTe DSL GDN prefill is not supported on this GPU "
+                    "(requires SM100+). Falling back to Triton for prefill."
+                )
+                self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashinfer():
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
@@ -108,8 +130,12 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer if either decode or prefill selected it
-        if decode_backend.is_flashinfer() or prefill_backend.is_flashinfer():
+        # Verify kernel: use FlashInfer when the selected FlashInfer kernel
+        # supports MTP verify. SM90 uses the fp32-state path; SM100 uses the
+        # bf16-state adapter in FlashInferGDNKernel.
+        if (
+            decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
+        ) and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
         else:
             self.verify_kernel = triton_kernel
@@ -259,6 +285,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
         self.dvr_state_adapter = DVRGatedStateAdapter.for_gdn(self.kernel_dispatcher)
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
 
     def forward_decode(
         self,
@@ -347,10 +388,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
     ):
-        # DVR target verify must use the same chunkwise scan path as prefill,
-        # while still restoring/exporting conv and recurrent state around the
-        # speculative window. Keep that flow separate from the EAGLE-style
-        # recurrent target-verify branch below.
+        # DVR target verify must match prefill's chunkwise scan semantics, while
+        # restoring/exporting speculative conv and recurrent states around the
+        # verified draft window.
         seq_len = mixed_qkv.shape[0]
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
@@ -422,9 +462,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        # The generic target-verify branch below is recurrent and suitable for
-        # tree/EAGLE verify. DVR needs chunkwise prefill-equivalent verify, so
-        # it exits early through the adapter-managed path.
         if self.dvr_state_adapter.is_dvr_target_verify(
             state_cache=mamba_cache_params, is_target_verify=is_target_verify
         ):
@@ -448,14 +485,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            has_initial_states = torch.ones(
-                seq_len // forward_batch.spec_info.draft_token_num,
-                dtype=torch.bool,
-                device=forward_batch.input_ids.device,
-            )
-            intermediate_state_indices = torch.arange(
-                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-            )
+            intermediate_state_indices = self.verify_intermediate_state_indices
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
@@ -481,16 +511,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                conv_dst = forward_batch.mamba_track_indices
+            if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track
+                )
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,
@@ -504,16 +531,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+        actual_seq_len = mixed_qkv.shape[0]
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if is_cuda() and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        else:
+            query, key, value = torch.split(
+                mixed_qkv,
+                [layer.q_dim, layer.k_dim, layer.v_dim],
+                dim=-1,
+            )
+            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
@@ -544,9 +582,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
-            # DVR reuses ordinary extend/prefill q/k/v/g/beta for the
-            # unclosed chunk tail. This is only a cache copy; the recurrent
-            # state update above remains the single source of live state.
             self.dvr_state_adapter.cache_extend_tail_from_state_inputs(
                 forward_batch=forward_batch,
                 state_cache=mamba_cache_params,

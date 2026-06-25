@@ -62,7 +62,7 @@ def _mp_set_executable(executable: str, debug_str: str):
 
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     multiprocessing.spawn.set_executable(executable)
-    logger.info(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")
+    logger.debug(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")
     try:
         yield
     finally:
@@ -70,7 +70,22 @@ def _mp_set_executable(executable: str, debug_str: str):
             os.fsdecode(multiprocessing.spawn.get_executable()) == executable
         ), f"{multiprocessing.spawn.get_executable()=}"
         multiprocessing.spawn.set_executable(old_executable)
-        logger.info(f"mp.set_executable revert to {old_executable}")
+        logger.debug(f"mp.set_executable revert to {old_executable}")
+
+
+def _get_nvml_device_index(device_id: int) -> int:
+    # _get_nvml_device_index is an internal PyTorch helper, so fall back to
+    # device_id directly if the helper is unavailable.
+    get_nvml_device_index = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if get_nvml_device_index is None:
+        logger.warning(
+            "torch.cuda._get_nvml_device_index is unavailable; falling back to "
+            f"device_id={device_id} as the NVML device index. This may select "
+            "the wrong physical GPU when CUDA_VISIBLE_DEVICES reorders devices "
+            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')})."
+        )
+        return device_id
+    return get_nvml_device_index(device_id)
 
 
 def _get_nvml_device_index(device_id: int) -> int:

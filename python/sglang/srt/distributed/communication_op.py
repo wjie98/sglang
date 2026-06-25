@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
 from typing import Any, Dict, Optional, Tuple, Union
@@ -21,6 +23,11 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     if should_use_tp_invariant_tree_all_reduce():
         return tree_all_reduce_sum(input_, device_group=get_tp_group().device_group)
     return get_tp_group().all_reduce(input_)
+
+
+def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across model parallel group."""
+    return get_tp_group().quant_all_reduce(input_)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
@@ -67,6 +74,13 @@ def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Te
             input_, device_group=get_attn_tp_group().device_group
         )
     return get_attn_tp_group().all_reduce(input_)
+
+
+def attention_tensor_model_parallel_quant_all_reduce(
+    input_: torch.Tensor,
+) -> torch.Tensor:
+    """All-reduce the input tensor across attention parallel group."""
+    return get_attn_tp_group().quant_all_reduce(input_)
 
 
 def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:

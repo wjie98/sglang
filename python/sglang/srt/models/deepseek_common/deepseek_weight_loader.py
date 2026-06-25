@@ -43,11 +43,15 @@ from sglang.srt.model_loader.utils import (
     should_async_load,
     should_deepgemm_weight_requant_ue8m0,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    RUNAI_STREAMER_TENSOR_ATTR,
+    default_weight_loader,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_fp8_fnuz,
     _is_hip,
+    _is_musa,
     _is_npu,
     _is_xpu,
     _use_aiter_gfx95,
@@ -63,6 +67,12 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+
+
+def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.clone().detach()
+    return tensor
 
 
 @dataclass(frozen=True)
@@ -251,7 +261,10 @@ class DeepseekV2WeightLoaderMixin:
                         if self.fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = loaded_weight
+                            # Clone: `loaded_weight` may be a view into an IPC
+                            # bucket that gets reused by the next chunk, and
+                            # the RunAI streamer also relies on cloning.
+                            cached_a_proj[name] = loaded_weight.detach().clone()
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
@@ -477,7 +490,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        (_is_cuda or _is_xpu)
+                        (_is_cuda or _is_musa or _is_xpu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
@@ -539,6 +552,9 @@ class DeepseekV2WeightLoaderMixin:
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
+                and self.config.architectures
+                and self.config.architectures[0]
+                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
@@ -561,6 +577,14 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
+                # XXX (MUSA): Remove this after adding FP8 support in bmm kernel on MUSA
+                if _is_musa and w.dtype == torch.float8_e4m3fn:
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]

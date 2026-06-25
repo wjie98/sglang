@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/kv_cache.py
 
 import logging
@@ -40,6 +42,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale = torch.nn.Parameter(
             torch.tensor(-1.0, dtype=torch.float32), requires_grad=False
         )
+        layer.k_scale._skip_weight_check = True
+        layer.v_scale._skip_weight_check = True
 
     def apply(self, layer: torch.nn.Module) -> torch.Tensor:
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
@@ -52,7 +56,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
-        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+        elif layer.k_scale <= 0.0 and layer.v_scale <= 0.0:
             # If no scales were loaded (both scales are invalid negative
             # values), use the default value of 1.0
             k_scale = 1.0

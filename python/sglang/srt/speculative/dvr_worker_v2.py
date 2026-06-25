@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -30,9 +30,9 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
     generate_simulated_accept_index,
-    maybe_detect_nan,
 )
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.async_probe import maybe_detect_nan
 
 if is_cuda():
     from sgl_kernel import (
@@ -60,7 +60,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
     def draft_worker(self):
         return self
 
-    def _ensure_model_worker_batch_compat(self, batch: ModelWorkerBatch):
+    def _ensure_model_worker_batch_compat(self, batch: ScheduleBatch):
         """Attach ScheduleBatch-like fields used by DVR linear-state helpers."""
 
         batch.req_to_token_pool = self.req_to_token_pool
@@ -71,7 +71,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         return batch
 
     def _draft_cache_locs_from_req_to_token(
-        self, batch: ModelWorkerBatch
+        self, batch: ScheduleBatch
     ) -> torch.Tensor:
         offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
             self.num_draft_tokens, dtype=torch.long, device=batch.seq_lens.device
@@ -82,7 +82,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         )
 
     @contextmanager
-    def _req_seqlen_matches_batch_prefix(self, batch: ModelWorkerBatch):
+    def _req_seqlen_matches_batch_prefix(self, batch: ScheduleBatch):
         """Make V1 DVR linear-state helpers see Spec v2's logical length.
 
         In overlap scheduling, output processing has not necessarily appended
@@ -128,7 +128,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     req.output_ids.pop()
 
     def forward_batch_generation(
-        self, model_worker_batch: ModelWorkerBatch
+        self, model_worker_batch: ScheduleBatch
     ) -> GenerationBatchResult:
         batch = self._ensure_model_worker_batch_compat(model_worker_batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -148,7 +148,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         return self.verify_v2(batch, verify_input)
 
     def forward_target_extend_v2(
-        self, batch: ModelWorkerBatch
+        self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         batch.capture_hidden_mode = CaptureHiddenMode.NULL
         batch_result = self.target_worker.forward_batch_generation(batch)
@@ -172,7 +172,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         )
         return batch_result
 
-    def _draft_preprocess_decode_v2(self, batch: ModelWorkerBatch):
+    def _draft_preprocess_decode_v2(self, batch: ScheduleBatch):
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
@@ -189,7 +189,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         batch.mamba_track_seqlens = None
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
-    def draft_v2(self, batch: ModelWorkerBatch) -> EagleVerifyInput:
+    def draft_v2(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
             return EagleVerifyInput.create_idle_input(
@@ -220,9 +220,9 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         (
             _tree_mask,
             positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             spec_info.verified_id,
@@ -241,10 +241,10 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             draft_token=draft_tokens.to(torch.long),
             custom_mask=None,
             positions=positions,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=self.num_draft_steps,
             topk=self.topk,
             draft_token_num=self.num_draft_tokens,
@@ -256,7 +256,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
 
     def verify_v2(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
     ) -> GenerationBatchResult:
         if not batch.forward_mode.is_idle():
@@ -346,7 +346,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
 
     def _sample_verify_v2(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
         logits_output: LogitsProcessorOutput,
         vocab_mask: Optional[torch.Tensor] = None,
@@ -405,9 +405,9 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 accept_index=accept_index,
                 accept_token_num=accept_lens,
                 candidates=candidates,
-                retrive_index=spec_info.retrive_index,
-                retrive_next_token=spec_info.retrive_next_token,
-                retrive_next_sibling=spec_info.retrive_next_sibling,
+                retrive_index=spec_info.retrieve_index,
+                retrive_next_token=spec_info.retrieve_next_token,
+                retrive_next_sibling=spec_info.retrieve_next_sibling,
                 target_predict=target_predict,
                 topk=self.topk,
             )
@@ -446,9 +446,9 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 accept_index=accept_index,
                 accept_token_num=accept_lens,
                 candidates=candidates,
-                retrive_index=spec_info.retrive_index,
-                retrive_next_token=spec_info.retrive_next_token,
-                retrive_next_sibling=spec_info.retrive_next_sibling,
+                retrive_index=spec_info.retrieve_index,
+                retrive_next_token=spec_info.retrieve_next_token,
+                retrive_next_sibling=spec_info.retrieve_next_sibling,
                 uniform_samples=torch.rand_like(candidates, dtype=torch.float32),
                 uniform_samples_for_final_sampling=torch.rand(
                     (bs,), dtype=torch.float32, device=self.device
@@ -475,7 +475,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
     def _commit_linear_state_after_verify_v2(
         self,
         *,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
         ctx,
@@ -548,7 +548,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
 
     def _compute_spec_v2_logprobs(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         predict: torch.Tensor,
         accept_index: torch.Tensor,

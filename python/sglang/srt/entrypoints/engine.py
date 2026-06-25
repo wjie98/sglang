@@ -27,6 +27,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import tempfile
 import threading
 import time
 from typing import (
@@ -55,21 +56,24 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
+    SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromDistributedReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
-    PostProcessWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -80,11 +84,16 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
+    run_multi_detokenizer_router_process,
+)
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.template_detection import resolve_auto_parsers
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -115,6 +124,7 @@ class SchedulerInitResult:
     """Result from launching schedulers."""
 
     scheduler_infos: List[Dict[str, Any]]
+    all_child_pids: List[int] = dataclasses.field(default_factory=list)
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
@@ -137,6 +147,33 @@ def init_tokenizer_manager(
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
+
+    # Resolve any remaining auto parsers using template manager's detection results
+    for attr, suggested, label in (
+        (
+            "reasoning_parser",
+            template_manager.suggested_reasoning_parser,
+            "reasoning parser",
+        ),
+        (
+            "tool_call_parser",
+            template_manager.suggested_tool_call_parser,
+            "tool-call parser",
+        ),
+    ):
+        if getattr(server_args, attr) != "auto":
+            continue
+        if suggested is not None:
+            setattr(server_args, attr, suggested)
+            logger.info(
+                f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
+            )
+        else:
+            logger.warning(
+                f"--{attr.replace('_', '-')}=auto specified but could not detect "
+                f"{label} from chat template. Disabling {label}."
+            )
+            setattr(server_args, attr, None)
 
     return tokenizer_manager, template_manager
 
@@ -167,6 +204,10 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
         Please refer to `ServerArgs` for the documentation.
         """
+
+        # Ensure plugins are loaded before ServerArgs construction,
+        # so hooks on ServerArgs.__post_init__ fire correctly.
+        load_plugins()
 
         # Parse server_args
         if "server_args" in kwargs:
@@ -207,11 +248,6 @@ class Engine(EngineScoreMixin, EngineBase):
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
-        # Access transfer engine info if bootstrap server is started.
-        if scheduler_init_result.engine_info_bootstrap_server is not None:
-            self.remote_instance_transfer_engine_info = (
-                scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
-            )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -224,7 +260,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Enable tracing
         if server_args.enable_trace:
-            process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+            process_tracing_init(
+                server_args.otlp_traces_endpoint,
+                "sglang",
+                trace_modules=server_args.trace_modules,
+            )
             thread_label = "Tokenizer"
             if server_args.disaggregation_mode == "prefill":
                 thread_label = "Prefill Tokenizer"
@@ -237,6 +277,10 @@ class Engine(EngineScoreMixin, EngineBase):
         except RuntimeError:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+
+    def get_all_child_pids(self) -> List[int]:
+        """Returns a list of all child process PIDs."""
+        return self._scheduler_init_result.all_child_pids
 
     def _resolve_routed_dp_rank(
         self,
@@ -257,7 +301,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
-                logger.warning(
+                logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
                 return None
@@ -287,12 +331,15 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        # See GenerateReqInput.mm_hashes / async_generate for the contract.
+        mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -324,12 +371,14 @@ class Engine(EngineScoreMixin, EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            mm_hashes=mm_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
             custom_logit_processor=custom_logit_processor,
+            require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             routed_experts_start_len=routed_experts_start_len,
@@ -379,12 +428,20 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
+        # Optional per-image hashes the caller has already computed (hex strings,
+        # one per image in `image_data`). When supplied, each MultimodalDataItem's
+        # `hash` is initialised from this list and `set_pad_value` skips the
+        # internal `hash_feature()` recompute. Intended for external KV routers
+        # that compute their own per-image hash for routing decisions and need
+        # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
+        mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
         logprob_start_len: Optional[Union[List[int], int]] = None,
         top_logprobs_num: Optional[Union[List[int], int]] = None,
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
@@ -416,11 +473,13 @@ class Engine(EngineScoreMixin, EngineBase):
             image_data=image_data,
             audio_data=audio_data,
             video_data=video_data,
+            mm_hashes=mm_hashes,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             routed_experts_start_len=routed_experts_start_len,
@@ -451,6 +510,8 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        embed_override_token_id: Optional[int] = None,
+        embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -465,6 +526,8 @@ class Engine(EngineScoreMixin, EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            embed_override_token_id=embed_override_token_id,
+            embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -480,6 +543,8 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        embed_override_token_id: Optional[int] = None,
+        embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -496,6 +561,8 @@ class Engine(EngineScoreMixin, EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            embed_override_token_id=embed_override_token_id,
+            embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -575,8 +642,9 @@ class Engine(EngineScoreMixin, EngineBase):
                                 writer,
                             ),
                         )
-                        with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                            server_args, gpu_id
+                        with (
+                            memory_saver_adapter.configure_subprocess(),
+                            numa_utils.configure_subprocess(server_args, gpu_id),
                         ):
                             proc.start()
 
@@ -598,11 +666,17 @@ class Engine(EngineScoreMixin, EngineBase):
             proc.start()
             scheduler_procs.append(proc)
 
+        all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
             scheduler_infos.extend(infos)
+            # For dp_size > 1, collect child scheduler PIDs from the DP controller
+            if server_args.dp_size > 1:
+                for info in infos:
+                    if SCHEDULER_PIDS_ARG in info:
+                        all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
 
         def wait_for_completion():
             for proc in scheduler_procs:
@@ -615,11 +689,69 @@ class Engine(EngineScoreMixin, EngineBase):
         return (
             SchedulerInitResult(
                 scheduler_infos=scheduler_infos,
+                all_child_pids=all_child_pids,
                 wait_for_ready=wait_for_ready,
                 wait_for_completion=wait_for_completion,
             ),
             scheduler_procs,
         )
+
+    @classmethod
+    def _launch_detokenizer_subprocesses(
+        cls,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        run_detokenizer_process_func: Callable,
+    ) -> Tuple[List[mp.Process], List[str]]:
+        """Launch detokenizer worker(s).
+
+        - When ``detokenizer_worker_num == 1``: a single detokenizer process listens on
+          ``port_args.detokenizer_ipc_name`` (the original behavior).
+        - When ``detokenizer_worker_num > 1``: each detokenizer worker gets its own
+          private IPC socket, and a ``MultiDetokenizerRouter`` process owns the
+          original ``port_args.detokenizer_ipc_name`` and fans out to them.
+
+        Returns (processes, names) for SubprocessWatchdog.
+        """
+        processes: List[mp.Process] = []
+        names: List[str] = []
+
+        if server_args.detokenizer_worker_num <= 1:
+            proc = mp.Process(
+                target=run_detokenizer_process_func,
+                args=(server_args, port_args),
+            )
+            proc.start()
+            processes.append(proc)
+            names.append("detokenizer")
+            return processes, names
+
+        router_ipc_name = port_args.detokenizer_ipc_name
+        worker_ipc_names: List[str] = []
+        try:
+            for i in range(server_args.detokenizer_worker_num):
+                worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+                port_args.detokenizer_ipc_name = worker_ipc
+                proc = mp.Process(
+                    target=run_detokenizer_process_func,
+                    args=(server_args, port_args),
+                )
+                proc.start()
+                processes.append(proc)
+                names.append(f"detokenizer_{i}")
+                worker_ipc_names.append(worker_ipc)
+        finally:
+            port_args.detokenizer_ipc_name = router_ipc_name
+
+        router_proc = mp.Process(
+            target=run_multi_detokenizer_router_process,
+            args=(worker_ipc_names, server_args, port_args),
+        )
+        router_proc.start()
+        processes.append(router_proc)
+        names.append("detokenizer_router")
+
+        return processes, names
 
     @classmethod
     def _launch_subprocesses(
@@ -644,6 +776,11 @@ class Engine(EngineScoreMixin, EngineBase):
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
+
+        # Defensive: ensure plugins loaded (may already be loaded by
+        # Engine.__init__ or CLI entry).
+        load_plugins()
+
         server_args.check_server_args()
         _set_gc(server_args)
 
@@ -668,6 +805,12 @@ class Engine(EngineScoreMixin, EngineBase):
             engine_info_bootstrap_server = EngineInfoBootstrapServer(
                 host=server_args.host, port=bootstrap_port
             )
+
+        if (
+            server_args.reasoning_parser == "auto"
+            or server_args.tool_call_parser == "auto"
+        ):
+            resolve_auto_parsers(server_args)
 
         # Launch scheduler processes
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
@@ -711,15 +854,15 @@ class Engine(EngineScoreMixin, EngineBase):
                 None,
             )
 
-        # Launch detokenizer process
-        detoken_proc = mp.Process(
-            target=run_detokenizer_process_func,
-            args=(
-                server_args,
-                port_args,
-            ),
+        # Launch detokenizer process(es) — optionally fronted by a router when
+        # detokenizer_worker_num > 1.
+        detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
+            server_args=server_args,
+            port_args=port_args,
+            run_detokenizer_process_func=run_detokenizer_process_func,
         )
-        detoken_proc.start()
+        for p in detoken_procs:
+            scheduler_init_result.all_child_pids.append(p.pid)
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
         if server_args.tokenizer_worker_num == 1:
@@ -743,8 +886,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
-        processes.append(detoken_proc)
-        names.append("detokenizer")
+        processes.extend(detoken_procs)
+        names.extend(detoken_names)
         subprocess_watchdog = SubprocessWatchdog(
             processes=processes, process_names=names
         )
@@ -759,13 +902,21 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def shutdown(self):
-        """Shutdown the engine"""
+        """Shutdown the engine; block until the scheduler subprocess releases
+        its GPU context so the caller can immediately reallocate on the same
+        device."""
         if (
             self.tokenizer_manager is not None
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
-        kill_process_tree(os.getpid(), include_parent=False)
+
+        send_to_rpc = getattr(self, "send_to_rpc", None)
+        if send_to_rpc is not None:
+            send_to_rpc.close(linger=0)
+            self.send_to_rpc = None
+
+        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
         return self
@@ -962,31 +1113,20 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.update_weights_from_ipc(obj, None)
         )
 
-    def post_process_weights(
-        self,
-        restore_weights_before_load: bool = False,
-        post_process_quantization: bool = False,
-        post_load_weights: bool = False,
-    ):
+    def begin_weight_update(self):
+        """Open a weight-update session.
+        Must be called before update_weights_from_*; pair with end_weight_update.
         """
-        Optional post-processing for updated weights (e.g., Marlin conversion).
-        Should be called after weight update is finished.
-
-        Args:
-            restore_weights_before_load: Restore weights to pre-quantization state.
-            post_process_quantization: Re-apply quantization post-processing.
-            post_load_weights: Call model.post_load_weights() for models that
-                need post-load decomposition (e.g., DeepSeek MLA kv_b_proj
-                decomposition into w_kc/w_vc tensors after RDMA weight transfer).
-        """
-        obj = PostProcessWeightsReqInput(
-            restore_weights_before_load=restore_weights_before_load,
-            post_process_quantization=post_process_quantization,
-            post_load_weights=post_load_weights,
+        obj = BeginWeightUpdateReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.begin_weight_update(obj, None)
         )
 
+    def end_weight_update(self):
+        """Close the weight-update session."""
+        obj = EndWeightUpdateReqInput()
         return self.loop.run_until_complete(
-            self.tokenizer_manager.post_process_weights(obj, None)
+            self.tokenizer_manager.end_weight_update(obj, None)
         )
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
@@ -1004,19 +1144,48 @@ class Engine(EngineScoreMixin, EngineBase):
         load_format: Optional[str] = None,
     ):
         if load_format == "flattened_bucket":
-            serialized_tensors = tensors
+            serialized_named_tensors = list(tensors)
         else:
-            serialized_tensors = MultiprocessingSerializer.serialize(
-                tensors, output_str=True
-            )
+            serialized_named_tensors = [
+                MultiprocessingSerializer.serialize(tensors, output_str=True)
+                for _ in range(self.server_args.tp_size)
+            ]
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,
-            serialized_tensors=serialized_tensors,
+            serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+        )
+
+    def load_lora_adapter_from_distributed(
+        self,
+        lora_name: str,
+        config_dict: Dict,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        pinned: bool = False,
+        added_tokens_config: Optional[Dict] = None,
+    ):
+        """Load a new LoRA adapter whose weights are broadcast over
+        a process group. The weight-update group must already be
+        initialized via `init_weights_update_group`."""
+        lora_req = LoadLoRAAdapterFromDistributedReqInput(
+            lora_name=lora_name,
+            config_dict=config_dict,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            pinned=pinned,
+            added_tokens_config=added_tokens_config,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter_from_distributed(lora_req, None)
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
@@ -1160,7 +1329,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.7.post2",
+                "0.6.12",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1168,7 +1337,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.1",
+                "0.4.3",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
