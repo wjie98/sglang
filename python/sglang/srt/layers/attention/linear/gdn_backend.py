@@ -1,4 +1,3 @@
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -23,9 +22,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
-
-_DVR_DEBUG_GDN_EXTEND_PRINTS = 0
-_DVR_DEBUG_STEP_VERIFY_PRINTS = 0
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -439,77 +435,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             num_v_heads=layer.num_v_heads,
             head_v_dim=layer.head_v_dim,
         )
-        if os.environ.get("SGLANG_DVR_DEBUG_LIVE_VERIFY") == "1":
-            return self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                intermediate_states_buffer=mamba_cache_params.intermediate_ssm,
-                intermediate_state_indices=self.verify_intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=self.forward_metadata.retrieve_parent_token,
-            )
-        if os.environ.get("SGLANG_DVR_DEBUG_STEP_DECODE_VERIFY") == "1":
-            global _DVR_DEBUG_STEP_VERIFY_PRINTS
-            if _DVR_DEBUG_STEP_VERIFY_PRINTS < 20:
-                print(
-                    "[DVR_GDN_STEP_DECODE_VERIFY]",
-                    {
-                        "layer_id": layer.layer_id,
-                        "seq_len": int(query.shape[1]),
-                        "batch_size": int(dvr_context.verify_batch_size),
-                        "draft_token_num": int(dvr_context.draft_token_num),
-                    },
-                    flush=True,
-                )
-                _DVR_DEBUG_STEP_VERIFY_PRINTS += 1
-            batch_size = dvr_context.verify_batch_size
-            draft_token_num = dvr_context.draft_token_num
-            value_shape = (layer.num_v_heads, layer.head_v_dim)
-            core_attn_out = query.new_empty(
-                1, batch_size * draft_token_num, *value_shape
-            )
-            decode_query_start_loc = torch.arange(
-                0,
-                batch_size + 1,
-                dtype=torch.int32,
-                device=query.device,
-            )
-            row_base = (
-                torch.arange(batch_size, dtype=torch.long, device=query.device)
-                * draft_token_num
-            )
-            intermediate_indices = self.verify_intermediate_state_indices[
-                :batch_size
-            ].to(torch.long)
-            for step in range(draft_token_num):
-                rows = row_base + step
-                step_out = self.kernel_dispatcher.decode(
-                    q=query[:, rows],
-                    k=key[:, rows],
-                    v=value[:, rows],
-                    a=a[rows],
-                    b=b[rows],
-                    A_log=layer.A_log,
-                    dt_bias=layer.dt_bias,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices[:batch_size],
-                    query_start_loc=decode_query_start_loc,
-                )
-                core_attn_out[:, rows] = step_out
-                mamba_cache_params.intermediate_ssm[
-                    intermediate_indices, step
-                ] = ssm_states[cache_indices[:batch_size]].to(
-                    mamba_cache_params.intermediate_ssm.dtype, copy=False
-                )
-            return core_attn_out
         return self.dvr_state_adapter.process_target_verify_state(
             context=dvr_context,
             draft_state_inputs=draft_state_inputs,
@@ -658,23 +583,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
             )
             if not self.is_draft_worker:
-                global _DVR_DEBUG_GDN_EXTEND_PRINTS
-                if (
-                    os.environ.get("SGLANG_DVR_DEBUG_GDN_STATE") == "1"
-                    and _DVR_DEBUG_GDN_EXTEND_PRINTS < 200
-                ):
-                    print(
-                        "[DVR_GDN_EXTEND_CACHE_WRITE]",
-                        {
-                            "layer_id": layer.layer_id,
-                            "is_draft_worker": self.is_draft_worker,
-                            "forward_mode": str(forward_batch.forward_mode),
-                            "extend_prefix_lens_cpu": forward_batch.extend_prefix_lens_cpu,
-                            "extend_seq_lens_cpu": forward_batch.extend_seq_lens_cpu,
-                        },
-                        flush=True,
-                    )
-                    _DVR_DEBUG_GDN_EXTEND_PRINTS += 1
                 # DVR state-input windows are target-model prefill oracles.
                 # EAGLE/MTP draft workers share request slots and must not
                 # overwrite those windows with draft-model q/k/v/g/beta rows.
@@ -700,23 +608,5 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
-
-        if is_target_verify and os.environ.get("SGLANG_DVR_DEBUG_LIVE_VERIFY") == "1":
-            core_attn_out = self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
-            )
 
         return core_attn_out

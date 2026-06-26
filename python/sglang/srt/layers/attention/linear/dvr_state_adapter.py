@@ -5,7 +5,6 @@ External callers:
 - dvr_linear_state uses backup/restore/commit methods around draft and verify.
 """
 
-import os
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
@@ -25,9 +24,6 @@ from sglang.srt.layers.attention.linear.dvr_state_verify import (
 )
 
 __all__ = ["DVRGatedStateAdapter"]
-
-_DVR_DEBUG_VERIFY_STATE_PRINTS = 0
-
 
 @dataclass(frozen=True)
 class DVRGatedForwardContext:
@@ -365,12 +361,6 @@ class DVRGatedStateAdapter:
         if live_backup is not None:
             for conv, saved_conv in zip(state_cache.conv, live_backup.conv, strict=True):
                 conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)
-            if os.environ.get("SGLANG_DVR_DEBUG_LIVE_VERIFY") == "1" or os.environ.get(
-                "SGLANG_DVR_DEBUG_STEP_DECODE_VERIFY"
-            ) == "1":
-                state_cache.temporal[:, live_indices] = live_backup.temporal.to(
-                    state_cache.temporal.dtype, copy=False
-                )
 
     def make_forward_context(
         self,
@@ -502,24 +492,6 @@ class DVRGatedStateAdapter:
             tail_lens.clamp(min=0, max=self.chunk_size),
             torch.zeros_like(tail_lens),
         )
-        global _DVR_DEBUG_VERIFY_STATE_PRINTS
-        if (
-            os.environ.get("SGLANG_DVR_DEBUG_GDN_STATE") == "1"
-            and _DVR_DEBUG_VERIFY_STATE_PRINTS < 200
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            print(
-                "[DVR_GDN_VERIFY_STATE]",
-                {
-                    "draft_token_num": int(draft_token_num),
-                    "batch_size": int(batch_size),
-                    "cache_indices": dvr_indices.detach().cpu().tolist(),
-                    "state_input_indices": state_input_indices.detach().cpu().tolist(),
-                    "tail_lens": tail_lens.detach().cpu().tolist(),
-                },
-                flush=True,
-            )
-            _DVR_DEBUG_VERIFY_STATE_PRINTS += 1
         return run_dvr_chunkwise_verify(
             state_ops=self.ops,
             state_window=state_window,
@@ -556,25 +528,6 @@ class DVRGatedStateAdapter:
         )
         tail_lens_after = tail_lens_before + accepted_token_counts
         crosses_chunk_boundary = tail_lens_after >= self.chunk_size
-        if (
-            os.environ.get("SGLANG_DVR_DEBUG_COMMIT") == "1"
-            and crosses_chunk_boundary.any()
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            print(
-                "[DVR_COMMIT_DEBUG]",
-                {
-                    "tail_lens_before": tail_lens_before.detach().cpu().tolist(),
-                    "accepted_token_counts": accepted_token_counts.detach()
-                    .cpu()
-                    .tolist(),
-                    "accepted_steps": accepted_steps.detach().cpu().tolist(),
-                    "crosses_chunk_boundary": crosses_chunk_boundary.detach()
-                    .cpu()
-                    .tolist(),
-                },
-                flush=True,
-            )
 
         self.ops.scatter_state(
             state_cache.conv[0],
@@ -584,11 +537,8 @@ class DVRGatedStateAdapter:
         )
 
         no_commit_step = torch.full_like(tail_lens_before, -1)
-        use_oracle_boundary = (
-            os.environ.get("SGLANG_DVR_TRACK_ORACLE_BOUNDARY") == "1"
-        )
         crossing_req_indices = torch.nonzero(crosses_chunk_boundary).flatten()
-        if crossing_req_indices.numel() > 0 and not use_oracle_boundary:
+        if crossing_req_indices.numel() > 0:
             # Build the chunk checkpoint from DVR's prefill-equivalent
             # state-input window.  The target-verify intermediate buffer is
             # row-indexed for accepted draft steps; rebuilding from the rolling
@@ -608,17 +558,16 @@ class DVRGatedStateAdapter:
                     device=tail_lens_before.device,
                 ),
             )
-        if not use_oracle_boundary:
-            self.ops.scatter_state(
-                state_cache.conv[0],
-                state_cache.intermediate_conv_window[0],
-                boundary_indices,
-                torch.where(
-                    crosses_chunk_boundary,
-                    self.chunk_size - 1 - tail_lens_before,
-                    no_commit_step,
-                ),
-            )
+        self.ops.scatter_state(
+            state_cache.conv[0],
+            state_cache.intermediate_conv_window[0],
+            boundary_indices,
+            torch.where(
+                crosses_chunk_boundary,
+                self.chunk_size - 1 - tail_lens_before,
+                no_commit_step,
+            ),
+        )
 
         new_tail_lens = tail_lens_after - self.chunk_size
         tail_lens_after = torch.where(

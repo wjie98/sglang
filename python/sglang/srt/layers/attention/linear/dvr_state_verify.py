@@ -5,7 +5,6 @@ chunkwise verify, export boundary state/conv windows, and rebuild live
 recurrent state for the next self-draft decode.
 """
 
-import os
 from typing import Optional
 
 import torch
@@ -115,24 +114,6 @@ def select_dvr_draft_suffix(
     ).contiguous()
 
 
-def _debug_pack_dvr_verify_window(
-    state_inputs: DVRStateInputs,
-    *,
-    tail_lens: torch.Tensor,
-    draft_token_num: int,
-) -> tuple[DVRStateInputs, torch.Tensor]:
-    lens = tail_lens + draft_token_num
-    pieces = []
-    for tensor in state_inputs.tensors():
-        rows = [tensor[i, : int(lens[i].item())] for i in range(tensor.shape[0])]
-        pieces.append(torch.cat(rows, dim=0).unsqueeze(0))
-    cu_seqlens = torch.zeros(
-        lens.numel() + 1, dtype=torch.long, device=tail_lens.device
-    )
-    cu_seqlens[1:] = torch.cumsum(lens, dim=0)
-    return type(state_inputs).from_tensors(tuple(pieces)), cu_seqlens
-
-
 def run_dvr_chunkwise_verify(
     *,
     state_ops: DVRStateOps,
@@ -171,44 +152,12 @@ def run_dvr_chunkwise_verify(
         col_start=tail_lens,
         draft_token_num=draft_token_num,
     )
-    keep_lens = tail_lens + draft_token_num
-    if os.environ.get("SGLANG_DVR_DEBUG_ZERO_FUTURE_DRAFTS") == "1":
-        keep_lens = tail_lens + 1
     state_window.zero_after_lens(
         indices=input_indices,
-        keep_lens=keep_lens,
+        keep_lens=tail_lens + draft_token_num,
     )
     verify_window_size = chunk_size + draft_token_num
     window_inputs = state_window.read_window(indices=input_indices)
-    if os.environ.get("SGLANG_DVR_DEBUG_VARLEN_VERIFY") == "1":
-        window_inputs, packed_query_start_loc = _debug_pack_dvr_verify_window(
-            window_inputs,
-            tail_lens=tail_lens,
-            draft_token_num=draft_token_num,
-        )
-        core_attn_out, _, h = state_ops.scan_chunkwise(
-            state_inputs=window_inputs,
-            ssm_states=ssm_states,
-            cache_indices=indices,
-            query_start_loc=packed_query_start_loc,
-        )
-        value_shape = core_attn_out.shape[-2:]
-        cols = tail_lens.to(torch.long)
-        rows = torch.arange(
-            batch_size, dtype=torch.long, device=core_attn_out.device
-        )
-        starts = packed_query_start_loc[:-1]
-        gather_cols = (
-            starts.unsqueeze(1)
-            + cols.unsqueeze(1)
-            + torch.arange(
-                draft_token_num, dtype=torch.long, device=core_attn_out.device
-            ).unsqueeze(0)
-        )
-        packed_suffix = core_attn_out[0, gather_cols.reshape(-1)]
-        return packed_suffix.reshape(
-            1, batch_size * draft_token_num, *value_shape
-        ).contiguous()
     core_attn_out, _, h = state_ops.scan_chunkwise(
         state_inputs=window_inputs,
         ssm_states=ssm_states,
