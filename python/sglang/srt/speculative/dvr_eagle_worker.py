@@ -188,7 +188,9 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         if batch.forward_mode.is_idle():
             return
 
-        self._restore_dvr_boundary_backup_for_eagle_draft(batch)
+        # EAGLE/MTP draft owns its draft KV state and does not run target GDN
+        # state. DVR only checkpoints/restores target recurrent state for the
+        # verifier; self-decode is the path that reuses the target live cache.
         # Spec v2 may start the next forward before output processing appends
         # accepted tokens to Req.output_ids. Reuse the self-draft compatibility
         # window so boundary lookup sees the same logical prefix as the batch.
@@ -210,32 +212,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             self._prepare_dvr_boundary_for_verify(batch)
         finally:
             batch.spec_info = previous_spec_info
-
-    def _restore_dvr_boundary_backup_for_eagle_draft(
-        self, batch: ScheduleBatch
-    ) -> None:
-        """Restore target recurrent slots before EAGLE draft mutates them.
-
-        EAGLE/MTP draft workers share request mamba live slots with the target
-        worker. DVR must therefore keep backups from the last target-clean
-        point and restore them before preparing the next draft; otherwise the
-        next backup can accidentally capture draft-model recurrent state.
-        """
-
-        if self.linear_state.boundary_backup is None:
-            return
-        ctx = self.linear_state.state_context(batch, require_boundary=False)
-        if ctx is None:
-            return
-        ctx.state_adapter.restore_recurrent_state(
-            state_cache=ctx.state_cache,
-            backup=self.linear_state.boundary_backup,
-        )
-        if self.linear_state.live_backup is not None:
-            ctx.state_adapter.restore_recurrent_state(
-                state_cache=ctx.state_cache,
-                backup=self.linear_state.live_backup,
-            )
 
     def _target_suffix_extend_verify_logits(
         self,
