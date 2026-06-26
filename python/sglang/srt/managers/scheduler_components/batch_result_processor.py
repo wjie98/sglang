@@ -901,8 +901,8 @@ class SchedulerBatchResultProcessor:
 
         if batch.spec_algorithm.is_decode_verify_rollback():
             if batch.is_spec_v2:
-                req.dvr_skip_mamba_radix_finished_insert = True
-                self._commit_dvr_pending_mamba_checkpoint(req, batch, result, i)
+                req.skip_mamba_radix_finished_insert = True
+                self._commit_pending_mamba_checkpoint(req, batch, result, i)
             return
 
         lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
@@ -950,7 +950,7 @@ class SchedulerBatchResultProcessor:
 
         return False, 0
 
-    def _commit_dvr_pending_mamba_checkpoint(
+    def _commit_pending_mamba_checkpoint(
         self,
         req: Req,
         batch: ScheduleBatch,
@@ -959,10 +959,10 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         pending_seqlen = None
         pending_track_idx = None
-        if result.dvr_pending_mamba_track_seqlens is not None:
-            pending_seqlen = result.dvr_pending_mamba_track_seqlens[i]
-        if result.dvr_pending_mamba_track_indices is not None:
-            pending_track_idx = result.dvr_pending_mamba_track_indices[i]
+        if result.pending_mamba_checkpoint_seqlens is not None:
+            pending_seqlen = result.pending_mamba_checkpoint_seqlens[i]
+        if result.pending_mamba_checkpoint_track_indices is not None:
+            pending_track_idx = result.pending_mamba_checkpoint_track_indices[i]
         if pending_seqlen is None or pending_track_idx is None:
             return
 
@@ -977,8 +977,8 @@ class SchedulerBatchResultProcessor:
         req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
             pending_track_idx
         )
-        req.dvr_pending_mamba_track_idx = None
-        req.dvr_pending_mamba_track_seqlen = None
+        req.pending_mamba_checkpoint_track_idx = None
+        req.pending_mamba_checkpoint_seqlen = None
 
     @staticmethod
     def _set_mamba_radix_cache_insert_snapshot(

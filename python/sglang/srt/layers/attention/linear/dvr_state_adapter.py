@@ -11,6 +11,8 @@ from typing import Any, Optional, Tuple
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.srt.layers.attention.linear.dvr_gdn_state import DVRGDNStateInputs
 from sglang.srt.layers.attention.linear.dvr_state import (
     DVRRecurrentStateBackup,
     DVRStateInputs,
@@ -414,6 +416,89 @@ class DVRGatedStateAdapter:
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             chunk_size=self.chunk_size,
+        )
+
+    def cache_gdn_extend_tail(
+        self,
+        *,
+        forward_batch,
+        state_cache,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+    ):
+        self.cache_extend_tail_from_state_inputs(
+            forward_batch=forward_batch,
+            state_cache=state_cache,
+            state_inputs=DVRGDNStateInputs.from_extend_forward(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+            ),
+        )
+
+    def forward_gdn_target_verify(
+        self,
+        *,
+        layer,
+        forward_batch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        state_cache,
+        cache_indices: torch.Tensor,
+        query_start_loc: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run GDN target verify using DVR's prefill-equivalent state replay."""
+
+        context = self.make_forward_context(
+            layer=layer,
+            forward_batch=forward_batch,
+            state_cache=state_cache,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            conv_states=state_cache.conv[0],
+            ssm_states=state_cache.temporal,
+            seq_len=mixed_qkv.shape[0],
+        )
+        mixed_qkv = self.process_target_verify_conv(
+            context=context,
+            conv_input=mixed_qkv,
+        )
+
+        query, key, value = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        actual_seq_len = query.shape[0]
+        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        draft_state_inputs = DVRGDNStateInputs.from_draft_rows(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            batch_size=context.verify_batch_size,
+            draft_token_num=context.draft_token_num,
+            num_q_heads=layer.num_q_heads,
+            head_q_dim=layer.head_q_dim,
+            num_k_heads=layer.num_k_heads,
+            head_k_dim=layer.head_k_dim,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
+        )
+        return self.process_target_verify_state(
+            context=context,
+            draft_state_inputs=draft_state_inputs,
         )
 
     def process_target_verify_conv(

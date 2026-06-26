@@ -424,33 +424,6 @@ class LoRAAdapter(nn.Module):
             if kv_a_name in weights:
                 weights.pop(kv_a_name)
 
-    def normalize_fused_qkv_a_proj(
-        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
-    ):
-        """Fuse separate q_a_proj and kv_a_proj_with_mqa LoRA weights into
-        a single fused_qkv_a_proj_with_mqa entry (concat along dim 0 for
-        both A and B), matching the DeepSeek MLA fused projection layout."""
-        for weight_name in weight_names:
-            if "q_a_proj" not in weight_name:
-                continue
-            if "fused_qkv_a_proj_with_mqa" in weight_name:
-                continue
-
-            q_a_name = weight_name
-            kv_a_name = weight_name.replace("q_a_proj", "kv_a_proj_with_mqa")
-            fused_name = weight_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-
-            kv_a_weight = (
-                weights[kv_a_name]
-                if kv_a_name in weights
-                else torch.zeros_like(weights[q_a_name])
-            )
-
-            weights[fused_name] = torch.cat((weights[q_a_name], kv_a_weight), dim=0)
-            weights.pop(q_a_name)
-            if kv_a_name in weights:
-                weights.pop(kv_a_name)
-
     def pin_weights_in_cpu(self):
         for layer in self.layers:
             for name, weight in layer.weights.items():

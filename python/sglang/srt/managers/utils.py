@@ -61,11 +61,11 @@ class GenerationBatchResult:
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
     extra_keep_alive_refs: Optional[List[Any]] = None
 
-    # DVR spec v2 checkpoint metadata captured on the forward stream. Output
+    # Mamba checkpoint metadata captured on the forward stream. Output
     # processing uses this snapshot after copy_done instead of reading mutable
     # Req fields that may already belong to a later overlap iteration.
-    dvr_pending_mamba_track_indices: Optional[List[Optional[int]]] = None
-    dvr_pending_mamba_track_seqlens: Optional[List[Optional[int]]] = None
+    pending_mamba_checkpoint_track_indices: Optional[List[Optional[int]]] = None
+    pending_mamba_checkpoint_seqlens: Optional[List[Optional[int]]] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None

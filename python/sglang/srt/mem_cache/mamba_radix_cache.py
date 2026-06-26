@@ -516,11 +516,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
-        if getattr(req, "dvr_skip_mamba_radix_finished_insert", False):
-            # DVR spec v2 keeps post-verify Mamba checkpoints request-local.
-            # Prefill/unfinished-cache entries are still reusable, but the
-            # generated suffix is not inserted until generated-prefix checkpoint
-            # ownership is proven end-to-end.
+        if getattr(req, "skip_mamba_radix_finished_insert", False):
+            # Some overlap verify paths keep post-verify Mamba checkpoints
+            # request-local. Prefill/unfinished-cache entries are still
+            # reusable, but the generated suffix is not inserted until
+            # generated-prefix checkpoint ownership is proven end-to-end.
             is_insert = False
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[

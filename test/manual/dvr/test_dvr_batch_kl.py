@@ -135,7 +135,7 @@ def post(base_url: str, payload: Dict[str, Any], timeout: int = 600) -> Any:
 
 
 def flush_cache(base_url: str):
-    req = urllib.request.Request(base_url + "/flush_cache", data=b"{}")
+    req = urllib.request.Request(base_url + "/flush_cache?timeout=10", data=b"{}")
     try:
         urllib.request.urlopen(req, timeout=60).read()
     except urllib.error.HTTPError as exc:

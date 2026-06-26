@@ -352,7 +352,10 @@ class MambaPool:
                         DVRGDNStateInputCache,
                     )
 
-                    intermediate_ssm_tokens = speculative_num_draft_tokens
+                    # DVR verify only commits the first chunk-boundary recurrent
+                    # state. Draft-token state inputs are kept separately in
+                    # dvr_state_input_cache for prefill-equivalent replay.
+                    intermediate_ssm_tokens = 1
                     intermediate_conv_tokens = speculative_num_draft_tokens
                     dvr_state_input_cache = DVRGDNStateInputCache.create(
                         num_layers=num_mamba_layers,

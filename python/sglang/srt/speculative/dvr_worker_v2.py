@@ -421,8 +421,8 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
-            dvr_pending_mamba_track_indices=pending_track_indices,
-            dvr_pending_mamba_track_seqlens=pending_track_seqlens,
+            pending_mamba_checkpoint_track_indices=pending_track_indices,
+            pending_mamba_checkpoint_seqlens=pending_track_seqlens,
             routed_experts_output=batch_result.routed_experts_output,
         )
 
@@ -622,8 +622,8 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     req.rid
                 ]
                 pending_track_seqlens[i] = new_boundary_seqlen
-                req.dvr_pending_mamba_track_idx = pending_track_indices[i]
-                req.dvr_pending_mamba_track_seqlen = new_boundary_seqlen
+                req.pending_mamba_checkpoint_track_idx = pending_track_indices[i]
+                req.pending_mamba_checkpoint_seqlen = new_boundary_seqlen
         self.linear_state.boundary_backup = None
         self.linear_state.live_backup = None
         return pending_track_indices, pending_track_seqlens

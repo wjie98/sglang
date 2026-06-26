@@ -775,9 +775,9 @@ class Req(ReqDllmMixin):
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
-        self.dvr_pending_mamba_track_idx: Optional[int] = None
-        self.dvr_pending_mamba_track_seqlen: Optional[int] = None
-        self.dvr_skip_mamba_radix_finished_insert: bool = False
+        self.pending_mamba_checkpoint_track_idx: Optional[int] = None
+        self.pending_mamba_checkpoint_seqlen: Optional[int] = None
+        self.skip_mamba_radix_finished_insert: bool = False
         self.mamba_radix_cache_insert_indices: Optional[torch.Tensor] = None
         self.mamba_radix_cache_insert_seqlen: Optional[int] = None
 
@@ -1367,9 +1367,9 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
-        self.dvr_pending_mamba_track_idx = None
-        self.dvr_pending_mamba_track_seqlen = None
-        self.dvr_skip_mamba_radix_finished_insert = False
+        self.pending_mamba_checkpoint_track_idx = None
+        self.pending_mamba_checkpoint_seqlen = None
+        self.skip_mamba_radix_finished_insert = False
         self.mamba_radix_cache_insert_indices = None
         self.mamba_radix_cache_insert_seqlen = None
         self.already_computed = 0
@@ -1960,11 +1960,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
-        use_dvr_mamba_radix_snapshot = (
+        use_mamba_radix_snapshot = (
             self.is_spec_v2 and self.spec_algorithm.is_decode_verify_rollback()
         )
         mamba_track_cache_seqlens_cpu = (
-            [] if use_dvr_mamba_radix_snapshot else None
+            [] if use_mamba_radix_snapshot else None
         )
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):

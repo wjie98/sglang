@@ -336,6 +336,9 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             "mamba_track_indices": batch.mamba_track_indices,
             "mamba_track_mask": batch.mamba_track_mask,
             "mamba_track_seqlens": batch.mamba_track_seqlens,
+            "mamba_cow_src_indices": batch.mamba_cow_src_indices,
+            "mamba_cow_dst_indices": batch.mamba_cow_dst_indices,
+            "mamba_clear_indices": batch.mamba_clear_indices,
             "multimodal_inputs": batch.multimodal_inputs,
         }
 
@@ -379,6 +382,12 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             batch.mamba_track_indices = None
             batch.mamba_track_mask = None
             batch.mamba_track_seqlens = None
+            # Full replay starts from DVR-managed recurrent state. Do not
+            # re-apply cached-prefix deferred Mamba COW/clear ops that were
+            # already consumed by the real prefill/verify forward.
+            batch.mamba_cow_src_indices = None
+            batch.mamba_cow_dst_indices = None
+            batch.mamba_clear_indices = None
             batch.req_to_token_pool.write(
                 (draft_rows, draft_offsets),
                 draft_cache_locs.to(torch.int32),
@@ -703,8 +712,8 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
-            dvr_pending_mamba_track_indices=pending_track_indices,
-            dvr_pending_mamba_track_seqlens=pending_track_seqlens,
+            pending_mamba_checkpoint_track_indices=pending_track_indices,
+            pending_mamba_checkpoint_seqlens=pending_track_seqlens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

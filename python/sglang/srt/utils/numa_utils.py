@@ -88,21 +88,6 @@ def _get_nvml_device_index(device_id: int) -> int:
     return get_nvml_device_index(device_id)
 
 
-def _get_nvml_device_index(device_id: int) -> int:
-    # _get_nvml_device_index is an internal PyTorch helper, so fall back to
-    # device_id directly if the helper is unavailable.
-    get_nvml_device_index = getattr(torch.cuda, "_get_nvml_device_index", None)
-    if get_nvml_device_index is None:
-        logger.warning(
-            "torch.cuda._get_nvml_device_index is unavailable; falling back to "
-            f"device_id={device_id} as the NVML device index. This may select "
-            "the wrong physical GPU when CUDA_VISIBLE_DEVICES reorders devices "
-            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')})."
-        )
-        return device_id
-    return get_nvml_device_index(device_id)
-
-
 def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional[int]:
     """
     Returns the NUMA node for the given GPU id. If it is not set in the server_args, it will try to query the NUMA node for the GPU.

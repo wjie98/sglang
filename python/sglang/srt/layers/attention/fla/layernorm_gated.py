@@ -29,7 +29,7 @@ _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
-MAX_ROWS_PER_BLOCK = 1
+MAX_ROWS_PER_BLOCK = 4
 
 
 def rms_norm_ref(

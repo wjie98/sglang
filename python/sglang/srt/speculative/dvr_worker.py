@@ -910,6 +910,9 @@ class DecodeVerifyRollbackWorker:
             "mamba_track_indices": batch.mamba_track_indices,
             "mamba_track_mask": batch.mamba_track_mask,
             "mamba_track_seqlens": batch.mamba_track_seqlens,
+            "mamba_cow_src_indices": batch.mamba_cow_src_indices,
+            "mamba_cow_dst_indices": batch.mamba_cow_dst_indices,
+            "mamba_clear_indices": batch.mamba_clear_indices,
         }
 
         try:
@@ -952,6 +955,13 @@ class DecodeVerifyRollbackWorker:
             batch.mamba_track_indices = None
             batch.mamba_track_mask = None
             batch.mamba_track_seqlens = None
+            # Cached-prefix prefill can leave deferred Mamba COW/clear tensors
+            # on ScheduleBatch after the real forward consumed its ForwardBatch
+            # copy. Full replay must start from zero recurrent state and must
+            # not re-apply those cached-prefix restore ops.
+            batch.mamba_cow_src_indices = None
+            batch.mamba_cow_dst_indices = None
+            batch.mamba_clear_indices = None
             batch.req_to_token_pool.write(
                 (draft_rows, draft_offsets),
                 draft_cache_locs.to(torch.int32),
