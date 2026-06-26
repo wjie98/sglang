@@ -606,6 +606,7 @@ class DVRGatedStateAdapter:
         verified_tail_lens: torch.Tensor,
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
+        boundary_already_tracked: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         state_window = DVRStateInputWindow.from_cache(state_cache)
         tail_lens_before = verified_tail_lens.to(
@@ -613,6 +614,17 @@ class DVRGatedStateAdapter:
         )
         tail_lens_after = tail_lens_before + accepted_token_counts
         crosses_chunk_boundary = tail_lens_after >= self.chunk_size
+        if boundary_already_tracked is None:
+            boundary_already_tracked = torch.zeros_like(crosses_chunk_boundary)
+        else:
+            boundary_already_tracked = boundary_already_tracked.to(
+                device=live_indices.device, dtype=torch.bool
+            )
+        # Suffix replay can pre-materialize the next boundary through the
+        # backend's normal EXTEND tracking path.  Do not rebuild or scatter that
+        # same boundary from TARGET_VERIFY intermediates, whose rows are indexed
+        # by accepted draft steps rather than prefill positions.
+        boundary_needs_rebuild = crosses_chunk_boundary & ~boundary_already_tracked
 
         self.ops.scatter_state(
             state_cache.conv[0],
@@ -622,7 +634,7 @@ class DVRGatedStateAdapter:
         )
 
         no_commit_step = torch.full_like(tail_lens_before, -1)
-        crossing_req_indices = torch.nonzero(crosses_chunk_boundary).flatten()
+        crossing_req_indices = torch.nonzero(boundary_needs_rebuild).flatten()
         if crossing_req_indices.numel() > 0:
             # Build the chunk checkpoint from DVR's prefill-equivalent
             # state-input window.  The target-verify intermediate buffer is
@@ -648,7 +660,7 @@ class DVRGatedStateAdapter:
             state_cache.intermediate_conv_window[0],
             boundary_indices,
             torch.where(
-                crosses_chunk_boundary,
+                boundary_needs_rebuild,
                 self.chunk_size - 1 - tail_lens_before,
                 no_commit_step,
             ),

@@ -809,18 +809,20 @@ class DecodeVerifyRollbackWorker:
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
 
-    def _target_full_replay_verify_logits(
+    def _target_suffix_extend_verify_logits(
         self,
         *,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
         linear_state_ctx,
     ) -> Optional[torch.Tensor]:
-        """Compute target verifier logits with deterministic full-prefix replay.
+        """Compute verifier logits by replaying only the deterministic suffix.
 
         The ordinary TARGET_VERIFY forward still runs first so DVR can commit
-        accepted recurrent states.  This oracle is used only for sampling and
-        returned logprobs, where exact prefill equivalence is required.
+        accepted recurrent states.  The oracle restores the live recurrent slot
+        to the chunk-boundary checkpoint, then runs an ordinary EXTEND over the
+        unclosed tail plus draft tokens.  This keeps verifier logits equivalent
+        to target prefill without replaying the full prefix on every step.
         """
 
         if batch.forward_mode.is_idle() or linear_state_ctx is None:
@@ -829,6 +831,8 @@ class DecodeVerifyRollbackWorker:
         state_adapter = linear_state_ctx.state_adapter
         state_cache = linear_state_ctx.state_cache
         live_indices = linear_state_ctx.live_indices
+        boundary_indices = linear_state_ctx.boundary_indices
+        assert boundary_indices is not None
 
         bs = len(batch.seq_lens)
         draft_token_num = spec_info.draft_token_num
@@ -841,25 +845,43 @@ class DecodeVerifyRollbackWorker:
                 else batch.seq_lens.detach().cpu().tolist()
             )
         )
-        extend_lens_cpu = [int(seq_len) + draft_token_num for seq_len in base_seq_lens_cpu]
+        boundary_lens = self.linear_state.boundary_lens_for_replay(
+            batch, base_seq_lens_cpu
+        )
+        tail_lens_cpu = [
+            int(seq_len) - int(boundary)
+            for seq_len, boundary in zip(
+                base_seq_lens_cpu, boundary_lens, strict=True
+            )
+        ]
+        extend_lens_cpu = [tail + draft_token_num for tail in tail_lens_cpu]
         final_seq_lens_cpu = [
-            int(seq_len) + draft_token_num for seq_len in base_seq_lens_cpu
+            int(boundary) + int(extend_len)
+            for boundary, extend_len in zip(
+                boundary_lens, extend_lens_cpu, strict=True
+            )
         ]
 
         input_ids = []
         out_cache_locs = []
         draft_tokens = spec_info.draft_token.reshape(bs, draft_token_num)
         draft_cache_locs = batch.out_cache_loc.reshape(bs, draft_token_num)
-        for req_i, (req, seq_len) in enumerate(
-            zip(batch.reqs, base_seq_lens_cpu, strict=True)
+        for req_i, (req, seq_len, boundary, tail_len) in enumerate(
+            zip(
+                batch.reqs,
+                base_seq_lens_cpu,
+                boundary_lens,
+                tail_lens_cpu,
+                strict=True,
+            )
         ):
             token_ids = self._request_token_ids_for_replay(req, int(seq_len))
-            input_ids.extend(token_ids[: int(seq_len)])
+            input_ids.extend(token_ids[int(boundary) : int(seq_len)])
             input_ids.extend(draft_tokens[req_i].detach().cpu().tolist())
-            if int(seq_len) > 0:
+            if int(tail_len) > 0:
                 out_cache_locs.append(
                     batch.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : int(seq_len)
+                        req.req_pool_idx, int(boundary) : int(seq_len)
                     ].to(torch.long)
                 )
             out_cache_locs.append(draft_cache_locs[req_i].to(torch.long))
@@ -884,7 +906,18 @@ class DecodeVerifyRollbackWorker:
         draft_rows = batch.req_pool_indices.to(torch.long).unsqueeze(1).expand_as(
             draft_offsets
         )
+        possible_boundary_track, boundary_track_seqlens = (
+            self.linear_state.suffix_replay_boundary_track_info(
+                boundary_lens,
+                extend_lens_cpu,
+                device=batch.seq_lens.device,
+            )
+        )
 
+        # ForwardBatch.init_new reads many mutable ScheduleBatch fields.  The
+        # oracle below temporarily reinterprets the live verify batch as an
+        # ordinary EXTEND over "tail + draft", then restores every touched field
+        # in finally so the scheduler still sees the original TARGET_VERIFY.
         saved_fields = {
             "forward_mode": batch.forward_mode,
             "global_forward_mode": batch.global_forward_mode,
@@ -916,9 +949,7 @@ class DecodeVerifyRollbackWorker:
         }
 
         try:
-            state_adapter.zero_recurrent_state(
-                state_cache=state_cache, indices=live_indices
-            )
+            self.linear_state.restore_boundary_state_for_suffix_replay(linear_state_ctx)
 
             batch.forward_mode = ForwardMode.EXTEND
             batch.global_forward_mode = None
@@ -931,7 +962,7 @@ class DecodeVerifyRollbackWorker:
             batch.out_cache_loc = torch.cat(out_cache_locs).to(
                 device=batch.seq_lens.device
             )
-            batch.prefix_lens = [0 for _ in batch.reqs]
+            batch.prefix_lens = [int(x) for x in boundary_lens]
             batch.extend_lens = [int(x) for x in extend_lens_cpu]
             batch.extend_num_tokens = len(input_ids)
             batch.extend_logprob_start_lens = [int(x) for x in extend_lens_cpu]
@@ -952,16 +983,35 @@ class DecodeVerifyRollbackWorker:
             batch.return_hidden_states = False
             batch.return_hidden_states_before_norm = False
             batch.return_logprob = False
-            batch.mamba_track_indices = None
-            batch.mamba_track_mask = None
-            batch.mamba_track_seqlens = None
+            if possible_boundary_track.any():
+                # Reuse the normal EXTEND mamba tracker to materialize the next
+                # chunk checkpoint while replaying the suffix.  Sampling may
+                # later reject before that boundary; commit_after_verify will
+                # roll back those speculative checkpoint writes.
+                batch.mamba_track_indices = boundary_indices.to(
+                    device=batch.seq_lens.device, dtype=torch.long
+                )
+                batch.mamba_track_mask = possible_boundary_track
+                batch.mamba_track_seqlens = boundary_track_seqlens
+                self.linear_state.set_suffix_replay_boundary_track_mask(
+                    possible_boundary_track
+                )
+            else:
+                batch.mamba_track_indices = None
+                batch.mamba_track_mask = None
+                batch.mamba_track_seqlens = None
+                self.linear_state.set_suffix_replay_boundary_track_mask(None)
             # Cached-prefix prefill can leave deferred Mamba COW/clear tensors
             # on ScheduleBatch after the real forward consumed its ForwardBatch
-            # copy. Full replay must start from zero recurrent state and must
-            # not re-apply those cached-prefix restore ops.
+            # copy. Suffix replay starts from DVR-managed recurrent state and
+            # must not re-apply those cached-prefix restore ops.
             batch.mamba_cow_src_indices = None
             batch.mamba_cow_dst_indices = None
             batch.mamba_clear_indices = None
+            # The suffix EXTEND must see draft KV at absolute positions
+            # base_seq_len..base_seq_len+draft.  These are the same slots the
+            # real verify path owns, so publishing them in req_to_token_pool is
+            # intentional even though the rest of ScheduleBatch is restored.
             batch.req_to_token_pool.write(
                 (draft_rows, draft_offsets),
                 draft_cache_locs.to(torch.int32),
@@ -976,16 +1026,16 @@ class DecodeVerifyRollbackWorker:
             hidden_states = oracle_output.logits_output.hidden_states
             if hidden_states is None:
                 raise RuntimeError(
-                    "DVR full replay verifier did not return hidden states."
+                    "DVR suffix EXTEND verifier did not return hidden states."
                 )
 
             gather_indices = []
             offset = 0
-            for seq_len, extend_len in zip(
-                base_seq_lens_cpu, extend_lens_cpu, strict=True
+            for tail_len, extend_len in zip(
+                tail_lens_cpu, extend_lens_cpu, strict=True
             ):
                 gather_indices.extend(
-                    range(offset + int(seq_len), offset + int(seq_len) + draft_token_num)
+                    range(offset + int(tail_len), offset + int(tail_len) + draft_token_num)
                 )
                 offset += extend_len
             gather_indices_t = torch.tensor(
@@ -1042,7 +1092,7 @@ class DecodeVerifyRollbackWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
-        oracle_logits = self._target_full_replay_verify_logits(
+        oracle_logits = self._target_suffix_extend_verify_logits(
             batch=batch,
             spec_info=spec_info,
             linear_state_ctx=linear_state_ctx,

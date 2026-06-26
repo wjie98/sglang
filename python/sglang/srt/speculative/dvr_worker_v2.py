@@ -168,6 +168,9 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             target_req_seqlen = int(seq_len) + 1
             append_count = max(0, target_req_seqlen - req.seqlen)
             if append_count:
+                # Only req.seqlen matters to the reused V1 lifecycle helper
+                # here.  The token value is a placeholder and is removed in the
+                # finally block before output processing observes req.output_ids.
                 req.output_ids.extend([int(token_id)] * append_count)
             appended_counts.append(append_count)
         try:
@@ -339,7 +342,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             batch, is_verify=True
         )
         logits_output = batch_result.logits_output
-        oracle_logits = self._target_full_replay_verify_logits(
+        oracle_logits = self._target_suffix_extend_verify_logits(
             batch=batch,
             spec_info=spec_info,
             linear_state_ctx=linear_state_ctx,
@@ -590,6 +593,16 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         verified_tail_lens = verified_tail_lens.to(
             device=ctx.live_indices.device, dtype=torch.long
         )
+        # The suffix oracle may have already asked the normal EXTEND tracker to
+        # write the next boundary checkpoint.  Let the lifecycle roll that back
+        # for rejected tails or mark it as already materialized for crossings.
+        boundary_already_tracked = (
+            self.linear_state.prepare_suffix_replay_boundary_commit(
+                ctx=ctx,
+                verified_tail_lens_cpu=pre_verify_tail_lens_cpu,
+                accepted_token_counts_cpu=accepted_token_counts_cpu,
+            )
+        )
         ctx.state_adapter.commit_after_verify(
             state_cache=ctx.state_cache,
             state_input_indices=ctx.state_input_indices,
@@ -598,6 +611,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             verified_tail_lens=verified_tail_lens,
             accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
+            boundary_already_tracked=boundary_already_tracked,
         )
 
         for i, (req, verified_tail_len, accepted_token_num) in enumerate(
@@ -626,6 +640,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 req.pending_mamba_checkpoint_seqlen = new_boundary_seqlen
         self.linear_state.boundary_backup = None
         self.linear_state.live_backup = None
+        self.linear_state.suffix_replay_boundary_track_mask = None
         return pending_track_indices, pending_track_seqlens
 
     def _compute_spec_v2_logprobs(

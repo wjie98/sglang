@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.attention.linear.dvr_state import DVRRecurrentStateBackup
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
@@ -43,6 +44,7 @@ class DVRLinearStateLifecycle:
         self.boundary_track_idx = {}
         self.boundary_backup = None
         self.live_backup = None
+        self.suffix_replay_boundary_track_mask = None
         self.validate_args()
 
     def validate_args(self):
@@ -106,14 +108,18 @@ class DVRLinearStateLifecycle:
         if accepted_token_counts.numel() == 0:
             return
 
-        # EAGLE verify has already appended accepted tokens to req.output_ids.
-        # Recover the pre-verify tail length from CPU request metadata instead
-        # of reading the GPU state-window position tensor back to CPU.
+        seq_lens_cpu = (
+            batch.seq_lens_cpu.tolist()
+            if batch.seq_lens_cpu is not None
+            else batch.seq_lens.detach().cpu().tolist()
+        )
+        # Use the immutable pre-verify logical lengths from ScheduleBatch.
+        # Request metadata can already reflect accepted tokens in some spec
+        # paths, which is exactly the off-by-one/full-prefix replay dependency
+        # that suffix replay must avoid.
         verified_tail_lens_cpu = [
-            req.seqlen - accepted_token_num - 1 - self.boundary_seqlen[req.rid]
-            for req, accepted_token_num in zip(
-                batch.reqs, accepted_token_counts_cpu, strict=True
-            )
+            int(seq_len) - self.boundary_seqlen[req.rid]
+            for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
         ]
         verified_tail_lens = ctx.state_adapter.state_input_tail_lens(
             state_cache=ctx.state_cache,
@@ -128,6 +134,11 @@ class DVRLinearStateLifecycle:
         verified_tail_lens = verified_tail_lens.to(
             device=ctx.live_indices.device, dtype=torch.long
         )
+        boundary_already_tracked = self.prepare_suffix_replay_boundary_commit(
+            ctx=ctx,
+            verified_tail_lens_cpu=verified_tail_lens_cpu,
+            accepted_token_counts_cpu=accepted_token_counts_cpu,
+        )
         ctx.state_adapter.commit_after_verify(
             state_cache=ctx.state_cache,
             state_input_indices=ctx.state_input_indices,
@@ -136,6 +147,7 @@ class DVRLinearStateLifecycle:
             verified_tail_lens=verified_tail_lens,
             accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
+            boundary_already_tracked=boundary_already_tracked,
         )
 
         for req, verified_tail_len, accepted_token_num in zip(
@@ -152,6 +164,7 @@ class DVRLinearStateLifecycle:
                 )
         self.boundary_backup = None
         self.live_backup = None
+        self.suffix_replay_boundary_track_mask = None
 
     def has_dvr_state(self, batch: ScheduleBatch) -> bool:
         state_adapter = self.state_adapter()
@@ -164,11 +177,12 @@ class DVRLinearStateLifecycle:
                 self.boundary_seqlen.pop(rid, None)
                 self.boundary_track_idx.pop(rid, None)
 
-        for req in batch.reqs:
+        seq_lens_cpu = self.batch_seq_lens_cpu(batch)
+        for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True):
             recorded_boundary = self.boundary_seqlen.get(req.rid)
             if recorded_boundary is None:
                 continue
-            current_boundary, _ = self.boundary_and_tail(req)
+            current_boundary, _ = self.boundary_and_tail_for_seq_len(int(seq_len))
             if (
                 req.rid not in self.boundary_track_idx
                 or recorded_boundary != current_boundary
@@ -215,10 +229,27 @@ class DVRLinearStateLifecycle:
         verified_tail_len = (req.seqlen - 1) - boundary_seqlen
         return boundary_seqlen, verified_tail_len
 
+    @staticmethod
+    def boundary_and_tail_for_seq_len(seq_len: int) -> Tuple[int, int]:
+        boundary_seqlen = (seq_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+        verified_tail_len = seq_len - boundary_seqlen
+        return boundary_seqlen, verified_tail_len
+
+    @staticmethod
+    def batch_seq_lens_cpu(batch: ScheduleBatch) -> List[int]:
+        if batch.seq_lens_cpu is not None:
+            return [int(x) for x in batch.seq_lens_cpu.tolist()]
+        return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
+
     def current_prefill_checkpoint_track_idx(
-        self, batch: ScheduleBatch, req, state_adapter
+        self,
+        batch: ScheduleBatch,
+        req,
+        state_adapter,
+        boundary_seqlen: Optional[int] = None,
     ) -> Optional[int]:
-        boundary_seqlen, _ = self.boundary_and_tail(req)
+        if boundary_seqlen is None:
+            boundary_seqlen, _ = self.boundary_and_tail(req)
         assert boundary_seqlen % FLA_CHUNK_SIZE == 0
         return state_adapter.get_current_prefill_checkpoint_track_idx(
             batch=batch, req=req, boundary_seqlen=boundary_seqlen
@@ -276,7 +307,7 @@ class DVRLinearStateLifecycle:
     ) -> Tuple[Optional[torch.Tensor], Optional[DVRBoundaryReplayTask]]:
         assert boundary_seqlen % FLA_CHUNK_SIZE == 0
         checkpoint_track_idx = self.current_prefill_checkpoint_track_idx(
-            batch, req, state_adapter
+            batch, req, state_adapter, boundary_seqlen
         )
         if checkpoint_track_idx is not None:
             # Normal prefill already wrote the chunk-aligned state into the
@@ -341,9 +372,12 @@ class DVRLinearStateLifecycle:
         zero_boundary_indices = []
         reset_pos_indices = []
         reset_pos_values = []
-        for i, req in enumerate(batch.reqs):
+        seq_lens_cpu = self.batch_seq_lens_cpu(batch)
+        for i, (req, seq_len) in enumerate(zip(batch.reqs, seq_lens_cpu, strict=True)):
             if req.rid not in self.boundary_seqlen:
-                boundary_seqlen, verified_tail_len = self.boundary_and_tail(req)
+                boundary_seqlen, verified_tail_len = self.boundary_and_tail_for_seq_len(
+                    int(seq_len)
+                )
                 reset_pos_indices.append(ctx.state_input_indices[i])
                 reset_pos_values.append(verified_tail_len)
                 zero_boundary_idx, replay_task = self.init_boundary_for_req(
@@ -381,12 +415,20 @@ class DVRLinearStateLifecycle:
         if ctx is None:
             return
         task_rids = {task.req.rid for task in tasks}
+        seq_lens_by_rid = {
+            req.rid: int(seq_len)
+            for req, seq_len in zip(
+                batch.reqs, self.batch_seq_lens_cpu(batch), strict=True
+            )
+        }
         state_input_indices = []
         tail_lens = []
         for i, req in enumerate(batch.reqs):
             if req.rid not in task_rids:
                 continue
-            _, verified_tail_len = self.boundary_and_tail(req)
+            seq_len = seq_lens_by_rid[req.rid]
+            boundary = self.boundary_seqlen[req.rid]
+            verified_tail_len = seq_len - boundary
             state_input_indices.append(ctx.state_input_indices[i])
             tail_lens.append(verified_tail_len)
         if not state_input_indices:
@@ -411,3 +453,142 @@ class DVRLinearStateLifecycle:
                 live_indices=ctx.live_indices,
             )
         )
+
+    def boundary_lens_for_replay(self, batch: ScheduleBatch, seq_lens_cpu) -> List[int]:
+        boundary_lens = []
+        for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True):
+            boundary = self.boundary_seqlen.get(req.rid)
+            if boundary is None:
+                raise RuntimeError(
+                    "DVR suffix replay requires a prepared chunk-boundary "
+                    f"checkpoint: rid={req.rid}, seq_len={int(seq_len)}."
+                )
+            if boundary > int(seq_len):
+                raise RuntimeError(
+                    "DVR suffix replay boundary is ahead of the batch prefix: "
+                    f"rid={req.rid}, boundary={boundary}, seq_len={int(seq_len)}."
+                )
+            boundary_lens.append(int(boundary))
+        return boundary_lens
+
+    def restore_boundary_state_for_suffix_replay(self, ctx: DVRLinearStateContext):
+        """Make live recurrent slots start exactly at DVR chunk boundaries.
+
+        Target verify uses the boundary SSM state together with the draft-start
+        conv state.  A deterministic suffix EXTEND oracle instead replays the
+        unclosed prefill tail, so both temporal and conv state must come from the
+        chunk-boundary checkpoint before the EXTEND forward runs.
+        """
+
+        assert ctx.boundary_indices is not None
+        boundary_backup = self.boundary_backup
+        if boundary_backup is None:
+            boundary_backup = ctx.state_adapter.backup_recurrent_state(
+                state_cache=ctx.state_cache,
+                indices=ctx.boundary_indices,
+            )
+        ctx.state_adapter.restore_recurrent_state(
+            state_cache=ctx.state_cache,
+            backup=boundary_backup,
+            indices=ctx.live_indices,
+        )
+
+    def set_suffix_replay_boundary_track_mask(
+        self, mask: Optional[torch.Tensor]
+    ) -> None:
+        self.suffix_replay_boundary_track_mask = None if mask is None else mask.detach()
+
+    @staticmethod
+    def suffix_replay_boundary_track_info(
+        boundary_lens, extend_lens_cpu, *, device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the extra-buffer tracking request for suffix EXTEND replay.
+
+        DVR only needs the next chunk-boundary checkpoint.  When the replayed
+        suffix extends past that boundary, the aligned boundary is not the final
+        EXTEND position; pass ``boundary + chunk + 1`` so the hybrid backend
+        retrieves the checkpoint from its chunk-intermediate ``h`` buffer rather
+        than from the final recurrent state.
+        """
+
+        track_mask = []
+        track_seqlens = []
+        for boundary, extend_len in zip(boundary_lens, extend_lens_cpu, strict=True):
+            boundary = int(boundary)
+            extend_len = int(extend_len)
+            should_track = extend_len >= FLA_CHUNK_SIZE
+            track_mask.append(should_track)
+            if not should_track:
+                track_seqlens.append(boundary)
+            elif extend_len == FLA_CHUNK_SIZE:
+                track_seqlens.append(boundary + FLA_CHUNK_SIZE)
+            else:
+                # Magic but intentional: the hybrid backend treats aligned
+                # track lengths as "copy final recurrent state".  A suffix
+                # replay longer than one chunk has a final state past the next
+                # DVR boundary, so make the requested length unaligned to force
+                # the backend to copy that boundary from its intermediate h.
+                track_seqlens.append(boundary + FLA_CHUNK_SIZE + 1)
+
+        return (
+            torch.tensor(track_mask, dtype=torch.bool, device=device),
+            torch.tensor(track_seqlens, dtype=torch.long, device=device),
+        )
+
+    @staticmethod
+    def _select_recurrent_backup(
+        backup: DVRRecurrentStateBackup, indices: torch.Tensor
+    ) -> DVRRecurrentStateBackup:
+        data_indices = indices.to(device=backup.temporal.device, dtype=torch.long)
+        meta_indices = indices.to(device=backup.indices.device, dtype=torch.long)
+        return DVRRecurrentStateBackup(
+            conv=tuple(conv[:, data_indices].clone() for conv in backup.conv),
+            temporal=backup.temporal[:, data_indices].clone(),
+            indices=backup.indices[meta_indices].clone(),
+        )
+
+    def restore_boundary_backup_for_mask(
+        self, ctx: DVRLinearStateContext, mask: torch.Tensor
+    ) -> None:
+        if self.boundary_backup is None:
+            return
+        selected_cpu = torch.nonzero(mask.detach().cpu(), as_tuple=True)[0]
+        if selected_cpu.numel() == 0:
+            return
+        backup = self._select_recurrent_backup(self.boundary_backup, selected_cpu)
+        selected = selected_cpu.to(device=ctx.boundary_indices.device, dtype=torch.long)
+        ctx.state_adapter.restore_recurrent_state(
+            state_cache=ctx.state_cache,
+            backup=backup,
+            indices=ctx.boundary_indices[selected],
+        )
+
+    def prepare_suffix_replay_boundary_commit(
+        self,
+        *,
+        ctx: DVRLinearStateContext,
+        verified_tail_lens_cpu,
+        accepted_token_counts_cpu,
+    ) -> Optional[torch.Tensor]:
+        tracked = self.suffix_replay_boundary_track_mask
+        if tracked is None:
+            return None
+        tracked = tracked.to(device=ctx.live_indices.device, dtype=torch.bool)
+        # Suffix EXTEND replay must decide whether to write the next boundary
+        # before speculative sampling knows how many draft tokens will commit.
+        # Undo replay-written checkpoints for requests that do not actually
+        # cross the boundary; for real crossings, tell commit_after_verify not
+        # to rebuild the checkpoint from the target-verify intermediate buffer.
+        crosses = torch.tensor(
+            [
+                int(tail_len) + int(accepted_count) >= FLA_CHUNK_SIZE
+                for tail_len, accepted_count in zip(
+                    verified_tail_lens_cpu, accepted_token_counts_cpu, strict=True
+                )
+            ],
+            dtype=torch.bool,
+            device=ctx.live_indices.device,
+        )
+        self.restore_boundary_backup_for_mask(ctx, tracked & ~crosses)
+        boundary_already_tracked = tracked & crosses
+        return boundary_already_tracked if boundary_already_tracked.any() else None

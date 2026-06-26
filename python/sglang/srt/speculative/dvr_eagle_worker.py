@@ -207,6 +207,9 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         self, batch: ScheduleBatch, bonus_tokens: torch.Tensor
     ) -> None:
         previous_spec_info = batch.spec_info
+        # _req_seqlen_matches_batch_prefix reads spec_info.bonus_tokens to pad
+        # req.seqlen-compatible metadata.  Prefill has the token separately, so
+        # install a short-lived EagleDraftInput and restore the real spec_info.
         batch.spec_info = EagleDraftInput(bonus_tokens=bonus_tokens)
         try:
             self._prepare_dvr_boundary_for_verify(batch)
@@ -252,10 +255,9 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             if batch.seq_lens_cpu is not None
             else batch.seq_lens.detach().cpu().tolist()
         )
-        # EAGLE keeps a bonus/root token one step ahead of the committed target
-        # KV/recurrent prefix.  Until the chunk-boundary suffix oracle models
-        # that lead exactly, use full prefill replay for the verifier logits.
-        boundary_lens = [0 for _ in batch.reqs]
+        boundary_lens = self.linear_state.boundary_lens_for_replay(
+            batch, base_seq_lens_cpu
+        )
         tail_lens_cpu = [
             int(seq_len) - int(boundary)
             for seq_len, boundary in zip(
@@ -314,7 +316,18 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         draft_rows = batch.req_pool_indices.to(torch.long).unsqueeze(1).expand_as(
             draft_offsets
         )
+        possible_boundary_track, boundary_track_seqlens = (
+            self.linear_state.suffix_replay_boundary_track_info(
+                boundary_lens,
+                extend_lens_cpu,
+                device=batch.seq_lens.device,
+            )
+        )
 
+        # ForwardBatch.init_new reads many mutable ScheduleBatch fields.  The
+        # oracle below temporarily reinterprets the live verify batch as an
+        # ordinary EXTEND over "tail + draft", then restores every touched field
+        # in finally so the scheduler still sees the original TARGET_VERIFY.
         saved_fields = {
             "forward_mode": batch.forward_mode,
             "global_forward_mode": batch.global_forward_mode,
@@ -347,9 +360,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         }
 
         try:
-            state_adapter.zero_recurrent_state(
-                state_cache=state_cache, indices=live_indices
-            )
+            self.linear_state.restore_boundary_state_for_suffix_replay(linear_state_ctx)
 
             batch.forward_mode = ForwardMode.EXTEND
             batch.global_forward_mode = None
@@ -383,15 +394,34 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             batch.return_hidden_states = False
             batch.return_hidden_states_before_norm = False
             batch.return_logprob = False
-            batch.mamba_track_indices = None
-            batch.mamba_track_mask = None
-            batch.mamba_track_seqlens = None
-            # Full replay starts from DVR-managed recurrent state. Do not
+            if possible_boundary_track.any():
+                # Reuse the normal EXTEND mamba tracker to materialize the next
+                # chunk checkpoint while replaying the suffix.  Sampling may
+                # later reject before that boundary; commit_after_verify will
+                # roll back those speculative checkpoint writes.
+                batch.mamba_track_indices = boundary_indices.to(
+                    device=batch.seq_lens.device, dtype=torch.long
+                )
+                batch.mamba_track_mask = possible_boundary_track
+                batch.mamba_track_seqlens = boundary_track_seqlens
+                self.linear_state.set_suffix_replay_boundary_track_mask(
+                    possible_boundary_track
+                )
+            else:
+                batch.mamba_track_indices = None
+                batch.mamba_track_mask = None
+                batch.mamba_track_seqlens = None
+                self.linear_state.set_suffix_replay_boundary_track_mask(None)
+            # Suffix replay starts from DVR-managed recurrent state. Do not
             # re-apply cached-prefix deferred Mamba COW/clear ops that were
             # already consumed by the real prefill/verify forward.
             batch.mamba_cow_src_indices = None
             batch.mamba_cow_dst_indices = None
             batch.mamba_clear_indices = None
+            # The suffix EXTEND must see draft KV at absolute positions
+            # base_seq_len..base_seq_len+draft.  These are the same slots the
+            # real verify path owns, so publishing them in req_to_token_pool is
+            # intentional even though the rest of ScheduleBatch is restored.
             batch.req_to_token_pool.write(
                 (draft_rows, draft_offsets),
                 draft_cache_locs.to(torch.int32),
@@ -590,6 +620,17 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                     self.target_worker,
                 )
             )
+        force_eager_target_verify = can_run_cuda_graph and self.plan_stream is not None
+        if force_eager_target_verify:
+            # The generic EAGLE target-verify graph can read padded DVR GDN
+            # state-input rows under overlap.  Keep draft graphs enabled, but
+            # run target verify eagerly so DVR's real batch shape owns metadata
+            # and recurrent commit buffers.
+            # `can_run_cuda_graph` is only a local worker flag; model_runner
+            # recomputes graph eligibility, so the actual guard is the scoped
+            # graph_runner swap below.
+            can_run_cuda_graph = False
+            verify_forward_batch.forward_metadata_ready = False
 
         record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
@@ -622,21 +663,34 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             ).cpu()
 
         linear_state_ctx = None
-        oracle_output = None
         with self._req_seqlen_matches_batch_prefix(batch):
             linear_state_ctx = self.linear_state.restore_for_verify(batch)
-            oracle_output = self._target_suffix_extend_verify_output(
-                batch=batch,
-                verify_input=verify_input,
-                linear_state_ctx=linear_state_ctx,
-            )
 
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
+        target_runner = self.target_worker.model_runner
+        saved_graph_runner = (
+            target_runner.graph_runner if force_eager_target_verify else None
         )
+        if saved_graph_runner is not None:
+            # model_runner._forward_raw checks target_runner.graph_runner
+            # directly.  Hide it only for this target verify call; draft and
+            # draft-extend graph runners are owned by the draft worker and stay
+            # enabled.
+            target_runner.graph_runner = None
+        try:
+            forward_batch_output = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+            )
+        finally:
+            if saved_graph_runner is not None:
+                target_runner.graph_runner = saved_graph_runner
         logits_output = forward_batch_output.logits_output
+        oracle_output = self._target_suffix_extend_verify_output(
+            batch=batch,
+            verify_input=verify_input,
+            linear_state_ctx=linear_state_ctx,
+        )
         if oracle_output is not None:
             oracle_logits, oracle_hidden_states = oracle_output
             logits_output.next_token_logits = oracle_logits
