@@ -26,7 +26,10 @@ def dvr_causal_verify_cuda_graph_metadata(
 
     old_custom_mask = getattr(spec_info, "custom_mask", None)
     should_clear_custom_mask = (
-        model_runner.spec_algorithm.is_decode_verify_rollback_self_draft()
+        (
+            model_runner.spec_algorithm.is_decode_verify_rollback_self_draft()
+            or getattr(model_runner, "enable_dvr_target_verify_cuda_graph", False)
+        )
         and forward_mode.is_target_verify()
         and spec_info is not None
     )

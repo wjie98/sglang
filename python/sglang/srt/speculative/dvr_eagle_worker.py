@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+
 import torch
 from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
@@ -9,6 +11,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.model_executor.dvr_eagle_verify_cuda_graph_runner import (
+    DVREagleTargetVerifyCudaGraphRunner,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -32,6 +37,21 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
+
+
+_ATTN_BACKEND_CHILD_ATTRS = (
+    "decode_backend",
+    "prefill_backend",
+    "full_attn_backend",
+    "linear_attn_backend",
+    "primary",
+)
+_ATTN_BACKEND_CHILD_LIST_ATTRS = (
+    "attn_backend_list",
+    "attn_backends",
+    "backends",
+    "children",
+)
 
 
 class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
@@ -68,6 +88,87 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             model_runner=self.model_runner,
         )
         self._dvr_eagle_replay_output_ids = {}
+        self.cuda_graph_runner_for_target_verify = None
+        if not self.server_args.disable_cuda_graph and (
+            self.server_args.model_impl != "mindspore"
+        ):
+            self.cuda_graph_runner_for_target_verify = (
+                DVREagleTargetVerifyCudaGraphRunner(self)
+            )
+
+    @contextmanager
+    def _target_verify_graph_runner_context(self):
+        target_runner = self.target_worker.model_runner
+        runner = self.cuda_graph_runner_for_target_verify
+        if runner is None and self.plan_stream is None:
+            yield
+            return
+
+        saved_graph_runner = target_runner.graph_runner
+        # Overlap target verify previously had to hide the generic EAGLE graph
+        # because its padded metadata does not understand DVR GDN state-input
+        # windows.  Prefer the DVR-EAGLE graph when captured; if capture is
+        # disabled, keep the old eager fallback by installing None only inside
+        # this scoped target-verify window.
+        target_runner.graph_runner = runner
+        try:
+            yield
+        finally:
+            target_runner.graph_runner = saved_graph_runner
+
+    @contextmanager
+    def _target_verify_prepare_context(self):
+        use_plan_stream = (
+            self.plan_stream is not None
+            and self.cuda_graph_runner_for_target_verify is None
+        )
+        # The dedicated DVR-EAGLE target-verify graph replays GDN state-input
+        # and commit-buffer side effects.  Preparing its graph buffers on the
+        # overlap plan stream can race with the graph replay on CUDA even after
+        # a stream wait, so keep this graph's replay_prepare on the compute
+        # stream.  If the dedicated graph is unavailable, preserve the previous
+        # plan-stream eager fallback.
+        stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
+        with stream_ctx, self._target_verify_graph_runner_context():
+            yield use_plan_stream
+
+    def _target_verify_graph_runner_bs(self, can_run_cuda_graph: bool):
+        if not can_run_cuda_graph:
+            return None
+        runner = (
+            self.cuda_graph_runner_for_target_verify
+            or self.target_worker.model_runner.graph_runner
+        )
+        return None if runner is None else runner.bs
+
+    def _iter_target_attention_backends(self):
+        seen = set()
+        stack = [self.target_worker.model_runner.attn_backend]
+        while stack:
+            backend = stack.pop()
+            if backend is None or id(backend) in seen:
+                continue
+            seen.add(id(backend))
+            yield backend
+
+            for attr_name in _ATTN_BACKEND_CHILD_ATTRS:
+                stack.append(getattr(backend, attr_name, None))
+            for attr_name in _ATTN_BACKEND_CHILD_LIST_ATTRS:
+                stack.extend(getattr(backend, attr_name, None) or ())
+
+    def _update_verify_buffers_to_fill_after_draft(
+        self, verify_input: DVREagleVerifyInput, can_run_cuda_graph: bool
+    ):
+        cuda_graph_bs = self._target_verify_graph_runner_bs(can_run_cuda_graph)
+        for backend in self._iter_target_attention_backends():
+            try:
+                backend.update_verify_buffers_to_fill_after_draft(
+                    verify_input, cuda_graph_bs
+                )
+            except NotImplementedError:
+                # Hybrid wrappers only route metadata calls to their children;
+                # the real full-attention backend owns this EAGLE overlap hook.
+                continue
 
     def _as_dvr_verify_input(
         self, verify_input: EagleVerifyInput
@@ -612,7 +713,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
-        with self.plan_stream_ctx:
+        with self._target_verify_prepare_context() as prepared_on_plan_stream:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
@@ -620,21 +721,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                     self.target_worker,
                 )
             )
-        force_eager_target_verify = can_run_cuda_graph and self.plan_stream is not None
-        if force_eager_target_verify:
-            # The generic EAGLE target-verify graph can read padded DVR GDN
-            # state-input rows under overlap.  Keep draft graphs enabled, but
-            # run target verify eagerly so DVR's real batch shape owns metadata
-            # and recurrent commit buffers.
-            # `can_run_cuda_graph` is only a local worker flag; model_runner
-            # recomputes graph eligibility, so the actual guard is the scoped
-            # graph_runner swap below.
-            can_run_cuda_graph = False
-            verify_forward_batch.forward_metadata_ready = False
 
         record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
-        if self.plan_stream:
+        if prepared_on_plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
@@ -649,10 +739,8 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                     self.target_worker.model_runner, batch
                 )
 
-            target_runner = self.target_worker.model_runner
-            target_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
-                verify_input,
-                target_runner.graph_runner.bs if can_run_cuda_graph else None,
+            self._update_verify_buffers_to_fill_after_draft(
+                verify_input, can_run_cuda_graph
             )
 
         if batch.has_grammar:
@@ -666,25 +754,12 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         with self._req_seqlen_matches_batch_prefix(batch):
             linear_state_ctx = self.linear_state.restore_for_verify(batch)
 
-        target_runner = self.target_worker.model_runner
-        saved_graph_runner = (
-            target_runner.graph_runner if force_eager_target_verify else None
-        )
-        if saved_graph_runner is not None:
-            # model_runner._forward_raw checks target_runner.graph_runner
-            # directly.  Hide it only for this target verify call; draft and
-            # draft-extend graph runners are owned by the draft worker and stay
-            # enabled.
-            target_runner.graph_runner = None
-        try:
+        with self._target_verify_graph_runner_context():
             forward_batch_output = self.target_worker.forward_batch_generation(
                 batch=None,
                 forward_batch=verify_forward_batch,
                 is_verify=True,
             )
-        finally:
-            if saved_graph_runner is not None:
-                target_runner.graph_runner = saved_graph_runner
         logits_output = forward_batch_output.logits_output
         oracle_output = self._target_suffix_extend_verify_output(
             batch=batch,
