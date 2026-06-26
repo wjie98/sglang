@@ -2811,7 +2811,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         draft_token_num=self.server_args.speculative_num_draft_tokens,
                         capture_hidden_mode=(
                             CaptureHiddenMode.NULL
-                            if self.spec_algorithm.is_decode_verify_rollback()
+                            if self.spec_algorithm.is_decode_verify_rollback_self_draft()
                             else CaptureHiddenMode.FULL
                         ),
                         seq_lens_sum=None,

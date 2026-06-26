@@ -204,6 +204,31 @@ class DVRStateInputWindow:
         for cache, value in zip(self.tensors(), values.tensors(), strict=True):
             cache[indices, cols] = value
 
+    def zero_after_lens(self, *, indices: torch.Tensor, keep_lens: torch.Tensor):
+        """Clear stale rolling-window columns after each request's live suffix."""
+
+        indices = indices.to(device=self.tensors()[0].device, dtype=torch.long)
+        keep_lens = keep_lens.to(device=indices.device, dtype=torch.long)
+        cols = torch.arange(self.capacity, dtype=torch.long, device=indices.device)
+        stale = cols.unsqueeze(0) >= keep_lens.unsqueeze(1)
+
+        has_layer_dim = (
+            self.tail_lens_cache is not None and self.tail_lens_cache.dim() == 2
+        )
+        for cache in self.tensors():
+            if has_layer_dim:
+                rows = cache[:, indices]
+                mask_shape = (1,) + stale.shape + (1,) * (rows.dim() - 3)
+                cache[:, indices] = torch.where(
+                    stale.view(mask_shape), torch.zeros_like(rows), rows
+                )
+            else:
+                rows = cache[indices]
+                mask_shape = stale.shape + (1,) * (rows.dim() - 2)
+                cache[indices] = torch.where(
+                    stale.view(mask_shape), torch.zeros_like(rows), rows
+                )
+
     def shift_after_boundary(
         self,
         *,

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import fields
 from typing import List, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -51,7 +52,33 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
-class DVRVerifyInput(EagleVerifyInput):
+class DVRTargetVerifyMixin:
+    """DVR target-verify CUDA graph fixups shared by DVR draft variants."""
+
+    @classmethod
+    def from_eagle_verify_input(cls, verify_input: EagleVerifyInput):
+        """Preserve EAGLE draft metadata while swapping in DVR verify hooks."""
+
+        return cls(
+            **{
+                field.name: getattr(verify_input, field.name)
+                for field in fields(EagleVerifyInput)
+            }
+        )
+
+    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
+        if not graph_runner.capture_forward_mode.is_target_verify():
+            return
+        # The generic num_token_non_padded slot is enabled only for EP. GDN DVR
+        # verify also needs the raw token count to mask padded graph rows.
+        graph_runner.buffers.num_token_non_padded.fill_(raw_num_token)
+
+
+class DVREagleVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
+    """DVR target verify with a standard EAGLE target-only sampler."""
+
+
+class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
     """DVR verify input with classic chain speculative sampling.
 
     Shared EAGLE verification is target-only. DVR self-draft records the draft
@@ -65,12 +92,8 @@ class DVRVerifyInput(EagleVerifyInput):
             return super()._sampling_fn_and_draft_probs(target_probs, batch)
         return chain_speculative_sampling, self.draft_probs
 
-    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
-        if not graph_runner.capture_forward_mode.is_target_verify():
-            return
-        # The generic num_token_non_padded slot is enabled only for EP. GDN DVR
-        # verify also needs the raw token count to mask padded graph rows.
-        graph_runner.buffers.num_token_non_padded.fill_(raw_num_token)
+
+DVRVerifyInput = DVRSelfDraftVerifyInput
 
 
 class DecodeVerifyRollbackWorker:
@@ -329,11 +352,6 @@ class DecodeVerifyRollbackWorker:
 
     @staticmethod
     def _request_token_ids_for_replay(req, boundary_seqlen: int):
-        if getattr(req, "multimodal_inputs", None) is not None:
-            raise RuntimeError(
-                "DVR boundary fallback replay does not support multimodal inputs yet."
-            )
-
         token_ids = req.origin_input_ids + req.output_ids
         if len(token_ids) >= boundary_seqlen:
             return token_ids
@@ -551,7 +569,7 @@ class DecodeVerifyRollbackWorker:
         )
         draft_tokens = draft_tokens.to(torch.long)
 
-        return DVRVerifyInput(
+        return DVRSelfDraftVerifyInput(
             draft_token=draft_tokens,
             # DVR uses topk=1 chain verify. The tree builder is still reused
             # for token order/retrieve metadata, but attention itself should
@@ -791,6 +809,202 @@ class DecodeVerifyRollbackWorker:
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
 
+    def _target_full_replay_verify_logits(
+        self,
+        *,
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+        linear_state_ctx,
+    ) -> Optional[torch.Tensor]:
+        """Compute target verifier logits with deterministic full-prefix replay.
+
+        The ordinary TARGET_VERIFY forward still runs first so DVR can commit
+        accepted recurrent states.  This oracle is used only for sampling and
+        returned logprobs, where exact prefill equivalence is required.
+        """
+
+        if batch.forward_mode.is_idle() or linear_state_ctx is None:
+            return None
+
+        state_adapter = linear_state_ctx.state_adapter
+        state_cache = linear_state_ctx.state_cache
+        live_indices = linear_state_ctx.live_indices
+
+        bs = len(batch.seq_lens)
+        draft_token_num = spec_info.draft_token_num
+        base_seq_lens_cpu = (
+            spec_info.seq_lens_cpu.tolist()
+            if getattr(spec_info, "seq_lens_cpu", None) is not None
+            else (
+                batch.seq_lens_cpu.tolist()
+                if batch.seq_lens_cpu is not None
+                else batch.seq_lens.detach().cpu().tolist()
+            )
+        )
+        extend_lens_cpu = [int(seq_len) + draft_token_num for seq_len in base_seq_lens_cpu]
+        final_seq_lens_cpu = [
+            int(seq_len) + draft_token_num for seq_len in base_seq_lens_cpu
+        ]
+
+        input_ids = []
+        out_cache_locs = []
+        draft_tokens = spec_info.draft_token.reshape(bs, draft_token_num)
+        draft_cache_locs = batch.out_cache_loc.reshape(bs, draft_token_num)
+        for req_i, (req, seq_len) in enumerate(
+            zip(batch.reqs, base_seq_lens_cpu, strict=True)
+        ):
+            token_ids = self._request_token_ids_for_replay(req, int(seq_len))
+            input_ids.extend(token_ids[: int(seq_len)])
+            input_ids.extend(draft_tokens[req_i].detach().cpu().tolist())
+            if int(seq_len) > 0:
+                out_cache_locs.append(
+                    batch.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, : int(seq_len)
+                    ].to(torch.long)
+                )
+            out_cache_locs.append(draft_cache_locs[req_i].to(torch.long))
+
+        if not input_ids:
+            return None
+
+        saved_tail_lens = state_adapter.state_input_tail_lens(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+        if saved_tail_lens is not None:
+            saved_tail_lens = saved_tail_lens.clone()
+
+        verify_ready_live_backup = state_adapter.backup_recurrent_state(
+            state_cache=state_cache,
+            indices=live_indices,
+        )
+        draft_offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
+            draft_token_num, dtype=torch.long, device=batch.seq_lens.device
+        ).unsqueeze(0)
+        draft_rows = batch.req_pool_indices.to(torch.long).unsqueeze(1).expand_as(
+            draft_offsets
+        )
+
+        saved_fields = {
+            "forward_mode": batch.forward_mode,
+            "global_forward_mode": batch.global_forward_mode,
+            "input_ids": batch.input_ids,
+            "input_embeds": batch.input_embeds,
+            "replace_embeds": batch.replace_embeds,
+            "replace_positions": batch.replace_positions,
+            "out_cache_loc": batch.out_cache_loc,
+            "seq_lens": batch.seq_lens,
+            "seq_lens_cpu": batch.seq_lens_cpu,
+            "seq_lens_sum": batch.seq_lens_sum,
+            "prefix_lens": batch.prefix_lens,
+            "extend_lens": batch.extend_lens,
+            "extend_num_tokens": batch.extend_num_tokens,
+            "extend_logprob_start_lens": batch.extend_logprob_start_lens,
+            "is_extend_in_batch": batch.is_extend_in_batch,
+            "all_extend_in_batch": batch.all_extend_in_batch,
+            "spec_info": batch.spec_info,
+            "capture_hidden_mode": batch.capture_hidden_mode,
+            "return_hidden_states": batch.return_hidden_states,
+            "return_hidden_states_before_norm": batch.return_hidden_states_before_norm,
+            "return_logprob": batch.return_logprob,
+            "mamba_track_indices": batch.mamba_track_indices,
+            "mamba_track_mask": batch.mamba_track_mask,
+            "mamba_track_seqlens": batch.mamba_track_seqlens,
+        }
+
+        try:
+            state_adapter.zero_recurrent_state(
+                state_cache=state_cache, indices=live_indices
+            )
+
+            batch.forward_mode = ForwardMode.EXTEND
+            batch.global_forward_mode = None
+            batch.input_ids = torch.tensor(
+                input_ids, dtype=torch.long, device=batch.seq_lens.device
+            )
+            batch.input_embeds = None
+            batch.replace_embeds = None
+            batch.replace_positions = None
+            batch.out_cache_loc = torch.cat(out_cache_locs).to(
+                device=batch.seq_lens.device
+            )
+            batch.prefix_lens = [0 for _ in batch.reqs]
+            batch.extend_lens = [int(x) for x in extend_lens_cpu]
+            batch.extend_num_tokens = len(input_ids)
+            batch.extend_logprob_start_lens = [int(x) for x in extend_lens_cpu]
+            batch.seq_lens = torch.tensor(
+                final_seq_lens_cpu,
+                dtype=torch.long,
+                device=saved_fields["seq_lens"].device,
+            )
+            batch.seq_lens_cpu = torch.tensor(
+                final_seq_lens_cpu,
+                dtype=torch.long,
+            )
+            batch.seq_lens_sum = sum(final_seq_lens_cpu)
+            batch.is_extend_in_batch = True
+            batch.all_extend_in_batch = True
+            batch.spec_info = None
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            batch.return_hidden_states = False
+            batch.return_hidden_states_before_norm = False
+            batch.return_logprob = False
+            batch.mamba_track_indices = None
+            batch.mamba_track_mask = None
+            batch.mamba_track_seqlens = None
+            batch.req_to_token_pool.write(
+                (draft_rows, draft_offsets),
+                draft_cache_locs.to(torch.int32),
+            )
+
+            forward_batch = ForwardBatch.init_new(batch, self.target_worker.model_runner)
+            oracle_output = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=forward_batch,
+                is_verify=True,
+            )
+            hidden_states = oracle_output.logits_output.hidden_states
+            if hidden_states is None:
+                raise RuntimeError(
+                    "DVR full replay verifier did not return hidden states."
+                )
+
+            gather_indices = []
+            offset = 0
+            for seq_len, extend_len in zip(
+                base_seq_lens_cpu, extend_lens_cpu, strict=True
+            ):
+                gather_indices.extend(
+                    range(offset + int(seq_len), offset + int(seq_len) + draft_token_num)
+                )
+                offset += extend_len
+            gather_indices_t = torch.tensor(
+                gather_indices, dtype=torch.long, device=hidden_states.device
+            )
+            draft_hidden_states = hidden_states[gather_indices_t]
+
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.next_token_logits_buffer = None
+            return self.target_worker.model_runner.model.logits_processor._get_logits(
+                draft_hidden_states,
+                self.target_worker.model_runner.model.lm_head,
+                logits_metadata,
+            )
+        finally:
+            state_adapter.restore_recurrent_state(
+                state_cache=state_cache,
+                backup=verify_ready_live_backup,
+                indices=live_indices,
+            )
+            if saved_tail_lens is not None:
+                state_adapter.set_state_input_tail_lens(
+                    state_cache=state_cache,
+                    state_input_indices=linear_state_ctx.state_input_indices,
+                    tail_lens=saved_tail_lens,
+                )
+            for name, value in saved_fields.items():
+                setattr(batch, name, value)
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -818,6 +1032,13 @@ class DecodeVerifyRollbackWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
+        oracle_logits = self._target_full_replay_verify_logits(
+            batch=batch,
+            spec_info=spec_info,
+            linear_state_ctx=linear_state_ctx,
+        )
+        if oracle_logits is not None:
+            logits_output.next_token_logits = oracle_logits
         maybe_detect_nan(logits_output.next_token_logits, "dvr target verify")
 
         spec_info.hidden_states = (

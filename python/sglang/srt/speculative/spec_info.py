@@ -34,6 +34,7 @@ class SpeculativeAlgorithm(Enum):
 
     DFLASH = auto()
     DECODE_VERIFY_ROLLBACK = auto()
+    DECODE_VERIFY_ROLLBACK_EAGLE = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -98,6 +99,7 @@ class SpeculativeAlgorithm(Enum):
         return self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
             SpeculativeAlgorithm.FROZEN_KV_MTP,
         )
 
@@ -111,7 +113,16 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DFLASH
 
     def is_decode_verify_rollback(self) -> bool:
+        return self in (
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
+        )
+
+    def is_decode_verify_rollback_self_draft(self) -> bool:
         return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+
+    def is_decode_verify_rollback_eagle(self) -> bool:
+        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -197,7 +208,14 @@ class SpeculativeAlgorithm(Enum):
 
             return FrozenKVMTPWorker
 
-        if self.is_decode_verify_rollback():
+        if self.is_decode_verify_rollback_eagle():
+            from sglang.srt.speculative.dvr_eagle_worker import (
+                DecodeVerifyRollbackEagleWorkerV2,
+            )
+
+            return DecodeVerifyRollbackEagleWorkerV2
+
+        if self.is_decode_verify_rollback_self_draft():
             if enable_overlap:
                 from sglang.srt.speculative.dvr_worker_v2 import (
                     DecodeVerifyRollbackWorkerV2,

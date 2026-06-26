@@ -20,7 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
 from sglang.srt.speculative.dvr_worker import (
-    DVRVerifyInput,
+    DVRSelfDraftVerifyInput,
     DecodeVerifyRollbackWorker,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -58,6 +58,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         self.speculative_num_steps = self.num_draft_steps
         self.speculative_num_draft_tokens = self.num_draft_tokens
         self.draft_runner = self.model_runner
+        self._dvr_v2_replay_output_ids = {}
 
     @property
     def draft_worker(self):
@@ -88,6 +89,49 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         return self.req_to_token_pool.req_to_token[req_pool_indices, offsets].reshape(
             -1
         )
+
+    def _v2_replay_stream(self, req) -> list[int]:
+        stream = self._dvr_v2_replay_output_ids.setdefault(
+            req.rid, list(req.output_ids)
+        )
+        if len(stream) < len(req.output_ids):
+            stream[:] = list(req.output_ids)
+        return stream
+
+    def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
+        origin_input_ids = list(req.origin_input_ids)
+        output_len = boundary_seqlen - len(origin_input_ids)
+        if output_len <= 0:
+            return origin_input_ids[:boundary_seqlen]
+
+        replay_output_ids = self._v2_replay_stream(req)
+        if len(replay_output_ids) >= output_len:
+            return origin_input_ids + replay_output_ids[:output_len]
+
+        token_ids = origin_input_ids + req.output_ids
+        if len(token_ids) >= boundary_seqlen:
+            return token_ids
+
+        if hasattr(req, "get_fill_ids"):
+            fill_ids = req.get_fill_ids()
+            if len(fill_ids) >= boundary_seqlen:
+                return fill_ids
+
+        raise RuntimeError(
+            "DVR spec-v2 replay cannot reconstruct the verified prefix: "
+            f"rid={req.rid}, origin_tokens={len(origin_input_ids)}, "
+            f"req_output_tokens={len(req.output_ids)}, "
+            f"tracked_output_tokens={len(replay_output_ids)}, "
+            f"boundary_seqlen={boundary_seqlen}."
+        )
+
+    def _advance_v2_replay_prefix(self, batch: ScheduleBatch, tokens_per_req) -> None:
+        if batch.forward_mode.is_idle() or batch.reqs is None:
+            return
+
+        for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
+            stream = self._v2_replay_stream(req)
+            stream.extend(int(token_id) for token_id in token_ids)
 
     @contextmanager
     def _req_seqlen_matches_batch_prefix(self, batch: ScheduleBatch):
@@ -168,6 +212,10 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         batch_result = self.target_worker.forward_batch_generation(batch)
         batch_result.new_seq_lens = batch.seq_lens
         next_token_ids = batch_result.next_token_ids
+        self._advance_v2_replay_prefix(
+            batch,
+            [[token_id] for token_id in next_token_ids.detach().cpu().tolist()],
+        )
         topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
         batch_result.next_draft_input = EagleDraftInput(
             hidden_states=self._dummy_hidden_states(
@@ -251,7 +299,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             tree_mask_mode=TreeMaskMode.QLEN_ONLY,
         )
 
-        return DVRVerifyInput(
+        return DVRSelfDraftVerifyInput(
             draft_token=draft_tokens.to(torch.long),
             custom_mask=None,
             positions=positions,
@@ -291,12 +339,32 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             batch, is_verify=True
         )
         logits_output = batch_result.logits_output
+        oracle_logits = self._target_full_replay_verify_logits(
+            batch=batch,
+            spec_info=spec_info,
+            linear_state_ctx=linear_state_ctx,
+        )
+        if oracle_logits is not None:
+            logits_output.next_token_logits = oracle_logits
         maybe_detect_nan(logits_output.next_token_logits, "dvr v2 target verify")
 
         predict, accept_lens, accept_index = self._sample_verify_v2(
             batch, spec_info, logits_output
         )
         new_seq_lens = scheduler_seq_lens + accept_lens
+        if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
+            predict_cpu = predict.detach().cpu().tolist()
+            accept_lens_cpu = accept_lens.detach().cpu().tolist()
+            self._advance_v2_replay_prefix(
+                batch,
+                [
+                    predict_cpu[
+                        req_i * self.num_draft_tokens : req_i * self.num_draft_tokens
+                        + int(accept_len)
+                    ]
+                    for req_i, accept_len in enumerate(accept_lens_cpu)
+                ],
+            )
 
         pending_track_indices = None
         pending_track_seqlens = None

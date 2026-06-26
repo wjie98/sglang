@@ -11,10 +11,23 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 logger = logging.getLogger(__name__)
 
 DVR_SPECULATIVE_ALGORITHM = "DECODE_VERIFY_ROLLBACK"
+DVR_EAGLE_SPECULATIVE_ALGORITHM = "DECODE_VERIFY_ROLLBACK_EAGLE"
+DVR_SPECULATIVE_ALGORITHMS = {
+    DVR_SPECULATIVE_ALGORITHM,
+    DVR_EAGLE_SPECULATIVE_ALGORITHM,
+}
 
 
 def is_dvr_enabled(server_args) -> bool:
+    return server_args.speculative_algorithm in DVR_SPECULATIVE_ALGORITHMS
+
+
+def is_dvr_self_draft_enabled(server_args) -> bool:
     return server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
+
+
+def is_dvr_eagle_enabled(server_args) -> bool:
+    return server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
 
 
 def handle_dvr_defaults(server_args):
@@ -83,8 +96,18 @@ def handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR currently does not support DP attention.")
     if server_args.disaggregation_mode != "null":
         raise ValueError("DVR currently does not support disaggregation mode.")
-    if server_args.speculative_draft_model_path is not None:
+    if (
+        is_dvr_self_draft_enabled(server_args)
+        and server_args.speculative_draft_model_path is not None
+    ):
         raise ValueError("DVR self draft does not use a draft model path.")
+    if (
+        is_dvr_eagle_enabled(server_args)
+        and server_args.speculative_draft_model_path is None
+    ):
+        raise ValueError(
+            "DVR EAGLE requires setting --speculative-draft-model-path."
+        )
 
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = 16
@@ -128,7 +151,17 @@ def handle_dvr_speculative_decoding(server_args):
             "this by explicitly setting --max-running-requests."
         )
 
-    if envs.SGLANG_ENABLE_SPEC_V2.get():
+    if is_dvr_eagle_enabled(server_args):
+        if not envs.SGLANG_ENABLE_SPEC_V2.get():
+            server_args.disable_overlap_schedule = True
+            logger.warning(
+                "Non-overlap synchronous spec v2 is used for DVR EAGLE. Set "
+                "SGLANG_ENABLE_SPEC_V2=True to use overlap scheduling."
+            )
+        else:
+            server_args.disable_overlap_schedule = False
+            logger.warning("Overlap spec v2 is enabled for DVR EAGLE.")
+    elif envs.SGLANG_ENABLE_SPEC_V2.get():
         server_args.disable_overlap_schedule = False
         logger.warning(
             "Spec v2 is enabled for DVR and overlap schedule is turned on."

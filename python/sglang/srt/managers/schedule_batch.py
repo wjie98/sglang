@@ -2497,7 +2497,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_spec_v2(self):
         # Whether the V2 worker/schema is used. Independent of overlap: the
         # non-overlap path also drives the V2 worker, just synchronously.
-        if self.spec_algorithm.is_decode_verify_rollback():
+        if self.spec_algorithm.is_decode_verify_rollback_eagle():
+            return True
+        if self.spec_algorithm.is_decode_verify_rollback_self_draft():
             return self.enable_overlap
         return self.spec_algorithm.supports_spec_v2()
 
