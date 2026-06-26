@@ -213,20 +213,24 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         finally:
             batch.spec_info = previous_spec_info
 
-    def _target_suffix_extend_verify_logits(
+    def _target_suffix_extend_verify_output(
         self,
         *,
         batch: ScheduleBatch,
         verify_input: DVREagleVerifyInput,
         linear_state_ctx,
-    ) -> torch.Tensor | None:
-        """Compute verifier logits by replaying the deterministic suffix prefill.
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Compute verifier outputs by replaying the deterministic suffix prefill.
 
         DVR correctness is defined by target prefill semantics.  For hybrid GDN
         models, a plain decode oracle can still diverge after EAGLE/MTP has
         prepared speculative state.  Replaying only the unclosed chunk tail plus
-        draft tokens starts from the DVR boundary checkpoint, keeps the replay
-        bounded by one chunk, and returns logits for draft-token rows only.
+        draft tokens starts from the DVR boundary checkpoint and returns the
+        prefill-equivalent logits and hidden states for draft-token rows.
+
+        EAGLE uses target hidden states to seed the next MTP draft step.  The
+        hidden states must come from the same replay as the verifier logits;
+        otherwise KL can remain correct while the next draft chain drifts.
         """
 
         if batch.forward_mode.is_idle() or linear_state_ctx is None:
@@ -469,10 +473,16 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
 
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.next_token_logits_buffer = None
-            return self.target_worker.model_runner.model.logits_processor._get_logits(
+            draft_logits = (
+                self.target_worker.model_runner.model.logits_processor._get_logits(
+                    draft_hidden_states,
+                    self.target_worker.model_runner.model.lm_head,
+                    logits_metadata,
+                )
+            )
+            return (
+                draft_logits,
                 draft_hidden_states,
-                self.target_worker.model_runner.model.lm_head,
-                logits_metadata,
             )
         finally:
             state_adapter.restore_recurrent_state(
@@ -612,10 +622,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             ).cpu()
 
         linear_state_ctx = None
-        oracle_logits = None
+        oracle_output = None
         with self._req_seqlen_matches_batch_prefix(batch):
             linear_state_ctx = self.linear_state.restore_for_verify(batch)
-            oracle_logits = self._target_suffix_extend_verify_logits(
+            oracle_output = self._target_suffix_extend_verify_output(
                 batch=batch,
                 verify_input=verify_input,
                 linear_state_ctx=linear_state_ctx,
@@ -627,8 +637,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             is_verify=True,
         )
         logits_output = forward_batch_output.logits_output
-        if oracle_logits is not None:
+        if oracle_output is not None:
+            oracle_logits, oracle_hidden_states = oracle_output
             logits_output.next_token_logits = oracle_logits
+            logits_output.hidden_states = oracle_hidden_states
 
         vocab_mask = None
         if batch.has_grammar:
