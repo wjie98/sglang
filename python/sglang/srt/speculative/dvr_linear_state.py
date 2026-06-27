@@ -9,7 +9,6 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.layers.attention.linear.dvr_state import DVRRecurrentStateBackup
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 
-
 @dataclass
 class DVRLinearStateContext:
     state_cache: Any
@@ -100,6 +99,7 @@ class DVRLinearStateLifecycle:
         accepted_steps: torch.Tensor,
         accepted_token_counts_cpu,
         ctx: Optional[DVRLinearStateContext] = None,
+        live_state_already_replayed: Optional[torch.Tensor] = None,
     ):
         ctx = ctx or self.state_context(batch, require_boundary=True)
         if ctx is None:
@@ -148,6 +148,7 @@ class DVRLinearStateLifecycle:
             accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
             boundary_already_tracked=boundary_already_tracked,
+            live_state_already_replayed=live_state_already_replayed,
         )
 
         for req, verified_tail_len, accepted_token_num in zip(
@@ -332,7 +333,6 @@ class DVRLinearStateLifecycle:
                 boundary_seqlen,
             )
             return None, None
-
         boundary_track_idx, dst = state_adapter.reserve_boundary_checkpoint(req=req)
         if boundary_seqlen == 0:
             self.set_boundary_checkpoint(

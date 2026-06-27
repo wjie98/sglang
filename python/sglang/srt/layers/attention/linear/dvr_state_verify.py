@@ -28,20 +28,18 @@ def write_dvr_chunk_boundary_state(
 
     DVR verifies a fixed physical window of `CHUNK_SIZE + draft_tokens`. Only
     the state at the first `CHUNK_SIZE` boundary can become the next deterministic
-    prefill-equivalent checkpoint. DVR always calls the chunkwise kernel with an
-    equal-length [batch, chunk+draft, ...] window, so the boundary state is h[:, 1].
+    prefill-equivalent checkpoint. FLA/GDN exports `h[:, 0]` as the initial state
+    and `h[:, 1]` as the first complete chunk boundary for the fixed
+    `CHUNK_SIZE + draft_tokens` verify window.
     """
 
     if h is None or h.shape[1] <= 1:
         return
 
-    boundary_state = h[:batch_size, 1]
-    # DVR only commits the first chunk-boundary state, stored in the one-slot
-    # boundary buffer allocated for DVR speculative state.
     intermediate_state_cache[
         intermediate_state_indices[:batch_size].to(torch.long),
         0,
-    ] = boundary_state.to(intermediate_state_cache.dtype)
+    ] = h[:batch_size, 1].to(intermediate_state_cache.dtype)
 
 
 def write_dvr_conv_windows(
@@ -191,6 +189,7 @@ def rebuild_dvr_live_state_grouped(
     boundary_indices: torch.Tensor,
     req_indices: torch.Tensor,
     token_count: torch.Tensor,
+    use_chunkwise_rebuild: bool = False,
 ):
     """Rebuild DVR live recurrent state from chunk-boundary checkpoints.
 
@@ -222,7 +221,13 @@ def rebuild_dvr_live_state_grouped(
         token_count.unsqueeze(0).expand(num_layers, -1).reshape(-1).contiguous()
     )
 
-    rebuilt_state = state_ops.rebuild_recurrent_state(
+    rebuild_fn = state_ops.rebuild_recurrent_state
+    if use_chunkwise_rebuild:
+        rebuild_fn = getattr(
+            state_ops, "rebuild_recurrent_state_chunkwise", rebuild_fn
+        )
+
+    rebuilt_state = rebuild_fn(
         window_inputs,
         initial_state=initial_state,
         token_count=flat_token_count,

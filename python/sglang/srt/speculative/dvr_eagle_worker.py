@@ -323,6 +323,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         batch: ScheduleBatch,
         verify_input: DVREagleVerifyInput,
         linear_state_ctx,
+        full_prefix_replay: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Compute verifier outputs by replaying the deterministic suffix prefill.
 
@@ -359,6 +360,8 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         boundary_lens = self.linear_state.boundary_lens_for_replay(
             batch, base_seq_lens_cpu
         )
+        if full_prefix_replay:
+            boundary_lens = [0 for _ in boundary_lens]
         tail_lens_cpu = [
             int(seq_len) - int(boundary)
             for seq_len, boundary in zip(
@@ -376,6 +379,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         input_ids = []
         out_cache_locs = []
         draft_tokens = verify_input.draft_token.reshape(bs, draft_token_num)
+        draft_tokens_cpu = draft_tokens.detach().cpu().tolist()
         draft_cache_locs = batch.out_cache_loc.reshape(bs, draft_token_num)
         for req_i, (req, seq_len, boundary, tail_len) in enumerate(
             zip(
@@ -388,7 +392,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         ):
             token_ids = self._request_token_ids_for_eagle_replay(req, int(seq_len))
             input_ids.extend(token_ids[int(boundary) : int(seq_len)])
-            input_ids.extend(draft_tokens[req_i].detach().cpu().tolist())
+            input_ids.extend(draft_tokens_cpu[req_i])
             if tail_len > 0:
                 out_cache_locs.append(
                     batch.req_to_token_pool.req_to_token[
@@ -406,6 +410,25 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         )
         if saved_tail_lens is not None:
             saved_tail_lens = saved_tail_lens.clone()
+        saved_state_input_window = state_adapter.backup_state_input_window(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+        if full_prefix_replay and saved_tail_lens is not None:
+            # Strict returned-logprob replay is compared against a flush-cache
+            # full prefill oracle.  Clear DVR's rolling state-input window so a
+            # cached radix prefix cannot leak into that full-prefix replay.
+            zero_tail_lens = torch.zeros_like(saved_tail_lens)
+            state_adapter.set_state_input_tail_lens(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                tail_lens=zero_tail_lens,
+            )
+            state_adapter.zero_state_input_after_lens(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                keep_lens=zero_tail_lens,
+            )
 
         verify_ready_live_backup = state_adapter.backup_recurrent_state(
             state_cache=state_cache,
@@ -424,6 +447,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 device=batch.seq_lens.device,
             )
         )
+        # The replay output replaces verifier logits/hidden states; checkpoint
+        # ownership stays with DVR's commit path rather than this temporary
+        # EXTEND forward.
+        possible_boundary_track = torch.zeros_like(possible_boundary_track)
 
         # ForwardBatch.init_new reads many mutable ScheduleBatch fields.  The
         # oracle below temporarily reinterprets the live verify batch as an
@@ -461,7 +488,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         }
 
         try:
-            self.linear_state.restore_boundary_state_for_suffix_replay(linear_state_ctx)
+            if not full_prefix_replay:
+                self.linear_state.restore_boundary_state_for_suffix_replay(
+                    linear_state_ctx
+                )
 
             batch.forward_mode = ForwardMode.EXTEND
             batch.global_forward_mode = None
@@ -518,7 +548,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             # already consumed by the real prefill/verify forward.
             batch.mamba_cow_src_indices = None
             batch.mamba_cow_dst_indices = None
-            batch.mamba_clear_indices = None
+            batch.mamba_clear_indices = live_indices if full_prefix_replay else None
             # The suffix EXTEND must see draft KV at absolute positions
             # base_seq_len..base_seq_len+draft.  These are the same slots the
             # real verify path owns, so publishing them in req_to_token_pool is
@@ -627,6 +657,11 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                     state_input_indices=linear_state_ctx.state_input_indices,
                     tail_lens=saved_tail_lens,
                 )
+            state_adapter.restore_state_input_window(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                backup=saved_state_input_window,
+            )
             for name, value in saved_fields.items():
                 setattr(batch, name, value)
 
@@ -761,11 +796,18 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 is_verify=True,
             )
         logits_output = forward_batch_output.logits_output
-        oracle_output = self._target_suffix_extend_verify_output(
-            batch=batch,
-            verify_input=verify_input,
-            linear_state_ctx=linear_state_ctx,
-        )
+        oracle_output = None
+        if batch.return_logprob or logits_output.hidden_states is None:
+            # Strict returned-logprob requests need the full-prefix oracle used by
+            # the self-DVR path.  Fast decode can consume the dedicated DVR-EAGLE
+            # target-verify graph directly; keep suffix replay only as a hidden
+            # state fallback for graph-disabled/eager configurations.
+            oracle_output = self._target_suffix_extend_verify_output(
+                batch=batch,
+                verify_input=verify_input,
+                linear_state_ctx=linear_state_ctx,
+                full_prefix_replay=batch.return_logprob,
+            )
         if oracle_output is not None:
             oracle_logits, oracle_hidden_states = oracle_output
             logits_output.next_token_logits = oracle_logits

@@ -338,15 +338,19 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         scheduler_seq_lens = batch.seq_lens
         with self._req_seqlen_matches_batch_prefix(batch):
             linear_state_ctx = self.linear_state.restore_for_verify(batch)
+        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True
         )
         logits_output = batch_result.logits_output
-        oracle_logits = self._target_suffix_extend_verify_logits(
-            batch=batch,
-            spec_info=spec_info,
-            linear_state_ctx=linear_state_ctx,
-        )
+        oracle_logits = None
+        if batch.return_logprob:
+            oracle_logits = self._target_suffix_extend_verify_logits(
+                batch=batch,
+                spec_info=spec_info,
+                linear_state_ctx=linear_state_ctx,
+                full_prefix_replay=True,
+            )
         if oracle_logits is not None:
             logits_output.next_token_logits = oracle_logits
         maybe_detect_nan(logits_output.next_token_logits, "dvr v2 target verify")

@@ -249,6 +249,22 @@ class DVRGatedStateAdapter:
             return None
         return state_window.tail_lens(indices=state_input_indices)
 
+    def backup_state_input_window(
+        self, *, state_cache, state_input_indices: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        state_window = DVRStateInputWindow.from_cache(state_cache)
+        return state_window.backup_rows(indices=state_input_indices)
+
+    def restore_state_input_window(
+        self,
+        *,
+        state_cache,
+        state_input_indices: torch.Tensor,
+        backup: Optional[Tuple[torch.Tensor, ...]],
+    ):
+        state_window = DVRStateInputWindow.from_cache(state_cache)
+        state_window.restore_rows(indices=state_input_indices, backup=backup)
+
     def set_state_input_tail_lens(
         self,
         *,
@@ -260,6 +276,18 @@ class DVRGatedStateAdapter:
         if not state_window.enabled:
             return
         state_window.set_tail_lens(indices=state_input_indices, value=tail_lens)
+
+    def zero_state_input_after_lens(
+        self,
+        *,
+        state_cache,
+        state_input_indices: torch.Tensor,
+        keep_lens: torch.Tensor,
+    ):
+        state_window = DVRStateInputWindow.from_cache(state_cache)
+        if not state_window.enabled:
+            return
+        state_window.zero_after_lens(indices=state_input_indices, keep_lens=keep_lens)
 
     def validate_state_cache(self, *, state_cache):
         assert state_cache.temporal.dtype == torch.float32, (
@@ -607,6 +635,7 @@ class DVRGatedStateAdapter:
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
         boundary_already_tracked: Optional[torch.Tensor] = None,
+        live_state_already_replayed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         state_window = DVRStateInputWindow.from_cache(state_cache)
         tail_lens_before = verified_tail_lens.to(
@@ -620,18 +649,27 @@ class DVRGatedStateAdapter:
             boundary_already_tracked = boundary_already_tracked.to(
                 device=live_indices.device, dtype=torch.bool
             )
+        if live_state_already_replayed is None:
+            live_state_already_replayed = torch.zeros_like(crosses_chunk_boundary)
+        else:
+            live_state_already_replayed = live_state_already_replayed.to(
+                device=live_indices.device, dtype=torch.bool
+            )
         # Suffix replay can pre-materialize the next boundary through the
         # backend's normal EXTEND tracking path.  Do not rebuild or scatter that
         # same boundary from TARGET_VERIFY intermediates, whose rows are indexed
         # by accepted draft steps rather than prefill positions.
         boundary_needs_rebuild = crosses_chunk_boundary & ~boundary_already_tracked
 
-        self.ops.scatter_state(
-            state_cache.conv[0],
-            state_cache.intermediate_conv_window[0],
-            live_indices,
-            accepted_steps,
-        )
+        has_live_conv_commit = (accepted_token_counts > 0) & ~live_state_already_replayed
+        live_conv_req_indices = torch.nonzero(has_live_conv_commit).flatten()
+        if live_conv_req_indices.numel() > 0:
+            self.ops.scatter_state(
+                state_cache.conv[0],
+                state_cache.intermediate_conv_window[0],
+                live_indices[live_conv_req_indices],
+                accepted_steps[live_conv_req_indices],
+            )
 
         no_commit_step = torch.full_like(tail_lens_before, -1)
         crossing_req_indices = torch.nonzero(boundary_needs_rebuild).flatten()
@@ -654,6 +692,7 @@ class DVRGatedStateAdapter:
                     dtype=torch.long,
                     device=tail_lens_before.device,
                 ),
+                use_chunkwise_rebuild=True,
             )
         self.ops.scatter_state(
             state_cache.conv[0],
@@ -670,25 +709,73 @@ class DVRGatedStateAdapter:
         tail_lens_after = torch.where(
             crosses_chunk_boundary, new_tail_lens, tail_lens_after
         )
+        # When suffix EXTEND replay already tracked the new chunk boundary, it
+        # also wrote the post-boundary tail into columns starting at zero.  Do
+        # not shift the old physical window over those freshly replayed rows.
+        shift_window_mask = crosses_chunk_boundary & ~boundary_already_tracked
         state_window.shift_after_boundary(
             indices=state_input_indices,
-            crosses_chunk_boundary=crosses_chunk_boundary,
+            crosses_chunk_boundary=shift_window_mask,
             chunk_size=self.chunk_size,
         )
-        rebuild_dvr_live_state_grouped(
-            state_ops=self.ops,
-            state_window=state_window,
-            temporal_state=state_cache.temporal,
-            state_input_indices=state_input_indices,
-            live_indices=live_indices,
-            boundary_indices=boundary_indices,
-            req_indices=torch.arange(
-                live_indices.shape[0],
-                dtype=torch.long,
-                device=live_indices.device,
-            ),
-            token_count=tail_lens_after,
+        state_window.zero_after_lens(
+            indices=state_input_indices,
+            keep_lens=tail_lens_after,
         )
+        req_indices = torch.arange(
+            live_indices.shape[0],
+            dtype=torch.long,
+            device=live_indices.device,
+        )
+        draft_token_num = state_cache.intermediate_conv_window[0].shape[2]
+        partial_accept = accepted_token_counts < draft_token_num
+        needs_live_rebuild = ~live_state_already_replayed
+        full_accept_req_indices = req_indices[(~partial_accept) & needs_live_rebuild]
+        full_accept_crossing_req_indices = full_accept_req_indices[
+            crosses_chunk_boundary[full_accept_req_indices]
+        ]
+        if full_accept_crossing_req_indices.numel() > 0:
+            rebuild_dvr_live_state_grouped(
+                state_ops=self.ops,
+                state_window=state_window,
+                temporal_state=state_cache.temporal,
+                state_input_indices=state_input_indices,
+                live_indices=live_indices,
+                boundary_indices=boundary_indices,
+                req_indices=full_accept_crossing_req_indices,
+                token_count=tail_lens_after[full_accept_crossing_req_indices],
+                use_chunkwise_rebuild=True,
+            )
+        full_accept_fast_req_indices = full_accept_req_indices[
+            ~crosses_chunk_boundary[full_accept_req_indices]
+        ]
+        if full_accept_fast_req_indices.numel() > 0:
+            rebuild_dvr_live_state_grouped(
+                state_ops=self.ops,
+                state_window=state_window,
+                temporal_state=state_cache.temporal,
+                state_input_indices=state_input_indices,
+                live_indices=live_indices,
+                boundary_indices=boundary_indices,
+                req_indices=full_accept_fast_req_indices,
+                token_count=tail_lens_after[full_accept_fast_req_indices],
+            )
+        partial_accept_req_indices = req_indices[partial_accept & needs_live_rebuild]
+        if partial_accept_req_indices.numel() > 0:
+            # Partial accept is the only time DVR must start the next draft from
+            # a shortened suffix.  Use the same chunkwise GDN math as prefill
+            # here; the all-accepted hot path keeps the faster recurrent rebuild.
+            rebuild_dvr_live_state_grouped(
+                state_ops=self.ops,
+                state_window=state_window,
+                temporal_state=state_cache.temporal,
+                state_input_indices=state_input_indices,
+                live_indices=live_indices,
+                boundary_indices=boundary_indices,
+                req_indices=partial_accept_req_indices,
+                token_count=tail_lens_after[partial_accept_req_indices],
+                use_chunkwise_rebuild=True,
+            )
 
         state_window.set_tail_lens(
             indices=state_input_indices, value=tail_lens_after.to(torch.int32)

@@ -6,6 +6,7 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
+from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (
@@ -184,6 +185,71 @@ def _rebuild_gdn_state_from_qkvg_beta_triton(
         num_stages=3,
     )
     return final_state
+
+
+def _zero_gdn_rows_after_token_count(
+    tensor: torch.Tensor, token_count: torch.Tensor
+) -> torch.Tensor:
+    token_count = token_count.to(device=tensor.device, dtype=torch.long).clamp(
+        min=0, max=tensor.shape[1]
+    )
+    rows = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
+    keep = rows < token_count.unsqueeze(1)
+    view_shape = keep.shape + (1,) * (tensor.dim() - 2)
+    return torch.where(keep.view(view_shape), tensor, torch.zeros_like(tensor))
+
+
+def _rebuild_gdn_state_from_qkvg_beta_chunkwise(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    initial_state: torch.Tensor,
+    token_count: Optional[Union[int, torch.Tensor]] = None,
+) -> torch.Tensor:
+    """Rebuild a GDN state with the same chunkwise kernel used by prefill.
+
+    The fast DVR recurrent kernel is sufficient for the all-accepted hot path,
+    but partial acceptance is a correctness boundary: the next draft starts from
+    a shortened suffix.  Reusing FLA's chunkwise path there keeps the rebuilt
+    live state bit-aligned with deterministic prefill instead of maintaining a
+    second copy of GDN's chunk-local gate math.
+    """
+
+    if token_count is None:
+        token_count = q.shape[1]
+    if isinstance(token_count, int):
+        token_count = torch.full(
+            (q.shape[0],), token_count, dtype=torch.long, device=q.device
+        )
+
+    q = _zero_gdn_rows_after_token_count(q, token_count)
+    k = _zero_gdn_rows_after_token_count(k, token_count)
+    v = _zero_gdn_rows_after_token_count(v, token_count)
+    g = _zero_gdn_rows_after_token_count(g, token_count)
+    beta = _zero_gdn_rows_after_token_count(beta, token_count)
+
+    # FLA returns boundary states in `h`; it does not update `initial_state`
+    # in-place.  Use the final exported state so chunkwise rebuild actually
+    # advances DVR's live recurrent slot after partial/cross-boundary commits.
+    initial_state = initial_state.clone()
+    cache_indices = torch.arange(
+        q.shape[0], dtype=torch.int32, device=q.device
+    )
+    _, _, h = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        initial_state_indices=cache_indices,
+        head_first=False,
+        use_qk_l2norm_in_kernel=True,
+    )
+    return h[:, -1]
 
 
 @dataclass(frozen=True)
@@ -389,6 +455,24 @@ class DVRGDNStateOps(DVRStateOps):
         assert self.rebuild_recurrent_state_fn is not None
         state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
         return self.rebuild_recurrent_state_fn(
+            state_inputs.q,
+            state_inputs.k,
+            state_inputs.v,
+            state_inputs.g,
+            state_inputs.beta,
+            initial_state=initial_state,
+            token_count=token_count,
+        )
+
+    def rebuild_recurrent_state_chunkwise(
+        self,
+        state_inputs: DVRStateInputs,
+        *,
+        initial_state: torch.Tensor,
+        token_count: Optional[Union[int, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
+        return _rebuild_gdn_state_from_qkvg_beta_chunkwise(
             state_inputs.q,
             state_inputs.k,
             state_inputs.v,

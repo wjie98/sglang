@@ -184,12 +184,16 @@ def dvr_self_draft_decode_context(
     disable_model_runner_graph: bool = False,
     disable_batch_invariant_ops: bool = False,
     clear_kernel_config_caches: bool = False,
+    disable_mamba_tracking: bool = False,
+    patch_spec_algorithm_for_graph: bool = True,
+    skip_graph_state_init: bool = True,
+    extra_attn_backends=(),
 ):
     """Temporarily switch the target runner into DVR self-draft decode mode.
 
     DVR verifies proposals with the deterministic target path afterwards, so the
     provisional self-draft path can use normal decode kernels, avoid
-    batch-invariant linear ops, and skip mamba prefix tracking during graph capture.
+    batch-invariant linear ops, and skip mamba prefix tracking when requested.
     All mutations are restored before target verify runs.
     """
 
@@ -217,26 +221,35 @@ def dvr_self_draft_decode_context(
         if disable_model_runner_graph:
             patch_attr(model_runner, "graph_runner", None)
 
-        for backend in _iter_attention_backends(model_runner.attn_backend):
-            patch_attr(backend, "enable_deterministic", False)
-            _patch_self_draft_decode_backend_defaults(backend, patch_attr)
+        seen_backend_roots = set()
+        for backend_root in (model_runner.attn_backend, *(extra_attn_backends or ())):
+            if backend_root is None or id(backend_root) in seen_backend_roots:
+                continue
+            seen_backend_roots.add(id(backend_root))
+            for backend in _iter_attention_backends(backend_root):
+                patch_attr(backend, "enable_deterministic", False)
+                _patch_self_draft_decode_backend_defaults(backend, patch_attr)
 
         if graph_capture:
             # Custom all-reduce is unsafe for deterministic DVR prefill/verify,
             # but the self-draft decode graph can capture it for speed.
             for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
                 patch_attr(ca_comm, "disabled", False)
-            # The target runner already initialized attention backend graph
-            # buffers for TARGET_VERIFY. Capture DVR self-draft as ordinary
-            # DECODE without reinitializing those shared buffers.
-            patch_attr(model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE)
-            patch_attr(
-                model_runner.attn_backend,
-                "init_cuda_graph_state",
-                skip_init_cuda_graph_state,
-            )
-            # Provisional self-draft tokens must not update mamba prefix-cache
-            # tracking slots. DVR commits verified recurrent state after verify.
+            if patch_spec_algorithm_for_graph:
+                # The target runner already initialized attention backend graph
+                # buffers for TARGET_VERIFY. Capture DVR self-draft as ordinary
+                # DECODE without reinitializing those shared buffers.
+                patch_attr(model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE)
+            if skip_graph_state_init:
+                patch_attr(
+                    model_runner.attn_backend,
+                    "init_cuda_graph_state",
+                    skip_init_cuda_graph_state,
+                )
+
+        if graph_capture or disable_mamba_tracking:
+            # Provisional draft tokens must not update mamba prefix-cache tracking
+            # slots. DVR commits verified recurrent state after target verify.
             patch_attr(
                 model_runner.server_args, "mamba_scheduler_strategy", "no_buffer"
             )
@@ -250,6 +263,34 @@ def dvr_self_draft_decode_context(
         if clear_kernel_config_caches:
             _clear_determinism_sensitive_kernel_caches()
         env_override.__exit__(None, None, None)
+
+
+@contextmanager
+def dvr_eagle_draft_decode_context(
+    model_runner,
+    *,
+    graph_capture: bool = False,
+    clear_kernel_config_caches: bool = False,
+    attn_backends=(),
+):
+    """Run DVR-EAGLE/MTP draft as provisional, performance-first decode.
+
+    EAGLE draft keeps its own speculative metadata and graph-state buffers, so
+    this context only restores normal decode kernel choices and disables draft
+    tracking side effects. Target prefill/verify still run deterministically.
+    """
+
+    with dvr_self_draft_decode_context(
+        model_runner,
+        graph_capture=graph_capture,
+        disable_batch_invariant_ops=True,
+        clear_kernel_config_caches=clear_kernel_config_caches,
+        disable_mamba_tracking=True,
+        patch_spec_algorithm_for_graph=False,
+        skip_graph_state_init=False,
+        extra_attn_backends=attn_backends,
+    ):
+        yield
 
 
 class DVRDraftDecodeCudaGraphRunner:
@@ -275,5 +316,8 @@ class DVRDraftDecodeCudaGraphRunner:
         return self.runner.can_run(forward_batch)
 
     def replay(self, forward_batch: ForwardBatch):
-        with dvr_self_draft_decode_context(self.dvr_worker.model_runner):
+        with dvr_self_draft_decode_context(
+            self.dvr_worker.model_runner,
+            disable_mamba_tracking=True,
+        ):
             return self.runner.replay(forward_batch)

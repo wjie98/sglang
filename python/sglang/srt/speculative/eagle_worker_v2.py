@@ -34,6 +34,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+    dvr_eagle_draft_decode_context,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import ServerArgs
@@ -221,6 +224,18 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+    def _dvr_draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
+        if self.speculative_algorithm.is_decode_verify_rollback_eagle():
+            return dvr_eagle_draft_decode_context(
+                self.draft_runner,
+                clear_kernel_config_caches=clear_kernel_config_caches,
+                attn_backends=(
+                    self.draft_attn_backend,
+                    self.draft_extend_attn_backend,
+                ),
+            )
+        return contextlib.nullcontext()
+
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
         # top_scores_index are runtime-invariant. Must be rebuilt after any
@@ -402,14 +417,15 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
+        with self._dvr_draft_decode_context():
+            forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+                self.req_to_token_pool,
+                batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -428,17 +444,20 @@ class EagleDraftWorker(BaseDraftWorker):
                     self.cuda_graph_runner.replay(forward_batch)
                 )
             else:
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
+                with self._dvr_draft_decode_context(
+                    clear_kernel_config_caches=True
                 ):
-                    # Skip attention backend init for 1-step draft,
-                    # `draft_forward` only does sample in this case.
-                    self.draft_attn_backend.init_forward_metadata(forward_batch)
-                    forward_batch.mark_forward_metadata_ready()
-                parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                    forward_batch
-                )
+                    if (
+                        not forward_batch.forward_mode.is_idle()
+                        and self.speculative_num_steps > 1
+                    ):
+                        # Skip attention backend init for 1-step draft,
+                        # `draft_forward` only does sample in this case.
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                        forward_batch.mark_forward_metadata_ready()
+                    parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                        forward_batch
+                    )
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -659,21 +678,22 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_for_logprob_per_req=1,
         )
 
-        batch.spec_info = next_draft_input
+        with self._dvr_draft_decode_context(clear_kernel_config_caches=True):
+            batch.spec_info = next_draft_input
 
-        # Run forward (LAST mode: only the final hidden state per request,
-        # to feed the next draft step which expects [bs, hidden_dim]).
-        # STANDALONE skips hidden states end-to-end.
-        capture_hidden_mode = (
-            CaptureHiddenMode.NULL
-            if self.speculative_algorithm.is_standalone()
-            else CaptureHiddenMode.LAST
-        )
-        batch.capture_hidden_mode = capture_hidden_mode
-        forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
-        forward_batch.return_logprob = False
-        if mm_input_embeds is not None:
-            forward_batch.mm_input_embeds = mm_input_embeds
+            # Run forward (LAST mode: only the final hidden state per request,
+            # to feed the next draft step which expects [bs, hidden_dim]).
+            # STANDALONE skips hidden states end-to-end.
+            capture_hidden_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.LAST
+            )
+            batch.capture_hidden_mode = capture_hidden_mode
+            forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+            forward_batch.return_logprob = False
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds
 
         canary_ctx = (
             context_tuple(
@@ -686,7 +706,9 @@ class EagleDraftWorker(BaseDraftWorker):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with canary_ctx, self._dvr_draft_decode_context(
+            clear_kernel_config_caches=True
+        ):
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
@@ -718,7 +740,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Prepare for draft extend in a separate stream
-        with self.plan_stream_ctx:
+        with self._dvr_draft_decode_context(), self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
                 batch_result.next_token_ids,
@@ -761,9 +783,10 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch
                 )
             else:
-                draft_logits_output = self.draft_runner.forward(
-                    forward_batch
-                ).logits_output
+                with self._dvr_draft_decode_context(clear_kernel_config_caches=True):
+                    draft_logits_output = self.draft_runner.forward(
+                        forward_batch
+                    ).logits_output
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,

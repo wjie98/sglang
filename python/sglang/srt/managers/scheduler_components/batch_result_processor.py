@@ -900,8 +900,8 @@ class SchedulerBatchResultProcessor:
             return
 
         if batch.spec_algorithm.is_decode_verify_rollback():
+            req.skip_mamba_radix_finished_insert = True
             if batch.is_spec_v2:
-                req.skip_mamba_radix_finished_insert = True
                 self._commit_pending_mamba_checkpoint(req, batch, result, i)
             return
 

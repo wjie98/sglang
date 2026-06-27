@@ -204,6 +204,34 @@ class DVRStateInputWindow:
         for cache, value in zip(self.tensors(), values.tensors(), strict=True):
             cache[indices, cols] = value
 
+    def backup_rows(self, *, indices: torch.Tensor) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Snapshot request rows that a diagnostic EXTEND replay may overwrite."""
+
+        if self.inputs is None:
+            return None
+        indices = indices.to(device=self.tensors()[0].device, dtype=torch.long)
+        has_layer_dim = (
+            self.tail_lens_cache is not None and self.tail_lens_cache.dim() == 2
+        )
+        if has_layer_dim:
+            return tuple(cache[:, indices].clone() for cache in self.tensors())
+        return tuple(cache[indices].clone() for cache in self.tensors())
+
+    def restore_rows(
+        self, *, indices: torch.Tensor, backup: Optional[Tuple[torch.Tensor, ...]]
+    ):
+        if backup is None:
+            return
+        indices = indices.to(device=self.tensors()[0].device, dtype=torch.long)
+        has_layer_dim = (
+            self.tail_lens_cache is not None and self.tail_lens_cache.dim() == 2
+        )
+        for cache, saved in zip(self.tensors(), backup, strict=True):
+            if has_layer_dim:
+                cache[:, indices] = saved.to(cache.dtype, copy=False)
+            else:
+                cache[indices] = saved.to(cache.dtype, copy=False)
+
     def zero_after_lens(self, *, indices: torch.Tensor, keep_lens: torch.Tensor):
         """Clear stale rolling-window columns after each request's live suffix."""
 

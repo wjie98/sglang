@@ -419,6 +419,18 @@ class DecodeVerifyRollbackWorker:
                         device=ctx.live_indices.device, dtype=torch.long
                     ),
                 )
+            zero_source_live_indices = [
+                task.live_idx
+                for task in tasks
+                if task.source_state_indices is None and task.source_seqlen == 0
+            ]
+            if zero_source_live_indices:
+                ctx.state_adapter.zero_recurrent_state(
+                    state_cache=ctx.state_cache,
+                    indices=torch.stack(zero_source_live_indices).to(
+                        device=ctx.live_indices.device, dtype=torch.long
+                    ),
+                )
 
             reqs = [task.req for task in tasks]
             input_ids = []
@@ -698,6 +710,7 @@ class DecodeVerifyRollbackWorker:
             disable_model_runner_graph=True,
             disable_batch_invariant_ops=True,
             clear_kernel_config_caches=True,
+            disable_mamba_tracking=True,
         ):
             forward_batch.can_run_dp_cuda_graph = False
             return self.model_runner.forward(forward_batch).logits_output
@@ -815,6 +828,7 @@ class DecodeVerifyRollbackWorker:
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
         linear_state_ctx,
+        full_prefix_replay: bool = False,
     ) -> Optional[torch.Tensor]:
         """Compute verifier logits by replaying only the deterministic suffix.
 
@@ -848,6 +862,9 @@ class DecodeVerifyRollbackWorker:
         boundary_lens = self.linear_state.boundary_lens_for_replay(
             batch, base_seq_lens_cpu
         )
+        use_full_prefix_replay = full_prefix_replay
+        if use_full_prefix_replay:
+            boundary_lens = [0 for _ in boundary_lens]
         tail_lens_cpu = [
             int(seq_len) - int(boundary)
             for seq_len, boundary in zip(
@@ -895,6 +912,26 @@ class DecodeVerifyRollbackWorker:
         )
         if saved_tail_lens is not None:
             saved_tail_lens = saved_tail_lens.clone()
+        saved_state_input_window = state_adapter.backup_state_input_window(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+        if use_full_prefix_replay and saved_tail_lens is not None:
+            # Full-prefix replay must behave like a fresh prefill even when the
+            # generation request restored a cached radix prefix.  The live
+            # recurrent state is cleared below; clear DVR's rolling state-input
+            # window as well so no cached-prefix tail leaks into the replay.
+            zero_tail_lens = torch.zeros_like(saved_tail_lens)
+            state_adapter.set_state_input_tail_lens(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                tail_lens=zero_tail_lens,
+            )
+            state_adapter.zero_state_input_after_lens(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                keep_lens=zero_tail_lens,
+            )
 
         verify_ready_live_backup = state_adapter.backup_recurrent_state(
             state_cache=state_cache,
@@ -913,6 +950,11 @@ class DecodeVerifyRollbackWorker:
                 device=batch.seq_lens.device,
             )
         )
+        # Suffix replay is an oracle for verifier logits.  Let DVR's commit path
+        # materialize chunk-boundary checkpoints from its own rolling state-input
+        # window instead of publishing a checkpoint as a side effect of this
+        # temporary EXTEND replay.
+        possible_boundary_track = torch.zeros_like(possible_boundary_track)
 
         # ForwardBatch.init_new reads many mutable ScheduleBatch fields.  The
         # oracle below temporarily reinterprets the live verify batch as an
@@ -949,8 +991,6 @@ class DecodeVerifyRollbackWorker:
         }
 
         try:
-            self.linear_state.restore_boundary_state_for_suffix_replay(linear_state_ctx)
-
             batch.forward_mode = ForwardMode.EXTEND
             batch.global_forward_mode = None
             batch.input_ids = torch.tensor(
@@ -1005,9 +1045,20 @@ class DecodeVerifyRollbackWorker:
             # on ScheduleBatch after the real forward consumed its ForwardBatch
             # copy. Suffix replay starts from DVR-managed recurrent state and
             # must not re-apply those cached-prefix restore ops.
-            batch.mamba_cow_src_indices = None
-            batch.mamba_cow_dst_indices = None
-            batch.mamba_clear_indices = None
+            if use_full_prefix_replay:
+                # Strict logprob replay starts from the zero recurrent state to
+                # match a flush-cache full prefill oracle. The fast DVR verify
+                # path below restores the chunk boundary instead.
+                batch.mamba_cow_src_indices = None
+                batch.mamba_cow_dst_indices = None
+                batch.mamba_clear_indices = live_indices
+            else:
+                # Run the boundary->live restore through the existing deferred COW
+                # mechanism so it executes on the forward stream, matching normal
+                # prefix-cache prefill and avoiding cross-stream state races.
+                batch.mamba_cow_src_indices = boundary_indices
+                batch.mamba_cow_dst_indices = live_indices
+                batch.mamba_clear_indices = None
             # The suffix EXTEND must see draft KV at absolute positions
             # base_seq_len..base_seq_len+draft.  These are the same slots the
             # real verify path owns, so publishing them in req_to_token_pool is
@@ -1017,12 +1068,11 @@ class DecodeVerifyRollbackWorker:
                 draft_cache_locs.to(torch.int32),
             )
 
-            forward_batch = ForwardBatch.init_new(batch, self.target_worker.model_runner)
             oracle_output = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=forward_batch,
+                batch=batch,
                 is_verify=True,
             )
+            forward_batch = ForwardBatch.init_new(batch, self.target_worker.model_runner)
             hidden_states = oracle_output.logits_output.hidden_states
             if hidden_states is None:
                 raise RuntimeError(
@@ -1062,6 +1112,259 @@ class DecodeVerifyRollbackWorker:
                     state_input_indices=linear_state_ctx.state_input_indices,
                     tail_lens=saved_tail_lens,
                 )
+            state_adapter.restore_state_input_window(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                backup=saved_state_input_window,
+            )
+            for name, value in saved_fields.items():
+                setattr(batch, name, value)
+
+    def _replay_accepted_suffix_for_partial_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+        verify_output: EagleVerifyOutput,
+        linear_state_ctx,
+        accepted_token_counts_cpu: List[int],
+    ) -> Optional[torch.Tensor]:
+        """Refresh live GDN state with the exact accepted-token suffix.
+
+        The hot TARGET_VERIFY path forwards the proposed draft tokens.  When a
+        row is rejected, however, SGLang commits the target-predicted token at
+        that row.  Replaying only "unclosed chunk tail + accepted tokens" keeps
+        DVR's live recurrent state aligned with the actual scheduler-owned
+        token sequence without replaying the full prefix.
+        """
+
+        if batch.forward_mode.is_idle() or linear_state_ctx is None:
+            return None
+
+        accepted_ids = verify_output.draft_extend_input.input_ids
+        if accepted_ids is None or accepted_ids.numel() == 0:
+            return None
+        total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
+        if accepted_ids.numel() != total_accepted or batch.out_cache_loc.numel() != total_accepted:
+            return None
+
+        state_adapter = linear_state_ctx.state_adapter
+        state_cache = linear_state_ctx.state_cache
+        live_indices = linear_state_ctx.live_indices
+        boundary_indices = linear_state_ctx.boundary_indices
+        assert boundary_indices is not None
+
+        base_seq_lens_cpu = (
+            spec_info.seq_lens_cpu.tolist()
+            if getattr(spec_info, "seq_lens_cpu", None) is not None
+            else (
+                batch.seq_lens_cpu.tolist()
+                if batch.seq_lens_cpu is not None
+                else batch.seq_lens.detach().cpu().tolist()
+            )
+        )
+        boundary_lens = self.linear_state.boundary_lens_for_replay(
+            batch, base_seq_lens_cpu
+        )
+        tail_lens_cpu = [
+            int(seq_len) - int(boundary)
+            for seq_len, boundary in zip(
+                base_seq_lens_cpu, boundary_lens, strict=True
+            )
+        ]
+        extend_lens_cpu = [
+            int(tail) + int(accepted)
+            for tail, accepted in zip(
+                tail_lens_cpu, accepted_token_counts_cpu, strict=True
+            )
+        ]
+        needs_exact_replay = any(
+            int(accepted) < self.num_draft_tokens
+            for accepted in accepted_token_counts_cpu
+        )
+        if not needs_exact_replay:
+            return None
+        final_seq_lens_cpu = [
+            int(boundary) + int(extend_len)
+            for boundary, extend_len in zip(
+                boundary_lens, extend_lens_cpu, strict=True
+            )
+        ]
+
+        accepted_ids_cpu = accepted_ids.detach().cpu().tolist()
+        accepted_cache_locs = batch.out_cache_loc.to(torch.long)
+        input_ids = []
+        out_cache_locs = []
+        accepted_rows = []
+        accepted_offsets = []
+        token_offset = 0
+        for req_i, (req, seq_len, boundary, tail_len, accepted_count) in enumerate(
+            zip(
+                batch.reqs,
+                base_seq_lens_cpu,
+                boundary_lens,
+                tail_lens_cpu,
+                accepted_token_counts_cpu,
+                strict=True,
+            )
+        ):
+            accepted_count = int(accepted_count)
+            token_ids = self._request_token_ids_for_replay(req, int(seq_len))
+            input_ids.extend(token_ids[int(boundary) : int(seq_len)])
+            accepted_slice = accepted_ids_cpu[token_offset : token_offset + accepted_count]
+            input_ids.extend(accepted_slice)
+            if int(tail_len) > 0:
+                out_cache_locs.append(
+                    batch.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, int(boundary) : int(seq_len)
+                    ].to(torch.long)
+                )
+            accepted_locs = accepted_cache_locs[
+                token_offset : token_offset + accepted_count
+            ]
+            out_cache_locs.append(accepted_locs)
+            if accepted_count > 0:
+                accepted_rows.append(
+                    batch.req_pool_indices[req_i]
+                    .to(dtype=torch.long)
+                    .repeat(accepted_count)
+                )
+                accepted_offsets.append(
+                    torch.arange(
+                        int(seq_len),
+                        int(seq_len) + accepted_count,
+                        dtype=torch.long,
+                        device=batch.seq_lens.device,
+                    )
+                )
+            token_offset += accepted_count
+
+        if not input_ids:
+            return None
+
+        saved_tail_lens = state_adapter.state_input_tail_lens(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+        if saved_tail_lens is not None:
+            saved_tail_lens = saved_tail_lens.clone()
+        saved_state_input_window = state_adapter.backup_state_input_window(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+
+        possible_boundary_track, boundary_track_seqlens = (
+            self.linear_state.suffix_replay_boundary_track_info(
+                boundary_lens,
+                extend_lens_cpu,
+                device=batch.seq_lens.device,
+            )
+        )
+        possible_boundary_track = torch.zeros_like(possible_boundary_track)
+
+        saved_fields = {
+            "forward_mode": batch.forward_mode,
+            "global_forward_mode": batch.global_forward_mode,
+            "input_ids": batch.input_ids,
+            "input_embeds": batch.input_embeds,
+            "replace_embeds": batch.replace_embeds,
+            "replace_positions": batch.replace_positions,
+            "out_cache_loc": batch.out_cache_loc,
+            "seq_lens": batch.seq_lens,
+            "seq_lens_cpu": batch.seq_lens_cpu,
+            "seq_lens_sum": batch.seq_lens_sum,
+            "prefix_lens": batch.prefix_lens,
+            "extend_lens": batch.extend_lens,
+            "extend_num_tokens": batch.extend_num_tokens,
+            "extend_logprob_start_lens": batch.extend_logprob_start_lens,
+            "is_extend_in_batch": batch.is_extend_in_batch,
+            "all_extend_in_batch": batch.all_extend_in_batch,
+            "spec_info": batch.spec_info,
+            "capture_hidden_mode": batch.capture_hidden_mode,
+            "return_hidden_states": batch.return_hidden_states,
+            "return_hidden_states_before_norm": batch.return_hidden_states_before_norm,
+            "return_logprob": batch.return_logprob,
+            "mamba_track_indices": batch.mamba_track_indices,
+            "mamba_track_mask": batch.mamba_track_mask,
+            "mamba_track_seqlens": batch.mamba_track_seqlens,
+            "mamba_cow_src_indices": batch.mamba_cow_src_indices,
+            "mamba_cow_dst_indices": batch.mamba_cow_dst_indices,
+            "mamba_clear_indices": batch.mamba_clear_indices,
+        }
+        try:
+            batch.forward_mode = ForwardMode.EXTEND
+            batch.global_forward_mode = None
+            batch.input_ids = torch.tensor(
+                input_ids, dtype=torch.long, device=batch.seq_lens.device
+            )
+            batch.input_embeds = None
+            batch.replace_embeds = None
+            batch.replace_positions = None
+            batch.out_cache_loc = torch.cat(out_cache_locs).to(
+                device=batch.seq_lens.device
+            )
+            batch.prefix_lens = [int(x) for x in boundary_lens]
+            batch.extend_lens = [int(x) for x in extend_lens_cpu]
+            batch.extend_num_tokens = len(input_ids)
+            batch.extend_logprob_start_lens = [int(x) for x in extend_lens_cpu]
+            batch.seq_lens = torch.tensor(
+                final_seq_lens_cpu,
+                dtype=torch.long,
+                device=saved_fields["seq_lens"].device,
+            )
+            batch.seq_lens_cpu = torch.tensor(
+                final_seq_lens_cpu,
+                dtype=torch.long,
+            )
+            batch.seq_lens_sum = sum(final_seq_lens_cpu)
+            batch.is_extend_in_batch = True
+            batch.all_extend_in_batch = True
+            batch.spec_info = None
+            batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            batch.return_hidden_states = False
+            batch.return_hidden_states_before_norm = False
+            batch.return_logprob = False
+            if possible_boundary_track.any():
+                batch.mamba_track_indices = boundary_indices.to(
+                    device=batch.seq_lens.device, dtype=torch.long
+                )
+                batch.mamba_track_mask = possible_boundary_track
+                batch.mamba_track_seqlens = boundary_track_seqlens
+                self.linear_state.set_suffix_replay_boundary_track_mask(
+                    possible_boundary_track
+                )
+            else:
+                batch.mamba_track_indices = None
+                batch.mamba_track_mask = None
+                batch.mamba_track_seqlens = None
+                self.linear_state.set_suffix_replay_boundary_track_mask(None)
+            batch.mamba_cow_src_indices = boundary_indices
+            batch.mamba_cow_dst_indices = live_indices
+            batch.mamba_clear_indices = None
+            if accepted_rows:
+                batch.req_to_token_pool.write(
+                    (torch.cat(accepted_rows), torch.cat(accepted_offsets)),
+                    accepted_cache_locs.to(
+                        device=batch.seq_lens.device, dtype=torch.int32
+                    ),
+                )
+
+            self.target_worker.forward_batch_generation(batch=batch, is_verify=True)
+            return torch.ones(
+                len(batch.reqs), dtype=torch.bool, device=live_indices.device
+            )
+        finally:
+            if saved_tail_lens is not None:
+                state_adapter.set_state_input_tail_lens(
+                    state_cache=state_cache,
+                    state_input_indices=linear_state_ctx.state_input_indices,
+                    tail_lens=saved_tail_lens,
+                )
+            state_adapter.restore_state_input_window(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                backup=saved_state_input_window,
+            )
             for name, value in saved_fields.items():
                 setattr(batch, name, value)
 
@@ -1092,11 +1395,18 @@ class DecodeVerifyRollbackWorker:
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
-        oracle_logits = self._target_suffix_extend_verify_logits(
-            batch=batch,
-            spec_info=spec_info,
-            linear_state_ctx=linear_state_ctx,
-        )
+        oracle_logits = None
+        if batch.return_logprob:
+            # Strict returned logprobs are compared against a flush-cache full
+            # prefill oracle.  The current Triton cached-prefix target-verify
+            # path is deterministic but not bitwise identical to full prefill,
+            # so only logprob-returning requests pay for a full-prefix oracle.
+            oracle_logits = self._target_suffix_extend_verify_logits(
+                batch=batch,
+                spec_info=spec_info,
+                linear_state_ctx=linear_state_ctx,
+                full_prefix_replay=True,
+            )
         if oracle_logits is not None:
             logits_output.next_token_logits = oracle_logits
         maybe_detect_nan(logits_output.next_token_logits, "dvr target verify")
@@ -1126,12 +1436,23 @@ class DecodeVerifyRollbackWorker:
             ) = self._accepted_token_counts_and_steps(
                 verify_output, linear_state_ctx.live_indices.device
             )
+            accepted_replay = self._replay_accepted_suffix_for_partial_verify(
+                batch=batch,
+                spec_info=spec_info,
+                verify_output=verify_output,
+                linear_state_ctx=linear_state_ctx,
+                accepted_token_counts_cpu=accepted_token_counts_cpu,
+            )
+            live_state_already_replayed = None
+            if accepted_replay is not None:
+                live_state_already_replayed = accepted_replay
             self.linear_state.commit_after_verify(
                 batch=batch,
                 accepted_token_counts=accepted_token_counts,
                 accepted_steps=accepted_steps,
                 accepted_token_counts_cpu=accepted_token_counts_cpu,
                 ctx=linear_state_ctx,
+                live_state_already_replayed=live_state_already_replayed,
             )
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
