@@ -352,7 +352,7 @@ class DecodeVerifyRollbackWorker:
 
     @staticmethod
     def _request_token_ids_for_replay(req, boundary_seqlen: int):
-        token_ids = req.origin_input_ids + req.output_ids
+        token_ids = list(req.origin_input_ids) + list(req.output_ids)
         if len(token_ids) >= boundary_seqlen:
             return token_ids
 
@@ -541,10 +541,14 @@ class DecodeVerifyRollbackWorker:
                 self.num_draft_tokens,
             )
 
-        replay_tasks = self.linear_state.prepare_for_draft(batch)
+        replay_tasks = self.linear_state.prepare_for_draft(
+            batch, use_request_seqlen=True
+        )
         if replay_tasks:
             self._replay_linear_state_boundaries(batch, replay_tasks)
-            self.linear_state.restore_tail_lens_after_replay(batch, replay_tasks)
+            self.linear_state.restore_tail_lens_after_replay(
+                batch, replay_tasks, use_request_seqlen=True
+            )
         self.linear_state.finish_prepare_for_draft(batch)
         self._draft_preprocess_decode(batch)
         spec_info = batch.spec_info
@@ -1436,13 +1440,15 @@ class DecodeVerifyRollbackWorker:
             ) = self._accepted_token_counts_and_steps(
                 verify_output, linear_state_ctx.live_indices.device
             )
-            accepted_replay = self._replay_accepted_suffix_for_partial_verify(
-                batch=batch,
-                spec_info=spec_info,
-                verify_output=verify_output,
-                linear_state_ctx=linear_state_ctx,
-                accepted_token_counts_cpu=accepted_token_counts_cpu,
-            )
+            accepted_replay = None
+            if not isinstance(spec_info, DVRSelfDraftVerifyInput):
+                accepted_replay = self._replay_accepted_suffix_for_partial_verify(
+                    batch=batch,
+                    spec_info=spec_info,
+                    verify_output=verify_output,
+                    linear_state_ctx=linear_state_ctx,
+                    accepted_token_counts_cpu=accepted_token_counts_cpu,
+                )
             live_state_already_replayed = None
             if accepted_replay is not None:
                 live_state_already_replayed = accepted_replay
@@ -1453,6 +1459,9 @@ class DecodeVerifyRollbackWorker:
                 accepted_token_counts_cpu=accepted_token_counts_cpu,
                 ctx=linear_state_ctx,
                 live_state_already_replayed=live_state_already_replayed,
+                use_fast_self_draft_commit=isinstance(
+                    spec_info, DVRSelfDraftVerifyInput
+                ),
             )
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)

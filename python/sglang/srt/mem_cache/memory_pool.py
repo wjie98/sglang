@@ -359,7 +359,9 @@ class MambaPool:
                     intermediate_conv_tokens = speculative_num_draft_tokens
                     dvr_state_input_cache = DVRGDNStateInputCache.create(
                         num_layers=num_mamba_layers,
-                        num_slots=spec_state_size + 1,
+                        # Slot 0 is the padded-row dummy; real DVR rows use
+                        # req_pool_idx + 1 to match the v5 hot path.
+                        num_slots=spec_state_size + 2,
                         num_draft_tokens=speculative_num_draft_tokens,
                         state_shape=cache_params.shape,
                         dtype=conv_dtype,

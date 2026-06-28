@@ -89,6 +89,7 @@ from sglang.srt.utils.common import (
     is_npu,
     log_info_on_rank0,
     next_power_of_2,
+    require_gathered_buffer,
 )
 
 _is_npu = is_npu()
@@ -209,6 +210,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
+            self._dvr_draft_decode_context(clear_kernel_config_caches=True),
         ):
             self.init_attention_backend()
             if server_args.enable_breakable_cuda_graph:
@@ -223,6 +225,15 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self._draft_extend_selected_logits = (
+            self.topk == 1
+            and not require_gathered_buffer(self.draft_runner.server_args)
+            and getattr(
+                self.draft_runner.model,
+                "supports_draft_extend_selected_logits",
+                False,
+            )
+        )
 
     def _dvr_draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
         if self.speculative_algorithm.is_decode_verify_rollback_eagle():
@@ -230,8 +241,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_runner,
                 clear_kernel_config_caches=clear_kernel_config_caches,
                 attn_backends=(
-                    self.draft_attn_backend,
-                    self.draft_extend_attn_backend,
+                    getattr(self, "draft_attn_backend", None),
+                    getattr(self, "draft_extend_attn_backend", None),
                 ),
             )
         return contextlib.nullcontext()
@@ -737,7 +748,9 @@ class EagleDraftWorker(BaseDraftWorker):
             * self.speculative_num_draft_tokens
             + batch_result.accept_lens
             - 1
-        )
+        ).to(torch.long)
+        if self._draft_extend_selected_logits:
+            draft_input.selected_hidden_indices = select_index
 
         # Prepare for draft extend in a separate stream
         with self._dvr_draft_decode_context(), self.plan_stream_ctx:
@@ -798,15 +811,17 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+        if not self._draft_extend_selected_logits:
+            draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
                 select_index
             ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
+        # The worker owns selected-row topk for graph and eager paths.  When the
+        # draft model supports selected logits, the model has already gathered
+        # these rows before lm_head; otherwise slice the full-width output here.
         if self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.

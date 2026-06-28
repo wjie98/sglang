@@ -317,6 +317,22 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
 
+    def _should_defer_non_streaming_logprob_output(self, req: Req) -> bool:
+        """Keep DVR-EAGLE non-streaming logprobs local until final repair.
+
+        DVR-EAGLE rewrites strict returned logprobs from a final prompt+output
+        full-prefill oracle. Once a non-streaming chunk is sent to the
+        detokenizer, it cannot be repaired in place, so only the final response
+        should carry those logprobs.
+        """
+
+        return (
+            self.return_logprob
+            and req.return_logprob
+            and not req.stream
+            and self.spec_algorithm.is_decode_verify_rollback_eagle()
+        )
+
     def accept(self, *, req: Req) -> None:
         if req.finished():
             assert not req.finished_output
@@ -341,9 +357,12 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
-                should_output = (
-                    len(req.output_ids) % self.default_force_stream_interval == 0
-                )
+                if self._should_defer_non_streaming_logprob_output(req):
+                    should_output = False
+                else:
+                    should_output = (
+                        len(req.output_ids) % self.default_force_stream_interval == 0
+                    )
 
         if not should_output:
             return

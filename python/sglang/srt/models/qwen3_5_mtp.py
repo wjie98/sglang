@@ -110,6 +110,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        # The MTP block must still run every draft token to keep draft KV/GDN
+        # state complete, but topk=1 draft-extend only consumes the selected
+        # hidden rows for the next seed.  Let the worker gather those rows
+        # before lm_head and skip full-vocab logits for unused draft rows.
+        self.supports_draft_extend_selected_logits = True
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -189,6 +194,19 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     forward_batch,
                     hidden_states,
                 )
+
+            selected_hidden_indices = getattr(
+                forward_batch.spec_info, "selected_hidden_indices", None
+            )
+            if (
+                selected_hidden_indices is not None
+                and forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                # Draft-extend must run all draft tokens through the MTP block so
+                # draft KV/GDN state stays complete, but topk=1 only consumes one
+                # logits row per request for the next seed.  Gather immediately
+                # before lm_head to avoid bs*num_draft_tokens full-vocab matmuls.
+                hidden_states = hidden_states.index_select(0, selected_hidden_indices)
         finally:
             exit_stack.close()
 

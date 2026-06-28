@@ -52,6 +52,39 @@ _ATTN_BACKEND_CHILD_LIST_ATTRS = (
     "backends",
     "children",
 )
+_TEMP_EXTEND_BATCH_FIELDS = (
+    "forward_mode",
+    "global_forward_mode",
+    "input_ids",
+    "input_embeds",
+    "replace_embeds",
+    "replace_positions",
+    "out_cache_loc",
+    "seq_lens",
+    "seq_lens_cpu",
+    "seq_lens_sum",
+    "prefix_lens",
+    "extend_lens",
+    "extend_num_tokens",
+    "extend_logprob_start_lens",
+    "extend_input_logprob_token_ids",
+    "global_num_tokens",
+    "global_num_tokens_for_logprob",
+    "is_extend_in_batch",
+    "all_extend_in_batch",
+    "spec_info",
+    "capture_hidden_mode",
+    "return_hidden_states",
+    "return_hidden_states_before_norm",
+    "return_logprob",
+    "mamba_track_indices",
+    "mamba_track_mask",
+    "mamba_track_seqlens",
+    "mamba_cow_src_indices",
+    "mamba_cow_dst_indices",
+    "mamba_clear_indices",
+    "multimodal_inputs",
+)
 
 
 class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
@@ -132,6 +165,26 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         with stream_ctx, self._target_verify_graph_runner_context():
             yield use_plan_stream
 
+    @contextmanager
+    def _temporary_target_extend_batch(self, batch: ScheduleBatch):
+        """Temporarily reinterpret a live verify batch as EXTEND.
+
+        DVR-EAGLE uses target EXTEND replays as correctness oracles for GDN
+        state and strict returned logprobs. ForwardBatch.init_new reads mutable
+        ScheduleBatch fields, so every field touched by those temporary replays
+        must be restored before the scheduler continues the real TARGET_VERIFY
+        path.
+        """
+
+        saved_fields = {
+            name: getattr(batch, name) for name in _TEMP_EXTEND_BATCH_FIELDS
+        }
+        try:
+            yield saved_fields
+        finally:
+            for name, value in saved_fields.items():
+                setattr(batch, name, value)
+
     def _target_verify_graph_runner_bs(self, can_run_cuda_graph: bool):
         if not can_run_cuda_graph:
             return None
@@ -187,22 +240,23 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         if replay_output_ids is not None and len(replay_output_ids) >= output_len:
             return origin_input_ids + replay_output_ids[:output_len]
 
-        token_ids = origin_input_ids + req.output_ids
-        if replay_output_ids is None and len(token_ids) >= seq_len:
+        # The replay stream is a helper for overlap timing.  If it is behind
+        # but the request already exposes a complete logical prefix, use that
+        # instead of failing the strict oracle path.
+        token_ids = origin_input_ids + list(req.output_ids)
+        if len(token_ids) >= seq_len:
             return token_ids
 
         if hasattr(req, "get_fill_ids"):
-            fill_ids = req.get_fill_ids()
-            if replay_output_ids is None and len(fill_ids) >= seq_len:
+            fill_ids = list(req.get_fill_ids())
+            if len(fill_ids) >= seq_len:
                 return fill_ids
 
         fill_ids = getattr(req, "full_untruncated_fill_ids", None)
-        if (
-            replay_output_ids is None
-            and fill_ids is not None
-            and len(fill_ids) >= seq_len
-        ):
-            return fill_ids
+        if fill_ids is not None:
+            fill_ids = list(fill_ids)
+            if len(fill_ids) >= seq_len:
+                return fill_ids
 
         raise RuntimeError(
             "DVR EAGLE replay cannot reconstruct the verified prefix: "
@@ -247,6 +301,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             else batch.seq_lens.detach().cpu().tolist()
         )
         accept_lens_cpu = accept_lens.detach().cpu().tolist()
+        # EAGLE v2 emits the accepted draft-token prefix. Target's bonus token
+        # seeds the next draft round, where it becomes a draft token before it
+        # can be committed.  Tracking predict/accept_index here would shift the
+        # replay prefix by one target prediction.
         draft_tokens_cpu = (
             verify_input.draft_token.reshape(bs, draft_token_num)
             .detach()
@@ -324,7 +382,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         verify_input: DVREagleVerifyInput,
         linear_state_ctx,
         full_prefix_replay: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
         """Compute verifier outputs by replaying the deterministic suffix prefill.
 
         DVR correctness is defined by target prefill semantics.  For hybrid GDN
@@ -391,8 +449,9 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             )
         ):
             token_ids = self._request_token_ids_for_eagle_replay(req, int(seq_len))
-            input_ids.extend(token_ids[int(boundary) : int(seq_len)])
-            input_ids.extend(draft_tokens_cpu[req_i])
+            replay_chunk_ids = token_ids[int(boundary) : int(seq_len)]
+            replay_chunk_ids.extend(draft_tokens_cpu[req_i])
+            input_ids.extend(replay_chunk_ids)
             if tail_len > 0:
                 out_cache_locs.append(
                     batch.req_to_token_pool.req_to_token[
@@ -452,218 +511,489 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         # EXTEND forward.
         possible_boundary_track = torch.zeros_like(possible_boundary_track)
 
-        # ForwardBatch.init_new reads many mutable ScheduleBatch fields.  The
-        # oracle below temporarily reinterprets the live verify batch as an
-        # ordinary EXTEND over "tail + draft", then restores every touched field
-        # in finally so the scheduler still sees the original TARGET_VERIFY.
-        saved_fields = {
-            "forward_mode": batch.forward_mode,
-            "global_forward_mode": batch.global_forward_mode,
-            "input_ids": batch.input_ids,
-            "input_embeds": batch.input_embeds,
-            "replace_embeds": batch.replace_embeds,
-            "replace_positions": batch.replace_positions,
-            "out_cache_loc": batch.out_cache_loc,
-            "seq_lens": batch.seq_lens,
-            "seq_lens_cpu": batch.seq_lens_cpu,
-            "seq_lens_sum": batch.seq_lens_sum,
-            "prefix_lens": batch.prefix_lens,
-            "extend_lens": batch.extend_lens,
-            "extend_num_tokens": batch.extend_num_tokens,
-            "extend_logprob_start_lens": batch.extend_logprob_start_lens,
-            "is_extend_in_batch": batch.is_extend_in_batch,
-            "all_extend_in_batch": batch.all_extend_in_batch,
-            "spec_info": batch.spec_info,
-            "capture_hidden_mode": batch.capture_hidden_mode,
-            "return_hidden_states": batch.return_hidden_states,
-            "return_hidden_states_before_norm": batch.return_hidden_states_before_norm,
-            "return_logprob": batch.return_logprob,
-            "mamba_track_indices": batch.mamba_track_indices,
-            "mamba_track_mask": batch.mamba_track_mask,
-            "mamba_track_seqlens": batch.mamba_track_seqlens,
-            "mamba_cow_src_indices": batch.mamba_cow_src_indices,
-            "mamba_cow_dst_indices": batch.mamba_cow_dst_indices,
-            "mamba_clear_indices": batch.mamba_clear_indices,
-            "multimodal_inputs": batch.multimodal_inputs,
-        }
+        with self._temporary_target_extend_batch(batch) as saved_fields:
+            try:
+                if not full_prefix_replay:
+                    self.linear_state.restore_boundary_state_for_suffix_replay(
+                        linear_state_ctx
+                    )
 
-        try:
-            if not full_prefix_replay:
-                self.linear_state.restore_boundary_state_for_suffix_replay(
-                    linear_state_ctx
+                batch.forward_mode = ForwardMode.EXTEND
+                batch.global_forward_mode = None
+                batch.input_ids = torch.tensor(
+                    input_ids, dtype=torch.long, device=batch.seq_lens.device
+                )
+                batch.input_embeds = None
+                batch.replace_embeds = None
+                batch.replace_positions = None
+                batch.out_cache_loc = torch.cat(out_cache_locs).to(
+                    device=batch.seq_lens.device
+                )
+                batch.prefix_lens = [int(x) for x in boundary_lens]
+                batch.extend_lens = [int(x) for x in extend_lens_cpu]
+                batch.extend_num_tokens = len(input_ids)
+                batch.extend_logprob_start_lens = [int(x) for x in extend_lens_cpu]
+                batch.extend_input_logprob_token_ids = None
+                if saved_fields["global_num_tokens"] is not None:
+                    dp_world = len(saved_fields["global_num_tokens"])
+                    batch.global_num_tokens = [len(input_ids)] * dp_world
+                    batch.global_num_tokens_for_logprob = [len(input_ids)] * dp_world
+                batch.seq_lens = torch.tensor(
+                    final_seq_lens_cpu,
+                    dtype=torch.long,
+                    device=saved_fields["seq_lens"].device,
+                )
+                batch.seq_lens_cpu = torch.tensor(
+                    final_seq_lens_cpu,
+                    dtype=torch.long,
+                )
+                batch.seq_lens_sum = sum(final_seq_lens_cpu)
+                batch.is_extend_in_batch = True
+                batch.all_extend_in_batch = True
+                batch.spec_info = None
+                batch.capture_hidden_mode = CaptureHiddenMode.FULL
+                batch.return_hidden_states = False
+                batch.return_hidden_states_before_norm = False
+                batch.return_logprob = False
+                if possible_boundary_track.any():
+                    # Reuse the normal EXTEND mamba tracker to materialize the next
+                    # chunk checkpoint while replaying the suffix.  Sampling may
+                    # later reject before that boundary; commit_after_verify will
+                    # roll back those speculative checkpoint writes.
+                    batch.mamba_track_indices = boundary_indices.to(
+                        device=batch.seq_lens.device, dtype=torch.long
+                    )
+                    batch.mamba_track_mask = possible_boundary_track
+                    batch.mamba_track_seqlens = boundary_track_seqlens
+                    self.linear_state.set_suffix_replay_boundary_track_mask(
+                        possible_boundary_track
+                    )
+                else:
+                    batch.mamba_track_indices = None
+                    batch.mamba_track_mask = None
+                    batch.mamba_track_seqlens = None
+                    self.linear_state.set_suffix_replay_boundary_track_mask(None)
+                # Suffix replay starts from DVR-managed recurrent state. Do not
+                # re-apply cached-prefix deferred Mamba COW/clear ops that were
+                # already consumed by the real prefill/verify forward.
+                batch.mamba_cow_src_indices = None
+                batch.mamba_cow_dst_indices = None
+                batch.mamba_clear_indices = live_indices if full_prefix_replay else None
+                # The suffix EXTEND must see draft KV at absolute positions
+                # base_seq_len..base_seq_len+draft.  These are the same slots the
+                # real verify path owns, so publishing them in req_to_token_pool is
+                # intentional even though the rest of ScheduleBatch is restored.
+                batch.req_to_token_pool.write(
+                    (draft_rows, draft_offsets),
+                    draft_cache_locs.to(torch.int32),
                 )
 
-            batch.forward_mode = ForwardMode.EXTEND
-            batch.global_forward_mode = None
-            batch.input_ids = torch.tensor(
-                input_ids, dtype=torch.long, device=batch.seq_lens.device
-            )
-            batch.input_embeds = None
-            batch.replace_embeds = None
-            batch.replace_positions = None
-            batch.out_cache_loc = torch.cat(out_cache_locs).to(
-                device=batch.seq_lens.device
-            )
-            batch.prefix_lens = [int(x) for x in boundary_lens]
-            batch.extend_lens = [int(x) for x in extend_lens_cpu]
-            batch.extend_num_tokens = len(input_ids)
-            batch.extend_logprob_start_lens = [int(x) for x in extend_lens_cpu]
-            batch.seq_lens = torch.tensor(
-                final_seq_lens_cpu,
-                dtype=torch.long,
-                device=saved_fields["seq_lens"].device,
-            )
-            batch.seq_lens_cpu = torch.tensor(
-                final_seq_lens_cpu,
-                dtype=torch.long,
-            )
-            batch.seq_lens_sum = sum(final_seq_lens_cpu)
-            batch.is_extend_in_batch = True
-            batch.all_extend_in_batch = True
-            batch.spec_info = None
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch.return_hidden_states = False
-            batch.return_hidden_states_before_norm = False
-            batch.return_logprob = False
-            if possible_boundary_track.any():
-                # Reuse the normal EXTEND mamba tracker to materialize the next
-                # chunk checkpoint while replaying the suffix.  Sampling may
-                # later reject before that boundary; commit_after_verify will
-                # roll back those speculative checkpoint writes.
-                batch.mamba_track_indices = boundary_indices.to(
-                    device=batch.seq_lens.device, dtype=torch.long
-                )
-                batch.mamba_track_mask = possible_boundary_track
-                batch.mamba_track_seqlens = boundary_track_seqlens
-                self.linear_state.set_suffix_replay_boundary_track_mask(
-                    possible_boundary_track
-                )
-            else:
-                batch.mamba_track_indices = None
-                batch.mamba_track_mask = None
-                batch.mamba_track_seqlens = None
-                self.linear_state.set_suffix_replay_boundary_track_mask(None)
-            # Suffix replay starts from DVR-managed recurrent state. Do not
-            # re-apply cached-prefix deferred Mamba COW/clear ops that were
-            # already consumed by the real prefill/verify forward.
-            batch.mamba_cow_src_indices = None
-            batch.mamba_cow_dst_indices = None
-            batch.mamba_clear_indices = live_indices if full_prefix_replay else None
-            # The suffix EXTEND must see draft KV at absolute positions
-            # base_seq_len..base_seq_len+draft.  These are the same slots the
-            # real verify path owns, so publishing them in req_to_token_pool is
-            # intentional even though the rest of ScheduleBatch is restored.
-            batch.req_to_token_pool.write(
-                (draft_rows, draft_offsets),
-                draft_cache_locs.to(torch.int32),
-            )
-
-            forward_batch = ForwardBatch.init_new(batch, self.target_worker.model_runner)
-            if self.target_worker.model_runner.model_is_mrope:
-                mrope_chunks = []
-                mm_inputs = saved_fields["multimodal_inputs"]
-                for req_i, (seq_len, boundary, extend_len, tail_len) in enumerate(
-                    zip(
-                        base_seq_lens_cpu,
-                        boundary_lens,
-                        extend_lens_cpu,
-                        tail_lens_cpu,
-                        strict=True,
-                    )
-                ):
-                    mm_input = (
-                        None
-                        if mm_inputs is None or req_i >= len(mm_inputs)
-                        else mm_inputs[req_i]
-                    )
-                    mm_positions = getattr(mm_input, "mrope_positions", None)
-                    chunk_parts = []
-                    if mm_positions is not None:
-                        tail_positions = mm_positions[
-                            :, int(boundary) : int(seq_len)
-                        ].to(device=batch.seq_lens.device, dtype=torch.long)
-                        if tail_positions.shape[1] > 0:
-                            chunk_parts.append(tail_positions)
-                    filled_tail = (
-                        sum(part.shape[1] for part in chunk_parts)
-                        if chunk_parts
-                        else 0
-                    )
-                    if filled_tail < int(tail_len):
-                        start = int(boundary) + filled_tail
-                        fallback_tail = torch.arange(
-                            start,
+                forward_batch = ForwardBatch.init_new(batch, self.target_worker.model_runner)
+                if self.target_worker.model_runner.model_is_mrope:
+                    mrope_chunks = []
+                    mm_inputs = saved_fields["multimodal_inputs"]
+                    for req_i, (seq_len, boundary, extend_len, tail_len) in enumerate(
+                        zip(
+                            base_seq_lens_cpu,
+                            boundary_lens,
+                            extend_lens_cpu,
+                            tail_lens_cpu,
+                            strict=True,
+                        )
+                    ):
+                        mm_input = (
+                            None
+                            if mm_inputs is None or req_i >= len(mm_inputs)
+                            else mm_inputs[req_i]
+                        )
+                        mm_positions = getattr(mm_input, "mrope_positions", None)
+                        chunk_parts = []
+                        if mm_positions is not None:
+                            tail_positions = mm_positions[
+                                :, int(boundary) : int(seq_len)
+                            ].to(device=batch.seq_lens.device, dtype=torch.long)
+                            if tail_positions.shape[1] > 0:
+                                chunk_parts.append(tail_positions)
+                        filled_tail = (
+                            sum(part.shape[1] for part in chunk_parts)
+                            if chunk_parts
+                            else 0
+                        )
+                        if filled_tail < int(tail_len):
+                            start = int(boundary) + filled_tail
+                            fallback_tail = torch.arange(
+                                start,
+                                int(seq_len),
+                                dtype=torch.long,
+                                device=batch.seq_lens.device,
+                            ).unsqueeze(0).repeat(3, 1)
+                            chunk_parts.append(fallback_tail)
+                        draft_positions = torch.arange(
                             int(seq_len),
+                            int(seq_len) + draft_token_num,
                             dtype=torch.long,
                             device=batch.seq_lens.device,
                         ).unsqueeze(0).repeat(3, 1)
-                        chunk_parts.append(fallback_tail)
-                    draft_positions = torch.arange(
-                        int(seq_len),
-                        int(seq_len) + draft_token_num,
-                        dtype=torch.long,
-                        device=batch.seq_lens.device,
-                    ).unsqueeze(0).repeat(3, 1)
-                    chunk_parts.append(draft_positions)
-                    mrope_chunks.append(torch.cat(chunk_parts, dim=1))
-                forward_batch.mrope_positions = torch.cat(mrope_chunks, dim=1)
-            oracle_output = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=forward_batch,
-                is_verify=True,
-            )
-            hidden_states = oracle_output.logits_output.hidden_states
-            if hidden_states is None:
-                raise RuntimeError(
-                    "DVR EAGLE suffix EXTEND verifier did not return hidden states."
+                        chunk_parts.append(draft_positions)
+                        mrope_chunks.append(torch.cat(chunk_parts, dim=1))
+                    forward_batch.mrope_positions = torch.cat(mrope_chunks, dim=1)
+                oracle_output = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=forward_batch,
+                    is_verify=True,
                 )
+                hidden_states = oracle_output.logits_output.hidden_states
+                if hidden_states is None:
+                    raise RuntimeError(
+                        "DVR EAGLE suffix EXTEND verifier did not return hidden states."
+                    )
 
-            gather_indices = []
-            offset = 0
-            for tail_len, extend_len in zip(
-                tail_lens_cpu, extend_lens_cpu, strict=True
-            ):
-                gather_indices.extend(
-                    range(offset + tail_len, offset + tail_len + draft_token_num)
+                hidden_gather_indices = []
+                offset = 0
+                for tail_len, extend_len in zip(
+                    tail_lens_cpu, extend_lens_cpu, strict=True
+                ):
+                    hidden_gather_indices.extend(
+                        range(offset + tail_len, offset + tail_len + draft_token_num)
+                    )
+                    offset += extend_len
+                hidden_gather_indices_t = torch.tensor(
+                    hidden_gather_indices, dtype=torch.long, device=hidden_states.device
                 )
-                offset += extend_len
-            gather_indices_t = torch.tensor(
-                gather_indices, dtype=torch.long, device=hidden_states.device
-            )
-            draft_hidden_states = hidden_states[gather_indices_t]
+                draft_hidden_states = hidden_states[hidden_gather_indices_t]
 
-            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
-            logits_metadata.next_token_logits_buffer = None
-            draft_logits = (
-                self.target_worker.model_runner.model.logits_processor._get_logits(
+                logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+                logits_metadata.next_token_logits_buffer = None
+                draft_logits = (
+                    self.target_worker.model_runner.model.logits_processor._get_logits(
+                        draft_hidden_states,
+                        self.target_worker.model_runner.model.lm_head,
+                        logits_metadata,
+                    )
+                )
+                return (
+                    draft_logits,
                     draft_hidden_states,
-                    self.target_worker.model_runner.model.lm_head,
-                    logits_metadata,
+                    None,
                 )
-            )
-            return (
-                draft_logits,
-                draft_hidden_states,
-            )
-        finally:
-            state_adapter.restore_recurrent_state(
-                state_cache=state_cache,
-                backup=verify_ready_live_backup,
-                indices=live_indices,
-            )
-            if saved_tail_lens is not None:
-                state_adapter.set_state_input_tail_lens(
+            finally:
+                state_adapter.restore_recurrent_state(
+                    state_cache=state_cache,
+                    backup=verify_ready_live_backup,
+                    indices=live_indices,
+                )
+                if saved_tail_lens is not None:
+                    state_adapter.set_state_input_tail_lens(
+                        state_cache=state_cache,
+                        state_input_indices=linear_state_ctx.state_input_indices,
+                        tail_lens=saved_tail_lens,
+                    )
+                state_adapter.restore_state_input_window(
                     state_cache=state_cache,
                     state_input_indices=linear_state_ctx.state_input_indices,
-                    tail_lens=saved_tail_lens,
+                    backup=saved_state_input_window,
                 )
-            state_adapter.restore_state_input_window(
+
+    def _target_full_prefix_score_accepted_logprobs(
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_input: DVREagleVerifyInput,
+        linear_state_ctx,
+        predict: torch.Tensor,
+        accept_lens: torch.Tensor,
+        draft_token_num: int,
+    ) -> torch.Tensor | None:
+        """Score emitted EAGLE tokens with the same full-prefill oracle as KL tests.
+
+        EAGLE's verify matrix mixes accepted draft tokens and a target bonus
+        token.  Their row semantics differ enough that reconstructing returned
+        logprobs from verify rows is fragile.  For strict return_logprob
+        requests, replay the full prefix plus the actually emitted tokens and
+        read SGLang's standard input-logprob slice.  This path is intentionally
+        outside the no-logprob hot path.
+        """
+
+        if batch.forward_mode.is_idle() or linear_state_ctx is None:
+            return None
+
+        state_adapter = linear_state_ctx.state_adapter
+        state_cache = linear_state_ctx.state_cache
+        live_indices = linear_state_ctx.live_indices
+
+        bs = len(batch.seq_lens)
+        base_seq_lens_cpu = (
+            batch.seq_lens_cpu.tolist()
+            if batch.seq_lens_cpu is not None
+            else batch.seq_lens.detach().cpu().tolist()
+        )
+        accept_lens_cpu = accept_lens.detach().cpu().tolist()
+        predict_cpu = predict.detach().cpu().tolist()
+        draft_tokens_cpu = (
+            verify_input.draft_token.reshape(bs, draft_token_num)
+            .detach()
+            .cpu()
+            .tolist()
+        )
+
+        input_ids = []
+        logprob_token_ids = []
+        out_cache_locs = []
+        extend_lens_cpu = []
+        final_seq_lens_cpu = []
+        final_score_specs = []
+        write_rows = []
+        write_offsets = []
+        write_locs = []
+        flat_cache_locs = batch.out_cache_loc.to(torch.long)
+
+        for req_i, (req, seq_len, accept_len) in enumerate(
+            zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
+        ):
+            accept_len = int(accept_len)
+            compact_start = req_i * draft_token_num
+            token_ids = self._request_token_ids_for_eagle_replay(req, int(seq_len))
+            prev_output_len = len(req.output_ids)
+            max_new_tokens = req.sampling_params.max_new_tokens
+            final_output_len = None
+            if (
+                not req.stream
+                and req.send_output_token_logprobs_offset == 0
+                and max_new_tokens is not None
+                and prev_output_len + accept_len >= max_new_tokens
+            ):
+                final_output_len = int(max_new_tokens)
+
+            if final_output_len is not None:
+                # For GDN models, logprobs inside an unclosed chunk are only
+                # strictly comparable to the final full-prefill oracle once the
+                # whole generated suffix is known.  Non-streaming requests have
+                # not sent output logprobs yet, so patch the final response from
+                # the exact prompt+output scoring pass instead of relying on
+                # per-verify-round rows.
+                final_curr_len = max(0, final_output_len - prev_output_len)
+                emitted_tokens = [
+                    int(token)
+                    for token in predict_cpu[
+                        compact_start : compact_start + final_curr_len
+                    ]
+                ]
+                final_output_ids = list(req.output_ids) + emitted_tokens
+                replay_ids = token_ids[: int(seq_len)] + emitted_tokens
+                logprob_token_ids.extend(replay_ids[1:])
+                logprob_token_ids.append(0)
+                final_score_specs.append(
+                    (req_i, req, prev_output_len, final_curr_len, final_output_ids)
+                )
+            else:
+                # DVR-EAGLE's recurrent/KV state advances over the accepted
+                # draft prefix, while Spec v2 emits the one-token-shifted
+                # stream.  Replay the accepted draft prefix as context and ask
+                # input-logprob to score the shifted tokens: draft[1:] plus the
+                # target bonus.
+                replay_tokens = [
+                    int(token) for token in draft_tokens_cpu[req_i][:accept_len]
+                ]
+                bonus_token = int(predict_cpu[compact_start + accept_len - 1])
+                replay_ids = token_ids[: int(seq_len)] + replay_tokens
+                logprob_token_ids.extend(replay_ids[1:])
+                logprob_token_ids.append(bonus_token)
+
+            input_ids.extend(replay_ids)
+
+            if int(seq_len) > 0:
+                out_cache_locs.append(
+                    batch.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, : int(seq_len)
+                    ].to(torch.long)
+                )
+            current_write_len = (
+                accept_len if final_output_len is None else final_curr_len
+            )
+            accepted_locs = flat_cache_locs[
+                compact_start : compact_start + current_write_len
+            ]
+            out_cache_locs.append(accepted_locs)
+
+            req_row = torch.full(
+                (current_write_len,),
+                int(req.req_pool_idx),
+                dtype=torch.long,
+                device=batch.seq_lens.device,
+            )
+            req_offsets = torch.arange(
+                int(seq_len),
+                int(seq_len) + current_write_len,
+                dtype=torch.long,
+                device=batch.seq_lens.device,
+            )
+            if current_write_len > 0:
+                write_rows.append(req_row)
+                write_offsets.append(req_offsets)
+                write_locs.append(accepted_locs.to(device=batch.seq_lens.device))
+
+            extend_len = len(replay_ids)
+            extend_lens_cpu.append(extend_len)
+            final_seq_lens_cpu.append(extend_len)
+
+        if not input_ids:
+            return None
+
+        saved_tail_lens = state_adapter.state_input_tail_lens(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+        if saved_tail_lens is not None:
+            saved_tail_lens = saved_tail_lens.clone()
+        saved_state_input_window = state_adapter.backup_state_input_window(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+        if saved_tail_lens is not None:
+            zero_tail_lens = torch.zeros_like(saved_tail_lens)
+            state_adapter.set_state_input_tail_lens(
                 state_cache=state_cache,
                 state_input_indices=linear_state_ctx.state_input_indices,
-                backup=saved_state_input_window,
+                tail_lens=zero_tail_lens,
             )
-            for name, value in saved_fields.items():
-                setattr(batch, name, value)
+            state_adapter.zero_state_input_after_lens(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                keep_lens=zero_tail_lens,
+            )
+
+        live_backup = state_adapter.backup_recurrent_state(
+            state_cache=state_cache,
+            indices=live_indices,
+        )
+        with self._temporary_target_extend_batch(batch) as saved_fields:
+            try:
+                batch.forward_mode = ForwardMode.EXTEND
+                batch.global_forward_mode = None
+                batch.input_ids = torch.tensor(
+                    input_ids, dtype=torch.long, device=batch.seq_lens.device
+                )
+                batch.input_embeds = None
+                batch.replace_embeds = None
+                batch.replace_positions = None
+                batch.out_cache_loc = torch.cat(out_cache_locs).to(batch.seq_lens.device)
+                batch.prefix_lens = [0 for _ in extend_lens_cpu]
+                batch.extend_lens = [int(x) for x in extend_lens_cpu]
+                batch.extend_num_tokens = len(input_ids)
+                batch.extend_logprob_start_lens = [0 for _ in extend_lens_cpu]
+                batch.extend_input_logprob_token_ids = torch.tensor(
+                    logprob_token_ids, dtype=torch.long, device=batch.seq_lens.device
+                )
+                if saved_fields["global_num_tokens"] is not None:
+                    dp_world = len(saved_fields["global_num_tokens"])
+                    batch.global_num_tokens = [len(input_ids)] * dp_world
+                    batch.global_num_tokens_for_logprob = [len(input_ids)] * dp_world
+                batch.seq_lens = torch.tensor(
+                    final_seq_lens_cpu,
+                    dtype=torch.long,
+                    device=saved_fields["seq_lens"].device,
+                )
+                batch.seq_lens_cpu = torch.tensor(final_seq_lens_cpu, dtype=torch.long)
+                batch.seq_lens_sum = sum(final_seq_lens_cpu)
+                batch.is_extend_in_batch = True
+                batch.all_extend_in_batch = True
+                batch.spec_info = None
+                batch.capture_hidden_mode = CaptureHiddenMode.NULL
+                batch.return_hidden_states = False
+                batch.return_hidden_states_before_norm = False
+                batch.return_logprob = True
+                batch.mamba_track_indices = None
+                batch.mamba_track_mask = None
+                batch.mamba_track_seqlens = None
+                batch.mamba_cow_src_indices = None
+                batch.mamba_cow_dst_indices = None
+                batch.mamba_clear_indices = live_indices
+                batch.multimodal_inputs = [None for _ in extend_lens_cpu]
+
+                if write_rows:
+                    batch.req_to_token_pool.write(
+                        (torch.cat(write_rows), torch.cat(write_offsets)),
+                        torch.cat(write_locs).to(torch.int32),
+                    )
+
+                forward_batch = ForwardBatch.init_new(batch, self.target_worker.model_runner)
+                score_output = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=forward_batch,
+                    is_verify=True,
+                )
+                input_token_logprobs = score_output.logits_output.input_token_logprobs
+                if input_token_logprobs is None:
+                    raise RuntimeError(
+                        "DVR EAGLE full-prefix accepted-token scoring did not return "
+                        "input_token_logprobs."
+                    )
+
+                final_score_req_indices = {spec[0] for spec in final_score_specs}
+                padded = torch.zeros(
+                    (bs, draft_token_num),
+                    dtype=input_token_logprobs.dtype,
+                    device=input_token_logprobs.device,
+                )
+                offset = 0
+                for req_i, (seq_len, extend_len, accept_len) in enumerate(
+                    zip(
+                        base_seq_lens_cpu,
+                        extend_lens_cpu,
+                        accept_lens_cpu,
+                        strict=True,
+                    )
+                ):
+                    if req_i in final_score_req_indices:
+                        offset += int(extend_len)
+                        continue
+                    start = offset + int(seq_len)
+                    end = start + int(accept_len)
+                    padded[req_i, : int(accept_len)] = input_token_logprobs[start:end]
+                    offset += int(extend_len)
+                for (
+                    req_i,
+                    req,
+                    prev_output_len,
+                    final_curr_len,
+                    final_output_ids,
+                ) in final_score_specs:
+                    prompt_len = len(req.origin_input_ids)
+                    req_offset = sum(extend_lens_cpu[:req_i])
+                    output_logprob_start = req_offset + prompt_len - 1
+                    output_logprob_end = output_logprob_start + len(final_output_ids)
+                    final_logprobs = input_token_logprobs[
+                        output_logprob_start:output_logprob_end
+                    ]
+                    if req.logprob.output_token_logprobs_val is not None:
+                        req.logprob.output_token_logprobs_val[:] = (
+                            final_logprobs[:prev_output_len].detach().cpu().tolist()
+                        )
+                        req.logprob.output_token_logprobs_idx[:] = final_output_ids[
+                            :prev_output_len
+                        ]
+                    if final_curr_len > 0:
+                        padded[req_i, :final_curr_len] = final_logprobs[
+                            prev_output_len : prev_output_len + final_curr_len
+                        ]
+                return padded
+            finally:
+                state_adapter.restore_recurrent_state(
+                    state_cache=state_cache,
+                    backup=live_backup,
+                    indices=live_indices,
+                )
+                if saved_tail_lens is not None:
+                    state_adapter.set_state_input_tail_lens(
+                        state_cache=state_cache,
+                        state_input_indices=linear_state_ctx.state_input_indices,
+                        tail_lens=saved_tail_lens,
+                    )
+                state_adapter.restore_state_input_window(
+                    state_cache=state_cache,
+                    state_input_indices=linear_state_ctx.state_input_indices,
+                    backup=saved_state_input_window,
+                )
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -808,10 +1138,12 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 linear_state_ctx=linear_state_ctx,
                 full_prefix_replay=batch.return_logprob,
             )
+        oracle_input_logprobs = None
         if oracle_output is not None:
-            oracle_logits, oracle_hidden_states = oracle_output
+            oracle_logits, oracle_hidden_states, oracle_input_logprobs = oracle_output
             logits_output.next_token_logits = oracle_logits
             logits_output.hidden_states = oracle_hidden_states
+        used_suffix_oracle = oracle_output is not None
 
         vocab_mask = None
         if batch.has_grammar:
@@ -839,11 +1171,16 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             batch, logits_output, vocab_mask
         )
         new_seq_lens = batch.seq_lens + accept_lens
-        self._advance_eagle_replay_prefix(
-            batch=batch,
-            verify_input=verify_input,
-            accept_lens=accept_lens,
-        )
+        # The fast no-logprob graph path consumes target verify hidden states
+        # directly.  Replay-prefix tracking is only needed when strict logprob
+        # requests or graph/eager fallback may reconstruct a suffix oracle; it
+        # copies accepted draft tokens to CPU, so keep it off the hot path.
+        if batch.return_logprob or used_suffix_oracle or not can_run_cuda_graph:
+            self._advance_eagle_replay_prefix(
+                batch=batch,
+                verify_input=verify_input,
+                accept_lens=accept_lens,
+            )
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -856,6 +1193,17 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
+
+        exact_output_logprobs = None
+        if batch.return_logprob and not batch.forward_mode.is_idle():
+            exact_output_logprobs = self._target_full_prefix_score_accepted_logprobs(
+                batch=batch,
+                verify_input=verify_input,
+                linear_state_ctx=linear_state_ctx,
+                predict=predict,
+                accept_lens=accept_lens,
+                draft_token_num=verify_input.draft_token_num,
+            )
 
         pending_track_indices = None
         pending_track_seqlens = None
@@ -884,6 +1232,18 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 accept_index,
                 self.speculative_num_steps,
             )
+            if exact_output_logprobs is not None:
+                pos = torch.arange(
+                    verify_input.draft_token_num,
+                    dtype=torch.long,
+                    device=accept_lens.device,
+                ).unsqueeze(0)
+                accepted_mask = pos < accept_lens.to(torch.long).unsqueeze(1)
+                logits_output.next_token_logprobs = torch.where(
+                    accepted_mask.to(logits_output.next_token_logprobs.device),
+                    exact_output_logprobs.to(logits_output.next_token_logprobs.device),
+                    logits_output.next_token_logprobs,
+                )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 

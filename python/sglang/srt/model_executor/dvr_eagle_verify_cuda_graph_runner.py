@@ -10,14 +10,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 def dvr_eagle_target_verify_cuda_graph_context(model_runner):
     """Capture/replay DVR-EAGLE target verify with DVR target semantics.
 
-    EAGLE still owns the draft model and sampling metadata, but DVR discards the
-    generic target-verify logits/hidden states and uses a suffix EXTEND oracle.
-    The target-verify graph still captures EAGLE-style FULL hidden outputs so
-    the standard graph eligibility checks pass, but DVR later replaces those
-    logits/hidden states with a suffix EXTEND oracle.  The flag below lets DVR
-    metadata helpers keep the captured verify graph causal and make padded rows
-    respect num_token_non_padded/state-input dummy slots without changing the
-    shared cuda graph runner.
+    EAGLE still owns the draft model and sampling metadata, while DVR needs the
+    target-verify graph to honor its GDN state-input window and padded-row
+    rules.  The flag below lets DVR metadata helpers keep the captured verify
+    graph causal and make padded rows respect num_token_non_padded/state-input
+    dummy slots without changing the shared cuda graph runner.  Strict
+    return-logprob and graph-disabled fallback paths may still rebuild a suffix
+    EXTEND oracle in the DVR worker; the no-logprob hot path consumes this graph
+    output directly.
     """
 
     saved_flag = getattr(model_runner, "enable_dvr_target_verify_cuda_graph", None)

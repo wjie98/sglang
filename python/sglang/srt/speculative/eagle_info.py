@@ -749,6 +749,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
     num_accept_tokens: Optional[torch.Tensor] = None
+    # V2 topk=1 draft-extend only needs one logits row per request for the
+    # next draft seed. Models that opt in can gather these hidden rows before
+    # lm_head, while still computing KV/GDN state for every draft token.
+    selected_hidden_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -895,6 +899,8 @@ class EagleDraftExtendInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
+    # Optional graph-captured equivalent of EagleDraftInput.selected_hidden_indices.
+    selected_hidden_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)

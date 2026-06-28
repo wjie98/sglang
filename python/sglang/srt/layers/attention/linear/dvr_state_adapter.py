@@ -27,6 +27,7 @@ from sglang.srt.layers.attention.linear.dvr_state_verify import (
 
 __all__ = ["DVRGatedStateAdapter"]
 
+
 @dataclass(frozen=True)
 class DVRGatedForwardContext:
     """Layer-local DVR state context for one gated linear-state forward."""
@@ -76,6 +77,7 @@ class DVRGatedForwardContext:
         indices = self.forward_batch.req_pool_indices[: self.verify_batch_size].to(
             device=self.cache_indices.device, dtype=torch.long
         )
+        indices = indices + 1
         valid_mask = self.valid_request_mask()
         # Slot 0 is the shared dummy DVR state-input slot used by padded graph rows.
         return torch.where(valid_mask, indices, torch.zeros_like(indices)), valid_mask
@@ -122,7 +124,7 @@ class DVRGatedStateAdapter:
     def get_state_input_indices(
         self, *, batch, device: torch.device
     ) -> torch.Tensor:
-        return batch.req_pool_indices.to(device=device, dtype=torch.long)
+        return batch.req_pool_indices.to(device=device, dtype=torch.long) + 1
 
     def get_boundary_indices(
         self,
@@ -437,7 +439,7 @@ class DVRGatedStateAdapter:
         state_input_indices = forward_batch.req_pool_indices.to(
             device=input_tensors[0].device, dtype=torch.long
         )
-
+        state_input_indices = state_input_indices + 1
         state_inputs.write_extend_tail(
             state_window,
             indices=state_input_indices,
@@ -636,6 +638,7 @@ class DVRGatedStateAdapter:
         accepted_steps: torch.Tensor,
         boundary_already_tracked: Optional[torch.Tensor] = None,
         live_state_already_replayed: Optional[torch.Tensor] = None,
+        use_fast_self_draft_commit: bool = False,
     ) -> torch.Tensor:
         state_window = DVRStateInputWindow.from_cache(state_cache)
         tail_lens_before = verified_tail_lens.to(
@@ -643,6 +646,74 @@ class DVRGatedStateAdapter:
         )
         tail_lens_after = tail_lens_before + accepted_token_counts
         crosses_chunk_boundary = tail_lens_after >= self.chunk_size
+        if use_fast_self_draft_commit:
+            # Self-DVR uses the target model as its own draft model, so the
+            # target-verify intermediate state is already the v5 hot-path state
+            # for the accepted chain.  EAGLE keeps the exact replay path below
+            # because rejected rows may commit target-generated tokens that did
+            # not come from the draft model.
+            self.ops.scatter_state(
+                state_cache.conv[0],
+                state_cache.intermediate_conv_window[0],
+                live_indices,
+                accepted_steps,
+            )
+
+            boundary_state_step = (
+                0 if state_cache.intermediate_ssm.shape[2] == 1 else self.chunk_size - 1
+            )
+            no_commit_step = torch.full_like(tail_lens_before, -1)
+            commit_step = torch.where(
+                crosses_chunk_boundary,
+                torch.full_like(tail_lens_before, boundary_state_step),
+                no_commit_step,
+            )
+            self.ops.scatter_state(
+                state_cache.temporal,
+                state_cache.intermediate_ssm,
+                boundary_indices,
+                commit_step,
+            )
+            self.ops.scatter_state(
+                state_cache.conv[0],
+                state_cache.intermediate_conv_window[0],
+                boundary_indices,
+                torch.where(
+                    crosses_chunk_boundary,
+                    self.chunk_size - 1 - tail_lens_before,
+                    no_commit_step,
+                ),
+            )
+
+            new_tail_lens = tail_lens_after - self.chunk_size
+            tail_lens_after = torch.where(
+                crosses_chunk_boundary, new_tail_lens, tail_lens_after
+            )
+            state_window.shift_after_boundary(
+                indices=state_input_indices,
+                crosses_chunk_boundary=crosses_chunk_boundary,
+                chunk_size=self.chunk_size,
+            )
+            rebuild_dvr_live_state_grouped(
+                state_ops=self.ops,
+                state_window=state_window,
+                temporal_state=state_cache.temporal,
+                state_input_indices=state_input_indices,
+                live_indices=live_indices,
+                boundary_indices=boundary_indices,
+                req_indices=torch.arange(
+                    live_indices.shape[0],
+                    dtype=torch.long,
+                    device=live_indices.device,
+                ),
+                token_count=tail_lens_after,
+            )
+
+            state_window.set_tail_lens(
+                indices=state_input_indices, value=tail_lens_after.to(torch.int32)
+            )
+            return crosses_chunk_boundary
+
         if boundary_already_tracked is None:
             boundary_already_tracked = torch.zeros_like(crosses_chunk_boundary)
         else:

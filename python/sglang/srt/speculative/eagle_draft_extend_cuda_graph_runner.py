@@ -59,6 +59,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
+    selected_hidden_indices: Optional[torch.Tensor]
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -92,12 +93,22 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
+        self.topk = model_runner.server_args.speculative_eagle_topk
+        self.use_selected_logits = (
+            self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+            and self.topk == 1
+            and not self.require_gathered_buffer
+            and getattr(
+                model_runner.model,
+                "supports_draft_extend_selected_logits",
+                False,
+            )
+        )
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
             if speculative_num_steps is None
             else speculative_num_steps
         )
-        self.topk = model_runner.server_args.speculative_eagle_topk
         self.draft_extend_attn_backend = (
             draft_extend_attn_backend or eagle_worker.draft_extend_attn_backend
         )
@@ -165,6 +176,14 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_accept_tokens = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
+            selected_hidden_indices = (
+                torch.arange(self.max_bs, dtype=torch.int64)
+                * self.num_tokens_per_bs
+                + self.num_tokens_per_bs
+                - 1
+                if self.use_selected_logits
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -195,15 +214,16 @@ class EAGLEDraftExtendCudaGraphRunner:
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
+            if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
+                logit_rows = (
+                    self.max_bs
+                    if self.use_selected_logits
+                    else self.max_bs * self.num_tokens_per_bs
+                )
+            else:
+                logit_rows = self.max_bs
             next_token_logits_buffer = torch.zeros(
-                (
-                    (
-                        self.max_bs * self.num_tokens_per_bs
-                        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
-                        else self.max_bs
-                    ),
-                    vocab_size,
-                ),
+                (logit_rows, vocab_size),
                 dtype=torch.float,
             )
 
@@ -219,6 +239,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             extend_seq_lens=extend_seq_lens,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            selected_hidden_indices=selected_hidden_indices,
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -329,15 +350,24 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[
-            : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
-        ]
+        selected_hidden_indices = (
+            buffers.selected_hidden_indices[:bs] if self.use_selected_logits else None
+        )
+        logit_rows = (
+            bs
+            if self.forward_mode == ForwardMode.DRAFT_EXTEND or self.use_selected_logits
+            else num_tokens
+        )
+        next_token_logits_buffer = buffers.next_token_logits_buffer[:logit_rows]
 
         # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
         # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
-        num_tokens_for_logprob = (
-            num_tokens if self.forward_mode.is_draft_extend_v2() else bs
-        )
+        if self.use_selected_logits:
+            num_tokens_for_logprob = bs
+        elif self.forward_mode.is_draft_extend_v2():
+            num_tokens_for_logprob = num_tokens
+        else:
+            num_tokens_for_logprob = bs
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
@@ -369,6 +399,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            selected_hidden_indices=selected_hidden_indices,
         )
 
         # Forward batch
@@ -487,6 +518,17 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
             buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
             buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            if self.use_selected_logits:
+                buffers.selected_hidden_indices.copy_(
+                    torch.arange(
+                        self.max_bs,
+                        dtype=torch.int64,
+                        device=buffers.selected_hidden_indices.device,
+                    )
+                    * self.num_tokens_per_bs
+                    + self.num_tokens_per_bs
+                    - 1
+                )
 
         # Common inputs
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -513,13 +555,22 @@ class EAGLEDraftExtendCudaGraphRunner:
             buffers.num_accept_tokens[:raw_bs].copy_(
                 forward_batch.spec_info.num_accept_tokens
             )
+        if self.use_selected_logits:
+            selected_hidden_indices = forward_batch.spec_info.selected_hidden_indices
+            if selected_hidden_indices is None:
+                raise RuntimeError(
+                    "selected draft-extend logits require selected_hidden_indices"
+                )
+            buffers.selected_hidden_indices[:raw_bs].copy_(selected_hidden_indices)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
             # V1: pruned_states = bs; V2: pruned_states = num_tokens
-            if self.forward_mode.is_draft_extend_v2():
+            if self.use_selected_logits:
+                buffers.global_num_tokens_for_logprob_gpu.fill_(bs)
+            elif self.forward_mode.is_draft_extend_v2():
                 buffers.global_num_tokens_for_logprob_gpu.fill_(
                     bs * self.num_tokens_per_bs
                 )
@@ -548,6 +599,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.positions = buffers.positions[:num_tokens]
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
+            if self.use_selected_logits:
+                forward_batch.spec_info.selected_hidden_indices = (
+                    buffers.selected_hidden_indices[:bs]
+                )
 
         from types import SimpleNamespace
 
@@ -576,7 +631,7 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
-            unpadding_bs = num_tokens
+            unpadding_bs = raw_bs if self.use_selected_logits else num_tokens
         elif bs != raw_bs:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[
                 :raw_bs
