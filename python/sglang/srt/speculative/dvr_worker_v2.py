@@ -125,13 +125,11 @@ class DecodeVerifyRollbackWorkerV2(
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
-        self.dvr_replay_prefix.prune_to_batch(batch)
-        for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
-            self.dvr_replay_prefix.append_output_tokens(
-                req,
-                token_ids,
-                initialize_from_req_output=True,
-            )
+        self.dvr_replay_prefix.append_batch_output_tokens(
+            batch,
+            tokens_per_req,
+            initialize_from_req_output=True,
+        )
 
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None

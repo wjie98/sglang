@@ -141,6 +141,23 @@ class DVRReplayPrefixTracker:
         )
         stream.extend(int(token_id) for token_id in token_ids)
 
+    def append_batch_output_tokens(
+        self,
+        batch: Any,
+        tokens_per_req,
+        *,
+        initialize_from_req_output: bool,
+    ) -> None:
+        """Advance all active replay streams from committed output-token rows."""
+
+        self.prune_to_batch(batch)
+        for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
+            self.append_output_tokens(
+                req,
+                token_ids,
+                initialize_from_req_output=initialize_from_req_output,
+            )
+
     def align_req_to_output_len(
         self,
         req: Any,
