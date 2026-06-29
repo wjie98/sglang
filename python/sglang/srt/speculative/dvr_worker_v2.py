@@ -74,14 +74,32 @@ class DecodeVerifyRollbackWorkerV2(
     ) -> None:
         return None
 
-    def _ensure_model_worker_batch_compat(self, batch: ScheduleBatch):
-        """Attach ScheduleBatch-like fields used by DVR linear-state helpers."""
+    @staticmethod
+    def _require_schedule_batch_interface(batch: ScheduleBatch):
+        """Validate the ScheduleBatch fields used by DVR helpers.
 
-        batch.req_to_token_pool = self.req_to_token_pool
-        batch.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
-        batch.model_config = self.model_config
-        batch.device = self.device
-        batch.batch_size = lambda: len(batch.reqs) if batch.reqs is not None else 0
+        Spec-v2 calls the worker with the scheduler-owned ScheduleBatch.  Earlier
+        revisions patched missing fields here, but that hid ownership bugs and
+        made the worker mutate scheduler state outside its normal data flow.
+        """
+
+        missing = [
+            name
+            for name in (
+                "req_to_token_pool",
+                "token_to_kv_pool_allocator",
+                "model_config",
+                "device",
+            )
+            if getattr(batch, name, None) is None
+        ]
+        if not callable(getattr(batch, "batch_size", None)):
+            missing.append("batch_size")
+        if missing:
+            raise RuntimeError(
+                "DVR spec-v2 requires a scheduler ScheduleBatch with fields: "
+                + ", ".join(missing)
+            )
         return batch
 
     def _draft_cache_locs_from_req_to_token(
@@ -118,7 +136,7 @@ class DecodeVerifyRollbackWorkerV2(
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
-        batch = self._ensure_model_worker_batch_compat(model_worker_batch)
+        batch = self._require_schedule_batch_interface(model_worker_batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             batch_result = self.forward_target_extend_v2(batch)
             if on_publish is not None:

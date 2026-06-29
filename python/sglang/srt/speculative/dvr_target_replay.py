@@ -98,6 +98,22 @@ class DVRSuffixDraftReplayPlan:
     hidden_gather_indices: torch.Tensor
 
 
+@dataclass
+class DVRAcceptedSuffixReplayPlan:
+    """Plan a target EXTEND replay over unclosed prefix tail plus accepted rows."""
+
+    base_seq_lens_cpu: list[int]
+    boundary_lens: list[int]
+    tail_lens_cpu: list[int]
+    extend_lens_cpu: list[int]
+    final_seq_lens_cpu: list[int]
+    input_ids: list[int]
+    out_cache_locs: list[torch.Tensor]
+    accepted_cache_locs: torch.Tensor
+    accepted_rows: Optional[torch.Tensor]
+    accepted_offsets: Optional[torch.Tensor]
+
+
 @contextmanager
 def linear_state_replay_context(
     linear_state_ctx,
@@ -252,6 +268,114 @@ def build_suffix_draft_replay_plan(
         draft_rows=draft_rows,
         draft_offsets=draft_offsets,
         hidden_gather_indices=hidden_gather_indices,
+    )
+
+
+def build_accepted_suffix_replay_plan(
+    *,
+    batch,
+    base_seq_lens_cpu: list[int],
+    boundary_lens: list[int],
+    accepted_tokens: torch.Tensor,
+    accepted_cache_locs: torch.Tensor,
+    accepted_token_counts_cpu: list[int],
+    num_draft_tokens: int,
+    request_token_ids_for_replay,
+) -> Optional[DVRAcceptedSuffixReplayPlan]:
+    """Build the live-state repair replay shape for partially accepted chains."""
+
+    if accepted_tokens is None or accepted_tokens.numel() == 0:
+        return None
+
+    total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
+    if accepted_tokens.numel() != total_accepted:
+        return None
+    if accepted_cache_locs.numel() != total_accepted:
+        return None
+
+    needs_exact_replay = any(
+        int(accepted) < num_draft_tokens for accepted in accepted_token_counts_cpu
+    )
+    if not needs_exact_replay:
+        return None
+
+    accepted_tokens_cpu = accepted_tokens.detach().cpu().tolist()
+    accepted_cache_locs = accepted_cache_locs.to(torch.long)
+    tail_lens_cpu = [
+        int(seq_len) - int(boundary)
+        for seq_len, boundary in zip(base_seq_lens_cpu, boundary_lens, strict=True)
+    ]
+    extend_lens_cpu = [
+        int(tail) + int(accepted)
+        for tail, accepted in zip(
+            tail_lens_cpu, accepted_token_counts_cpu, strict=True
+        )
+    ]
+    final_seq_lens_cpu = [
+        int(boundary) + int(extend_len)
+        for boundary, extend_len in zip(boundary_lens, extend_lens_cpu, strict=True)
+    ]
+
+    input_ids = []
+    out_cache_locs = []
+    accepted_rows = []
+    accepted_offsets = []
+    token_offset = 0
+    for req_i, (req, seq_len, boundary, tail_len, accepted_count) in enumerate(
+        zip(
+            batch.reqs,
+            base_seq_lens_cpu,
+            boundary_lens,
+            tail_lens_cpu,
+            accepted_token_counts_cpu,
+            strict=True,
+        )
+    ):
+        accepted_count = int(accepted_count)
+        token_ids = request_token_ids_for_replay(req, int(seq_len))
+        input_ids.extend(token_ids[int(boundary) : int(seq_len)])
+        input_ids.extend(
+            accepted_tokens_cpu[token_offset : token_offset + accepted_count]
+        )
+        if int(tail_len) > 0:
+            out_cache_locs.append(
+                batch.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, int(boundary) : int(seq_len)
+                ].to(torch.long)
+            )
+        out_cache_locs.append(
+            accepted_cache_locs[token_offset : token_offset + accepted_count]
+        )
+        if accepted_count > 0:
+            accepted_rows.append(
+                batch.req_pool_indices[req_i].to(dtype=torch.long).repeat(
+                    accepted_count
+                )
+            )
+            accepted_offsets.append(
+                torch.arange(
+                    int(seq_len),
+                    int(seq_len) + accepted_count,
+                    dtype=torch.long,
+                    device=batch.seq_lens.device,
+                )
+            )
+        token_offset += accepted_count
+
+    if not input_ids:
+        return None
+
+    return DVRAcceptedSuffixReplayPlan(
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        tail_lens_cpu=tail_lens_cpu,
+        extend_lens_cpu=extend_lens_cpu,
+        final_seq_lens_cpu=final_seq_lens_cpu,
+        input_ids=input_ids,
+        out_cache_locs=out_cache_locs,
+        accepted_cache_locs=accepted_cache_locs,
+        accepted_rows=torch.cat(accepted_rows) if accepted_rows else None,
+        accepted_offsets=torch.cat(accepted_offsets) if accepted_offsets else None,
     )
 
 
