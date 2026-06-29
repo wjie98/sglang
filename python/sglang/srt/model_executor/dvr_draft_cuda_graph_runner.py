@@ -93,6 +93,7 @@ def _clear_determinism_sensitive_kernel_caches():
     get_moe_configs.cache_clear()
     should_enable_swap_ab.cache_clear()
 
+
 def _uses_init_time_deterministic_num_splits(backend) -> bool:
     # FA3 and NSA store deterministic split policy at backend init time. FA4 is
     # deliberately excluded because FA4 CUDA graph does not support num_splits=0.

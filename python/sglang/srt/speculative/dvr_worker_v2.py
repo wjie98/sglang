@@ -48,7 +48,103 @@ if is_cuda():
     )
 
 
-class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
+class DVRSpecV2LinearStateMixin:
+    """Shared DVR spec-v2 linear-state commit helpers."""
+
+    @staticmethod
+    def _batch_seq_lens_cpu_list(batch: ScheduleBatch) -> list[int]:
+        if batch.seq_lens_cpu is not None:
+            return [int(x) for x in batch.seq_lens_cpu.tolist()]
+        return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
+
+    def _commit_linear_state_after_verify_v2(
+        self,
+        *,
+        batch: ScheduleBatch,
+        accepted_token_counts: torch.Tensor,
+        accepted_steps: torch.Tensor,
+        ctx,
+    ):
+        pending_track_indices = [None] * len(batch.reqs)
+        pending_track_seqlens = [None] * len(batch.reqs)
+        if accepted_token_counts.numel() == 0:
+            return pending_track_indices, pending_track_seqlens
+
+        accepted_token_counts_cpu = accepted_token_counts.cpu().tolist()
+        seq_lens_cpu = (
+            batch.seq_lens_cpu.tolist()
+            if batch.seq_lens_cpu is not None
+            else batch.seq_lens.detach().cpu().tolist()
+        )
+        pre_verify_tail_lens_cpu = [
+            int(seq_len) - self.linear_state.boundary_seqlen[req.rid]
+            for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
+        ]
+        verified_tail_lens = ctx.state_adapter.state_input_tail_lens(
+            state_cache=ctx.state_cache,
+            state_input_indices=ctx.state_input_indices,
+        )
+        if verified_tail_lens is None:
+            verified_tail_lens = torch.tensor(
+                pre_verify_tail_lens_cpu,
+                dtype=torch.long,
+                device=batch.seq_lens.device,
+            )
+        verified_tail_lens = verified_tail_lens.to(
+            device=ctx.live_indices.device, dtype=torch.long
+        )
+        # The suffix oracle may have already asked the normal EXTEND tracker to
+        # write the next boundary checkpoint.  Let the lifecycle roll that back
+        # for rejected tails or mark it as already materialized for crossings.
+        boundary_already_tracked = (
+            self.linear_state.prepare_suffix_replay_boundary_commit(
+                ctx=ctx,
+                verified_tail_lens_cpu=pre_verify_tail_lens_cpu,
+                accepted_token_counts_cpu=accepted_token_counts_cpu,
+            )
+        )
+        ctx.state_adapter.commit_after_verify(
+            state_cache=ctx.state_cache,
+            state_input_indices=ctx.state_input_indices,
+            live_indices=ctx.live_indices,
+            boundary_indices=ctx.boundary_indices,
+            verified_tail_lens=verified_tail_lens,
+            accepted_token_counts=accepted_token_counts,
+            accepted_steps=accepted_steps,
+            boundary_already_tracked=boundary_already_tracked,
+        )
+
+        for i, (req, verified_tail_len, accepted_token_num) in enumerate(
+            zip(
+                batch.reqs,
+                pre_verify_tail_lens_cpu,
+                accepted_token_counts_cpu,
+                strict=True,
+            )
+        ):
+            if verified_tail_len + accepted_token_num >= FLA_CHUNK_SIZE:
+                new_boundary_seqlen = (
+                    self.linear_state.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
+                )
+                self.linear_state.boundary_seqlen[req.rid] = new_boundary_seqlen
+                # Overlap scheduling processes accepted output tokens after the
+                # worker returns. Keep the newly written boundary state pending
+                # until scheduler output processing has materialized those
+                # tokens in req.output_ids, otherwise radix cache can observe a
+                # checkpoint beyond the committed token prefix.
+                pending_track_indices[i] = self.linear_state.boundary_track_idx[
+                    req.rid
+                ]
+                pending_track_seqlens[i] = new_boundary_seqlen
+        self.linear_state.boundary_backup = None
+        self.linear_state.live_backup = None
+        self.linear_state.suffix_replay_boundary_track_mask = None
+        return pending_track_indices, pending_track_seqlens
+
+
+class DecodeVerifyRollbackWorkerV2(
+    DVRSpecV2LinearStateMixin, DecodeVerifyRollbackWorker
+):
     """Overlap-scheduler DVR worker.
 
     DVR has no standalone draft model.  The scheduler still expects a spec-v2
@@ -112,12 +208,6 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 token_ids,
                 initialize_from_req_output=True,
             )
-
-    @staticmethod
-    def _batch_seq_lens_cpu_list(batch: ScheduleBatch) -> list[int]:
-        if batch.seq_lens_cpu is not None:
-            return [int(x) for x in batch.seq_lens_cpu.tolist()]
-        return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
@@ -505,90 +595,6 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
 
         accept_lens.add_(1)
         return predict, accept_lens, accept_index
-
-    def _commit_linear_state_after_verify_v2(
-        self,
-        *,
-        batch: ScheduleBatch,
-        accepted_token_counts: torch.Tensor,
-        accepted_steps: torch.Tensor,
-        ctx,
-    ):
-        pending_track_indices = [None] * len(batch.reqs)
-        pending_track_seqlens = [None] * len(batch.reqs)
-        if accepted_token_counts.numel() == 0:
-            return pending_track_indices, pending_track_seqlens
-
-        accepted_token_counts_cpu = accepted_token_counts.cpu().tolist()
-        seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if batch.seq_lens_cpu is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
-        pre_verify_tail_lens_cpu = [
-            int(seq_len) - self.linear_state.boundary_seqlen[req.rid]
-            for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
-        ]
-        verified_tail_lens = ctx.state_adapter.state_input_tail_lens(
-            state_cache=ctx.state_cache,
-            state_input_indices=ctx.state_input_indices,
-        )
-        if verified_tail_lens is None:
-            verified_tail_lens = torch.tensor(
-                pre_verify_tail_lens_cpu,
-                dtype=torch.long,
-                device=batch.seq_lens.device,
-            )
-        verified_tail_lens = verified_tail_lens.to(
-            device=ctx.live_indices.device, dtype=torch.long
-        )
-        # The suffix oracle may have already asked the normal EXTEND tracker to
-        # write the next boundary checkpoint.  Let the lifecycle roll that back
-        # for rejected tails or mark it as already materialized for crossings.
-        boundary_already_tracked = (
-            self.linear_state.prepare_suffix_replay_boundary_commit(
-                ctx=ctx,
-                verified_tail_lens_cpu=pre_verify_tail_lens_cpu,
-                accepted_token_counts_cpu=accepted_token_counts_cpu,
-            )
-        )
-        ctx.state_adapter.commit_after_verify(
-            state_cache=ctx.state_cache,
-            state_input_indices=ctx.state_input_indices,
-            live_indices=ctx.live_indices,
-            boundary_indices=ctx.boundary_indices,
-            verified_tail_lens=verified_tail_lens,
-            accepted_token_counts=accepted_token_counts,
-            accepted_steps=accepted_steps,
-            boundary_already_tracked=boundary_already_tracked,
-        )
-
-        for i, (req, verified_tail_len, accepted_token_num) in enumerate(
-            zip(
-                batch.reqs,
-                pre_verify_tail_lens_cpu,
-                accepted_token_counts_cpu,
-                strict=True,
-            )
-        ):
-            if verified_tail_len + accepted_token_num >= FLA_CHUNK_SIZE:
-                new_boundary_seqlen = (
-                    self.linear_state.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
-                )
-                self.linear_state.boundary_seqlen[req.rid] = new_boundary_seqlen
-                # Overlap scheduling processes accepted output tokens after the
-                # worker returns. Keep the newly written boundary state pending
-                # until scheduler output processing has materialized those
-                # tokens in req.output_ids, otherwise radix cache can observe a
-                # checkpoint beyond the committed token prefix.
-                pending_track_indices[i] = self.linear_state.boundary_track_idx[
-                    req.rid
-                ]
-                pending_track_seqlens[i] = new_boundary_seqlen
-        self.linear_state.boundary_backup = None
-        self.linear_state.live_backup = None
-        self.linear_state.suffix_replay_boundary_track_mask = None
-        return pending_track_indices, pending_track_seqlens
 
     def _compute_spec_v2_logprobs(
         self,

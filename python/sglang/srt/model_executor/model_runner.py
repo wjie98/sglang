@@ -2817,6 +2817,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
+                    spec_info = self.spec_algorithm.prepare_cuda_graph_verify_input(
+                        spec_info
+                    )
             elif self.spec_algorithm.is_dflash():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 

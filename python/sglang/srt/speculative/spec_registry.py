@@ -90,6 +90,12 @@ class CustomSpecAlgo:
     def supports_spec_v2(self) -> bool:
         return self.supports_overlap
 
+    def uses_spec_v2(self, enable_overlap: bool) -> bool:
+        return self.supports_spec_v2()
+
+    def prepare_cuda_graph_verify_input(self, verify_input: "SpecInput") -> "SpecInput":
+        return verify_input
+
     def create_worker(self, server_args: "ServerArgs") -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(

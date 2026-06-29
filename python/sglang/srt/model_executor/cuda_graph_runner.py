@@ -70,7 +70,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import share_input_buffers_in
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.speculative.dvr_utils import dvr_causal_verify_cuda_graph_metadata
 from sglang.srt.true_on_policy import (
     patch_prefill_only_deterministic_inference_for_cuda_graph,
 )
@@ -1000,18 +999,16 @@ class CudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            metadata_context = empty_context()
-            if (
-                self.model_runner.spec_algorithm.is_decode_verify_rollback()
-                and forward_batch.forward_mode.is_target_verify()
-            ):
-                metadata_context = dvr_causal_verify_cuda_graph_metadata(
-                    self.model_runner,
-                    attn_backend,
-                    forward_batch.forward_mode,
-                    forward_batch.spec_info,
-                    self.buffers.custom_mask,
+            metadata_context = (
+                empty_context()
+                if forward_batch.spec_info is None
+                else forward_batch.spec_info.cuda_graph_metadata_context(
+                    model_runner=self.model_runner,
+                    attn_backend=attn_backend,
+                    forward_mode=forward_batch.forward_mode,
+                    fallback_custom_mask=self.buffers.custom_mask,
                 )
+            )
             with metadata_context:
                 attn_backend.init_forward_metadata_out_graph(
                     forward_batch, in_capture=True
@@ -1148,7 +1145,7 @@ class CudaGraphRunner:
             padded_num_tokens=bs * self.num_tokens_per_bs,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        if hasattr(forward_batch.spec_info, "prepare_cuda_graph_replay_buffers"):
+        if forward_batch.spec_info is not None:
             forward_batch.spec_info.prepare_cuda_graph_replay_buffers(
                 self, raw_num_token
             )
@@ -1184,18 +1181,16 @@ class CudaGraphRunner:
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        metadata_context = empty_context()
-        if (
-            self.model_runner.spec_algorithm.is_decode_verify_rollback()
-            and self.capture_forward_mode.is_target_verify()
-        ):
-            metadata_context = dvr_causal_verify_cuda_graph_metadata(
-                self.model_runner,
-                attn_backend,
-                self.capture_forward_mode,
-                forward_batch.spec_info,
-                buffers.custom_mask,
+        metadata_context = (
+            empty_context()
+            if forward_batch.spec_info is None
+            else forward_batch.spec_info.cuda_graph_metadata_context(
+                model_runner=self.model_runner,
+                attn_backend=attn_backend,
+                forward_mode=self.capture_forward_mode,
+                fallback_custom_mask=buffers.custom_mask,
             )
+        )
         with metadata_context:
             attn_backend.init_forward_metadata_out_graph(fb_view)
 
@@ -1317,6 +1312,9 @@ class CudaGraphRunner:
                     capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
+                )
+                spec_info = self.model_runner.spec_algorithm.prepare_cuda_graph_verify_input(
+                    spec_info
                 )
         elif self.model_runner.spec_algorithm.is_dflash():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput

@@ -109,11 +109,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs.shape, dtype=torch.float32, device=batch.device
         )
 
-    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
-        """Optionally adjust graph-resident replay buffers before graph replay."""
-
-        return None
-
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
         return cls(

@@ -30,9 +30,9 @@ from sglang.srt.speculative.dvr_target_replay import (
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_worker import (
     DVREagleVerifyInput,
-    DecodeVerifyRollbackWorker,
+    DVRLinearBoundaryReplayMixin,
 )
-from sglang.srt.speculative.dvr_worker_v2 import DecodeVerifyRollbackWorkerV2
+from sglang.srt.speculative.dvr_worker_v2 import DVRSpecV2LinearStateMixin
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -60,7 +60,11 @@ _ATTN_BACKEND_CHILD_LIST_ATTRS = (
     "backends",
     "children",
 )
-class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
+
+
+class DecodeVerifyRollbackEagleWorkerV2(
+    DVRLinearBoundaryReplayMixin, DVRSpecV2LinearStateMixin, EAGLEWorkerV2
+):
     """EAGLE draft with DVR target verify/rollback semantics.
 
     The draft model and draft-extend phases stay on the standard EAGLE v2
@@ -68,17 +72,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     verify forward, so this path remains isolated from the self-decode draft
     worker.
     """
-
-    _request_token_ids_for_replay = (
-        DecodeVerifyRollbackWorker._request_token_ids_for_replay
-    )
-    _replay_linear_state_boundaries = (
-        DecodeVerifyRollbackWorker._replay_linear_state_boundaries
-    )
-    _batch_seq_lens_cpu_list = DecodeVerifyRollbackWorkerV2._batch_seq_lens_cpu_list
-    _commit_linear_state_after_verify_v2 = (
-        DecodeVerifyRollbackWorkerV2._commit_linear_state_after_verify_v2
-    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

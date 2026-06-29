@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
@@ -167,6 +168,28 @@ class SpeculativeAlgorithm(Enum):
             or self.is_decode_verify_rollback()
         )
 
+    def uses_spec_v2(self, enable_overlap: bool) -> bool:
+        """Return whether the scheduler should use the v2 worker/schema."""
+
+        if self.is_decode_verify_rollback_eagle():
+            return True
+        if self.is_decode_verify_rollback_self_draft():
+            return enable_overlap
+        return self.supports_spec_v2()
+
+    def prepare_cuda_graph_verify_input(self, verify_input: SpecInput) -> SpecInput:
+        """Let algorithms specialize the generic EAGLE verify graph input."""
+
+        if self.is_decode_verify_rollback_eagle():
+            from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
+
+            return DVREagleVerifyInput.from_eagle_verify_input(verify_input)
+        if self.is_decode_verify_rollback_self_draft():
+            from sglang.srt.speculative.dvr_worker import DVRSelfDraftVerifyInput
+
+            return DVRSelfDraftVerifyInput.from_eagle_verify_input(verify_input)
+        return verify_input
+
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:
@@ -311,3 +334,20 @@ class SpecInput(ABC):
             x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
+
+    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
+        """Optionally adjust graph-resident replay buffers before replay."""
+
+        return None
+
+    def cuda_graph_metadata_context(
+        self,
+        *,
+        model_runner,
+        attn_backend,
+        forward_mode,
+        fallback_custom_mask=None,
+    ):
+        """Scoped metadata patching for algorithms with graph-only invariants."""
+
+        return nullcontext()
