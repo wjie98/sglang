@@ -238,6 +238,10 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
+                        # DVR spec-v2 overlap prefill may materialize a
+                        # generated-prefix checkpoint. Use a DVR helper so the
+                        # normal cache path stays readable and only that case
+                        # attaches the matching mamba snapshot.
                         cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
                             req=req,
                             batch=batch,

@@ -1203,7 +1203,8 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         exact_output_logprobs = None
         if batch.return_logprob and not batch.forward_mode.is_idle():
             # DVR-EAGLE may rewrite previously collected output logprobs with a
-            # final full-prefix oracle, so non-streaming chunks must stay local.
+            # final full-prefix oracle. Mark requests here so the generic
+            # streamer only sees a request-level defer policy.
             self._defer_non_streaming_logprob_output_until_finish(batch)
             exact_output_logprobs = self._target_full_prefix_score_accepted_logprobs(
                 batch=batch,

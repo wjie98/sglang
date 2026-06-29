@@ -859,7 +859,8 @@ class Req(ReqDllmMixin):
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
         # Some algorithms repair non-streaming output logprobs before the final
-        # response. Keep intermediate chunks local until the request finishes.
+        # response. Keep this as request state so output streaming can remain
+        # algorithm-agnostic while holding intermediate chunks locally.
         self.defer_non_streaming_logprob_output: bool = False
 
         # Logprobs (arguments)

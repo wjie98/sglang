@@ -344,6 +344,9 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
+                # Some algorithms repair non-streaming logprobs at the final
+                # response. Defer those chunks through a request flag instead
+                # of making the streamer depend on a specific spec algorithm.
                 should_output = should_emit_non_streaming_output_chunk(
                     req=req,
                     return_logprob=self.return_logprob,
