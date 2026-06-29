@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -134,54 +133,11 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             stream = self._v2_replay_stream(req)
             stream.extend(int(token_id) for token_id in token_ids)
 
-    @contextmanager
-    def _req_seqlen_matches_batch_prefix(self, batch: ScheduleBatch):
-        """Make V1 DVR linear-state helpers see Spec v2's logical length.
-
-        In overlap scheduling, output processing has not necessarily appended
-        accepted tokens to ``req.output_ids`` when the next forward starts.
-        The existing DVR linear-state lifecycle derives chunk boundaries from
-        ``req.seqlen - 1``. Temporarily padding request output length keeps
-        those helpers on the same prefix length as V1 without changing forward
-        metadata or user-visible outputs.
-        """
-
-        if batch.forward_mode.is_idle() or batch.reqs is None:
-            yield
-            return
-
-        spec_info = batch.spec_info
-        bonus_tokens = getattr(spec_info, "bonus_tokens", None)
-        if bonus_tokens is None or bonus_tokens.numel() == 0:
-            bonus_tokens = torch.zeros(
-                len(batch.reqs), dtype=torch.int32, device=batch.seq_lens.device
-            )
-        seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if batch.seq_lens_cpu is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
-        verified_ids = bonus_tokens.detach().cpu().tolist()
-        appended_counts = []
-        for req, seq_len, token_id in zip(
-            batch.reqs, seq_lens_cpu, verified_ids, strict=True
-        ):
-            target_req_seqlen = int(seq_len) + 1
-            append_count = max(0, target_req_seqlen - req.seqlen)
-            if append_count:
-                # Only req.seqlen matters to the reused V1 lifecycle helper
-                # here.  The token value is a placeholder and is removed in the
-                # finally block before output processing observes req.output_ids.
-                req.output_ids.extend([int(token_id)] * append_count)
-            appended_counts.append(append_count)
-        try:
-            yield
-        finally:
-            for req, append_count in zip(
-                batch.reqs, appended_counts, strict=True
-            ):
-                for _ in range(append_count):
-                    req.output_ids.pop()
+    @staticmethod
+    def _batch_seq_lens_cpu_list(batch: ScheduleBatch) -> list[int]:
+        if batch.seq_lens_cpu is not None:
+            return [int(x) for x in batch.seq_lens_cpu.tolist()]
+        return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
@@ -264,12 +220,16 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 self.num_draft_tokens,
             )
 
-        with self._req_seqlen_matches_batch_prefix(batch):
-            replay_tasks = self.linear_state.prepare_for_draft(batch)
-            if replay_tasks:
-                self._replay_linear_state_boundaries(batch, replay_tasks)
-                self.linear_state.restore_tail_lens_after_replay(batch, replay_tasks)
-            self.linear_state.finish_prepare_for_draft(batch)
+        seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
+        replay_tasks = self.linear_state.prepare_for_draft(
+            batch, seq_lens_cpu=seq_lens_cpu
+        )
+        if replay_tasks:
+            self._replay_linear_state_boundaries(batch, replay_tasks)
+            self.linear_state.restore_tail_lens_after_replay(
+                batch, replay_tasks, seq_lens_cpu=seq_lens_cpu
+            )
+        self.linear_state.finish_prepare_for_draft(batch)
         self._draft_preprocess_decode_v2(batch)
 
         spec_info = batch.spec_info
@@ -337,8 +297,10 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         batch.spec_info = spec_info
 
         scheduler_seq_lens = batch.seq_lens
-        with self._req_seqlen_matches_batch_prefix(batch):
-            linear_state_ctx = self.linear_state.restore_for_verify(batch)
+        linear_state_ctx = self.linear_state.restore_for_verify(
+            batch,
+            seq_lens_cpu=self._batch_seq_lens_cpu_list(batch),
+        )
         batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True

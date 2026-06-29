@@ -106,9 +106,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     _replay_linear_state_boundaries = (
         DecodeVerifyRollbackWorker._replay_linear_state_boundaries
     )
-    _req_seqlen_matches_batch_prefix = (
-        DecodeVerifyRollbackWorkerV2._req_seqlen_matches_batch_prefix
-    )
+    _batch_seq_lens_cpu_list = DecodeVerifyRollbackWorkerV2._batch_seq_lens_cpu_list
     _commit_linear_state_after_verify_v2 = (
         DecodeVerifyRollbackWorkerV2._commit_linear_state_after_verify_v2
     )
@@ -353,31 +351,21 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
 
         # EAGLE/MTP draft owns its draft KV state and does not run target GDN
         # state. DVR only checkpoints/restores target recurrent state for the
-        # verifier; self-decode is the path that reuses the target live cache.
-        # Spec v2 may start the next forward before output processing appends
-        # accepted tokens to Req.output_ids. Reuse the self-draft compatibility
-        # window so boundary lookup sees the same logical prefix as the batch.
-        with self._req_seqlen_matches_batch_prefix(batch):
-            replay_tasks = self.linear_state.prepare_for_draft(batch)
-            if replay_tasks:
-                self._replay_linear_state_boundaries(batch, replay_tasks)
-                self.linear_state.restore_tail_lens_after_replay(
-                    batch, replay_tasks
-                )
-            self.linear_state.finish_prepare_for_draft(batch)
+        # verifier. Use batch logical lengths explicitly because overlap can run
+        # the next forward before Req.output_ids has been materialized.
+        seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
+        replay_tasks = self.linear_state.prepare_for_draft(
+            batch, seq_lens_cpu=seq_lens_cpu
+        )
+        if replay_tasks:
+            self._replay_linear_state_boundaries(batch, replay_tasks)
+            self.linear_state.restore_tail_lens_after_replay(
+                batch, replay_tasks, seq_lens_cpu=seq_lens_cpu
+            )
+        self.linear_state.finish_prepare_for_draft(batch)
 
-    def _prepare_dvr_boundary_for_prefill_draft(
-        self, batch: ScheduleBatch, bonus_tokens: torch.Tensor
-    ) -> None:
-        previous_spec_info = batch.spec_info
-        # _req_seqlen_matches_batch_prefix reads spec_info.bonus_tokens to pad
-        # req.seqlen-compatible metadata.  Prefill has the token separately, so
-        # install a short-lived EagleDraftInput and restore the real spec_info.
-        batch.spec_info = EagleDraftInput(bonus_tokens=bonus_tokens)
-        try:
-            self._prepare_dvr_boundary_for_verify(batch)
-        finally:
-            batch.spec_info = previous_spec_info
+    def _prepare_dvr_boundary_for_prefill_draft(self, batch: ScheduleBatch) -> None:
+        self._prepare_dvr_boundary_for_verify(batch)
 
     def _target_suffix_extend_verify_output(
         self,
@@ -1015,9 +1003,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
             batch_output.new_seq_lens = batch.seq_lens
-            self._prepare_dvr_boundary_for_prefill_draft(
-                batch, batch_output.next_token_ids
-            )
+            self._prepare_dvr_boundary_for_prefill_draft(batch)
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
@@ -1125,9 +1111,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 verify_input.retrieve_next_token.shape
             ).cpu()
 
-        linear_state_ctx = None
-        with self._req_seqlen_matches_batch_prefix(batch):
-            linear_state_ctx = self.linear_state.restore_for_verify(batch)
+        linear_state_ctx = self.linear_state.restore_for_verify(
+            batch,
+            seq_lens_cpu=self._batch_seq_lens_cpu_list(batch),
+        )
 
         with self._target_verify_graph_runner_context():
             forward_batch_output = self.target_worker.forward_batch_generation(

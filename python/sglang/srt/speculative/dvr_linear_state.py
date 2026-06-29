@@ -64,20 +64,33 @@ class DVRLinearStateLifecycle:
             )
 
     def prepare_for_draft(
-        self, batch: ScheduleBatch, *, use_request_seqlen: bool = False
+        self,
+        batch: ScheduleBatch,
+        *,
+        seq_lens_cpu: Optional[List[int]] = None,
+        use_request_seqlen: bool = False,
     ) -> List[DVRBoundaryReplayTask]:
-        self.sync_active_reqs(batch, use_request_seqlen=use_request_seqlen)
+        self.sync_active_reqs(
+            batch,
+            seq_lens_cpu=seq_lens_cpu,
+            use_request_seqlen=use_request_seqlen,
+        )
         return self.ensure_boundary_state(
-            batch, use_request_seqlen=use_request_seqlen
+            batch,
+            seq_lens_cpu=seq_lens_cpu,
+            use_request_seqlen=use_request_seqlen,
         )
 
     def finish_prepare_for_draft(self, batch: ScheduleBatch):
         self.backup_boundary_state(batch)
 
     def restore_for_verify(
-        self, batch: ScheduleBatch
+        self,
+        batch: ScheduleBatch,
+        *,
+        seq_lens_cpu: Optional[List[int]] = None,
     ) -> Optional[DVRLinearStateContext]:
-        replay_tasks = self.ensure_boundary_state(batch)
+        replay_tasks = self.ensure_boundary_state(batch, seq_lens_cpu=seq_lens_cpu)
         if replay_tasks:
             raise RuntimeError(
                 "DVR boundary replay tasks must be materialized before target verify."
@@ -191,7 +204,11 @@ class DVRLinearStateLifecycle:
         return state_adapter is not None and state_adapter.has_dvr_state(batch=batch)
 
     def sync_active_reqs(
-        self, batch: ScheduleBatch, *, use_request_seqlen: bool = False
+        self,
+        batch: ScheduleBatch,
+        *,
+        seq_lens_cpu: Optional[List[int]] = None,
+        use_request_seqlen: bool = False,
     ):
         active_rids = {req.rid for req in batch.reqs}
         for rid in list(self.boundary_seqlen):
@@ -199,7 +216,11 @@ class DVRLinearStateLifecycle:
                 self.boundary_seqlen.pop(rid, None)
                 self.boundary_track_idx.pop(rid, None)
 
-        seq_lens_cpu = None if use_request_seqlen else self.batch_seq_lens_cpu(batch)
+        seq_lens_cpu = (
+            None
+            if use_request_seqlen
+            else (seq_lens_cpu or self.batch_seq_lens_cpu(batch))
+        )
         for i, req in enumerate(batch.reqs):
             recorded_boundary = self.boundary_seqlen.get(req.rid)
             if recorded_boundary is None:
@@ -392,6 +413,7 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         ctx: Optional[DVRLinearStateContext] = None,
         *,
+        seq_lens_cpu: Optional[List[int]] = None,
         use_request_seqlen: bool = False,
     ) -> List[DVRBoundaryReplayTask]:
         ctx = ctx or self.state_context(batch)
@@ -401,7 +423,11 @@ class DVRLinearStateLifecycle:
         zero_boundary_indices = []
         reset_pos_indices = []
         reset_pos_values = []
-        seq_lens_cpu = None if use_request_seqlen else self.batch_seq_lens_cpu(batch)
+        seq_lens_cpu = (
+            None
+            if use_request_seqlen
+            else (seq_lens_cpu or self.batch_seq_lens_cpu(batch))
+        )
         for i, req in enumerate(batch.reqs):
             if req.rid not in self.boundary_seqlen:
                 boundary_seqlen, verified_tail_len = (
@@ -442,6 +468,7 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         tasks: List[DVRBoundaryReplayTask],
         *,
+        seq_lens_cpu: Optional[List[int]] = None,
         use_request_seqlen: bool = False,
     ):
         if not tasks:
@@ -452,11 +479,10 @@ class DVRLinearStateLifecycle:
         task_rids = {task.req.rid for task in tasks}
         seq_lens_by_rid = None
         if not use_request_seqlen:
+            seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
             seq_lens_by_rid = {
                 req.rid: int(seq_len)
-                for req, seq_len in zip(
-                    batch.reqs, self.batch_seq_lens_cpu(batch), strict=True
-                )
+                for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
             }
         state_input_indices = []
         tail_lens = []
