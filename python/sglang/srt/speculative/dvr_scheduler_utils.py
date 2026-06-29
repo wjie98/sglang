@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+from sglang.srt.mem_cache.mamba_radix_cache_policy import (
+    clear_req_mamba_radix_insert_snapshot,
+    mark_req_skip_mamba_radix_finished_insert,
+    set_req_mamba_radix_insert_snapshot,
+)
 
 
 @dataclass
@@ -14,28 +19,6 @@ class DVRMambaCheckpoint:
     @property
     def valid(self) -> bool:
         return self.track_idx is not None and self.seqlen is not None
-
-
-@dataclass
-class DVRRadixInsertSnapshot:
-    indices: Any
-    seqlen: int
-
-
-@dataclass
-class DVRRequestState:
-    """Per-request DVR scheduler state kept behind one Req field."""
-
-    skip_mamba_radix_finished_insert: bool = False
-    radix_insert_snapshot: Optional[DVRRadixInsertSnapshot] = None
-
-
-@dataclass
-class DVRMambaRadixCachePolicy:
-    """DVR cache policy consumed by mamba radix cache without branch details."""
-
-    skip_finished_insert: bool = False
-    insert_snapshot: Optional[DVRRadixInsertSnapshot] = None
 
 
 @dataclass
@@ -183,44 +166,6 @@ class DVRReplayPrefixTracker:
         stream.extend(int(token_id) for token_id in real_output_ids)
 
 
-def get_req_dvr_state(req: Any, *, create: bool = False) -> Optional[DVRRequestState]:
-    state = getattr(req, "dvr_runtime_state", None)
-    if state is None and create:
-        state = DVRRequestState()
-        req.dvr_runtime_state = state
-    return state
-
-
-def reset_req_dvr_state(req: Any) -> None:
-    req.dvr_runtime_state = None
-
-
-def mark_req_skip_mamba_radix_finished_insert(req: Any) -> None:
-    get_req_dvr_state(req, create=True).skip_mamba_radix_finished_insert = True
-
-
-def set_req_radix_insert_snapshot(req: Any, *, indices: Any, seqlen: int) -> None:
-    get_req_dvr_state(req, create=True).radix_insert_snapshot = DVRRadixInsertSnapshot(
-        indices=indices, seqlen=seqlen
-    )
-
-
-def get_req_mamba_radix_cache_policy(req: Any) -> DVRMambaRadixCachePolicy:
-    state = get_req_dvr_state(req)
-    if state is None:
-        return DVRMambaRadixCachePolicy()
-    return DVRMambaRadixCachePolicy(
-        skip_finished_insert=state.skip_mamba_radix_finished_insert,
-        insert_snapshot=state.radix_insert_snapshot,
-    )
-
-
-def clear_req_radix_insert_snapshot(req: Any) -> None:
-    state = get_req_dvr_state(req)
-    if state is not None:
-        state.radix_insert_snapshot = None
-
-
 def pending_mamba_checkpoint_for_result(result: Any, i: int) -> DVRMambaCheckpoint:
     aux = getattr(result, "spec_aux", None)
     checkpoints = getattr(aux, "pending_mamba_checkpoints", None)
@@ -329,7 +274,7 @@ def _set_req_radix_insert_snapshot_from_batch(
     batch: Any,
     req_index: int,
 ) -> None:
-    clear_req_radix_insert_snapshot(req)
+    clear_req_mamba_radix_insert_snapshot(req)
     if (
         batch.mamba_track_mask is None
         or batch.mamba_track_indices is None
@@ -338,7 +283,7 @@ def _set_req_radix_insert_snapshot_from_batch(
         return
     if not bool(batch.mamba_track_mask[req_index].item()):
         return
-    set_req_radix_insert_snapshot(
+    set_req_mamba_radix_insert_snapshot(
         req,
         indices=batch.mamba_track_indices[req_index].reshape(1),
         seqlen=int(batch.mamba_track_cache_seqlens[req_index].item()),

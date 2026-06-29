@@ -108,7 +108,18 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
             f"speculative_algorithm == EAGLE, got {server_args.speculative_algorithm}."
         )
 
-    if server_args.speculative_algorithm == "DFLASH":
+    if (
+        server_args.speculative_algorithm is not None
+        and SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        ).is_decode_verify_rollback()
+    ):
+        from sglang.srt.speculative.dvr_server_args import (
+            handle_dvr_speculative_decoding,
+        )
+
+        handle_dvr_speculative_decoding(server_args)
+    elif server_args.speculative_algorithm == "DFLASH":
         _handle_dflash(server_args)
     elif server_args.speculative_algorithm == "FROZEN_KV_MTP":
         _handle_frozen_kv_mtp(server_args)
@@ -128,6 +139,22 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
                 server_args.speculative_num_steps,
                 server_args.speculative_adaptive_config,
             )
+
+
+def handle_speculative_defaults(server_args: "ServerArgs") -> None:
+    if server_args.speculative_algorithm is None:
+        return
+
+    server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
+
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    if SpeculativeAlgorithm.from_string(
+        server_args.speculative_algorithm
+    ).is_decode_verify_rollback():
+        from sglang.srt.speculative.dvr_server_args import handle_dvr_defaults
+
+        handle_dvr_defaults(server_args)
 
 
 def _handle_dflash(server_args: "ServerArgs") -> None:

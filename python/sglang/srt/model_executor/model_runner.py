@@ -2787,39 +2787,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_num_tokens_cpu = None
 
         def get_spec_info():
-            spec_info = None
-            if (
-                self.spec_algorithm.is_eagle()
-                or self.spec_algorithm.is_standalone()
-                or self.spec_algorithm.is_decode_verify_rollback()
-            ):
-                from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
+            spec_info = self.spec_algorithm.create_target_verify_cuda_graph_input(
+                custom_mask=buffers.custom_mask,
+                spec_steps=self.server_args.speculative_num_steps,
+                topk=self.server_args.speculative_eagle_topk,
+                draft_token_num=self.server_args.speculative_num_draft_tokens,
+                default_capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            if spec_info is not None:
                 if self.is_draft_worker:
                     raise RuntimeError("This should not happen.")
-                else:
-                    spec_info = EagleVerifyInput(
-                        draft_token=None,
-                        custom_mask=buffers.custom_mask,
-                        positions=None,
-                        retrieve_index=None,
-                        retrieve_next_token=None,
-                        retrieve_next_sibling=None,
-                        retrieve_cum_len=None,
-                        spec_steps=self.server_args.speculative_num_steps,
-                        topk=self.server_args.speculative_eagle_topk,
-                        draft_token_num=self.server_args.speculative_num_draft_tokens,
-                        capture_hidden_mode=(
-                            self.spec_algorithm.target_verify_capture_hidden_mode(
-                                CaptureHiddenMode.FULL
-                            )
-                        ),
-                        seq_lens_sum=None,
-                        seq_lens_cpu=None,
-                    )
-                    spec_info = self.spec_algorithm.prepare_cuda_graph_verify_input(
-                        spec_info
-                    )
             elif self.spec_algorithm.is_dflash():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 

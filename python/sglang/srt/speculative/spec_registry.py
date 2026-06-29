@@ -104,6 +104,18 @@ class CustomSpecAlgo:
     ):
         return default_mode
 
+    def uses_eagle_style_target_verify_input(self) -> bool:
+        return False
+
+    def target_verify_graph_bs_uses_token_count(self) -> bool:
+        return False
+
+    def create_target_verify_cuda_graph_input(self, **kwargs) -> Optional["SpecInput"]:
+        return None
+
+    def uses_draft_decode_custom_all_reduce(self) -> bool:
+        return False
+
     def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
         return False
 

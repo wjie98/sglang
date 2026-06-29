@@ -49,8 +49,8 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.dvr_scheduler_utils import (
-    clear_req_radix_insert_snapshot,
+from sglang.srt.mem_cache.mamba_radix_cache_policy import (
+    clear_req_mamba_radix_insert_snapshot,
     get_req_mamba_radix_cache_policy,
 )
 
@@ -520,8 +520,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
-        dvr_cache_policy = get_req_mamba_radix_cache_policy(req)
-        if dvr_cache_policy.skip_finished_insert:
+        cache_policy = get_req_mamba_radix_cache_policy(req)
+        if cache_policy.skip_finished_insert:
             # Some overlap verify paths keep post-verify Mamba checkpoints
             # request-local. Prefill/unfinished-cache entries are still
             # reusable, but the generated suffix is not inserted until
@@ -645,8 +645,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
-        dvr_cache_policy = get_req_mamba_radix_cache_policy(req)
-        insert_snapshot = dvr_cache_policy.insert_snapshot
+        cache_policy = get_req_mamba_radix_cache_policy(req)
+        insert_snapshot = cache_policy.insert_snapshot
         insert_mamba_indices = (
             None if insert_snapshot is None else insert_snapshot.indices
         )
@@ -726,7 +726,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
         finally:
-            clear_req_radix_insert_snapshot(req)
+            clear_req_mamba_radix_insert_snapshot(req)
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
         if mamba_exist:
             self.req_to_token_pool.mamba_allocator.free(mamba_value_donated)

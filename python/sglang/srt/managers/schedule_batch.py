@@ -775,10 +775,6 @@ class Req(ReqDllmMixin):
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
-        # DVR-specific scheduler policies and one-shot cache snapshots live
-        # behind this opaque state object so Req does not grow a field per case.
-        self.dvr_runtime_state: Optional[Any] = None
-
         # Check finish
         self.tokenizer = None
         self.finished_reason: Optional[BaseFinishReason] = None
@@ -1356,7 +1352,6 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
-        self.dvr_runtime_state = None
         self.extend_logprob_start_len = 0
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None

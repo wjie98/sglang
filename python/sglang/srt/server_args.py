@@ -50,11 +50,6 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
-from sglang.srt.speculative.dvr_server_args import (
-    handle_dvr_defaults,
-    handle_dvr_speculative_decoding,
-    is_dvr_enabled,
-)
 from sglang.srt.true_on_policy.contracts import (
     resolve_true_on_policy_runtime_policy,
     validate_true_on_policy_contract,
@@ -1029,7 +1024,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
-        handle_dvr_speculative_decoding(self)
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -1240,7 +1234,9 @@ class ServerArgs:
             #       [overlap, non-overlap]
             self.mamba_scheduler_strategy = "no_buffer"
 
-        handle_dvr_defaults(self)
+        from sglang.srt.arg_groups.speculative_hook import handle_speculative_defaults
+
+        handle_speculative_defaults(self)
 
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
@@ -4338,12 +4334,29 @@ class ServerArgs:
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
-                    if is_dvr_enabled(self) and not self.disable_custom_all_reduce:
+                    if (
+                        self.speculative_algorithm is not None
+                        and not self.disable_custom_all_reduce
+                    ):
+                        from sglang.srt.speculative.spec_info import (
+                            SpeculativeAlgorithm,
+                        )
+
+                        use_draft_decode_custom_all_reduce = (
+                            SpeculativeAlgorithm.from_string(
+                                self.speculative_algorithm
+                            ).uses_draft_decode_custom_all_reduce()
+                        )
+                    else:
+                        use_draft_decode_custom_all_reduce = False
+
+                    if use_draft_decode_custom_all_reduce:
                         self.disable_custom_all_reduce = True
                         logger.warning(
                             "NCCL_ALGO is set to 'allreduce:tree'. Custom all reduce "
-                            "is disabled for deterministic prefill and verify; DVR "
-                            "may initialize it only for draft decode CUDA graphs."
+                            "is disabled for deterministic prefill and verify; the "
+                            "speculative algorithm may initialize it only for draft "
+                            "decode CUDA graphs."
                         )
                     else:
                         self.disable_custom_all_reduce = True
