@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
+    DVRReplayPrefixTracker,
     DVRSpecResultAux,
     defer_req_non_streaming_logprob_output,
 )
@@ -90,7 +91,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             server_args=self.server_args,
             model_runner=self.model_runner,
         )
-        self._dvr_eagle_replay_output_ids = {}
+        self.dvr_replay_prefix = DVRReplayPrefixTracker()
         self.cuda_graph_runner_for_target_verify = None
         if not self.server_args.disable_cuda_graph and (
             self.server_args.model_impl != "mindspore"
@@ -181,38 +182,12 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         return DVREagleVerifyInput.from_eagle_verify_input(verify_input)
 
     def _request_token_ids_for_eagle_replay(self, req, seq_len: int):
-        origin_input_ids = list(req.origin_input_ids)
-        output_len = seq_len - len(origin_input_ids)
-        if output_len <= 0:
-            return origin_input_ids[:seq_len]
-
-        replay_output_ids = self._dvr_eagle_replay_output_ids.get(req.rid)
-        if replay_output_ids is not None and len(replay_output_ids) >= output_len:
-            return origin_input_ids + replay_output_ids[:output_len]
-
-        # The replay stream is a helper for overlap timing.  If it is behind
-        # but the request already exposes a complete logical prefix, use that
-        # instead of failing the strict oracle path.
-        token_ids = origin_input_ids + list(req.output_ids)
-        if len(token_ids) >= seq_len:
-            return token_ids
-
-        if hasattr(req, "get_fill_ids"):
-            fill_ids = list(req.get_fill_ids())
-            if len(fill_ids) >= seq_len:
-                return fill_ids
-
-        fill_ids = getattr(req, "full_untruncated_fill_ids", None)
-        if fill_ids is not None:
-            fill_ids = list(fill_ids)
-            if len(fill_ids) >= seq_len:
-                return fill_ids
-
-        raise RuntimeError(
-            "DVR EAGLE replay cannot reconstruct the verified prefix: "
-            f"rid={req.rid}, tracked_output_tokens="
-            f"{0 if replay_output_ids is None else len(replay_output_ids)}, "
-            f"required_output_tokens={output_len}, seq_len={seq_len}."
+        return self.dvr_replay_prefix.request_token_ids(
+            req,
+            seq_len,
+            initialize_from_req_output=False,
+            include_full_untruncated_fill_ids=True,
+            error_prefix="DVR EAGLE",
         )
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
@@ -238,10 +213,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
-        active_rids = {req.rid for req in batch.reqs}
-        for rid in list(self._dvr_eagle_replay_output_ids):
-            if rid not in active_rids:
-                self._dvr_eagle_replay_output_ids.pop(rid, None)
+        self.dvr_replay_prefix.prune_to_batch(batch)
 
         bs = len(batch.seq_lens)
         draft_token_num = verify_input.draft_token_num
@@ -269,29 +241,21 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             draft_tokens_cpu,
             strict=True,
         ):
-            replay_output_ids = self._dvr_eagle_replay_output_ids.setdefault(
-                req.rid, []
-            )
             prefix_output_len = max(0, int(seq_len) - len(req.origin_input_ids))
-            if len(replay_output_ids) > prefix_output_len:
-                del replay_output_ids[prefix_output_len:]
-            elif len(replay_output_ids) < prefix_output_len:
-                missing = prefix_output_len - len(replay_output_ids)
-                real_output_ids = req.output_ids[
-                    len(replay_output_ids) : prefix_output_len
-                ]
-                if len(real_output_ids) != missing:
-                    raise RuntimeError(
-                        "DVR EAGLE replay prefix is behind the batch logical "
-                        f"length: rid={req.rid}, tracked={len(replay_output_ids)}, "
-                        f"required={prefix_output_len}."
-                    )
-                replay_output_ids.extend(int(token_id) for token_id in real_output_ids)
+            self.dvr_replay_prefix.align_req_to_output_len(
+                req,
+                prefix_output_len,
+                error_prefix="DVR EAGLE replay prefix",
+            )
 
             accepted_token_ids = [
                 int(token_id) for token_id in draft_tokens[: int(accepted_len)]
             ]
-            replay_output_ids.extend(accepted_token_ids)
+            self.dvr_replay_prefix.append_output_tokens(
+                req,
+                accepted_token_ids,
+                initialize_from_req_output=False,
+            )
 
     def _prepare_dvr_boundary_for_verify(self, batch: ScheduleBatch) -> None:
         if batch.forward_mode.is_idle():

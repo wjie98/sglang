@@ -62,6 +62,120 @@ class DVRSpecResultAux:
         return cls(pending_mamba_checkpoints=checkpoints)
 
 
+class DVRReplayPrefixTracker:
+    """Per-worker replay prefix stream for spec-v2 overlap DVR.
+
+    Spec-v2 can start the next DVR replay before the scheduler has materialized
+    the just-verified tokens into ``Req.output_ids``.  Self-DVR and DVR-EAGLE
+    advance that logical prefix from different token sources, but both need the
+    same request-id keyed stream and fallback reconstruction rules.
+    """
+
+    def __init__(self) -> None:
+        self._output_ids_by_rid: dict[Any, list[int]] = {}
+
+    def prune_to_batch(self, batch: Any) -> None:
+        if batch.reqs is None:
+            self._output_ids_by_rid.clear()
+            return
+
+        active_rids = {req.rid for req in batch.reqs}
+        for rid in list(self._output_ids_by_rid):
+            if rid not in active_rids:
+                self._output_ids_by_rid.pop(rid, None)
+
+    def stream_for_req(
+        self,
+        req: Any,
+        *,
+        initialize_from_req_output: bool,
+    ) -> list[int]:
+        initial_output_ids = list(req.output_ids) if initialize_from_req_output else []
+        stream = self._output_ids_by_rid.setdefault(req.rid, initial_output_ids)
+        if initialize_from_req_output and len(stream) < len(req.output_ids):
+            stream[:] = list(req.output_ids)
+        return stream
+
+    def request_token_ids(
+        self,
+        req: Any,
+        seq_len: int,
+        *,
+        initialize_from_req_output: bool,
+        include_full_untruncated_fill_ids: bool = False,
+        error_prefix: str,
+    ) -> list[int]:
+        origin_input_ids = list(req.origin_input_ids)
+        output_len = seq_len - len(origin_input_ids)
+        if output_len <= 0:
+            return origin_input_ids[:seq_len]
+
+        stream = self.stream_for_req(
+            req, initialize_from_req_output=initialize_from_req_output
+        )
+        if len(stream) >= output_len:
+            return origin_input_ids + stream[:output_len]
+
+        token_ids = origin_input_ids + list(req.output_ids)
+        if len(token_ids) >= seq_len:
+            return token_ids
+
+        if hasattr(req, "get_fill_ids"):
+            fill_ids = list(req.get_fill_ids())
+            if len(fill_ids) >= seq_len:
+                return fill_ids
+
+        if include_full_untruncated_fill_ids:
+            fill_ids = getattr(req, "full_untruncated_fill_ids", None)
+            if fill_ids is not None:
+                fill_ids = list(fill_ids)
+                if len(fill_ids) >= seq_len:
+                    return fill_ids
+
+        raise RuntimeError(
+            f"{error_prefix} replay cannot reconstruct the verified prefix: "
+            f"rid={req.rid}, origin_tokens={len(origin_input_ids)}, "
+            f"req_output_tokens={len(req.output_ids)}, "
+            f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
+        )
+
+    def append_output_tokens(
+        self,
+        req: Any,
+        token_ids,
+        *,
+        initialize_from_req_output: bool,
+    ) -> None:
+        stream = self.stream_for_req(
+            req, initialize_from_req_output=initialize_from_req_output
+        )
+        stream.extend(int(token_id) for token_id in token_ids)
+
+    def align_req_to_output_len(
+        self,
+        req: Any,
+        output_len: int,
+        *,
+        error_prefix: str,
+    ) -> None:
+        stream = self.stream_for_req(req, initialize_from_req_output=False)
+        if len(stream) > output_len:
+            del stream[output_len:]
+            return
+
+        if len(stream) == output_len:
+            return
+
+        missing = output_len - len(stream)
+        real_output_ids = req.output_ids[len(stream) : output_len]
+        if len(real_output_ids) != missing:
+            raise RuntimeError(
+                f"{error_prefix} is behind the batch logical length: "
+                f"rid={req.rid}, tracked={len(stream)}, required={output_len}."
+            )
+        stream.extend(int(token_id) for token_id in real_output_ids)
+
+
 def get_req_dvr_state(req: Any, *, create: bool = False) -> Optional[DVRRequestState]:
     state = getattr(req, "dvr_runtime_state", None)
     if state is None and create:

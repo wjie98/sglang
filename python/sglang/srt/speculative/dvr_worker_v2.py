@@ -17,7 +17,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.dvr_scheduler_utils import DVRSpecResultAux
+from sglang.srt.speculative.dvr_scheduler_utils import (
+    DVRReplayPrefixTracker,
+    DVRSpecResultAux,
+)
 from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
 from sglang.srt.speculative.dvr_worker import (
     DVRSelfDraftVerifyInput,
@@ -58,7 +61,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         self.speculative_num_steps = self.num_draft_steps
         self.speculative_num_draft_tokens = self.num_draft_tokens
         self.draft_runner = self.model_runner
-        self._dvr_v2_replay_output_ids = {}
+        self.dvr_replay_prefix = DVRReplayPrefixTracker()
 
     @property
     def draft_worker(self):
@@ -90,48 +93,25 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             -1
         )
 
-    def _v2_replay_stream(self, req) -> list[int]:
-        stream = self._dvr_v2_replay_output_ids.setdefault(
-            req.rid, list(req.output_ids)
-        )
-        if len(stream) < len(req.output_ids):
-            stream[:] = list(req.output_ids)
-        return stream
-
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
-        origin_input_ids = list(req.origin_input_ids)
-        output_len = boundary_seqlen - len(origin_input_ids)
-        if output_len <= 0:
-            return origin_input_ids[:boundary_seqlen]
-
-        replay_output_ids = self._v2_replay_stream(req)
-        if len(replay_output_ids) >= output_len:
-            return origin_input_ids + replay_output_ids[:output_len]
-
-        token_ids = origin_input_ids + req.output_ids
-        if len(token_ids) >= boundary_seqlen:
-            return token_ids
-
-        if hasattr(req, "get_fill_ids"):
-            fill_ids = req.get_fill_ids()
-            if len(fill_ids) >= boundary_seqlen:
-                return fill_ids
-
-        raise RuntimeError(
-            "DVR spec-v2 replay cannot reconstruct the verified prefix: "
-            f"rid={req.rid}, origin_tokens={len(origin_input_ids)}, "
-            f"req_output_tokens={len(req.output_ids)}, "
-            f"tracked_output_tokens={len(replay_output_ids)}, "
-            f"boundary_seqlen={boundary_seqlen}."
+        return self.dvr_replay_prefix.request_token_ids(
+            req,
+            boundary_seqlen,
+            initialize_from_req_output=True,
+            error_prefix="DVR spec-v2",
         )
 
     def _advance_v2_replay_prefix(self, batch: ScheduleBatch, tokens_per_req) -> None:
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
+        self.dvr_replay_prefix.prune_to_batch(batch)
         for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
-            stream = self._v2_replay_stream(req)
-            stream.extend(int(token_id) for token_id in token_ids)
+            self.dvr_replay_prefix.append_output_tokens(
+                req,
+                token_ids,
+                initialize_from_req_output=True,
+            )
 
     @staticmethod
     def _batch_seq_lens_cpu_list(batch: ScheduleBatch) -> list[int]:
