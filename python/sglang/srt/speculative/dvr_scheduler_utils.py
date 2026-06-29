@@ -216,13 +216,10 @@ def commit_pending_mamba_checkpoint_from_result(
     tree_cache: Any,
 ) -> None:
     checkpoint = pending_mamba_checkpoint_for_result(result, req_index)
-    if not checkpoint.valid:
-        return
-
-    materialized_len = len(req.origin_input_ids) + len(req.output_ids)
-    page_size = getattr(tree_cache, "page_size", 1)
-    if checkpoint.seqlen > materialized_len or (
-        page_size != 1 and checkpoint.seqlen % page_size != 0
+    if not _pending_mamba_checkpoint_is_committable(
+        checkpoint=checkpoint,
+        req=req,
+        tree_cache=tree_cache,
     ):
         return
 
@@ -230,6 +227,23 @@ def commit_pending_mamba_checkpoint_from_result(
     req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
         checkpoint.track_idx
     )
+
+
+def _pending_mamba_checkpoint_is_committable(
+    *,
+    checkpoint: DVRMambaCheckpoint,
+    req: Any,
+    tree_cache: Any,
+) -> bool:
+    if not checkpoint.valid:
+        return False
+
+    materialized_len = len(req.origin_input_ids) + len(req.output_ids)
+    if checkpoint.seqlen > materialized_len:
+        return False
+
+    page_size = getattr(tree_cache, "page_size", 1)
+    return page_size == 1 or checkpoint.seqlen % page_size == 0
 
 
 def maybe_handle_dvr_mamba_checkpoint_after_decode(
