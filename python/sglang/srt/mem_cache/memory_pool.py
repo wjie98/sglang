@@ -248,12 +248,6 @@ class MambaPool:
         intermediate_conv_window: List[torch.Tensor]
         linear_state_input_cache: Optional[Any] = None
 
-        @property
-        def dvr_state_input_cache(self):
-            # Compatibility for DVR code that has not yet moved to the generic
-            # linear_state_input_cache name.
-            return self.linear_state_input_cache
-
         def at_layer_idx(self, layer: int):
             kwargs = {}
             # Use fields instead of vars to avoid torch.compile graph break.
@@ -509,7 +503,6 @@ class MambaPool:
                 "intermediate_ssm",
                 "intermediate_conv_window",
                 "linear_state_input_cache",
-                "dvr_state_input_cache",
             ):
                 continue
             value = getattr(self.mamba_cache, field)
@@ -541,7 +534,7 @@ class MambaPool:
         """
         state_tensors = []
         for field in vars(self.mamba_cache):
-            if field in ("linear_state_input_cache", "dvr_state_input_cache"):
+            if field == "linear_state_input_cache":
                 continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):

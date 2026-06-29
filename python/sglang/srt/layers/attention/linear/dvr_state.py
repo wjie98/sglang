@@ -148,8 +148,6 @@ class DVRStateInputWindow:
     def from_cache(cls, state_cache) -> "DVRStateInputWindow":
         cache = getattr(state_cache, "linear_state_input_cache", None)
         if cache is None:
-            cache = getattr(state_cache, "dvr_state_input_cache", None)
-        if cache is None:
             return cls(inputs=None, tail_lens_cache=None)
         return cache.window()
 

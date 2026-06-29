@@ -141,7 +141,7 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         dtype=torch.float32,
         device="cpu",
     )[0]
-    state_cache = SimpleNamespace(dvr_state_input_cache=cache)
+    state_cache = SimpleNamespace(linear_state_input_cache=cache)
     draft_adapter = DVRGatedStateAdapter(ops=None, is_draft_worker=True)
     target_adapter = DVRGatedStateAdapter(ops=None, is_draft_worker=False)
 
