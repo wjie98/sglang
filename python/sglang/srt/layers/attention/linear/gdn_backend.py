@@ -404,6 +404,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache=mamba_cache_params, is_target_verify=is_target_verify
         ):
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            # DVR target verify replays GDN state with prefill-equivalent inputs.
             return self.dvr_state_adapter.forward_gdn_target_verify(
                 layer=layer,
                 forward_batch=forward_batch,
@@ -520,6 +521,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
+            # Cache target-model GDN tail inputs for later DVR verify/replay.
             self.dvr_state_adapter.cache_gdn_extend_tail(
                 forward_batch=forward_batch,
                 state_cache=mamba_cache_params,
