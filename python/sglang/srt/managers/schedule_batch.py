@@ -858,6 +858,9 @@ class Req(ReqDllmMixin):
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
+        # Some algorithms repair non-streaming output logprobs before the final
+        # response. Keep intermediate chunks local until the request finishes.
+        self.defer_non_streaming_logprob_output: bool = False
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
@@ -1358,6 +1361,7 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
+        self.defer_non_streaming_logprob_output = False
         self.extend_logprob_start_len = 0
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None

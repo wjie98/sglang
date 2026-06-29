@@ -995,6 +995,12 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                     backup=saved_state_input_window,
                 )
 
+    @staticmethod
+    def _defer_non_streaming_logprob_output_until_finish(batch: ScheduleBatch) -> None:
+        for req in batch.reqs:
+            if req.return_logprob and not req.stream:
+                req.defer_non_streaming_logprob_output = True
+
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             target_capture_mode = (
@@ -1196,6 +1202,9 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
 
         exact_output_logprobs = None
         if batch.return_logprob and not batch.forward_mode.is_idle():
+            # DVR-EAGLE may rewrite previously collected output logprobs with a
+            # final full-prefix oracle, so non-streaming chunks must stay local.
+            self._defer_non_streaming_logprob_output_until_finish(batch)
             exact_output_logprobs = self._target_full_prefix_score_accepted_logprobs(
                 batch=batch,
                 verify_input=verify_input,

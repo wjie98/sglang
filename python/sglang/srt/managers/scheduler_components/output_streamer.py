@@ -318,19 +318,17 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_idx = []
 
     def _should_defer_non_streaming_logprob_output(self, req: Req) -> bool:
-        """Keep DVR-EAGLE non-streaming logprobs local until final repair.
+        """Keep repairable non-streaming logprobs local until final response.
 
-        DVR-EAGLE rewrites strict returned logprobs from a final prompt+output
-        full-prefill oracle. Once a non-streaming chunk is sent to the
-        detokenizer, it cannot be repaired in place, so only the final response
-        should carry those logprobs.
+        Once a non-streaming logprob chunk is sent to the detokenizer, later
+        algorithm-level repairs cannot update it in place.
         """
 
         return (
             self.return_logprob
             and req.return_logprob
             and not req.stream
-            and self.spec_algorithm.is_decode_verify_rollback_eagle()
+            and req.defer_non_streaming_logprob_output
         )
 
     def accept(self, *, req: Req) -> None:
