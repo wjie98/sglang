@@ -32,6 +32,14 @@ class DVRRequestState:
 
 
 @dataclass
+class DVRMambaRadixCachePolicy:
+    """DVR cache policy consumed by mamba radix cache without branch details."""
+
+    skip_finished_insert: bool = False
+    insert_snapshot: Optional[DVRRadixInsertSnapshot] = None
+
+
+@dataclass
 class DVRSpecResultAux:
     """Worker-to-scheduler DVR metadata carried by GenerationBatchResult."""
 
@@ -192,20 +200,20 @@ def mark_req_skip_mamba_radix_finished_insert(req: Any) -> None:
     get_req_dvr_state(req, create=True).skip_mamba_radix_finished_insert = True
 
 
-def should_skip_mamba_radix_finished_insert(req: Any) -> bool:
-    state = get_req_dvr_state(req)
-    return bool(state and state.skip_mamba_radix_finished_insert)
-
-
 def set_req_radix_insert_snapshot(req: Any, *, indices: Any, seqlen: int) -> None:
     get_req_dvr_state(req, create=True).radix_insert_snapshot = (
         DVRRadixInsertSnapshot(indices=indices, seqlen=seqlen)
     )
 
 
-def get_req_radix_insert_snapshot(req: Any) -> Optional[DVRRadixInsertSnapshot]:
+def get_req_mamba_radix_cache_policy(req: Any) -> DVRMambaRadixCachePolicy:
     state = get_req_dvr_state(req)
-    return None if state is None else state.radix_insert_snapshot
+    if state is None:
+        return DVRMambaRadixCachePolicy()
+    return DVRMambaRadixCachePolicy(
+        skip_finished_insert=state.skip_mamba_radix_finished_insert,
+        insert_snapshot=state.radix_insert_snapshot,
+    )
 
 
 def clear_req_radix_insert_snapshot(req: Any) -> None:

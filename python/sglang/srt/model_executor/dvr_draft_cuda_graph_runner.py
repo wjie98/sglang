@@ -294,6 +294,29 @@ def dvr_eagle_draft_decode_context(
         yield
 
 
+@contextmanager
+def draft_decode_performance_context(
+    model_runner,
+    *,
+    graph_capture: bool = False,
+    clear_kernel_config_caches: bool = False,
+    attn_backends=(),
+):
+    """Apply draft-decode performance policy when the algorithm needs one."""
+
+    if model_runner.spec_algorithm.is_decode_verify_rollback_eagle():
+        with dvr_eagle_draft_decode_context(
+            model_runner,
+            graph_capture=graph_capture,
+            clear_kernel_config_caches=clear_kernel_config_caches,
+            attn_backends=attn_backends,
+        ):
+            yield
+        return
+
+    yield
+
+
 class DVRDraftDecodeCudaGraphRunner:
     """CUDA graph runner for DVR self-draft decode.
 

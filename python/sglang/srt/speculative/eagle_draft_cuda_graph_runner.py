@@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    dvr_eagle_draft_decode_context,
+    draft_decode_performance_context,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
@@ -194,18 +194,14 @@ class EAGLEDraftCudaGraphRunner:
         self.buffers.share_buffers()
 
         # Capture
-        dvr_capture_ctx = (
-            dvr_eagle_draft_decode_context(
-                model_runner,
-                graph_capture=True,
-                clear_kernel_config_caches=True,
-                attn_backends=(self.draft_attn_backend,),
-            )
-            if model_runner.spec_algorithm.is_decode_verify_rollback_eagle()
-            else contextlib.nullcontext()
+        draft_decode_ctx = draft_decode_performance_context(
+            model_runner,
+            graph_capture=True,
+            clear_kernel_config_caches=True,
+            attn_backends=(self.draft_attn_backend,),
         )
         try:
-            with model_capture_mode(), dvr_capture_ctx:
+            with model_capture_mode(), draft_decode_ctx:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
@@ -265,15 +261,11 @@ class EAGLEDraftCudaGraphRunner:
             else contextlib.nullcontext()
         )
         with ctx:
-            dvr_replay_ctx = (
-                dvr_eagle_draft_decode_context(
-                    self.model_runner,
-                    attn_backends=(self.draft_attn_backend,),
-                )
-                if self.model_runner.spec_algorithm.is_decode_verify_rollback_eagle()
-                else contextlib.nullcontext()
+            draft_decode_ctx = draft_decode_performance_context(
+                self.model_runner,
+                attn_backends=(self.draft_attn_backend,),
             )
-            with dvr_replay_ctx:
+            with draft_decode_ctx:
                 self.graphs[self.bs].replay()
 
     def capture(self):

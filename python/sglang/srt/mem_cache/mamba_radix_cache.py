@@ -51,8 +51,7 @@ from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dvr_scheduler_utils import (
     clear_req_radix_insert_snapshot,
-    get_req_radix_insert_snapshot,
-    should_skip_mamba_radix_finished_insert,
+    get_req_mamba_radix_cache_policy,
 )
 
 if TYPE_CHECKING:
@@ -521,7 +520,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
-        if should_skip_mamba_radix_finished_insert(req):
+        dvr_cache_policy = get_req_mamba_radix_cache_policy(req)
+        if dvr_cache_policy.skip_finished_insert:
             # Some overlap verify paths keep post-verify Mamba checkpoints
             # request-local. Prefill/unfinished-cache entries are still
             # reusable, but the generated suffix is not inserted until
@@ -645,7 +645,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
-        insert_snapshot = get_req_radix_insert_snapshot(req)
+        dvr_cache_policy = get_req_mamba_radix_cache_policy(req)
+        insert_snapshot = dvr_cache_policy.insert_snapshot
         insert_mamba_indices = (
             None if insert_snapshot is None else insert_snapshot.indices
         )

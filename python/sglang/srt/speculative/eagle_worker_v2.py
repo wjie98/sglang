@@ -35,7 +35,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    dvr_eagle_draft_decode_context,
+    draft_decode_performance_context,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -210,7 +210,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
-            self._dvr_draft_decode_context(clear_kernel_config_caches=True),
+            self._draft_decode_context(clear_kernel_config_caches=True),
         ):
             self.init_attention_backend()
             if server_args.enable_breakable_cuda_graph:
@@ -235,17 +235,15 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         )
 
-    def _dvr_draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
-        if self.speculative_algorithm.is_decode_verify_rollback_eagle():
-            return dvr_eagle_draft_decode_context(
-                self.draft_runner,
-                clear_kernel_config_caches=clear_kernel_config_caches,
-                attn_backends=(
-                    getattr(self, "draft_attn_backend", None),
-                    getattr(self, "draft_extend_attn_backend", None),
-                ),
-            )
-        return contextlib.nullcontext()
+    def _draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
+        return draft_decode_performance_context(
+            self.draft_runner,
+            clear_kernel_config_caches=clear_kernel_config_caches,
+            attn_backends=(
+                getattr(self, "draft_attn_backend", None),
+                getattr(self, "draft_extend_attn_backend", None),
+            ),
+        )
 
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
@@ -428,7 +426,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        with self._dvr_draft_decode_context():
+        with self._draft_decode_context():
             forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
                 self.req_to_token_pool,
                 batch,
@@ -455,9 +453,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     self.cuda_graph_runner.replay(forward_batch)
                 )
             else:
-                with self._dvr_draft_decode_context(
-                    clear_kernel_config_caches=True
-                ):
+                with self._draft_decode_context(clear_kernel_config_caches=True):
                     if (
                         not forward_batch.forward_mode.is_idle()
                         and self.speculative_num_steps > 1
@@ -689,7 +685,7 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_for_logprob_per_req=1,
         )
 
-        with self._dvr_draft_decode_context(clear_kernel_config_caches=True):
+        with self._draft_decode_context(clear_kernel_config_caches=True):
             batch.spec_info = next_draft_input
 
             # Run forward (LAST mode: only the final hidden state per request,
@@ -717,9 +713,7 @@ class EagleDraftWorker(BaseDraftWorker):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx, self._dvr_draft_decode_context(
-            clear_kernel_config_caches=True
-        ):
+        with canary_ctx, self._draft_decode_context(clear_kernel_config_caches=True):
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
@@ -753,7 +747,7 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_input.selected_hidden_indices = select_index
 
         # Prepare for draft extend in a separate stream
-        with self._dvr_draft_decode_context(), self.plan_stream_ctx:
+        with self._draft_decode_context(), self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
                 batch_result.next_token_ids,
@@ -796,7 +790,7 @@ class EagleDraftWorker(BaseDraftWorker):
                     forward_batch
                 )
             else:
-                with self._dvr_draft_decode_context(clear_kernel_config_caches=True):
+                with self._draft_decode_context(clear_kernel_config_caches=True):
                     draft_logits_output = self.draft_runner.forward(
                         forward_batch
                     ).logits_output
