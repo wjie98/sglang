@@ -176,6 +176,65 @@ def _iter_decode_custom_all_reduce_comms(model_runner):
             yield ca_comm
 
 
+def _skip_init_cuda_graph_state(*args, **kwargs):
+    return None
+
+
+def _patch_draft_determinism_flags(
+    model_runner,
+    global_server_args,
+    patch_attr,
+    *,
+    disable_model_runner_graph: bool,
+):
+    patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
+    patch_attr(global_server_args, "enable_deterministic_inference", False)
+    if disable_model_runner_graph:
+        patch_attr(model_runner, "graph_runner", None)
+
+
+def _patch_draft_decode_backend_tree(model_runner, extra_attn_backends, patch_attr):
+    seen_backend_roots = set()
+    for backend_root in (model_runner.attn_backend, *(extra_attn_backends or ())):
+        if backend_root is None or id(backend_root) in seen_backend_roots:
+            continue
+        seen_backend_roots.add(id(backend_root))
+        for backend in _iter_attention_backends(backend_root):
+            patch_attr(backend, "enable_deterministic", False)
+            _patch_self_draft_decode_backend_defaults(backend, patch_attr)
+
+
+def _patch_graph_capture_extras(
+    model_runner,
+    patch_attr,
+    *,
+    patch_spec_algorithm_for_graph: bool,
+    skip_graph_state_init: bool,
+):
+    # Custom all-reduce is unsafe for deterministic DVR prefill/verify, but the
+    # self-draft decode graph can capture it for speed.
+    for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
+        patch_attr(ca_comm, "disabled", False)
+    if patch_spec_algorithm_for_graph:
+        # The target runner already initialized attention backend graph buffers
+        # for TARGET_VERIFY. Capture DVR self-draft as ordinary DECODE without
+        # reinitializing those shared buffers.
+        patch_attr(model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE)
+    if skip_graph_state_init:
+        patch_attr(
+            model_runner.attn_backend,
+            "init_cuda_graph_state",
+            _skip_init_cuda_graph_state,
+        )
+
+
+def _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr):
+    # Provisional draft tokens must not update mamba prefix-cache tracking
+    # slots. DVR commits verified recurrent state after target verify.
+    patch_attr(model_runner.server_args, "mamba_scheduler_strategy", "no_buffer")
+    patch_attr(global_server_args, "mamba_scheduler_strategy", "no_buffer")
+
+
 @contextmanager
 def dvr_self_draft_decode_context(
     model_runner,
@@ -206,9 +265,6 @@ def dvr_self_draft_decode_context(
         patched_attrs.append((obj, attr_name, getattr(obj, attr_name)))
         setattr(obj, attr_name, value)
 
-    def skip_init_cuda_graph_state(*args, **kwargs):
-        return None
-
     env_override = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False)
     env_override.__enter__()
 
@@ -216,44 +272,28 @@ def dvr_self_draft_decode_context(
         if clear_kernel_config_caches:
             _clear_determinism_sensitive_kernel_caches()
 
-        patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
-        patch_attr(global_server_args, "enable_deterministic_inference", False)
-        if disable_model_runner_graph:
-            patch_attr(model_runner, "graph_runner", None)
-
-        seen_backend_roots = set()
-        for backend_root in (model_runner.attn_backend, *(extra_attn_backends or ())):
-            if backend_root is None or id(backend_root) in seen_backend_roots:
-                continue
-            seen_backend_roots.add(id(backend_root))
-            for backend in _iter_attention_backends(backend_root):
-                patch_attr(backend, "enable_deterministic", False)
-                _patch_self_draft_decode_backend_defaults(backend, patch_attr)
+        _patch_draft_determinism_flags(
+            model_runner,
+            global_server_args,
+            patch_attr,
+            disable_model_runner_graph=disable_model_runner_graph,
+        )
+        _patch_draft_decode_backend_tree(
+            model_runner, extra_attn_backends, patch_attr
+        )
 
         if graph_capture:
-            # Custom all-reduce is unsafe for deterministic DVR prefill/verify,
-            # but the self-draft decode graph can capture it for speed.
-            for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
-                patch_attr(ca_comm, "disabled", False)
-            if patch_spec_algorithm_for_graph:
-                # The target runner already initialized attention backend graph
-                # buffers for TARGET_VERIFY. Capture DVR self-draft as ordinary
-                # DECODE without reinitializing those shared buffers.
-                patch_attr(model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE)
-            if skip_graph_state_init:
-                patch_attr(
-                    model_runner.attn_backend,
-                    "init_cuda_graph_state",
-                    skip_init_cuda_graph_state,
-                )
+            _patch_graph_capture_extras(
+                model_runner,
+                patch_attr,
+                patch_spec_algorithm_for_graph=patch_spec_algorithm_for_graph,
+                skip_graph_state_init=skip_graph_state_init,
+            )
 
         if graph_capture or disable_mamba_tracking:
-            # Provisional draft tokens must not update mamba prefix-cache tracking
-            # slots. DVR commits verified recurrent state after target verify.
-            patch_attr(
-                model_runner.server_args, "mamba_scheduler_strategy", "no_buffer"
+            _patch_draft_mamba_tracking(
+                model_runner, global_server_args, patch_attr
             )
-            patch_attr(global_server_args, "mamba_scheduler_strategy", "no_buffer")
 
         with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
             yield
