@@ -19,6 +19,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.speculative.dvr_scheduler_utils import (
+    DVRSpecResultAux,
+    defer_req_non_streaming_logprob_output,
+)
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_worker import (
     DVREagleVerifyInput,
@@ -999,7 +1003,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     def _defer_non_streaming_logprob_output_until_finish(batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if req.return_logprob and not req.stream:
-                req.defer_non_streaming_logprob_output = True
+                defer_req_non_streaming_logprob_output(req)
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -1265,8 +1269,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
-            pending_mamba_checkpoint_track_indices=pending_track_indices,
-            pending_mamba_checkpoint_seqlens=pending_track_seqlens,
+            spec_aux=DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
+                pending_track_indices,
+                pending_track_seqlens,
+            ),
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

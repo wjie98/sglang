@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.speculative.dvr_scheduler_utils import DVRSpecResultAux
 from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
 from sglang.srt.speculative.dvr_worker import (
     DVRSelfDraftVerifyInput,
@@ -428,8 +429,10 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
-            pending_mamba_checkpoint_track_indices=pending_track_indices,
-            pending_mamba_checkpoint_seqlens=pending_track_seqlens,
+            spec_aux=DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
+                pending_track_indices,
+                pending_track_seqlens,
+            ),
             routed_experts_output=batch_result.routed_experts_output,
         )
 
@@ -640,8 +643,6 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     req.rid
                 ]
                 pending_track_seqlens[i] = new_boundary_seqlen
-                req.pending_mamba_checkpoint_track_idx = pending_track_indices[i]
-                req.pending_mamba_checkpoint_seqlen = new_boundary_seqlen
         self.linear_state.boundary_backup = None
         self.linear_state.live_backup = None
         self.linear_state.suffix_replay_boundary_track_mask = None

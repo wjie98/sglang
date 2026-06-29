@@ -28,6 +28,8 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dvr_scheduler_utils import (
     cache_unfinished_prefill_req_with_dvr_mamba_snapshot,
+    commit_pending_mamba_checkpoint_from_result,
+    mark_req_skip_mamba_radix_finished_insert,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -890,9 +892,15 @@ class SchedulerBatchResultProcessor:
             return
 
         if batch.spec_algorithm.is_decode_verify_rollback():
-            req.skip_mamba_radix_finished_insert = True
+            mark_req_skip_mamba_radix_finished_insert(req)
             if batch.is_spec_v2:
-                self._commit_pending_mamba_checkpoint(req, batch, result, i)
+                commit_pending_mamba_checkpoint_from_result(
+                    req=req,
+                    batch=batch,
+                    result=result,
+                    req_index=i,
+                    tree_cache=self.tree_cache,
+                )
             return
 
         lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
@@ -939,36 +947,6 @@ class SchedulerBatchResultProcessor:
                 return True, cur // interval * interval
 
         return False, 0
-
-    def _commit_pending_mamba_checkpoint(
-        self,
-        req: Req,
-        batch: ScheduleBatch,
-        result: GenerationBatchResult,
-        i: int,
-    ) -> None:
-        pending_seqlen = None
-        pending_track_idx = None
-        if result.pending_mamba_checkpoint_seqlens is not None:
-            pending_seqlen = result.pending_mamba_checkpoint_seqlens[i]
-        if result.pending_mamba_checkpoint_track_indices is not None:
-            pending_track_idx = result.pending_mamba_checkpoint_track_indices[i]
-        if pending_seqlen is None or pending_track_idx is None:
-            return
-
-        materialized_len = len(req.origin_input_ids) + len(req.output_ids)
-        page_size = getattr(self.tree_cache, "page_size", 1)
-        if pending_seqlen > materialized_len or (
-            page_size != 1 and pending_seqlen % page_size != 0
-        ):
-            return
-
-        req.mamba_last_track_seqlen = pending_seqlen
-        req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-            pending_track_idx
-        )
-        req.pending_mamba_checkpoint_track_idx = None
-        req.pending_mamba_checkpoint_seqlen = None
 
     def mamba_lazy_post_decode_at_boundary(self, req: Req, batch: ScheduleBatch):
         """Post-decode cleanup at a lazy-mode track boundary.

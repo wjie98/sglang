@@ -775,11 +775,9 @@ class Req(ReqDllmMixin):
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
-        self.pending_mamba_checkpoint_track_idx: Optional[int] = None
-        self.pending_mamba_checkpoint_seqlen: Optional[int] = None
-        self.skip_mamba_radix_finished_insert: bool = False
-        self.mamba_radix_cache_insert_indices: Optional[torch.Tensor] = None
-        self.mamba_radix_cache_insert_seqlen: Optional[int] = None
+        # DVR-specific scheduler policies and one-shot cache snapshots live
+        # behind this opaque state object so Req does not grow a field per case.
+        self.dvr_runtime_state: Optional[Any] = None
 
         # Check finish
         self.tokenizer = None
@@ -858,10 +856,6 @@ class Req(ReqDllmMixin):
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs
         self.send_output_token_logprobs_offset: int = 0
-        # Some algorithms repair non-streaming output logprobs before the final
-        # response. Keep this as request state so output streaming can remain
-        # algorithm-agnostic while holding intermediate chunks locally.
-        self.defer_non_streaming_logprob_output: bool = False
 
         # Logprobs (arguments)
         self.return_logprob = return_logprob
@@ -1362,7 +1356,7 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
-        self.defer_non_streaming_logprob_output = False
+        self.dvr_runtime_state = None
         self.extend_logprob_start_len = 0
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
@@ -1372,11 +1366,6 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
-        self.pending_mamba_checkpoint_track_idx = None
-        self.pending_mamba_checkpoint_seqlen = None
-        self.skip_mamba_radix_finished_insert = False
-        self.mamba_radix_cache_insert_indices = None
-        self.mamba_radix_cache_insert_seqlen = None
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0

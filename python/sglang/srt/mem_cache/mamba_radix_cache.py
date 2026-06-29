@@ -49,6 +49,11 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.dvr_scheduler_utils import (
+    clear_req_radix_insert_snapshot,
+    get_req_radix_insert_snapshot,
+    should_skip_mamba_radix_finished_insert,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -516,7 +521,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
-        if getattr(req, "skip_mamba_radix_finished_insert", False):
+        if should_skip_mamba_radix_finished_insert(req):
             # Some overlap verify paths keep post-verify Mamba checkpoints
             # request-local. Prefill/unfinished-cache entries are still
             # reusable, but the generated suffix is not inserted until
@@ -640,8 +645,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
-        insert_mamba_indices = getattr(req, "mamba_radix_cache_insert_indices", None)
-        insert_mamba_seqlen = getattr(req, "mamba_radix_cache_insert_seqlen", None)
+        insert_snapshot = get_req_radix_insert_snapshot(req)
+        insert_mamba_indices = (
+            None if insert_snapshot is None else insert_snapshot.indices
+        )
+        insert_mamba_seqlen = None if insert_snapshot is None else insert_snapshot.seqlen
         cache_len = (
             insert_mamba_seqlen
             if self.enable_mamba_extra_buffer
@@ -717,8 +725,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
         finally:
-            req.mamba_radix_cache_insert_indices = None
-            req.mamba_radix_cache_insert_seqlen = None
+            clear_req_radix_insert_snapshot(req)
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
         if mamba_exist:
             self.req_to_token_pool.mamba_allocator.free(mamba_value_donated)
