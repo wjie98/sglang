@@ -29,11 +29,11 @@ from sglang.srt.speculative.dvr_target_replay import (
     target_extend_replay_batch,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
-from sglang.srt.speculative.dvr_worker import (
-    DVREagleVerifyInput,
-    DVRLinearBoundaryReplayMixin,
+from sglang.srt.speculative.dvr_linear_state_worker import (
+    DVRLinearStateReplayMixin,
+    DVRSpecV2LinearStateMixin,
 )
-from sglang.srt.speculative.dvr_worker_v2 import DVRSpecV2LinearStateMixin
+from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -65,7 +65,7 @@ _ATTN_BACKEND_CHILD_LIST_ATTRS = (
 
 
 class DecodeVerifyRollbackEagleWorkerV2(
-    DVRLinearBoundaryReplayMixin, DVRSpecV2LinearStateMixin, EAGLEWorkerV2
+    DVRLinearStateReplayMixin, DVRSpecV2LinearStateMixin, EAGLEWorkerV2
 ):
     """EAGLE draft with DVR target verify/rollback semantics.
 
