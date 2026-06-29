@@ -2810,9 +2810,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         topk=self.server_args.speculative_eagle_topk,
                         draft_token_num=self.server_args.speculative_num_draft_tokens,
                         capture_hidden_mode=(
-                            CaptureHiddenMode.NULL
-                            if self.spec_algorithm.is_decode_verify_rollback_self_draft()
-                            else CaptureHiddenMode.FULL
+                            self.spec_algorithm.target_verify_capture_hidden_mode(
+                                CaptureHiddenMode.FULL
+                            )
                         ),
                         seq_lens_sum=None,
                         seq_lens_cpu=None,

@@ -27,7 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+from sglang.srt.speculative.draft_decode_context import (
     draft_decode_performance_context,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput

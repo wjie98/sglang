@@ -1287,16 +1287,11 @@ class CudaGraphRunner:
                 raise RuntimeError("This should not happen.")
             else:
 
-                # DVR self-draft does not consume target-verify hidden states.
-                # DVR-EAGLE still feeds target hidden states into the MTP
-                # draft-extend pass, so it must be captured like EAGLE.
                 capture_mode = (
-                    CaptureHiddenMode.NULL
-                    if (
-                        self.model_runner.spec_algorithm.is_standalone()
-                        or self.model_runner.spec_algorithm.is_decode_verify_rollback_self_draft()
+                    self.model_runner.spec_algorithm.target_verify_capture_hidden_mode(
+                        CaptureHiddenMode.FULL,
+                        null_for_standalone=True,
                     )
-                    else CaptureHiddenMode.FULL
                 )
                 spec_info = EagleVerifyInput(
                     draft_token=None,
@@ -1313,8 +1308,10 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
-                spec_info = self.model_runner.spec_algorithm.prepare_cuda_graph_verify_input(
-                    spec_info
+                spec_info = (
+                    self.model_runner.spec_algorithm.prepare_cuda_graph_verify_input(
+                        spec_info
+                    )
                 )
         elif self.model_runner.spec_algorithm.is_dflash():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput

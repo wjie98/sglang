@@ -190,6 +190,32 @@ class SpeculativeAlgorithm(Enum):
             return DVRSelfDraftVerifyInput.from_eagle_verify_input(verify_input)
         return verify_input
 
+    def target_verify_capture_hidden_mode(
+        self,
+        default_mode,
+        *,
+        null_for_standalone: bool = False,
+    ):
+        """Return the hidden-state capture mode for target-verify graph inputs.
+
+        Most EAGLE-style algorithms need target hidden states for draft extend.
+        DVR self-draft consumes only verified tokens, while standalone graph
+        capture can use a cheaper NULL mode in the cuda graph runner path.
+        """
+
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        if self.is_decode_verify_rollback_self_draft():
+            return CaptureHiddenMode.NULL
+        if null_for_standalone and self.is_standalone():
+            return CaptureHiddenMode.NULL
+        return default_mode
+
+    def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
+        """Whether spec-v2 scheduling must preserve mamba radix checkpoints."""
+
+        return self.is_decode_verify_rollback()
+
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:

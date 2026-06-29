@@ -9,7 +9,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-
 _BACKEND_CHILD_ATTRS = (
     "decode_backend",
     "prefill_backend",
@@ -292,29 +291,6 @@ def dvr_eagle_draft_decode_context(
         extra_attn_backends=attn_backends,
     ):
         yield
-
-
-@contextmanager
-def draft_decode_performance_context(
-    model_runner,
-    *,
-    graph_capture: bool = False,
-    clear_kernel_config_caches: bool = False,
-    attn_backends=(),
-):
-    """Apply draft-decode performance policy when the algorithm needs one."""
-
-    if model_runner.spec_algorithm.is_decode_verify_rollback_eagle():
-        with dvr_eagle_draft_decode_context(
-            model_runner,
-            graph_capture=graph_capture,
-            clear_kernel_config_caches=clear_kernel_config_caches,
-            attn_backends=attn_backends,
-        ):
-            yield
-        return
-
-    yield
 
 
 class DVRDraftDecodeCudaGraphRunner:

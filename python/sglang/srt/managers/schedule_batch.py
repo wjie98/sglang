@@ -1955,11 +1955,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
         use_mamba_radix_snapshot = (
-            self.is_spec_v2 and self.spec_algorithm.is_decode_verify_rollback()
+            self.is_spec_v2
+            and self.spec_algorithm.needs_mamba_radix_snapshot_for_spec_v2()
         )
-        mamba_track_cache_seqlens_cpu = (
-            [] if use_mamba_radix_snapshot else None
-        )
+        mamba_track_cache_seqlens_cpu = [] if use_mamba_radix_snapshot else None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_input_len
@@ -2040,9 +2039,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
                 if mamba_track_cache_seqlens_cpu is not None:
-                    mamba_track_cache_seqlens_cpu.append(
-                        track_entry.track_cache_seqlen
-                    )
+                    mamba_track_cache_seqlens_cpu.append(track_entry.track_cache_seqlen)
 
             if self.return_logprob:
                 # Find input logprob token ids.

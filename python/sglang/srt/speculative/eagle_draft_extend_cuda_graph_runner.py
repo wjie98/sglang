@@ -27,7 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+from sglang.srt.speculative.draft_decode_context import (
     draft_decode_performance_context,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
@@ -177,8 +177,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
             selected_hidden_indices = (
-                torch.arange(self.max_bs, dtype=torch.int64)
-                * self.num_tokens_per_bs
+                torch.arange(self.max_bs, dtype=torch.int64) * self.num_tokens_per_bs
                 + self.num_tokens_per_bs
                 - 1
                 if self.use_selected_logits

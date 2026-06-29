@@ -96,6 +96,17 @@ class CustomSpecAlgo:
     def prepare_cuda_graph_verify_input(self, verify_input: "SpecInput") -> "SpecInput":
         return verify_input
 
+    def target_verify_capture_hidden_mode(
+        self,
+        default_mode,
+        *,
+        null_for_standalone: bool = False,
+    ):
+        return default_mode
+
+    def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
+        return False
+
     def create_worker(self, server_args: "ServerArgs") -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(

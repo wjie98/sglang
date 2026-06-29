@@ -201,8 +201,8 @@ def mark_req_skip_mamba_radix_finished_insert(req: Any) -> None:
 
 
 def set_req_radix_insert_snapshot(req: Any, *, indices: Any, seqlen: int) -> None:
-    get_req_dvr_state(req, create=True).radix_insert_snapshot = (
-        DVRRadixInsertSnapshot(indices=indices, seqlen=seqlen)
+    get_req_dvr_state(req, create=True).radix_insert_snapshot = DVRRadixInsertSnapshot(
+        indices=indices, seqlen=seqlen
     )
 
 
@@ -281,11 +281,10 @@ def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
     token, the radix-cache insert must carry the matching mamba track snapshot.
     """
 
-    should_cache_unfinished = (
-        not batch.decoding_reqs or req not in batch.decoding_reqs
-    )
+    should_cache_unfinished = not batch.decoding_reqs or req not in batch.decoding_reqs
     is_dvr_spec_v2 = (
-        batch.is_spec_v2 and batch.spec_algorithm.is_decode_verify_rollback()
+        batch.is_spec_v2
+        and batch.spec_algorithm.needs_mamba_radix_snapshot_for_spec_v2()
     )
     if is_dvr_spec_v2 and not should_cache_unfinished:
         scheduled_extend_len = (

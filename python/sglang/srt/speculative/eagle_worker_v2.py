@@ -34,9 +34,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    draft_decode_performance_context,
-)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import ServerArgs
@@ -45,6 +42,9 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sglang.srt.speculative.draft_decode_context import (
+    draft_decode_performance_context,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -806,9 +806,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Reorganize the spec info for the next batch
         if not self._draft_extend_selected_logits:
-            draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-                select_index
-            ]
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
             if draft_logits_output.hidden_states is not None:
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
