@@ -6,10 +6,10 @@ import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative.dvr_target_replay import (
+    build_boundary_replay_batch,
+    build_boundary_replay_plan,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRBoundaryReplayTask
 
@@ -27,7 +27,6 @@ class DVRLinearStateReplayMixin:
         if ctx is None:
             return
 
-        device = batch.device
         live_indices = torch.stack([task.live_idx for task in tasks]).to(
             device=ctx.live_indices.device, dtype=torch.long
         )
@@ -83,97 +82,16 @@ class DVRLinearStateReplayMixin:
                     ),
                 )
 
-            reqs = [task.req for task in tasks]
-            input_ids = []
-            out_cache_locs = []
-            prefix_lens = []
-            extend_lens = []
-            seq_lens = []
-            for task in tasks:
-                token_ids = self._request_token_ids_for_replay(
-                    task.req, task.boundary_seqlen
-                )
-                replay_token_ids = token_ids[
-                    task.source_seqlen : task.boundary_seqlen
-                ]
-                input_ids.extend(replay_token_ids)
-                out_cache_locs.append(
-                    batch.req_to_token_pool.req_to_token[
-                        task.req.req_pool_idx,
-                        task.source_seqlen : task.boundary_seqlen,
-                    ].to(torch.long)
-                )
-                prefix_lens.append(task.source_seqlen)
-                extend_lens.append(task.boundary_seqlen - task.source_seqlen)
-                seq_lens.append(task.boundary_seqlen)
-
-            if not input_ids:
+            replay_plan = build_boundary_replay_plan(
+                batch=batch,
+                tasks=tasks,
+                state_adapter=ctx.state_adapter,
+                request_token_ids_for_replay=self._request_token_ids_for_replay,
+            )
+            if replay_plan is None:
                 return
 
-            boundary_indices = ctx.state_adapter.get_boundary_indices_for_reqs(
-                reqs=[task.req for task in tasks],
-                track_indices=[task.boundary_track_idx for task in tasks],
-                device=device,
-            )
-            replay_batch = ScheduleBatch(
-                reqs=reqs,
-                req_to_token_pool=batch.req_to_token_pool,
-                token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
-                tree_cache=batch.tree_cache,
-                model_config=batch.model_config,
-                enable_overlap=batch.enable_overlap,
-                device=batch.device,
-                forward_mode=ForwardMode.EXTEND,
-                input_ids=torch.tensor(input_ids, dtype=torch.int64, device=device),
-                req_pool_indices=torch.tensor(
-                    [req.req_pool_idx for req in reqs],
-                    dtype=torch.int64,
-                    device=device,
-                ),
-                seq_lens=torch.tensor(seq_lens, dtype=torch.int64, device=device),
-                out_cache_loc=torch.cat(out_cache_locs).to(device=device),
-                seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64),
-                seq_lens_sum=sum(seq_lens),
-                return_logprob=False,
-                top_logprobs_nums=None,
-                token_ids_logprobs=None,
-                global_num_tokens=None,
-                global_num_tokens_for_logprob=None,
-                is_extend_in_batch=False,
-                all_extend_in_batch=False,
-                can_run_dp_cuda_graph=False,
-                tbo_split_seq_index=None,
-                global_forward_mode=None,
-                extend_num_tokens=len(input_ids),
-                extend_lens=extend_lens,
-                prefix_lens=prefix_lens,
-                extend_logprob_start_lens=prefix_lens,
-                extend_input_logprob_token_ids=None,
-                multimodal_inputs=[req.multimodal_inputs for req in reqs],
-                encoder_cached=None,
-                encoder_lens=None,
-                encoder_lens_cpu=None,
-                encoder_out_cache_loc=None,
-                sampling_info=None,
-                orig_seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-                input_embeds=None,
-                ne_token_table=None,
-                spec_algorithm=batch.spec_algorithm,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                hicache_consumer_index=-1,
-                is_prefill_only=True,
-                dllm_config=batch.dllm_config,
-                has_grammar=False,
-                return_hidden_states_before_norm=False,
-                mamba_track_indices=boundary_indices,
-                mamba_track_mask=torch.ones(
-                    len(tasks), dtype=torch.bool, device=device
-                ),
-                mamba_track_seqlens=torch.tensor(
-                    seq_lens, dtype=torch.int64, device=device
-                ),
-            )
+            replay_batch = build_boundary_replay_batch(batch, replay_plan)
             forward_batch = ForwardBatch.init_new(replay_batch, self.model_runner)
             self.model_runner.forward(forward_batch)
         finally:

@@ -7,6 +7,7 @@ from typing import Any, Optional
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsMetadata
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -112,6 +113,19 @@ class DVRAcceptedSuffixReplayPlan:
     accepted_cache_locs: torch.Tensor
     accepted_rows: Optional[torch.Tensor]
     accepted_offsets: Optional[torch.Tensor]
+
+
+@dataclass
+class DVRBoundaryReplayPlan:
+    """Plan an EXTEND replay that materializes missing chunk-boundary state."""
+
+    reqs: list[Any]
+    input_ids: list[int]
+    out_cache_locs: list[torch.Tensor]
+    prefix_lens: list[int]
+    extend_lens: list[int]
+    final_seq_lens: list[int]
+    boundary_indices: torch.Tensor
 
 
 @contextmanager
@@ -376,6 +390,126 @@ def build_accepted_suffix_replay_plan(
         accepted_cache_locs=accepted_cache_locs,
         accepted_rows=torch.cat(accepted_rows) if accepted_rows else None,
         accepted_offsets=torch.cat(accepted_offsets) if accepted_offsets else None,
+    )
+
+
+def build_boundary_replay_plan(
+    *,
+    batch,
+    tasks,
+    state_adapter,
+    request_token_ids_for_replay,
+) -> Optional[DVRBoundaryReplayPlan]:
+    """Build replay inputs for missing chunk-boundary checkpoints.
+
+    Boundary replay is a real checkpoint materialization step, not a temporary
+    verifier oracle.  It therefore runs on a narrow ScheduleBatch containing
+    only the requests whose radix prefix did not already provide the requested
+    chunk-aligned state.
+    """
+
+    reqs = [task.req for task in tasks]
+    input_ids = []
+    out_cache_locs = []
+    prefix_lens = []
+    extend_lens = []
+    final_seq_lens = []
+
+    for task in tasks:
+        token_ids = request_token_ids_for_replay(task.req, task.boundary_seqlen)
+        replay_token_ids = token_ids[task.source_seqlen : task.boundary_seqlen]
+        input_ids.extend(replay_token_ids)
+        out_cache_locs.append(
+            batch.req_to_token_pool.req_to_token[
+                task.req.req_pool_idx,
+                task.source_seqlen : task.boundary_seqlen,
+            ].to(torch.long)
+        )
+        prefix_lens.append(task.source_seqlen)
+        extend_lens.append(task.boundary_seqlen - task.source_seqlen)
+        final_seq_lens.append(task.boundary_seqlen)
+
+    if not input_ids:
+        return None
+
+    boundary_indices = state_adapter.get_boundary_indices_for_reqs(
+        reqs=reqs,
+        track_indices=[task.boundary_track_idx for task in tasks],
+        device=batch.device,
+    )
+    return DVRBoundaryReplayPlan(
+        reqs=reqs,
+        input_ids=input_ids,
+        out_cache_locs=out_cache_locs,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+        final_seq_lens=final_seq_lens,
+        boundary_indices=boundary_indices,
+    )
+
+
+def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleBatch:
+    """Create the narrow ScheduleBatch used for boundary checkpoint replay."""
+
+    device = batch.device
+    return ScheduleBatch(
+        reqs=plan.reqs,
+        req_to_token_pool=batch.req_to_token_pool,
+        token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+        tree_cache=batch.tree_cache,
+        model_config=batch.model_config,
+        enable_overlap=batch.enable_overlap,
+        device=batch.device,
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=torch.tensor(plan.input_ids, dtype=torch.int64, device=device),
+        req_pool_indices=torch.tensor(
+            [req.req_pool_idx for req in plan.reqs],
+            dtype=torch.int64,
+            device=device,
+        ),
+        seq_lens=torch.tensor(plan.final_seq_lens, dtype=torch.int64, device=device),
+        out_cache_loc=torch.cat(plan.out_cache_locs).to(device=device),
+        seq_lens_cpu=torch.tensor(plan.final_seq_lens, dtype=torch.int64),
+        seq_lens_sum=sum(plan.final_seq_lens),
+        return_logprob=False,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        global_num_tokens=None,
+        global_num_tokens_for_logprob=None,
+        is_extend_in_batch=False,
+        all_extend_in_batch=False,
+        can_run_dp_cuda_graph=False,
+        tbo_split_seq_index=None,
+        global_forward_mode=None,
+        extend_num_tokens=len(plan.input_ids),
+        extend_lens=plan.extend_lens,
+        prefix_lens=plan.prefix_lens,
+        extend_logprob_start_lens=plan.prefix_lens,
+        extend_input_logprob_token_ids=None,
+        multimodal_inputs=[req.multimodal_inputs for req in plan.reqs],
+        encoder_cached=None,
+        encoder_lens=None,
+        encoder_lens_cpu=None,
+        encoder_out_cache_loc=None,
+        sampling_info=None,
+        orig_seq_lens=torch.tensor(plan.final_seq_lens, dtype=torch.int32, device=device),
+        input_embeds=None,
+        ne_token_table=None,
+        spec_algorithm=batch.spec_algorithm,
+        spec_info=None,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        hicache_consumer_index=-1,
+        is_prefill_only=True,
+        dllm_config=batch.dllm_config,
+        has_grammar=False,
+        return_hidden_states_before_norm=False,
+        mamba_track_indices=plan.boundary_indices,
+        mamba_track_mask=torch.ones(
+            len(plan.reqs), dtype=torch.bool, device=device
+        ),
+        mamba_track_seqlens=torch.tensor(
+            plan.final_seq_lens, dtype=torch.int64, device=device
+        ),
     )
 
 
