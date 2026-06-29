@@ -54,7 +54,7 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
-    if spec_algorithm.is_decode_verify_rollback_self_draft():
+    if spec_algorithm.uses_target_kv_pool_for_draft():
         # DVR self-draft reuses the target model runner and target KV pool. There
         # is no independent draft KV pool to register for disaggregation/HiCache.
         return None, None

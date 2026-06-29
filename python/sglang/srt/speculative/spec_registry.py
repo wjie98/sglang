@@ -107,6 +107,12 @@ class CustomSpecAlgo:
     def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
         return False
 
+    def linear_speculative_state_extension_factory(self, model_runner):
+        return None
+
+    def uses_target_kv_pool_for_draft(self) -> bool:
+        return False
+
     def create_worker(self, server_args: "ServerArgs") -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(

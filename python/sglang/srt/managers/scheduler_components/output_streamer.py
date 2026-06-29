@@ -26,7 +26,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dvr_scheduler_utils import (
+from sglang.srt.speculative.output_policy import (
     should_emit_non_streaming_output_chunk,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

@@ -28,8 +28,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dvr_scheduler_utils import (
     cache_unfinished_prefill_req_with_dvr_mamba_snapshot,
-    commit_pending_mamba_checkpoint_from_result,
-    mark_req_skip_mamba_radix_finished_insert,
+    maybe_handle_dvr_mamba_checkpoint_after_decode,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -891,16 +890,13 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        if batch.spec_algorithm.is_decode_verify_rollback():
-            mark_req_skip_mamba_radix_finished_insert(req)
-            if batch.is_spec_v2:
-                commit_pending_mamba_checkpoint_from_result(
-                    req=req,
-                    batch=batch,
-                    result=result,
-                    req_index=i,
-                    tree_cache=self.tree_cache,
-                )
+        if maybe_handle_dvr_mamba_checkpoint_after_decode(
+            req=req,
+            batch=batch,
+            result=result,
+            req_index=i,
+            tree_cache=self.tree_cache,
+        ):
             return
 
         lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()

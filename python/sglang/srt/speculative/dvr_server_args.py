@@ -30,21 +30,6 @@ def is_dvr_eagle_enabled(server_args) -> bool:
     return server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
 
 
-def get_dvr_linear_speculative_state_extension_factory(model_runner):
-    """Return DVR's optional linear-state cache factory for hybrid GDN models."""
-
-    if not is_dvr_enabled(model_runner.server_args):
-        return None
-    if model_runner.hybrid_gdn_config is None:
-        return None
-
-    from sglang.srt.layers.attention.linear.dvr_gdn_state import (
-        create_dvr_gdn_speculative_state_extension,
-    )
-
-    return create_dvr_gdn_speculative_state_extension
-
-
 def handle_dvr_defaults(server_args):
     if not is_dvr_enabled(server_args):
         return

@@ -216,6 +216,25 @@ class SpeculativeAlgorithm(Enum):
 
         return self.is_decode_verify_rollback()
 
+    def linear_speculative_state_extension_factory(self, model_runner):
+        """Return an optional linear-state cache extension factory."""
+
+        if not self.is_decode_verify_rollback():
+            return None
+        if model_runner.hybrid_gdn_config is None:
+            return None
+
+        from sglang.srt.layers.attention.linear.dvr_gdn_state import (
+            create_dvr_gdn_speculative_state_extension,
+        )
+
+        return create_dvr_gdn_speculative_state_extension
+
+    def uses_target_kv_pool_for_draft(self) -> bool:
+        """Whether the draft path reuses the target KV pool."""
+
+        return self.is_decode_verify_rollback_self_draft()
+
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:

@@ -28,7 +28,6 @@ class DVRRequestState:
 
     skip_mamba_radix_finished_insert: bool = False
     radix_insert_snapshot: Optional[DVRRadixInsertSnapshot] = None
-    defer_non_streaming_logprob_output: bool = False
 
 
 @dataclass
@@ -222,15 +221,6 @@ def clear_req_radix_insert_snapshot(req: Any) -> None:
         state.radix_insert_snapshot = None
 
 
-def defer_req_non_streaming_logprob_output(req: Any) -> None:
-    get_req_dvr_state(req, create=True).defer_non_streaming_logprob_output = True
-
-
-def _defer_non_streaming_logprob_output(req: Any) -> bool:
-    state = get_req_dvr_state(req)
-    return bool(state and state.defer_non_streaming_logprob_output)
-
-
 def pending_mamba_checkpoint_for_result(result: Any, i: int) -> DVRMambaCheckpoint:
     aux = getattr(result, "spec_aux", None)
     checkpoints = getattr(aux, "pending_mamba_checkpoints", None)
@@ -262,6 +252,31 @@ def commit_pending_mamba_checkpoint_from_result(
     req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
         checkpoint.track_idx
     )
+
+
+def maybe_handle_dvr_mamba_checkpoint_after_decode(
+    *,
+    req: Any,
+    batch: Any,
+    result: Any,
+    req_index: int,
+    tree_cache: Any,
+) -> bool:
+    """Handle DVR's decode-time mamba checkpoint commit if applicable."""
+
+    if not batch.spec_algorithm.is_decode_verify_rollback():
+        return False
+
+    mark_req_skip_mamba_radix_finished_insert(req)
+    if batch.is_spec_v2:
+        commit_pending_mamba_checkpoint_from_result(
+            req=req,
+            batch=batch,
+            result=result,
+            req_index=req_index,
+            tree_cache=tree_cache,
+        )
+    return True
 
 
 def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
@@ -306,29 +321,6 @@ def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
     maybe_cache_unfinished_req(req, tree_cache)
     if enable_hisparse:
         hisparse_coordinator.admit_request_into_staging(req)
-
-
-def should_emit_non_streaming_output_chunk(
-    *,
-    req: Any,
-    return_logprob: bool,
-    force_stream_interval: int,
-) -> bool:
-    """Return whether a non-streaming generation chunk can be sent now.
-
-    Algorithms that repair output logprobs, such as DVR-EAGLE exact logprob
-    replay, set a request-level defer flag. The streamer only follows that
-    flag and keeps the algorithm-specific repair details out of output code.
-    """
-
-    if (
-        return_logprob
-        and req.return_logprob
-        and not req.stream
-        and _defer_non_streaming_logprob_output(req)
-    ):
-        return False
-    return len(req.output_ids) % force_stream_interval == 0
 
 
 def _set_req_radix_insert_snapshot_from_batch(
