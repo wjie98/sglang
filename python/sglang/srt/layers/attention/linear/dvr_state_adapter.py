@@ -94,12 +94,18 @@ class DVRGatedStateAdapter:
 
     ops: DVRStateOps
     chunk_size: int = FLA_CHUNK_SIZE
+    is_draft_worker: bool = False
 
     @classmethod
-    def for_gdn(cls, kernel_dispatcher) -> "DVRGatedStateAdapter":
+    def for_gdn(
+        cls, kernel_dispatcher, *, is_draft_worker: bool = False
+    ) -> "DVRGatedStateAdapter":
         from sglang.srt.layers.attention.linear.dvr_gdn_state import DVRGDNStateOps
 
-        return cls(DVRGDNStateOps.create(kernel_dispatcher))
+        return cls(
+            DVRGDNStateOps.create(kernel_dispatcher),
+            is_draft_worker=is_draft_worker,
+        )
 
     def has_dvr_state(self, *, batch) -> bool:
         req_to_token_pool = batch.req_to_token_pool
@@ -425,6 +431,11 @@ class DVRGatedStateAdapter:
         state_cache,
         state_inputs: DVRStateInputs,
     ):
+        if self.is_draft_worker:
+            # DVR state-input windows are target-model prefill oracles.  EAGLE
+            # and MTP draft workers may share request slots with the target
+            # worker, so draft-model state inputs must never overwrite them.
+            return
         state_window = DVRStateInputWindow.from_cache(state_cache)
         if not state_window.enabled:
             return

@@ -283,7 +283,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        self.dvr_state_adapter = DVRGatedStateAdapter.for_gdn(self.kernel_dispatcher)
+        self.dvr_state_adapter = DVRGatedStateAdapter.for_gdn(
+            self.kernel_dispatcher,
+            is_draft_worker=self.is_draft_worker,
+        )
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -517,19 +520,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
-            if not self.is_draft_worker:
-                # DVR state-input windows are target-model prefill oracles.
-                # EAGLE/MTP draft workers share request slots and must not
-                # overwrite those windows with draft-model q/k/v/g/beta rows.
-                self.dvr_state_adapter.cache_gdn_extend_tail(
-                    forward_batch=forward_batch,
-                    state_cache=mamba_cache_params,
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                )
+            self.dvr_state_adapter.cache_gdn_extend_tail(
+                forward_batch=forward_batch,
+                state_cache=mamba_cache_params,
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+            )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
