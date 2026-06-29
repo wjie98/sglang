@@ -17,11 +17,14 @@ from sglang.srt.model_executor.dvr_eagle_verify_cuda_graph_runner import (
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRSpecResultAux,
     defer_req_non_streaming_logprob_output,
+)
+from sglang.srt.speculative.dvr_target_replay import (
+    DVRTargetReplaySpec,
+    target_extend_replay_batch,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_worker import (
@@ -56,41 +59,6 @@ _ATTN_BACKEND_CHILD_LIST_ATTRS = (
     "backends",
     "children",
 )
-_TEMP_EXTEND_BATCH_FIELDS = (
-    "forward_mode",
-    "global_forward_mode",
-    "input_ids",
-    "input_embeds",
-    "replace_embeds",
-    "replace_positions",
-    "out_cache_loc",
-    "seq_lens",
-    "seq_lens_cpu",
-    "seq_lens_sum",
-    "prefix_lens",
-    "extend_lens",
-    "extend_num_tokens",
-    "extend_logprob_start_lens",
-    "extend_input_logprob_token_ids",
-    "global_num_tokens",
-    "global_num_tokens_for_logprob",
-    "is_extend_in_batch",
-    "all_extend_in_batch",
-    "spec_info",
-    "capture_hidden_mode",
-    "return_hidden_states",
-    "return_hidden_states_before_norm",
-    "return_logprob",
-    "mamba_track_indices",
-    "mamba_track_mask",
-    "mamba_track_seqlens",
-    "mamba_cow_src_indices",
-    "mamba_cow_dst_indices",
-    "mamba_clear_indices",
-    "multimodal_inputs",
-)
-
-
 class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     """EAGLE draft with DVR target verify/rollback semantics.
 
@@ -166,26 +134,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
         with stream_ctx, self._target_verify_graph_runner_context():
             yield use_plan_stream
-
-    @contextmanager
-    def _temporary_target_extend_batch(self, batch: ScheduleBatch):
-        """Temporarily reinterpret a live verify batch as EXTEND.
-
-        DVR-EAGLE uses target EXTEND replays as correctness oracles for GDN
-        state and strict returned logprobs. ForwardBatch.init_new reads mutable
-        ScheduleBatch fields, so every field touched by those temporary replays
-        must be restored before the scheduler continues the real TARGET_VERIFY
-        path.
-        """
-
-        saved_fields = {
-            name: getattr(batch, name) for name in _TEMP_EXTEND_BATCH_FIELDS
-        }
-        try:
-            yield saved_fields
-        finally:
-            for name, value in saved_fields.items():
-                setattr(batch, name, value)
 
     def _target_verify_graph_runner_bs(self, can_run_cuda_graph: bool):
         if not can_run_cuda_graph:
@@ -502,75 +450,50 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         # ownership stays with DVR's commit path rather than this temporary
         # EXTEND forward.
         possible_boundary_track = torch.zeros_like(possible_boundary_track)
+        if possible_boundary_track.any():
+            # Reuse the normal EXTEND mamba tracker to materialize the next
+            # chunk checkpoint while replaying the suffix.  Sampling may later
+            # reject before that boundary; commit_after_verify will roll back
+            # those speculative checkpoint writes.
+            mamba_track_indices = boundary_indices.to(
+                device=batch.seq_lens.device, dtype=torch.long
+            )
+            mamba_track_mask = possible_boundary_track
+            mamba_track_seqlens = boundary_track_seqlens
+            self.linear_state.set_suffix_replay_boundary_track_mask(
+                possible_boundary_track
+            )
+        else:
+            mamba_track_indices = None
+            mamba_track_mask = None
+            mamba_track_seqlens = None
+            self.linear_state.set_suffix_replay_boundary_track_mask(None)
 
-        with self._temporary_target_extend_batch(batch) as saved_fields:
+        replay_spec = DVRTargetReplaySpec(
+            input_ids=input_ids,
+            out_cache_locs=out_cache_locs,
+            prefix_lens=[int(x) for x in boundary_lens],
+            extend_lens=[int(x) for x in extend_lens_cpu],
+            final_seq_lens=final_seq_lens_cpu,
+            extend_logprob_start_lens=[int(x) for x in extend_lens_cpu],
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_logprob=False,
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=mamba_track_seqlens,
+            # Suffix replay starts from DVR-managed recurrent state. Do not
+            # re-apply cached-prefix deferred Mamba COW/clear ops that were
+            # already consumed by the real prefill/verify forward.
+            mamba_clear_indices=live_indices if full_prefix_replay else None,
+        )
+
+        with target_extend_replay_batch(batch, replay_spec) as replay_ctx:
             try:
                 if not full_prefix_replay:
                     self.linear_state.restore_boundary_state_for_suffix_replay(
                         linear_state_ctx
                     )
 
-                batch.forward_mode = ForwardMode.EXTEND
-                batch.global_forward_mode = None
-                batch.input_ids = torch.tensor(
-                    input_ids, dtype=torch.long, device=batch.seq_lens.device
-                )
-                batch.input_embeds = None
-                batch.replace_embeds = None
-                batch.replace_positions = None
-                batch.out_cache_loc = torch.cat(out_cache_locs).to(
-                    device=batch.seq_lens.device
-                )
-                batch.prefix_lens = [int(x) for x in boundary_lens]
-                batch.extend_lens = [int(x) for x in extend_lens_cpu]
-                batch.extend_num_tokens = len(input_ids)
-                batch.extend_logprob_start_lens = [int(x) for x in extend_lens_cpu]
-                batch.extend_input_logprob_token_ids = None
-                if saved_fields["global_num_tokens"] is not None:
-                    dp_world = len(saved_fields["global_num_tokens"])
-                    batch.global_num_tokens = [len(input_ids)] * dp_world
-                    batch.global_num_tokens_for_logprob = [len(input_ids)] * dp_world
-                batch.seq_lens = torch.tensor(
-                    final_seq_lens_cpu,
-                    dtype=torch.long,
-                    device=saved_fields["seq_lens"].device,
-                )
-                batch.seq_lens_cpu = torch.tensor(
-                    final_seq_lens_cpu,
-                    dtype=torch.long,
-                )
-                batch.seq_lens_sum = sum(final_seq_lens_cpu)
-                batch.is_extend_in_batch = True
-                batch.all_extend_in_batch = True
-                batch.spec_info = None
-                batch.capture_hidden_mode = CaptureHiddenMode.FULL
-                batch.return_hidden_states = False
-                batch.return_hidden_states_before_norm = False
-                batch.return_logprob = False
-                if possible_boundary_track.any():
-                    # Reuse the normal EXTEND mamba tracker to materialize the next
-                    # chunk checkpoint while replaying the suffix.  Sampling may
-                    # later reject before that boundary; commit_after_verify will
-                    # roll back those speculative checkpoint writes.
-                    batch.mamba_track_indices = boundary_indices.to(
-                        device=batch.seq_lens.device, dtype=torch.long
-                    )
-                    batch.mamba_track_mask = possible_boundary_track
-                    batch.mamba_track_seqlens = boundary_track_seqlens
-                    self.linear_state.set_suffix_replay_boundary_track_mask(
-                        possible_boundary_track
-                    )
-                else:
-                    batch.mamba_track_indices = None
-                    batch.mamba_track_mask = None
-                    batch.mamba_track_seqlens = None
-                    self.linear_state.set_suffix_replay_boundary_track_mask(None)
-                # Suffix replay starts from DVR-managed recurrent state. Do not
-                # re-apply cached-prefix deferred Mamba COW/clear ops that were
-                # already consumed by the real prefill/verify forward.
-                batch.mamba_cow_src_indices = None
-                batch.mamba_cow_dst_indices = None
-                batch.mamba_clear_indices = live_indices if full_prefix_replay else None
                 # The suffix EXTEND must see draft KV at absolute positions
                 # base_seq_len..base_seq_len+draft.  These are the same slots the
                 # real verify path owns, so publishing them in req_to_token_pool is
@@ -583,7 +506,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 forward_batch = ForwardBatch.init_new(batch, self.target_worker.model_runner)
                 if self.target_worker.model_runner.model_is_mrope:
                     mrope_chunks = []
-                    mm_inputs = saved_fields["multimodal_inputs"]
+                    mm_inputs = replay_ctx.saved_fields["multimodal_inputs"]
                     for req_i, (seq_len, boundary, extend_len, tail_len) in enumerate(
                         zip(
                             base_seq_lens_cpu,
@@ -858,50 +781,22 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             state_cache=state_cache,
             indices=live_indices,
         )
-        with self._temporary_target_extend_batch(batch) as saved_fields:
-            try:
-                batch.forward_mode = ForwardMode.EXTEND
-                batch.global_forward_mode = None
-                batch.input_ids = torch.tensor(
-                    input_ids, dtype=torch.long, device=batch.seq_lens.device
-                )
-                batch.input_embeds = None
-                batch.replace_embeds = None
-                batch.replace_positions = None
-                batch.out_cache_loc = torch.cat(out_cache_locs).to(batch.seq_lens.device)
-                batch.prefix_lens = [0 for _ in extend_lens_cpu]
-                batch.extend_lens = [int(x) for x in extend_lens_cpu]
-                batch.extend_num_tokens = len(input_ids)
-                batch.extend_logprob_start_lens = [0 for _ in extend_lens_cpu]
-                batch.extend_input_logprob_token_ids = torch.tensor(
-                    logprob_token_ids, dtype=torch.long, device=batch.seq_lens.device
-                )
-                if saved_fields["global_num_tokens"] is not None:
-                    dp_world = len(saved_fields["global_num_tokens"])
-                    batch.global_num_tokens = [len(input_ids)] * dp_world
-                    batch.global_num_tokens_for_logprob = [len(input_ids)] * dp_world
-                batch.seq_lens = torch.tensor(
-                    final_seq_lens_cpu,
-                    dtype=torch.long,
-                    device=saved_fields["seq_lens"].device,
-                )
-                batch.seq_lens_cpu = torch.tensor(final_seq_lens_cpu, dtype=torch.long)
-                batch.seq_lens_sum = sum(final_seq_lens_cpu)
-                batch.is_extend_in_batch = True
-                batch.all_extend_in_batch = True
-                batch.spec_info = None
-                batch.capture_hidden_mode = CaptureHiddenMode.NULL
-                batch.return_hidden_states = False
-                batch.return_hidden_states_before_norm = False
-                batch.return_logprob = True
-                batch.mamba_track_indices = None
-                batch.mamba_track_mask = None
-                batch.mamba_track_seqlens = None
-                batch.mamba_cow_src_indices = None
-                batch.mamba_cow_dst_indices = None
-                batch.mamba_clear_indices = live_indices
-                batch.multimodal_inputs = [None for _ in extend_lens_cpu]
+        replay_spec = DVRTargetReplaySpec(
+            input_ids=input_ids,
+            out_cache_locs=out_cache_locs,
+            prefix_lens=[0 for _ in extend_lens_cpu],
+            extend_lens=[int(x) for x in extend_lens_cpu],
+            final_seq_lens=final_seq_lens_cpu,
+            extend_logprob_start_lens=[0 for _ in extend_lens_cpu],
+            extend_input_logprob_token_ids=logprob_token_ids,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_logprob=True,
+            mamba_clear_indices=live_indices,
+            multimodal_inputs=[None for _ in extend_lens_cpu],
+        )
 
+        with target_extend_replay_batch(batch, replay_spec):
+            try:
                 if write_rows:
                     batch.req_to_token_pool.write(
                         (torch.cat(write_rows), torch.cat(write_offsets)),
