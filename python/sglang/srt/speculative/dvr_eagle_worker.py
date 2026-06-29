@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 
 import torch
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
@@ -62,6 +63,25 @@ _ATTN_BACKEND_CHILD_LIST_ATTRS = (
     "backends",
     "children",
 )
+
+
+@dataclass
+class _DVREagleAcceptedLogprobReplayPlan:
+    """Full-prefix replay plan for exact DVR-EAGLE returned logprobs."""
+
+    bs: int
+    draft_token_num: int
+    base_seq_lens_cpu: list[int]
+    accept_lens_cpu: list[int]
+    input_ids: list[int]
+    logprob_token_ids: list[int]
+    out_cache_locs: list[torch.Tensor]
+    extend_lens_cpu: list[int]
+    final_seq_lens_cpu: list[int]
+    final_score_specs: list[tuple]
+    write_rows: list[torch.Tensor]
+    write_offsets: list[torch.Tensor]
+    write_locs: list[torch.Tensor]
 
 
 class DecodeVerifyRollbackEagleWorkerV2(
@@ -468,8 +488,35 @@ class DecodeVerifyRollbackEagleWorkerV2(
         if batch.forward_mode.is_idle() or linear_state_ctx is None:
             return None
 
-        live_indices = linear_state_ctx.live_indices
+        replay_plan = self._build_accepted_logprob_replay_plan(
+            batch=batch,
+            verify_input=verify_input,
+            predict=predict,
+            accept_lens=accept_lens,
+            draft_token_num=draft_token_num,
+        )
+        if replay_plan is None:
+            return None
 
+        input_token_logprobs = self._run_accepted_logprob_replay(
+            batch=batch,
+            linear_state_ctx=linear_state_ctx,
+            replay_plan=replay_plan,
+        )
+        return self._accepted_logprob_rows_from_replay(
+            replay_plan=replay_plan,
+            input_token_logprobs=input_token_logprobs,
+        )
+
+    def _build_accepted_logprob_replay_plan(
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_input: DVREagleVerifyInput,
+        predict: torch.Tensor,
+        accept_lens: torch.Tensor,
+        draft_token_num: int,
+    ) -> _DVREagleAcceptedLogprobReplayPlan | None:
         bs = len(batch.seq_lens)
         base_seq_lens_cpu = (
             batch.seq_lens_cpu.tolist()
@@ -588,18 +635,41 @@ class DecodeVerifyRollbackEagleWorkerV2(
         if not input_ids:
             return None
 
-        replay_spec = DVRTargetReplaySpec(
+        return _DVREagleAcceptedLogprobReplayPlan(
+            bs=bs,
+            draft_token_num=draft_token_num,
+            base_seq_lens_cpu=base_seq_lens_cpu,
+            accept_lens_cpu=accept_lens_cpu,
             input_ids=input_ids,
+            logprob_token_ids=logprob_token_ids,
             out_cache_locs=out_cache_locs,
-            prefix_lens=[0 for _ in extend_lens_cpu],
-            extend_lens=[int(x) for x in extend_lens_cpu],
-            final_seq_lens=final_seq_lens_cpu,
-            extend_logprob_start_lens=[0 for _ in extend_lens_cpu],
-            extend_input_logprob_token_ids=logprob_token_ids,
+            extend_lens_cpu=extend_lens_cpu,
+            final_seq_lens_cpu=final_seq_lens_cpu,
+            final_score_specs=final_score_specs,
+            write_rows=write_rows,
+            write_offsets=write_offsets,
+            write_locs=write_locs,
+        )
+
+    def _run_accepted_logprob_replay(
+        self,
+        *,
+        batch: ScheduleBatch,
+        linear_state_ctx,
+        replay_plan: _DVREagleAcceptedLogprobReplayPlan,
+    ) -> torch.Tensor:
+        replay_spec = DVRTargetReplaySpec(
+            input_ids=replay_plan.input_ids,
+            out_cache_locs=replay_plan.out_cache_locs,
+            prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
+            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+            final_seq_lens=replay_plan.final_seq_lens_cpu,
+            extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
+            extend_input_logprob_token_ids=replay_plan.logprob_token_ids,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_logprob=True,
-            mamba_clear_indices=live_indices,
-            multimodal_inputs=[None for _ in extend_lens_cpu],
+            mamba_clear_indices=linear_state_ctx.live_indices,
+            multimodal_inputs=[None for _ in replay_plan.extend_lens_cpu],
         )
 
         with (
@@ -610,10 +680,13 @@ class DecodeVerifyRollbackEagleWorkerV2(
             ),
             target_extend_replay_batch(batch, replay_spec),
         ):
-            if write_rows:
+            if replay_plan.write_rows:
                 batch.req_to_token_pool.write(
-                    (torch.cat(write_rows), torch.cat(write_offsets)),
-                    torch.cat(write_locs).to(torch.int32),
+                    (
+                        torch.cat(replay_plan.write_rows),
+                        torch.cat(replay_plan.write_offsets),
+                    ),
+                    torch.cat(replay_plan.write_locs).to(torch.int32),
                 )
 
             forward_batch = ForwardBatch.init_new(
@@ -630,55 +703,65 @@ class DecodeVerifyRollbackEagleWorkerV2(
                     "DVR EAGLE full-prefix accepted-token scoring did not return "
                     "input_token_logprobs."
                 )
+            return input_token_logprobs
 
-            final_score_req_indices = {spec[0] for spec in final_score_specs}
-            padded = torch.zeros(
-                (bs, draft_token_num),
-                dtype=input_token_logprobs.dtype,
-                device=input_token_logprobs.device,
+    @staticmethod
+    def _accepted_logprob_rows_from_replay(
+        *,
+        replay_plan: _DVREagleAcceptedLogprobReplayPlan,
+        input_token_logprobs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map full-prefix input-logprob rows back to compact spec-v2 outputs."""
+
+        final_score_req_indices = {spec[0] for spec in replay_plan.final_score_specs}
+        padded = torch.zeros(
+            (replay_plan.bs, replay_plan.draft_token_num),
+            dtype=input_token_logprobs.dtype,
+            device=input_token_logprobs.device,
+        )
+        offset = 0
+        for req_i, (seq_len, extend_len, accept_len) in enumerate(
+            zip(
+                replay_plan.base_seq_lens_cpu,
+                replay_plan.extend_lens_cpu,
+                replay_plan.accept_lens_cpu,
+                strict=True,
             )
-            offset = 0
-            for req_i, (seq_len, extend_len, accept_len) in enumerate(
-                zip(
-                    base_seq_lens_cpu,
-                    extend_lens_cpu,
-                    accept_lens_cpu,
-                    strict=True,
-                )
-            ):
-                if req_i in final_score_req_indices:
-                    offset += int(extend_len)
-                    continue
-                start = offset + int(seq_len)
-                end = start + int(accept_len)
-                padded[req_i, : int(accept_len)] = input_token_logprobs[start:end]
+        ):
+            if req_i in final_score_req_indices:
                 offset += int(extend_len)
-            for (
-                req_i,
-                req,
-                prev_output_len,
-                final_curr_len,
-                final_output_ids,
-            ) in final_score_specs:
-                prompt_len = len(req.origin_input_ids)
-                req_offset = sum(extend_lens_cpu[:req_i])
-                output_logprob_start = req_offset + prompt_len - 1
-                output_logprob_end = output_logprob_start + len(final_output_ids)
-                final_logprobs = input_token_logprobs[
-                    output_logprob_start:output_logprob_end
+                continue
+            start = offset + int(seq_len)
+            end = start + int(accept_len)
+            padded[req_i, : int(accept_len)] = input_token_logprobs[start:end]
+            offset += int(extend_len)
+
+        for (
+            req_i,
+            req,
+            prev_output_len,
+            final_curr_len,
+            final_output_ids,
+        ) in replay_plan.final_score_specs:
+            prompt_len = len(req.origin_input_ids)
+            req_offset = sum(replay_plan.extend_lens_cpu[:req_i])
+            output_logprob_start = req_offset + prompt_len - 1
+            output_logprob_end = output_logprob_start + len(final_output_ids)
+            final_logprobs = input_token_logprobs[
+                output_logprob_start:output_logprob_end
+            ]
+            if req.logprob.output_token_logprobs_val is not None:
+                req.logprob.output_token_logprobs_val[:] = (
+                    final_logprobs[:prev_output_len].detach().cpu().tolist()
+                )
+                req.logprob.output_token_logprobs_idx[:] = final_output_ids[
+                    :prev_output_len
                 ]
-                if req.logprob.output_token_logprobs_val is not None:
-                    req.logprob.output_token_logprobs_val[:] = (
-                        final_logprobs[:prev_output_len].detach().cpu().tolist()
-                    )
-                    req.logprob.output_token_logprobs_idx[:] = final_output_ids[
-                        :prev_output_len
-                    ]
-                if final_curr_len > 0:
-                    padded[req_i, :final_curr_len] = final_logprobs[
-                        prev_output_len : prev_output_len + final_curr_len
-                    ]
-            return padded
+            if final_curr_len > 0:
+                padded[req_i, :final_curr_len] = final_logprobs[
+                    prev_output_len : prev_output_len + final_curr_len
+                ]
+        return padded
 
     @staticmethod
     def _defer_non_streaming_logprob_output_until_finish(batch: ScheduleBatch) -> None:
