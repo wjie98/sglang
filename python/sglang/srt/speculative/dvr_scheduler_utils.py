@@ -52,6 +52,22 @@ class DVRSpecResultAux:
         return cls(pending_mamba_checkpoints=checkpoints)
 
 
+def dvr_spec_aux_from_pending_mamba_checkpoints(
+    track_indices: Optional[list[Optional[int]]],
+    seqlens: Optional[list[Optional[int]]],
+) -> Optional[DVRSpecResultAux]:
+    """Build DVR scheduler aux data from verify-produced mamba checkpoints.
+
+    Workers should not depend on the aux object's internal fields; the scheduler
+    side owns how these pending checkpoints are represented and committed.
+    """
+
+    return DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
+        track_indices,
+        seqlens,
+    )
+
+
 class DVRReplayPrefixTracker:
     """Per-worker replay prefix stream for spec-v2 overlap DVR.
 

@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
-    DVRSpecResultAux,
+    dvr_spec_aux_from_pending_mamba_checkpoints,
 )
 from sglang.srt.speculative.dvr_linear_state_worker import DVRSpecV2LinearStateMixin
 from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
@@ -383,7 +383,7 @@ class DecodeVerifyRollbackWorkerV2(
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
-            spec_aux=DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
+            spec_aux=dvr_spec_aux_from_pending_mamba_checkpoints(
                 pending_track_indices,
                 pending_track_seqlens,
             ),
