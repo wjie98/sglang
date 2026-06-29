@@ -45,6 +45,10 @@ from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.linear_state_extension import (
+    LinearSpeculativeStateExtensionConfig,
+    LinearSpeculativeStateExtensionFactory,
+)
 from sglang.srt.mem_cache.triton_ops.cache_move import (
     copy_all_layer_kv_cache_tiled,
 )
@@ -242,7 +246,13 @@ class MambaPool:
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
-        dvr_state_input_cache: Optional[Any] = None
+        linear_state_input_cache: Optional[Any] = None
+
+        @property
+        def dvr_state_input_cache(self):
+            # Compatibility for DVR code that has not yet moved to the generic
+            # linear_state_input_cache name.
+            return self.linear_state_input_cache
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -281,6 +291,9 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        linear_speculative_state_extension_factory: Optional[
+            LinearSpeculativeStateExtensionFactory
+        ] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -344,33 +357,34 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                from sglang.srt.server_args import get_global_server_args
-                from sglang.srt.speculative.dvr_server_args import is_dvr_enabled
 
-                if is_dvr_enabled(get_global_server_args()):
-                    from sglang.srt.layers.attention.linear.dvr_gdn_state import (
-                        DVRGDNStateInputCache,
+                extension = None
+                if linear_speculative_state_extension_factory is not None:
+                    extension = linear_speculative_state_extension_factory(
+                        LinearSpeculativeStateExtensionConfig(
+                            num_layers=num_mamba_layers,
+                            spec_state_size=spec_state_size,
+                            num_draft_tokens=speculative_num_draft_tokens,
+                            state_shape=cache_params.shape,
+                            conv_dtype=conv_dtype,
+                            ssm_dtype=ssm_dtype,
+                            device=device,
+                        )
                     )
 
-                    # DVR verify only commits the first chunk-boundary recurrent
-                    # state. Draft-token state inputs are kept separately in
-                    # dvr_state_input_cache for prefill-equivalent replay.
-                    intermediate_ssm_tokens = 1
-                    intermediate_conv_tokens = speculative_num_draft_tokens
-                    dvr_state_input_cache = DVRGDNStateInputCache.create(
-                        num_layers=num_mamba_layers,
-                        # Slot 0 is the padded-row dummy; real DVR rows use
-                        # req_pool_idx + 1 to match the v5 hot path.
-                        num_slots=spec_state_size + 2,
-                        num_draft_tokens=speculative_num_draft_tokens,
-                        state_shape=cache_params.shape,
-                        dtype=conv_dtype,
-                        device=device,
-                    )
-                else:
+                if extension is None:
                     intermediate_ssm_tokens = speculative_num_draft_tokens
                     intermediate_conv_tokens = speculative_num_draft_tokens
-                    dvr_state_input_cache = None
+                    linear_state_input_cache = None
+                    extension_log_label = "linear_state_input_cache"
+                    extension_mem_usage_bytes = 0
+                else:
+                    intermediate_ssm_tokens = extension.intermediate_ssm_tokens
+                    intermediate_conv_tokens = extension.intermediate_conv_tokens
+                    linear_state_input_cache = extension.state_input_cache
+                    extension_log_label = extension.log_label
+                    extension_mem_usage_bytes = extension.mem_usage_bytes()
+
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
                 intermediate_ssm_state_cache = torch.zeros(
@@ -406,7 +420,7 @@ class MambaPool:
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
-                    dvr_state_input_cache=dvr_state_input_cache,
+                    linear_state_input_cache=linear_state_input_cache,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -415,7 +429,7 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                    f"dvr_state_input_cache size: {(dvr_state_input_cache.mem_usage_bytes() if dvr_state_input_cache is not None else 0) / GB:.2f}GB "
+                    f"{extension_log_label} size: {extension_mem_usage_bytes / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
@@ -491,7 +505,12 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             # Skip intermediate buffers used only for speculative decoding
             # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "linear_state_input_cache",
+                "dvr_state_input_cache",
+            ):
                 continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):
@@ -522,6 +541,8 @@ class MambaPool:
         """
         state_tensors = []
         for field in vars(self.mamba_cache):
+            if field in ("linear_state_input_cache", "dvr_state_input_cache"):
+                continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):
                 state_tensors.extend(value)
@@ -557,6 +578,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
+        linear_speculative_state_extension_factory: Optional[
+            LinearSpeculativeStateExtensionFactory
+        ] = None,
     ):
         super().__init__(
             size=size,
@@ -579,6 +603,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            linear_speculative_state_extension_factory=linear_speculative_state_extension_factory,
         )
 
     def _init_mamba_pool(
@@ -590,6 +615,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        linear_speculative_state_extension_factory: Optional[
+            LinearSpeculativeStateExtensionFactory
+        ] = None,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -599,6 +627,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            linear_speculative_state_extension_factory=linear_speculative_state_extension_factory,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

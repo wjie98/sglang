@@ -10,9 +10,13 @@ from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (
-    DVRStateInputs,
     DVRStateInputCache,
+    DVRStateInputs,
     DVRStateOps,
+)
+from sglang.srt.mem_cache.linear_state_extension import (
+    LinearSpeculativeStateExtension,
+    LinearSpeculativeStateExtensionConfig,
 )
 from sglang.srt.utils import is_cpu
 
@@ -20,6 +24,7 @@ __all__ = [
     "DVRGDNStateInputs",
     "DVRGDNStateInputCache",
     "DVRGDNStateOps",
+    "create_dvr_gdn_speculative_state_extension",
 ]
 
 if not is_cpu():
@@ -394,6 +399,31 @@ class DVRGDNStateInputCache(DVRStateInputCache):
 
     def state_inputs(self) -> DVRGDNStateInputs:
         return DVRGDNStateInputs.from_tensors(self.tensors)
+
+
+def create_dvr_gdn_speculative_state_extension(
+    config: LinearSpeculativeStateExtensionConfig,
+) -> LinearSpeculativeStateExtension:
+    """Create DVR-GDN's extra state-input cache for target-verify replay."""
+
+    return LinearSpeculativeStateExtension(
+        # DVR verify commits only the first chunk-boundary recurrent state.
+        # Draft-token q/k/v/g/beta rows are kept in the side cache below so the
+        # target replay can rebuild prefill-equivalent recurrent states.
+        intermediate_ssm_tokens=1,
+        intermediate_conv_tokens=config.num_draft_tokens,
+        state_input_cache=DVRGDNStateInputCache.create(
+            num_layers=config.num_layers,
+            # Slot 0 is the padded-row dummy; real DVR rows use req_pool_idx + 1
+            # to preserve the v5 hot-path indexing convention.
+            num_slots=config.spec_state_size + 2,
+            num_draft_tokens=config.num_draft_tokens,
+            state_shape=config.state_shape,
+            dtype=config.conv_dtype,
+            device=config.device,
+        ),
+        log_label="linear_state_input_cache",
+    )
 
 
 @dataclass

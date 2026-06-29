@@ -7,9 +7,14 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.layers.attention.linear.dvr_gdn_state import (
     DVRGDNStateInputCache,
     DVRGDNStateInputs,
+    create_dvr_gdn_speculative_state_extension,
 )
+from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputWindow
 from sglang.srt.layers.attention.linear.dvr_state_adapter import (
     DVRGatedStateAdapter,
+)
+from sglang.srt.mem_cache.linear_state_extension import (
+    LinearSpeculativeStateExtensionConfig,
 )
 
 
@@ -62,6 +67,60 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
     assert torch.equal(layer_inputs.v[1, :2], v)
     assert torch.equal(layer_inputs.g[1, :2], g)
     assert torch.equal(layer_inputs.beta[1, :2], beta)
+
+
+def test_gdn_state_input_cache_uses_generic_linear_state_field():
+    state_shape = Mamba2StateShape.create(
+        tp_world_size=2,
+        intermediate_size=32 * 128,
+        n_groups=16,
+        num_heads=32,
+        head_dim=128,
+        state_size=128,
+        conv_kernel=4,
+    )
+    cache = DVRGDNStateInputCache.create(
+        num_layers=1,
+        num_slots=3,
+        num_draft_tokens=16,
+        state_shape=state_shape,
+        dtype=torch.float32,
+        device="cpu",
+    )[0]
+
+    state_cache = SimpleNamespace(linear_state_input_cache=cache)
+    window = DVRStateInputWindow.from_cache(state_cache)
+
+    assert window.enabled
+    assert window.capacity == FLA_CHUNK_SIZE + 16
+
+
+def test_dvr_gdn_speculative_state_extension_factory():
+    state_shape = Mamba2StateShape.create(
+        tp_world_size=2,
+        intermediate_size=32 * 128,
+        n_groups=16,
+        num_heads=32,
+        head_dim=128,
+        state_size=128,
+        conv_kernel=4,
+    )
+    extension = create_dvr_gdn_speculative_state_extension(
+        LinearSpeculativeStateExtensionConfig(
+            num_layers=1,
+            spec_state_size=2,
+            num_draft_tokens=4,
+            state_shape=state_shape,
+            conv_dtype=torch.float32,
+            ssm_dtype=torch.float32,
+            device="cpu",
+        )
+    )
+
+    assert extension.intermediate_ssm_tokens == 1
+    assert extension.intermediate_conv_tokens == 4
+    assert extension.state_input_cache is not None
+    assert extension.state_input_cache.state_inputs().q.shape[1] == 4
 
 
 def test_gdn_extend_tail_cache_skips_draft_workers():

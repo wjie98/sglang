@@ -343,6 +343,16 @@ class ModelRunnerKVCacheMixin:
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
+                linear_speculative_state_extension_factory = None
+                if self.server_args.speculative_algorithm is not None:
+                    from sglang.srt.speculative.dvr_server_args import (
+                        get_dvr_linear_speculative_state_extension_factory,
+                    )
+
+                    linear_speculative_state_extension_factory = (
+                        get_dvr_linear_speculative_state_extension_factory(self)
+                    )
+
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
@@ -364,6 +374,7 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    linear_speculative_state_extension_factory=linear_speculative_state_extension_factory,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
