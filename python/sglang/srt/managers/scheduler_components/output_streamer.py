@@ -26,6 +26,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dvr_scheduler_utils import (
+    should_emit_non_streaming_output_chunk,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -317,20 +320,6 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
 
-    def _should_defer_non_streaming_logprob_output(self, req: Req) -> bool:
-        """Keep repairable non-streaming logprobs local until final response.
-
-        Once a non-streaming logprob chunk is sent to the detokenizer, later
-        algorithm-level repairs cannot update it in place.
-        """
-
-        return (
-            self.return_logprob
-            and req.return_logprob
-            and not req.stream
-            and req.defer_non_streaming_logprob_output
-        )
-
     def accept(self, *, req: Req) -> None:
         if req.finished():
             assert not req.finished_output
@@ -355,12 +344,11 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
-                if self._should_defer_non_streaming_logprob_output(req):
-                    should_output = False
-                else:
-                    should_output = (
-                        len(req.output_ids) % self.default_force_stream_interval == 0
-                    )
+                should_output = should_emit_non_streaming_output_chunk(
+                    req=req,
+                    return_logprob=self.return_logprob,
+                    force_stream_interval=self.default_force_stream_interval,
+                )
 
         if not should_output:
             return

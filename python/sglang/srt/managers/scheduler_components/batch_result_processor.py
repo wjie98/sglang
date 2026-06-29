@@ -26,6 +26,9 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.dvr_scheduler_utils import (
+    cache_unfinished_prefill_req_with_dvr_mamba_snapshot,
+)
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -235,31 +238,14 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
-                        should_cache_unfinished = (
-                            not batch.decoding_reqs
-                            or req not in batch.decoding_reqs
+                        cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
+                            req=req,
+                            batch=batch,
+                            req_index=i,
+                            tree_cache=self.tree_cache,
+                            enable_hisparse=self.server_args.enable_hisparse,
+                            hisparse_coordinator=self.hisparse_coordinator,
                         )
-                        is_dvr_spec_v2 = (
-                            batch.is_spec_v2
-                            and batch.spec_algorithm.is_decode_verify_rollback()
-                        )
-                        if is_dvr_spec_v2 and not should_cache_unfinished:
-                            scheduled_extend_len = (
-                                batch.extend_lens[i]
-                                if batch.extend_lens is not None
-                                else req.extend_input_len
-                            )
-                            should_cache_unfinished = scheduled_extend_len > 1
-                        if should_cache_unfinished:
-                            if is_dvr_spec_v2:
-                                self._set_mamba_radix_cache_insert_snapshot(
-                                    req, batch, i
-                                )
-                            maybe_cache_unfinished_req(req, self.tree_cache)
-                            if self.server_args.enable_hisparse:
-                                self.hisparse_coordinator.admit_request_into_staging(
-                                    req
-                                )
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
@@ -979,27 +965,6 @@ class SchedulerBatchResultProcessor:
         )
         req.pending_mamba_checkpoint_track_idx = None
         req.pending_mamba_checkpoint_seqlen = None
-
-    @staticmethod
-    def _set_mamba_radix_cache_insert_snapshot(
-        req: Req,
-        batch: ScheduleBatch,
-        i: int,
-    ) -> None:
-        req.mamba_radix_cache_insert_indices = None
-        req.mamba_radix_cache_insert_seqlen = None
-        if (
-            batch.mamba_track_mask is None
-            or batch.mamba_track_indices is None
-            or batch.mamba_track_cache_seqlens is None
-        ):
-            return
-        if not bool(batch.mamba_track_mask[i].item()):
-            return
-        req.mamba_radix_cache_insert_indices = batch.mamba_track_indices[i].reshape(1)
-        req.mamba_radix_cache_insert_seqlen = int(
-            batch.mamba_track_cache_seqlens[i].item()
-        )
 
     def mamba_lazy_post_decode_at_boundary(self, req: Req, batch: ScheduleBatch):
         """Post-decode cleanup at a lazy-mode track boundary.
