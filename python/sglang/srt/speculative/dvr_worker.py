@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -27,11 +27,18 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     dvr_self_draft_decode_context,
 )
-from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
 from sglang.srt.speculative.dvr_linear_state import (
     DVRBoundaryReplayTask,
     DVRLinearStateLifecycle,
 )
+from sglang.srt.speculative.dvr_target_replay import (
+    DVRTargetReplaySpec,
+    build_suffix_draft_replay_plan,
+    draft_row_logits_from_replay_hidden_states,
+    linear_state_replay_context,
+    target_extend_replay_batch,
+)
+from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -870,14 +877,10 @@ class DecodeVerifyRollbackWorker(DVRLinearBoundaryReplayMixin):
         if batch.forward_mode.is_idle() or linear_state_ctx is None:
             return None
 
-        state_adapter = linear_state_ctx.state_adapter
-        state_cache = linear_state_ctx.state_cache
         live_indices = linear_state_ctx.live_indices
         boundary_indices = linear_state_ctx.boundary_indices
         assert boundary_indices is not None
 
-        bs = len(batch.seq_lens)
-        draft_token_num = spec_info.draft_token_num
         base_seq_lens_cpu = (
             spec_info.seq_lens_cpu.tolist()
             if getattr(spec_info, "seq_lens_cpu", None) is not None
@@ -890,263 +893,71 @@ class DecodeVerifyRollbackWorker(DVRLinearBoundaryReplayMixin):
         boundary_lens = self.linear_state.boundary_lens_for_replay(
             batch, base_seq_lens_cpu
         )
-        use_full_prefix_replay = full_prefix_replay
-        if use_full_prefix_replay:
+        if full_prefix_replay:
             boundary_lens = [0 for _ in boundary_lens]
-        tail_lens_cpu = [
-            int(seq_len) - int(boundary)
-            for seq_len, boundary in zip(
-                base_seq_lens_cpu, boundary_lens, strict=True
-            )
-        ]
-        extend_lens_cpu = [tail + draft_token_num for tail in tail_lens_cpu]
-        final_seq_lens_cpu = [
-            int(boundary) + int(extend_len)
-            for boundary, extend_len in zip(
-                boundary_lens, extend_lens_cpu, strict=True
-            )
-        ]
-
-        input_ids = []
-        out_cache_locs = []
-        draft_tokens = spec_info.draft_token.reshape(bs, draft_token_num)
-        draft_cache_locs = batch.out_cache_loc.reshape(bs, draft_token_num)
-        for req_i, (req, seq_len, boundary, tail_len) in enumerate(
-            zip(
-                batch.reqs,
-                base_seq_lens_cpu,
-                boundary_lens,
-                tail_lens_cpu,
-                strict=True,
-            )
-        ):
-            token_ids = self._request_token_ids_for_replay(req, int(seq_len))
-            input_ids.extend(token_ids[int(boundary) : int(seq_len)])
-            input_ids.extend(draft_tokens[req_i].detach().cpu().tolist())
-            if int(tail_len) > 0:
-                out_cache_locs.append(
-                    batch.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, int(boundary) : int(seq_len)
-                    ].to(torch.long)
-                )
-            out_cache_locs.append(draft_cache_locs[req_i].to(torch.long))
-
-        if not input_ids:
+        replay_plan = build_suffix_draft_replay_plan(
+            batch=batch,
+            base_seq_lens_cpu=base_seq_lens_cpu,
+            boundary_lens=boundary_lens,
+            draft_tokens=spec_info.draft_token,
+            draft_cache_locs=batch.out_cache_loc,
+            request_token_ids_for_replay=self._request_token_ids_for_replay,
+        )
+        if replay_plan is None:
             return None
 
-        saved_tail_lens = state_adapter.state_input_tail_lens(
-            state_cache=state_cache,
-            state_input_indices=linear_state_ctx.state_input_indices,
-        )
-        if saved_tail_lens is not None:
-            saved_tail_lens = saved_tail_lens.clone()
-        saved_state_input_window = state_adapter.backup_state_input_window(
-            state_cache=state_cache,
-            state_input_indices=linear_state_ctx.state_input_indices,
-        )
-        if use_full_prefix_replay and saved_tail_lens is not None:
-            # Full-prefix replay must behave like a fresh prefill even when the
-            # generation request restored a cached radix prefix.  The live
-            # recurrent state is cleared below; clear DVR's rolling state-input
-            # window as well so no cached-prefix tail leaks into the replay.
-            zero_tail_lens = torch.zeros_like(saved_tail_lens)
-            state_adapter.set_state_input_tail_lens(
-                state_cache=state_cache,
-                state_input_indices=linear_state_ctx.state_input_indices,
-                tail_lens=zero_tail_lens,
-            )
-            state_adapter.zero_state_input_after_lens(
-                state_cache=state_cache,
-                state_input_indices=linear_state_ctx.state_input_indices,
-                keep_lens=zero_tail_lens,
-            )
-
-        verify_ready_live_backup = state_adapter.backup_recurrent_state(
-            state_cache=state_cache,
-            indices=live_indices,
-        )
-        draft_offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
-            draft_token_num, dtype=torch.long, device=batch.seq_lens.device
-        ).unsqueeze(0)
-        draft_rows = batch.req_pool_indices.to(torch.long).unsqueeze(1).expand_as(
-            draft_offsets
-        )
-        possible_boundary_track, boundary_track_seqlens = (
-            self.linear_state.suffix_replay_boundary_track_info(
-                boundary_lens,
-                extend_lens_cpu,
-                device=batch.seq_lens.device,
-            )
-        )
         # Suffix replay is an oracle for verifier logits.  Let DVR's commit path
-        # materialize chunk-boundary checkpoints from its own rolling state-input
-        # window instead of publishing a checkpoint as a side effect of this
-        # temporary EXTEND replay.
-        possible_boundary_track = torch.zeros_like(possible_boundary_track)
-
-        # ForwardBatch.init_new reads many mutable ScheduleBatch fields.  The
-        # oracle below temporarily reinterprets the live verify batch as an
-        # ordinary EXTEND over "tail + draft", then restores every touched field
-        # in finally so the scheduler still sees the original TARGET_VERIFY.
-        saved_fields = {
-            "forward_mode": batch.forward_mode,
-            "global_forward_mode": batch.global_forward_mode,
-            "input_ids": batch.input_ids,
-            "input_embeds": batch.input_embeds,
-            "replace_embeds": batch.replace_embeds,
-            "replace_positions": batch.replace_positions,
-            "out_cache_loc": batch.out_cache_loc,
-            "seq_lens": batch.seq_lens,
-            "seq_lens_cpu": batch.seq_lens_cpu,
-            "seq_lens_sum": batch.seq_lens_sum,
-            "prefix_lens": batch.prefix_lens,
-            "extend_lens": batch.extend_lens,
-            "extend_num_tokens": batch.extend_num_tokens,
-            "extend_logprob_start_lens": batch.extend_logprob_start_lens,
-            "is_extend_in_batch": batch.is_extend_in_batch,
-            "all_extend_in_batch": batch.all_extend_in_batch,
-            "spec_info": batch.spec_info,
-            "capture_hidden_mode": batch.capture_hidden_mode,
-            "return_hidden_states": batch.return_hidden_states,
-            "return_hidden_states_before_norm": batch.return_hidden_states_before_norm,
-            "return_logprob": batch.return_logprob,
-            "mamba_track_indices": batch.mamba_track_indices,
-            "mamba_track_mask": batch.mamba_track_mask,
-            "mamba_track_seqlens": batch.mamba_track_seqlens,
-            "mamba_cow_src_indices": batch.mamba_cow_src_indices,
-            "mamba_cow_dst_indices": batch.mamba_cow_dst_indices,
-            "mamba_clear_indices": batch.mamba_clear_indices,
-        }
-
-        try:
-            batch.forward_mode = ForwardMode.EXTEND
-            batch.global_forward_mode = None
-            batch.input_ids = torch.tensor(
-                input_ids, dtype=torch.long, device=batch.seq_lens.device
-            )
-            batch.input_embeds = None
-            batch.replace_embeds = None
-            batch.replace_positions = None
-            batch.out_cache_loc = torch.cat(out_cache_locs).to(
-                device=batch.seq_lens.device
-            )
-            batch.prefix_lens = [int(x) for x in boundary_lens]
-            batch.extend_lens = [int(x) for x in extend_lens_cpu]
-            batch.extend_num_tokens = len(input_ids)
-            batch.extend_logprob_start_lens = [int(x) for x in extend_lens_cpu]
-            batch.seq_lens = torch.tensor(
-                final_seq_lens_cpu,
-                dtype=torch.long,
-                device=saved_fields["seq_lens"].device,
-            )
-            batch.seq_lens_cpu = torch.tensor(
-                final_seq_lens_cpu,
-                dtype=torch.long,
-            )
-            batch.seq_lens_sum = sum(final_seq_lens_cpu)
-            batch.is_extend_in_batch = True
-            batch.all_extend_in_batch = True
-            batch.spec_info = None
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch.return_hidden_states = False
-            batch.return_hidden_states_before_norm = False
-            batch.return_logprob = False
-            if possible_boundary_track.any():
-                # Reuse the normal EXTEND mamba tracker to materialize the next
-                # chunk checkpoint while replaying the suffix.  Sampling may
-                # later reject before that boundary; commit_after_verify will
-                # roll back those speculative checkpoint writes.
-                batch.mamba_track_indices = boundary_indices.to(
-                    device=batch.seq_lens.device, dtype=torch.long
-                )
-                batch.mamba_track_mask = possible_boundary_track
-                batch.mamba_track_seqlens = boundary_track_seqlens
-                self.linear_state.set_suffix_replay_boundary_track_mask(
-                    possible_boundary_track
-                )
-            else:
-                batch.mamba_track_indices = None
-                batch.mamba_track_mask = None
-                batch.mamba_track_seqlens = None
-                self.linear_state.set_suffix_replay_boundary_track_mask(None)
+        # materialize chunk-boundary checkpoints instead of publishing one as a
+        # side effect of this temporary EXTEND replay.
+        self.linear_state.set_suffix_replay_boundary_track_mask(None)
+        replay_spec = DVRTargetReplaySpec(
+            input_ids=replay_plan.input_ids,
+            out_cache_locs=replay_plan.out_cache_locs,
+            prefix_lens=[int(x) for x in replay_plan.boundary_lens],
+            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+            final_seq_lens=replay_plan.final_seq_lens_cpu,
+            extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_logprob=False,
             # Cached-prefix prefill can leave deferred Mamba COW/clear tensors
             # on ScheduleBatch after the real forward consumed its ForwardBatch
-            # copy. Suffix replay starts from DVR-managed recurrent state and
-            # must not re-apply those cached-prefix restore ops.
-            if use_full_prefix_replay:
-                # Strict logprob replay starts from the zero recurrent state to
-                # match a flush-cache full prefill oracle. The fast DVR verify
-                # path below restores the chunk boundary instead.
-                batch.mamba_cow_src_indices = None
-                batch.mamba_cow_dst_indices = None
-                batch.mamba_clear_indices = live_indices
-            else:
-                # Run the boundary->live restore through the existing deferred COW
-                # mechanism so it executes on the forward stream, matching normal
-                # prefix-cache prefill and avoiding cross-stream state races.
-                batch.mamba_cow_src_indices = boundary_indices
-                batch.mamba_cow_dst_indices = live_indices
-                batch.mamba_clear_indices = None
+            # copy.  Replay owns the restore operation explicitly below.
+            mamba_cow_src_indices=None if full_prefix_replay else boundary_indices,
+            mamba_cow_dst_indices=None if full_prefix_replay else live_indices,
+            mamba_clear_indices=live_indices if full_prefix_replay else None,
+        )
+
+        with (
+            linear_state_replay_context(
+                linear_state_ctx,
+                clear_state_input_window=full_prefix_replay,
+                restore_live_state=True,
+            ),
+            target_extend_replay_batch(batch, replay_spec),
+        ):
             # The suffix EXTEND must see draft KV at absolute positions
             # base_seq_len..base_seq_len+draft.  These are the same slots the
             # real verify path owns, so publishing them in req_to_token_pool is
             # intentional even though the rest of ScheduleBatch is restored.
             batch.req_to_token_pool.write(
-                (draft_rows, draft_offsets),
-                draft_cache_locs.to(torch.int32),
+                (replay_plan.draft_rows, replay_plan.draft_offsets),
+                replay_plan.draft_cache_locs.to(torch.int32),
             )
 
             oracle_output = self.target_worker.forward_batch_generation(
                 batch=batch,
                 is_verify=True,
             )
-            forward_batch = ForwardBatch.init_new(batch, self.target_worker.model_runner)
-            hidden_states = oracle_output.logits_output.hidden_states
-            if hidden_states is None:
-                raise RuntimeError(
-                    "DVR suffix EXTEND verifier did not return hidden states."
-                )
-
-            gather_indices = []
-            offset = 0
-            for tail_len, extend_len in zip(
-                tail_lens_cpu, extend_lens_cpu, strict=True
-            ):
-                gather_indices.extend(
-                    range(offset + int(tail_len), offset + int(tail_len) + draft_token_num)
-                )
-                offset += extend_len
-            gather_indices_t = torch.tensor(
-                gather_indices, dtype=torch.long, device=hidden_states.device
+            forward_batch = ForwardBatch.init_new(
+                batch, self.target_worker.model_runner
             )
-            draft_hidden_states = hidden_states[gather_indices_t]
-
-            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
-            logits_metadata.next_token_logits_buffer = None
-            return self.target_worker.model_runner.model.logits_processor._get_logits(
-                draft_hidden_states,
-                self.target_worker.model_runner.model.lm_head,
-                logits_metadata,
+            draft_logits, _ = draft_row_logits_from_replay_hidden_states(
+                target_worker=self.target_worker,
+                forward_batch=forward_batch,
+                hidden_states=oracle_output.logits_output.hidden_states,
+                hidden_gather_indices=replay_plan.hidden_gather_indices,
             )
-        finally:
-            state_adapter.restore_recurrent_state(
-                state_cache=state_cache,
-                backup=verify_ready_live_backup,
-                indices=live_indices,
-            )
-            if saved_tail_lens is not None:
-                state_adapter.set_state_input_tail_lens(
-                    state_cache=state_cache,
-                    state_input_indices=linear_state_ctx.state_input_indices,
-                    tail_lens=saved_tail_lens,
-                )
-            state_adapter.restore_state_input_window(
-                state_cache=state_cache,
-                state_input_indices=linear_state_ctx.state_input_indices,
-                backup=saved_state_input_window,
-            )
-            for name, value in saved_fields.items():
-                setattr(batch, name, value)
+            return draft_logits
 
     def _replay_accepted_suffix_for_partial_verify(
         self,
