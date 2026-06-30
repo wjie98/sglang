@@ -118,11 +118,15 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 DVREagleTargetVerifyCudaGraphRunner(self)
             )
 
+    @staticmethod
+    def _has_one_token_real_prompt(batch: ScheduleBatch) -> bool:
+        return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
+
     @contextmanager
-    def _target_verify_graph_runner_context(self):
+    def _target_verify_graph_runner_context(self, disable_cuda_graph: bool = False):
         target_runner = self.target_worker.model_runner
-        runner = self.cuda_graph_runner_for_target_verify
-        if runner is None and self.plan_stream is None:
+        runner = None if disable_cuda_graph else self.cuda_graph_runner_for_target_verify
+        if runner is None and self.plan_stream is None and not disable_cuda_graph:
             yield
             return
 
@@ -139,10 +143,10 @@ class DecodeVerifyRollbackEagleWorkerV2(
             target_runner.graph_runner = saved_graph_runner
 
     @contextmanager
-    def _target_verify_prepare_context(self):
+    def _target_verify_prepare_context(self, disable_cuda_graph: bool = False):
         use_plan_stream = (
             self.plan_stream is not None
-            and self.cuda_graph_runner_for_target_verify is None
+            and (self.cuda_graph_runner_for_target_verify is None or disable_cuda_graph)
         )
         # The dedicated DVR-EAGLE target-verify graph replays GDN state-input
         # and commit-buffer side effects.  Preparing its graph buffers on the
@@ -151,7 +155,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         # stream.  If the dedicated graph is unavailable, preserve the previous
         # plan-stream eager fallback.
         stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
-        with stream_ctx, self._target_verify_graph_runner_context():
+        with stream_ctx, self._target_verify_graph_runner_context(disable_cuda_graph):
             yield use_plan_stream
 
     def _target_verify_graph_runner_bs(self, can_run_cuda_graph: bool):
@@ -867,7 +871,10 @@ class DecodeVerifyRollbackEagleWorkerV2(
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
-        with self._target_verify_prepare_context() as prepared_on_plan_stream:
+        disable_verify_graph = self._has_one_token_real_prompt(batch)
+        with self._target_verify_prepare_context(
+            disable_cuda_graph=disable_verify_graph
+        ) as prepared_on_plan_stream:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
@@ -909,7 +916,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
             seq_lens_cpu=self._batch_seq_lens_cpu_list(batch),
         )
 
-        with self._target_verify_graph_runner_context():
+        with self._target_verify_graph_runner_context(
+            disable_cuda_graph=disable_verify_graph
+        ):
             forward_batch_output = self.target_worker.forward_batch_generation(
                 batch=None,
                 forward_batch=verify_forward_batch,

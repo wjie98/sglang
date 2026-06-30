@@ -231,6 +231,7 @@ class DecodeVerifyRollbackWorkerV2(
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        self._prepare_dvr_draft_forward_batch(batch, forward_batch)
         parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
             forward_batch
         )
@@ -294,9 +295,7 @@ class DecodeVerifyRollbackWorkerV2(
             seq_lens_cpu=self._batch_seq_lens_cpu_list(batch),
         )
         batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
-        batch_result = self.target_worker.forward_batch_generation(
-            batch, is_verify=True
-        )
+        batch_result = self._forward_target_verify_for_dvr(batch)
         logits_output = batch_result.logits_output
         oracle_logits = None
         if batch.return_logprob:

@@ -1,7 +1,14 @@
 from types import SimpleNamespace
 
+import pytest
+
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.draft_decode_context import draft_decode_performance_context
+from sglang.srt.speculative.dvr_scheduler_utils import (
+    DVRFinalLogprobRepair,
+    DVRSpecResultAux,
+    apply_dvr_final_logprob_repairs_from_result,
+)
 from sglang.srt.speculative.output_policy import (
     defer_req_non_streaming_logprob_output,
     should_emit_non_streaming_output_chunk,
@@ -113,3 +120,80 @@ def test_output_policy_defer_non_streaming_logprob():
         return_logprob=True,
         force_stream_interval=2,
     )
+
+
+def test_dvr_final_logprob_repair_applies_after_materialization():
+    req = SimpleNamespace(
+        rid="r0",
+        return_logprob=True,
+        output_ids=[10, 11, 12],
+        logprob=SimpleNamespace(
+            output_token_logprobs_val=[-1.0],
+            output_token_logprobs_idx=[10],
+        ),
+    )
+    result = SimpleNamespace(
+        spec_aux=DVRSpecResultAux(
+            final_logprob_repairs=[
+                DVRFinalLogprobRepair(
+                    output_ids=[10, 11, 12],
+                    output_logprobs=[-0.1, -0.2, -0.3],
+                )
+            ]
+        )
+    )
+
+    apply_dvr_final_logprob_repairs_from_result(SimpleNamespace(reqs=[req]), result)
+
+    assert req.logprob.output_token_logprobs_val == [-0.1, -0.2, -0.3]
+    assert req.logprob.output_token_logprobs_idx == [10, 11, 12]
+
+
+def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
+    req = SimpleNamespace(
+        rid="r0",
+        return_logprob=True,
+        output_ids=[10, 99],
+        logprob=SimpleNamespace(
+            output_token_logprobs_val=[],
+            output_token_logprobs_idx=[],
+        ),
+    )
+    result = SimpleNamespace(
+        spec_aux=DVRSpecResultAux(
+            final_logprob_repairs=[
+                DVRFinalLogprobRepair(
+                    output_ids=[10, 11],
+                    output_logprobs=[-0.1, -0.2],
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="materialized output ids"):
+        apply_dvr_final_logprob_repairs_from_result(SimpleNamespace(reqs=[req]), result)
+
+
+def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
+    req = SimpleNamespace(
+        rid="r0",
+        return_logprob=True,
+        output_ids=[10, 11],
+        logprob=SimpleNamespace(
+            output_token_logprobs_val=[],
+            output_token_logprobs_idx=[],
+        ),
+    )
+    result = SimpleNamespace(
+        spec_aux=DVRSpecResultAux(
+            final_logprob_repairs=[
+                DVRFinalLogprobRepair(
+                    output_ids=[10, 11],
+                    output_logprobs=[-0.1],
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="inconsistent ids/logprobs length"):
+        apply_dvr_final_logprob_repairs_from_result(SimpleNamespace(reqs=[req]), result)

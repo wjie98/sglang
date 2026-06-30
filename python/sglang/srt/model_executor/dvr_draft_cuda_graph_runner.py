@@ -180,6 +180,13 @@ def _skip_init_cuda_graph_state(*args, **kwargs):
     return None
 
 
+def _min_seq_len_cpu(forward_batch: ForwardBatch) -> int:
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is not None:
+        return int(seq_lens_cpu.min().item())
+    return int(forward_batch.seq_lens.min().item())
+
+
 def _patch_draft_determinism_flags(
     model_runner,
     global_server_args,
@@ -353,6 +360,15 @@ class DVRDraftDecodeCudaGraphRunner:
             self.runner = CudaGraphRunner(model_runner)
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
+        if getattr(forward_batch, "dvr_disable_draft_cuda_graph", False):
+            return False
+        # The first self-draft decode after a one-token prompt reaches the graph
+        # as seq_len=2 (prompt token + anchor token).  On GDN models that graph
+        # replay can hit an illegal access in the packed decode state-input
+        # window; eager decode handles the same boundary and the next step can
+        # return to the graph.
+        if _min_seq_len_cpu(forward_batch) <= 2:
+            return False
         return self.runner.can_run(forward_batch)
 
     def replay(self, forward_batch: ForwardBatch):

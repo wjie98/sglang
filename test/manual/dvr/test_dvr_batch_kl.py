@@ -28,6 +28,9 @@ Operational notes learned while debugging DVR:
 - Use lengths around and beyond FLA_CHUNK_SIZE=64 for GDN models. The defaults
   include 63/64/65/129 to cover pre-boundary, boundary, post-boundary, and
   multi-chunk state commits.
+- Use --prompt-token-lengths to synthesize exact prompt token lengths from the
+  server tokenizer. Combining prompt lengths and --max-new around 64 exercises
+  both input and output chunk boundaries without preparing an external cache.
 - --warm-cache is useful for checking radix-cache compatibility on the DVR
   generation path. The oracle is still flushed unless --no-flush-oracle is set.
 - Generation requests use logprob_start_len=-1. Setting logprob_start_len=0
@@ -203,6 +206,29 @@ def load_input_ids(path: Optional[str]) -> Optional[List[List[int]]]:
     if not isinstance(data, list) or not all(isinstance(x, list) for x in data):
         raise ValueError("--input-ids-json must contain a JSON list of token-id lists")
     return [[int(tok) for tok in row] for row in data]
+
+
+def make_prompt_token_boundary_inputs(
+    base_url: str,
+    lengths: Sequence[int],
+) -> List[List[int]]:
+    if not lengths:
+        raise ValueError("--prompt-token-lengths must contain at least one length")
+    if min(lengths) <= 0:
+        raise ValueError("--prompt-token-lengths values must be positive")
+
+    max_len = max(lengths)
+    text = (
+        "DVR boundary validation prompt with deterministic token content. "
+        "It is repeated so the local tokenizer can provide exact input-id "
+        "prefix lengths for chunk-boundary tests. "
+    )
+    token_ids_for_text = prompt_token_ids(base_url, text)
+    while len(token_ids_for_text) < max_len:
+        text += text
+        token_ids_for_text = prompt_token_ids(base_url, text)
+
+    return [token_ids_for_text[:length] for length in lengths]
 
 
 def build_cases(
@@ -477,6 +503,14 @@ def main():
         help="Optional JSON list of input-id lists, similar to the original LongBench DVR test cache.",
     )
     parser.add_argument(
+        "--prompt-token-lengths",
+        default=None,
+        help=(
+            "Comma-separated exact prompt token lengths to synthesize from the "
+            "server tokenizer. Ignored when --input-ids-json is set."
+        ),
+    )
+    parser.add_argument(
         "--limit-prompts",
         type=int,
         default=None,
@@ -510,6 +544,12 @@ def main():
     max_new_values = parse_int_list(args.max_new)
     input_ids = load_input_ids(args.input_ids_json)
     prompts = DEFAULT_PROMPTS
+    if input_ids is None and args.prompt_token_lengths is not None:
+        input_ids = make_prompt_token_boundary_inputs(
+            args.base_url,
+            parse_int_list(args.prompt_token_lengths),
+        )
+
     if input_ids is not None and args.limit_prompts is not None:
         input_ids = input_ids[: args.limit_prompts]
     elif args.limit_prompts is not None:

@@ -392,6 +392,45 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             f"boundary_seqlen={boundary_seqlen}."
         )
 
+    @staticmethod
+    def _has_one_token_real_prompt(batch: ScheduleBatch) -> bool:
+        return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
+
+    def _prepare_dvr_draft_forward_batch(
+        self, batch: ScheduleBatch, forward_batch: ForwardBatch
+    ) -> None:
+        # A one-token real prompt is page-padded to 64 tokens for DVR/GDN, but
+        # the self-draft CUDA graph still observes a state-input boundary that
+        # can illegal-access. Keep this edge inside DVR and use eager draft for
+        # the request; normal prompts continue to use the graph.
+        forward_batch.dvr_disable_draft_cuda_graph = self._has_one_token_real_prompt(
+            batch
+        )
+
+    def _forward_target_verify_for_dvr(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        # DVR exact output logprobs are derived from the full-prefix oracle after
+        # target verify. The ordinary target-verify pass only needs logits for
+        # accept/reject and GDN state commit, so keep its logprob metadata path
+        # disabled.
+        need_return_logprob = batch.return_logprob
+        disable_verify_graph = self._has_one_token_real_prompt(batch)
+        saved_graph_runner = None
+        batch.return_logprob = False
+        if disable_verify_graph:
+            # The same page-padded one-token prompt edge can crash TARGET_VERIFY
+            # graph replay on GDN models. Keep the fallback local to DVR; normal
+            # prompts and all non-DVR target paths still use the captured graph.
+            saved_graph_runner = self.model_runner.graph_runner
+            self.model_runner.graph_runner = None
+        try:
+            return self.target_worker.forward_batch_generation(batch, is_verify=True)
+        finally:
+            batch.return_logprob = need_return_logprob
+            if disable_verify_graph:
+                self.model_runner.graph_runner = saved_graph_runner
+
     def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -420,6 +459,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         batch.return_hidden_states = False
 
         forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+        self._prepare_dvr_draft_forward_batch(batch, forward_batch)
         parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
             forward_batch
         )
@@ -899,7 +939,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
 
         batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch.capture_hidden_mode = CaptureHiddenMode.NULL
-        batch_result = self.target_worker.forward_batch_generation(batch, is_verify=True)
+        batch_result = self._forward_target_verify_for_dvr(batch)
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,

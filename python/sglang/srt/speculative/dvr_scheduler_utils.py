@@ -120,6 +120,16 @@ def _apply_final_logprob_repair(req: Any, repair: DVRFinalLogprobRepair) -> None
         return
 
     output_len = len(repair.output_ids)
+    if output_len != len(repair.output_logprobs):
+        raise RuntimeError(
+            "DVR final logprob repair has inconsistent ids/logprobs length: "
+            f"rid={req.rid}, output_len={output_len}, "
+            f"logprob_len={len(repair.output_logprobs)}."
+        )
+
+    # Spec-v2 applies accepted tokens after the worker returns.  Repair only the
+    # exact materialized prefix; a mismatch here means the worker replay stream
+    # and scheduler-owned output stream have diverged.
     materialized_output_ids = list(req.output_ids[:output_len])
     if materialized_output_ids != repair.output_ids:
         raise RuntimeError(
