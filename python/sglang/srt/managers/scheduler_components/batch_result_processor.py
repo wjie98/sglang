@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dvr_scheduler_utils import (
+    apply_dvr_final_logprob_repairs_from_result,
     cache_unfinished_prefill_req_with_dvr_mamba_snapshot,
     maybe_handle_dvr_mamba_checkpoint_after_decode,
 )
@@ -702,6 +703,9 @@ class SchedulerBatchResultProcessor:
                     req=req, next_token_id=next_token_id, batch=batch
                 )
 
+        # DVR exact final logprobs are computed on the worker stream but can only
+        # be applied after Spec-v2 has materialized accepted tokens into Req.
+        apply_dvr_final_logprob_repairs_from_result(batch, result)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 

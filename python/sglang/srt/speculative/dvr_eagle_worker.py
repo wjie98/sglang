@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
+    DVRFinalLogprobRepair,
     DVRReplayPrefixTracker,
     dvr_spec_aux_from_pending_mamba_checkpoints,
 )
@@ -38,7 +39,9 @@ from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
-from sglang.srt.speculative.output_policy import defer_req_non_streaming_logprob_output
+from sglang.srt.speculative.output_policy import (
+    defer_req_non_streaming_logprob_output,
+)
 from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     record_stream_each,
@@ -474,7 +477,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         predict: torch.Tensor,
         accept_lens: torch.Tensor,
         draft_token_num: int,
-    ) -> torch.Tensor | None:
+    ) -> tuple[torch.Tensor | None, list[DVRFinalLogprobRepair | None] | None]:
         """Score emitted EAGLE tokens with the same full-prefill oracle as KL tests.
 
         EAGLE's verify matrix mixes accepted draft tokens and a target bonus
@@ -496,7 +499,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             draft_token_num=draft_token_num,
         )
         if replay_plan is None:
-            return None
+            return None, None
 
         input_token_logprobs = self._run_accepted_logprob_replay(
             batch=batch,
@@ -549,14 +552,16 @@ class DecodeVerifyRollbackEagleWorkerV2(
             accept_len = int(accept_len)
             compact_start = req_i * draft_token_num
             token_ids = self._request_token_ids_for_eagle_replay(req, int(seq_len))
-            prev_output_len = len(req.output_ids)
+            prompt_len = len(req.origin_input_ids)
+            prefix_output_len = max(0, int(seq_len) - prompt_len)
             max_new_tokens = req.sampling_params.max_new_tokens
             final_output_len = None
             if (
                 not req.stream
                 and req.send_output_token_logprobs_offset == 0
                 and max_new_tokens is not None
-                and prev_output_len + accept_len >= max_new_tokens
+                and prefix_output_len < max_new_tokens
+                and prefix_output_len + accept_len >= max_new_tokens
             ):
                 final_output_len = int(max_new_tokens)
 
@@ -564,22 +569,31 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 # For GDN models, logprobs inside an unclosed chunk are only
                 # strictly comparable to the final full-prefill oracle once the
                 # whole generated suffix is known.  Non-streaming requests have
-                # not sent output logprobs yet, so patch the final response from
-                # the exact prompt+output scoring pass instead of relying on
-                # per-verify-round rows.
-                final_curr_len = max(0, final_output_len - prev_output_len)
-                emitted_tokens = [
-                    int(token)
-                    for token in predict_cpu[
-                        compact_start : compact_start + final_curr_len
-                    ]
+                # not sent output logprobs yet.  Use the DVR replay prefix stream:
+                # in overlap, Req.output_ids can lag behind seq_len, and EAGLE's
+                # emitted stream is not simply the target predict tensor.
+                final_curr_len = max(0, final_output_len - prefix_output_len)
+                final_token_ids = self.dvr_replay_prefix.request_token_ids(
+                    req,
+                    prompt_len + final_output_len,
+                    initialize_from_req_output=False,
+                    include_full_untruncated_fill_ids=True,
+                    error_prefix="DVR EAGLE final logprob",
+                )
+                final_output_ids = final_token_ids[
+                    prompt_len : prompt_len + final_output_len
                 ]
-                final_output_ids = list(req.output_ids) + emitted_tokens
-                replay_ids = token_ids[: int(seq_len)] + emitted_tokens
+                replay_ids = final_token_ids[: prompt_len + final_output_len]
                 logprob_token_ids.extend(replay_ids[1:])
                 logprob_token_ids.append(0)
                 final_score_specs.append(
-                    (req_i, req, prev_output_len, final_curr_len, final_output_ids)
+                    (
+                        req_i,
+                        req,
+                        prefix_output_len,
+                        final_curr_len,
+                        final_output_ids,
+                    )
                 )
             else:
                 # DVR-EAGLE's recurrent/KV state advances over the accepted
@@ -710,7 +724,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         *,
         replay_plan: _DVREagleAcceptedLogprobReplayPlan,
         input_token_logprobs: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list[DVRFinalLogprobRepair | None] | None]:
         """Map full-prefix input-logprob rows back to compact spec-v2 outputs."""
 
         final_score_req_indices = {spec[0] for spec in replay_plan.final_score_specs}
@@ -736,10 +750,15 @@ class DecodeVerifyRollbackEagleWorkerV2(
             padded[req_i, : int(accept_len)] = input_token_logprobs[start:end]
             offset += int(extend_len)
 
+        final_logprob_repairs = (
+            [None for _ in range(replay_plan.bs)]
+            if replay_plan.final_score_specs
+            else None
+        )
         for (
             req_i,
             req,
-            prev_output_len,
+            prefix_output_len,
             final_curr_len,
             final_output_ids,
         ) in replay_plan.final_score_specs:
@@ -750,18 +769,16 @@ class DecodeVerifyRollbackEagleWorkerV2(
             final_logprobs = input_token_logprobs[
                 output_logprob_start:output_logprob_end
             ]
-            if req.logprob.output_token_logprobs_val is not None:
-                req.logprob.output_token_logprobs_val[:] = (
-                    final_logprobs[:prev_output_len].detach().cpu().tolist()
+            if final_logprob_repairs is not None:
+                final_logprob_repairs[req_i] = DVRFinalLogprobRepair(
+                    output_ids=final_output_ids,
+                    output_logprobs=final_logprobs.detach().cpu().tolist(),
                 )
-                req.logprob.output_token_logprobs_idx[:] = final_output_ids[
-                    :prev_output_len
-                ]
             if final_curr_len > 0:
                 padded[req_i, :final_curr_len] = final_logprobs[
-                    prev_output_len : prev_output_len + final_curr_len
+                    prefix_output_len : prefix_output_len + final_curr_len
                 ]
-        return padded
+        return padded, final_logprob_repairs
 
     @staticmethod
     def _defer_non_streaming_logprob_output_until_finish(batch: ScheduleBatch) -> None:
@@ -968,12 +985,16 @@ class DecodeVerifyRollbackEagleWorkerV2(
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         exact_output_logprobs = None
+        final_logprob_repairs = None
         if batch.return_logprob and not batch.forward_mode.is_idle():
             # DVR-EAGLE may rewrite previously collected output logprobs with a
             # final full-prefix oracle. Mark requests here so the generic
             # streamer only sees a request-level defer policy.
             self._defer_non_streaming_logprob_output_until_finish(batch)
-            exact_output_logprobs = self._target_full_prefix_score_accepted_logprobs(
+            (
+                exact_output_logprobs,
+                final_logprob_repairs,
+            ) = self._target_full_prefix_score_accepted_logprobs(
                 batch=batch,
                 verify_input=verify_input,
                 linear_state_ctx=linear_state_ctx,
@@ -1035,6 +1056,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             spec_aux=dvr_spec_aux_from_pending_mamba_checkpoints(
                 pending_track_indices,
                 pending_track_seqlens,
+                final_logprob_repairs=final_logprob_repairs,
             ),
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,

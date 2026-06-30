@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+
 _DEFER_NON_STREAMING_LOGPROB_OUTPUT_ATTR = "_defer_non_streaming_logprob_output"
 
 

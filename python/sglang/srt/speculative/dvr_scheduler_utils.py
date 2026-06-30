@@ -22,22 +22,42 @@ class DVRMambaCheckpoint:
 
 
 @dataclass
+class DVRFinalLogprobRepair:
+    """Exact final output logprobs produced by a DVR worker.
+
+    Spec-v2 overlap materializes accepted tokens into ``Req.output_ids`` after
+    the worker returns.  DVR workers may still compute a full-prefix logprob
+    oracle on the forward stream; carry the final rows here and apply them only
+    after scheduler result processing owns the final output token list.
+    """
+
+    output_ids: list[int]
+    output_logprobs: list[float]
+
+
+@dataclass
 class DVRSpecResultAux:
     """Worker-to-scheduler DVR metadata carried by GenerationBatchResult."""
 
     pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
+    final_logprob_repairs: Optional[
+        list[Optional[DVRFinalLogprobRepair]]
+    ] = None
 
     @classmethod
     def from_pending_mamba_checkpoint_lists(
         cls,
         track_indices: Optional[list[Optional[int]]],
         seqlens: Optional[list[Optional[int]]],
+        final_logprob_repairs: Optional[
+            list[Optional[DVRFinalLogprobRepair]]
+        ] = None,
     ) -> Optional["DVRSpecResultAux"]:
-        if track_indices is None and seqlens is None:
+        if track_indices is None and seqlens is None and final_logprob_repairs is None:
             return None
 
         if track_indices is None:
-            track_indices = [None] * len(seqlens)
+            track_indices = [None] * (len(seqlens) if seqlens is not None else 0)
         if seqlens is None:
             seqlens = [None] * len(track_indices)
 
@@ -49,12 +69,19 @@ class DVRSpecResultAux:
             )
             for track_idx, seqlen in zip(track_indices, seqlens, strict=True)
         ]
-        return cls(pending_mamba_checkpoints=checkpoints)
+        return cls(
+            pending_mamba_checkpoints=checkpoints or None,
+            final_logprob_repairs=final_logprob_repairs,
+        )
 
 
 def dvr_spec_aux_from_pending_mamba_checkpoints(
     track_indices: Optional[list[Optional[int]]],
     seqlens: Optional[list[Optional[int]]],
+    *,
+    final_logprob_repairs: Optional[
+        list[Optional[DVRFinalLogprobRepair]]
+    ] = None,
 ) -> Optional[DVRSpecResultAux]:
     """Build DVR scheduler aux data from verify-produced mamba checkpoints.
 
@@ -65,7 +92,47 @@ def dvr_spec_aux_from_pending_mamba_checkpoints(
     return DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
         track_indices,
         seqlens,
+        final_logprob_repairs=final_logprob_repairs,
     )
+
+
+def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
+    """Apply DVR exact final logprob repairs after Spec-v2 output materializes."""
+
+    aux = getattr(result, "spec_aux", None)
+    repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = getattr(
+        aux, "final_logprob_repairs", None
+    )
+    if repairs is None:
+        return
+
+    for req_i, req in enumerate(batch.reqs):
+        if req_i >= len(repairs):
+            break
+        repair = repairs[req_i]
+        if repair is None:
+            continue
+        _apply_final_logprob_repair(req, repair)
+
+
+def _apply_final_logprob_repair(req: Any, repair: DVRFinalLogprobRepair) -> None:
+    if not req.return_logprob:
+        return
+
+    output_len = len(repair.output_ids)
+    materialized_output_ids = list(req.output_ids[:output_len])
+    if materialized_output_ids != repair.output_ids:
+        raise RuntimeError(
+            "DVR final logprob repair no longer matches materialized output ids: "
+            f"rid={req.rid}, materialized_tail={materialized_output_ids[-8:]}, "
+            f"repair_tail={repair.output_ids[-8:]}, repair_len={output_len}, "
+            f"req_output_len={len(req.output_ids)}."
+        )
+
+    if req.logprob.output_token_logprobs_val is None:
+        return
+    req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
+    req.logprob.output_token_logprobs_idx[:] = repair.output_ids
 
 
 class DVRReplayPrefixTracker:
