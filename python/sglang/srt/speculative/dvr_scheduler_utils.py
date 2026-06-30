@@ -9,6 +9,9 @@ from sglang.srt.mem_cache.mamba_radix_cache_policy import (
     mark_req_skip_mamba_radix_finished_insert,
     set_req_mamba_radix_insert_snapshot,
 )
+from sglang.srt.speculative.output_policy import (
+    allow_req_non_streaming_logprob_output,
+)
 
 
 @dataclass
@@ -140,9 +143,11 @@ def _apply_final_logprob_repair(req: Any, repair: DVRFinalLogprobRepair) -> None
         )
 
     if req.logprob.output_token_logprobs_val is None:
+        allow_req_non_streaming_logprob_output(req)
         return
     req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
     req.logprob.output_token_logprobs_idx[:] = repair.output_ids
+    allow_req_non_streaming_logprob_output(req)
 
 
 class DVRReplayPrefixTracker:

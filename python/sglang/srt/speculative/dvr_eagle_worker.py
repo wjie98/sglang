@@ -23,6 +23,10 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
     dvr_spec_aux_from_pending_mamba_checkpoints,
 )
+from sglang.srt.speculative.dvr_logprob_repair import (
+    defer_dvr_non_streaming_logprob_output_until_finish,
+    score_dvr_final_logprob_repairs,
+)
 from sglang.srt.speculative.dvr_target_replay import (
     DVRTargetReplaySpec,
     build_suffix_draft_replay_plan,
@@ -927,15 +931,14 @@ class DecodeVerifyRollbackEagleWorkerV2(
         logits_output = forward_batch_output.logits_output
         oracle_output = None
         if batch.return_logprob or logits_output.hidden_states is None:
-            # Strict returned-logprob requests need the full-prefix oracle used by
-            # the self-DVR path.  Fast decode can consume the dedicated DVR-EAGLE
-            # target-verify graph directly; keep suffix replay only as a hidden
-            # state fallback for graph-disabled/eager configurations.
+            # EAGLE needs replay logits and replay hidden states from the same
+            # suffix EXTEND so returned logprobs and the next MTP draft seed stay
+            # paired without replaying the already-closed prefix chunks.
             oracle_output = self._target_suffix_extend_verify_output(
                 batch=batch,
                 verify_input=verify_input,
                 linear_state_ctx=linear_state_ctx,
-                full_prefix_replay=batch.return_logprob,
+                full_prefix_replay=False,
             )
         oracle_input_logprobs = None
         if oracle_output is not None:
@@ -991,25 +994,43 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 accept_index.shape[1],
             )
         else:
+            accept_tokens = None
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
-        exact_output_logprobs = None
         final_logprob_repairs = None
         if batch.return_logprob and not batch.forward_mode.is_idle():
             # DVR-EAGLE may rewrite previously collected output logprobs with a
             # final full-prefix oracle. Mark requests here so the generic
             # streamer only sees a request-level defer policy.
-            self._defer_non_streaming_logprob_output_until_finish(batch)
-            (
-                exact_output_logprobs,
-                final_logprob_repairs,
-            ) = self._target_full_prefix_score_accepted_logprobs(
+            base_seq_lens_cpu = (
+                batch.seq_lens_cpu.tolist()
+                if batch.seq_lens_cpu is not None
+                else batch.seq_lens.detach().cpu().tolist()
+            )
+            defer_dvr_non_streaming_logprob_output_until_finish(
+                batch,
+                base_seq_lens_cpu=base_seq_lens_cpu,
+            )
+            final_logprob_repairs = score_dvr_final_logprob_repairs(
                 batch=batch,
-                verify_input=verify_input,
+                target_worker=self.target_worker,
+                replay_prefix=self.dvr_replay_prefix,
                 linear_state_ctx=linear_state_ctx,
-                predict=predict,
-                accept_lens=accept_lens,
-                draft_token_num=verify_input.draft_token_num,
+                base_seq_lens_cpu=base_seq_lens_cpu,
+                accept_lens_cpu=accept_lens.detach().cpu().tolist(),
+                accepted_token_ids_per_req=(
+                    [
+                        row[: int(accept_len)]
+                        for row, accept_len in zip(
+                            accept_tokens.detach().cpu().tolist(),
+                            accept_lens.detach().cpu().tolist(),
+                            strict=True,
+                        )
+                    ]
+                    if accept_tokens is not None
+                    else None
+                ),
+                error_prefix="DVR EAGLE final logprob",
             )
 
         pending_track_indices = None
@@ -1039,18 +1060,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 accept_index,
                 self.speculative_num_steps,
             )
-            if exact_output_logprobs is not None:
-                pos = torch.arange(
-                    verify_input.draft_token_num,
-                    dtype=torch.long,
-                    device=accept_lens.device,
-                ).unsqueeze(0)
-                accepted_mask = pos < accept_lens.to(torch.long).unsqueeze(1)
-                logits_output.next_token_logprobs = torch.where(
-                    accepted_mask.to(logits_output.next_token_logprobs.device),
-                    exact_output_logprobs.to(logits_output.next_token_logprobs.device),
-                    logits_output.next_token_logprobs,
-                )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 

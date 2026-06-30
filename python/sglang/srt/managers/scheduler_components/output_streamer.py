@@ -27,6 +27,8 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.output_policy import (
+    should_defer_finished_non_streaming_logprob_output,
+    should_defer_non_streaming_logprob_output,
     should_emit_non_streaming_output_chunk,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -322,6 +324,16 @@ class _GenerationStreamAccumulator:
 
     def accept(self, *, req: Req) -> None:
         if req.finished():
+            # Prompt-only/scoring requests have no output tokens to repair.
+            # For generation, keep finished non-streaming logprob responses
+            # buffered until the producing algorithm clears the defer flag.
+            if len(req.output_ids_through_stop) > 0 and (
+                should_defer_finished_non_streaming_logprob_output(
+                    req=req,
+                    return_logprob=self.return_logprob,
+                )
+            ):
+                return
             assert not req.finished_output
             req.finished_output = True
             if req.finished_len is None:

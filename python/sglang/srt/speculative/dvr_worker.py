@@ -944,20 +944,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
-        oracle_logits = None
-        if batch.return_logprob:
-            # Strict returned logprobs are compared against a flush-cache full
-            # prefill oracle.  The current Triton cached-prefix target-verify
-            # path is deterministic but not bitwise identical to full prefill,
-            # so only logprob-returning requests pay for a full-prefix oracle.
-            oracle_logits = self._target_suffix_extend_verify_logits(
-                batch=batch,
-                spec_info=spec_info,
-                linear_state_ctx=linear_state_ctx,
-                full_prefix_replay=True,
-            )
-        if oracle_logits is not None:
-            logits_output.next_token_logits = oracle_logits
         maybe_detect_nan(logits_output.next_token_logits, "dvr target verify")
 
         spec_info.hidden_states = (
