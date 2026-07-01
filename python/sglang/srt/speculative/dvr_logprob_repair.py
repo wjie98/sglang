@@ -449,7 +449,21 @@ def _temporary_final_replay_cache_mapping(
     batch: ScheduleBatch,
     replay_plan: _DVRFinalLogprobReplayPlan,
 ):
-    temp_cache_locs = _alloc_final_replay_cache_locs(batch, replay_plan)
+    allocated_cache_locs = None
+    try:
+        temp_cache_locs = _alloc_final_replay_cache_locs(batch, replay_plan)
+        allocated_cache_locs = temp_cache_locs
+    except RuntimeError as exc:
+        if not (
+            _is_kv_allocation_failure(exc)
+            and _can_reuse_live_cache_locs_for_final_replay(replay_plan)
+        ):
+            raise
+        # This replay is a final-response scoring oracle and every row belongs
+        # to a request that will finish in this verify step.  Reuse the live KV
+        # slots instead of requiring a second full-prefix copy; this keeps exact
+        # logprob repair viable under tight 80B token budgets.
+        temp_cache_locs = _live_cache_locs_for_final_replay(batch, replay_plan)
     write_rows, write_offsets = _final_replay_req_to_token_indices(
         batch, replay_plan
     )
@@ -466,7 +480,46 @@ def _temporary_final_replay_cache_mapping(
         yield temp_cache_locs
     finally:
         batch.req_to_token_pool.write((write_rows, write_offsets), saved_locs)
-        batch.token_to_kv_pool_allocator.free(temp_cache_locs)
+        if allocated_cache_locs is not None:
+            batch.token_to_kv_pool_allocator.free(allocated_cache_locs)
+
+
+def _can_reuse_live_cache_locs_for_final_replay(
+    replay_plan: _DVRFinalLogprobReplayPlan,
+) -> bool:
+    """Return whether final scoring may overwrite live request KV slots."""
+
+    final_req_indices = {req_i for req_i, *_ in replay_plan.final_score_specs}
+    return final_req_indices == set(range(len(replay_plan.extend_lens_cpu)))
+
+
+def _is_kv_allocation_failure(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return "out of memory" in message and "try to allocate" in message
+
+
+def _live_cache_locs_for_final_replay(
+    batch: ScheduleBatch,
+    replay_plan: _DVRFinalLogprobReplayPlan,
+) -> torch.Tensor:
+    """Return the existing per-request KV slots for final full-prefix replay."""
+
+    cache_locs = []
+    for req, extend_len in zip(
+        batch.reqs, replay_plan.extend_lens_cpu, strict=True
+    ):
+        cache_locs.append(
+            batch.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : int(extend_len)
+            ].to(torch.long)
+        )
+    cache_locs = torch.cat(cache_locs)
+    if torch.any(cache_locs <= 0):
+        raise RuntimeError(
+            "DVR final logprob repair cannot reuse live KV slots because the "
+            "request mapping does not cover the full replay prefix."
+        )
+    return cache_locs
 
 
 def _alloc_final_replay_cache_locs(

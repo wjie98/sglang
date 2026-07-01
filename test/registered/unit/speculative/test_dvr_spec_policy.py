@@ -5,7 +5,12 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.draft_decode_context import draft_decode_performance_context
-from sglang.srt.speculative.dvr_logprob_repair import _final_output_len_if_repair_needed
+from sglang.srt.speculative.dvr_logprob_repair import (
+    _DVRFinalLogprobReplayPlan,
+    _can_reuse_live_cache_locs_for_final_replay,
+    _final_output_len_if_repair_needed,
+    _is_kv_allocation_failure,
+)
 from sglang.srt.speculative.dvr_output_replay import compact_output_token_rows
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
@@ -370,6 +375,36 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
         )
         is None
     )
+
+
+def test_dvr_final_logprob_replay_reuses_live_slots_only_for_all_final_rows():
+    all_final = _DVRFinalLogprobReplayPlan(
+        input_ids=[],
+        logprob_token_ids=[],
+        extend_lens_cpu=[8, 9],
+        final_seq_lens_cpu=[8, 9],
+        final_score_specs=[(0, object(), 2, [10, 11]), (1, object(), 1, [20])],
+    )
+    partial_final = _DVRFinalLogprobReplayPlan(
+        input_ids=[],
+        logprob_token_ids=[],
+        extend_lens_cpu=[8, 9],
+        final_seq_lens_cpu=[8, 9],
+        final_score_specs=[(0, object(), 2, [10, 11])],
+    )
+
+    assert _can_reuse_live_cache_locs_for_final_replay(all_final)
+    assert not _can_reuse_live_cache_locs_for_final_replay(partial_final)
+
+
+def test_dvr_final_logprob_replay_identifies_allocator_oom():
+    assert _is_kv_allocation_failure(
+        RuntimeError(
+            "Prefill out of memory. Try to lower your batch size.\n"
+            "Try to allocate 725 tokens."
+        )
+    )
+    assert not _is_kv_allocation_failure(RuntimeError("CUDA out of memory"))
 
 
 def test_dvr_eagle_compacts_accepted_output_rows():
