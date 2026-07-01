@@ -2663,6 +2663,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
+                and not self._is_dvr_spec_v2_finished_by_published_seq_len(i)
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 
@@ -2730,6 +2731,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
             )
+
+    def _is_dvr_spec_v2_finished_by_published_seq_len(self, req_index: int) -> bool:
+        """Return True for overlap rows whose result is finished but not processed.
+
+        Spec-v2 overlap can publish new seq_lens before BatchResult processing
+        appends tokens to Req.output_ids. DVR workers mutate GDN state during
+        verify, so a row that already reached max_new_tokens must not enter the
+        next draft/verify round just because Req.finished() is still stale.
+        """
+        if not self.is_spec_v2 or not self.spec_algorithm.is_decode_verify_rollback():
+            return False
+
+        req = self.reqs[req_index]
+        max_new_tokens = req.sampling_params.max_new_tokens
+        if max_new_tokens is None:
+            return False
+        max_new_tokens = int(max_new_tokens)
+        if max_new_tokens <= 0:
+            return False
+
+        if self.seq_lens_cpu is not None:
+            seq_len = int(self.seq_lens_cpu[req_index].item())
+        elif self.seq_lens is not None:
+            seq_len = int(self.seq_lens[req_index].item())
+        else:
+            return False
+
+        # Decode seq_lens includes KV-visible generated tokens; the newest
+        # sampled bonus token is materialized into Req.output_ids one result
+        # processing step later, hence the final visible token corresponds to
+        # max_new_tokens - 1 here.
+        return seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because

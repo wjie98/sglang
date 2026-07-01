@@ -360,6 +360,7 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
             req_i=0,
             seq_len=len(req.origin_input_ids),
             accept_len=16,
+            observed_output_len=0,
             compact_output_token_ids_per_req=None,
         )
         == 17
@@ -371,21 +372,44 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
             req_i=0,
             seq_len=len(req.origin_input_ids) + 16,
             accept_len=0,
+            observed_output_len=0,
             compact_output_token_ids_per_req=None,
         )
         is None
     )
 
+    assert (
+        _final_output_len_if_repair_needed(
+            req=req,
+            req_i=0,
+            seq_len=len(req.origin_input_ids),
+            accept_len=0,
+            observed_output_len=17,
+            compact_output_token_ids_per_req=None,
+        )
+        == 17
+    )
+
 
 def test_dvr_final_logprob_replay_reuses_live_slots_only_for_all_final_rows():
     all_final = _DVRFinalLogprobReplayPlan(
+        req_indices=[0, 1],
         input_ids=[],
         logprob_token_ids=[],
         extend_lens_cpu=[8, 9],
         final_seq_lens_cpu=[8, 9],
         final_score_specs=[(0, object(), 2, [10, 11]), (1, object(), 1, [20])],
     )
-    partial_final = _DVRFinalLogprobReplayPlan(
+    single_final = _DVRFinalLogprobReplayPlan(
+        req_indices=[0],
+        input_ids=[],
+        logprob_token_ids=[],
+        extend_lens_cpu=[8],
+        final_seq_lens_cpu=[8],
+        final_score_specs=[(0, object(), 2, [10, 11])],
+    )
+    malformed_partial_final = _DVRFinalLogprobReplayPlan(
+        req_indices=[0, 1],
         input_ids=[],
         logprob_token_ids=[],
         extend_lens_cpu=[8, 9],
@@ -394,7 +418,8 @@ def test_dvr_final_logprob_replay_reuses_live_slots_only_for_all_final_rows():
     )
 
     assert _can_reuse_live_cache_locs_for_final_replay(all_final)
-    assert not _can_reuse_live_cache_locs_for_final_replay(partial_final)
+    assert _can_reuse_live_cache_locs_for_final_replay(single_final)
+    assert not _can_reuse_live_cache_locs_for_final_replay(malformed_partial_final)
 
 
 def test_dvr_final_logprob_replay_identifies_allocator_oom():

@@ -29,6 +29,10 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_linear_state_worker import DVRLinearStateReplayMixin
+from sglang.srt.speculative.dvr_logprob_repair import (
+    score_dvr_final_logprob_repairs,
+)
+from sglang.srt.speculative.dvr_scheduler_utils import DVRReplayPrefixTracker
 from sglang.srt.speculative.dvr_target_replay import (
     DVRTargetReplaySpec,
     build_accepted_suffix_replay_plan,
@@ -47,6 +51,9 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
     organize_draft_results,
+)
+from sglang.srt.speculative.output_policy import (
+    allow_req_non_streaming_logprob_output,
 )
 from sglang.srt.speculative.spec_utils import select_top_k_tokens
 from sglang.srt.utils import is_cuda
@@ -917,6 +924,78 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 len(batch.reqs), dtype=torch.bool, device=live_indices.device
             )
 
+    @staticmethod
+    def _seq_lens_cpu_list_for_verify(
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+    ) -> list[int]:
+        if getattr(spec_info, "seq_lens_cpu", None) is not None:
+            return [int(x) for x in spec_info.seq_lens_cpu.tolist()]
+        if batch.seq_lens_cpu is not None:
+            return [int(x) for x in batch.seq_lens_cpu.tolist()]
+        return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
+
+    @staticmethod
+    def _compact_accept_tokens_for_repair(
+        verify_output: EagleVerifyOutput,
+        accept_lens_cpu: list[int],
+    ) -> list[list[int]]:
+        accept_tokens = verify_output.accept_tokens.detach().cpu().tolist()
+        compact_tokens = []
+        offset = 0
+        for accept_len in accept_lens_cpu:
+            next_offset = offset + int(accept_len)
+            compact_tokens.append([int(x) for x in accept_tokens[offset:next_offset]])
+            offset = next_offset
+        return compact_tokens
+
+    def _repair_final_logprobs_for_spec_v1(
+        self,
+        *,
+        batch: ScheduleBatch,
+        linear_state_ctx,
+        base_seq_lens_cpu: list[int],
+        accept_lens_cpu: list[int],
+        compact_output_token_ids_per_req: list[list[int]],
+    ) -> None:
+        """Repair final non-streaming DVR output logprobs with a prefill oracle."""
+
+        if linear_state_ctx is None or not any(
+            req.return_logprob and not req.stream and req.finished()
+            for req in batch.reqs
+        ):
+            return
+
+        repairs = score_dvr_final_logprob_repairs(
+            batch=batch,
+            target_worker=self.target_worker,
+            replay_prefix=DVRReplayPrefixTracker(),
+            linear_state_ctx=linear_state_ctx,
+            base_seq_lens_cpu=base_seq_lens_cpu,
+            accept_lens_cpu=accept_lens_cpu,
+            compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+            error_prefix="DVR spec-v1 final logprob",
+        )
+        if repairs is None:
+            return
+
+        for req_i, req in enumerate(batch.reqs):
+            if req_i >= len(repairs):
+                break
+            repair = repairs[req_i]
+            if repair is None or not req.return_logprob:
+                continue
+            output_len = len(repair.output_ids)
+            if list(req.output_ids[:output_len]) != repair.output_ids:
+                raise RuntimeError(
+                    "DVR spec-v1 final logprob repair no longer matches "
+                    f"materialized output ids: rid={req.rid}, "
+                    f"repair_len={output_len}, req_output_len={len(req.output_ids)}."
+                )
+            req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
+            req.logprob.output_token_logprobs_idx[:] = repair.output_ids
+            allow_req_non_streaming_logprob_output(req)
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -936,6 +1015,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         )
         batch.spec_info = spec_info
         linear_state_ctx = self.linear_state.restore_for_verify(batch)
+        base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
 
         batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -996,6 +1076,22 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             )
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
+            accept_lens_cpu = [
+                int(num_correct) + 1
+                for num_correct in verify_output.num_correct_drafts_per_req_cpu
+            ]
+            self._repair_final_logprobs_for_spec_v1(
+                batch=batch,
+                linear_state_ctx=linear_state_ctx,
+                base_seq_lens_cpu=base_seq_lens_cpu,
+                accept_lens_cpu=accept_lens_cpu,
+                compact_output_token_ids_per_req=(
+                    self._compact_accept_tokens_for_repair(
+                        verify_output,
+                        accept_lens_cpu,
+                    )
+                ),
+            )
         self.postprocess_for_verify(batch, verify_output)
         return logits_output, verify_output, can_run_cuda_graph
 

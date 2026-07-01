@@ -231,11 +231,20 @@ class DecodeVerifyRollbackWorkerV2(
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
-        self._prepare_dvr_draft_forward_batch(batch, forward_batch)
-        parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
-            forward_batch
-        )
+        # Self-draft only proposes token ids. Keep user-visible exact logprobs
+        # on the target verify path; carrying return_logprob into draft decode
+        # adds unnecessary logits metadata and can perturb the overlap GDN state
+        # lifecycle before verify repairs it.
+        saved_return_logprob = batch.return_logprob
+        batch.return_logprob = False
+        try:
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            self._prepare_dvr_draft_forward_batch(batch, forward_batch)
+            parent_list, top_scores_index, draft_tokens, draft_probs = (
+                self.draft_forward(forward_batch)
+            )
+        finally:
+            batch.return_logprob = saved_return_logprob
 
         (
             _tree_mask,

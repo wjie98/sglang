@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 import torch
@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
     DVRReplayPrefixTracker,
@@ -32,6 +32,7 @@ from sglang.srt.speculative.output_policy import (
 class _DVRFinalLogprobReplayPlan:
     """Full-prefill scoring plan for final non-streaming DVR output logprobs."""
 
+    req_indices: list[int]
     input_ids: list[int]
     logprob_token_ids: list[int]
     extend_lens_cpu: list[int]
@@ -152,6 +153,7 @@ def _build_final_logprob_replay_plan(
     compact_output_token_ids_per_req: Optional[list[list[int]]],
     error_prefix: str,
 ) -> Optional[_DVRFinalLogprobReplayPlan]:
+    req_indices: list[int] = []
     input_ids: list[int] = []
     logprob_token_ids: list[int] = []
     extend_lens_cpu: list[int] = []
@@ -162,11 +164,16 @@ def _build_final_logprob_replay_plan(
     for req_i, (req, seq_len, accept_len) in enumerate(
         zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
     ):
+        observed_output_len = _observed_output_len_for_final_replay(
+            req=req,
+            replay_prefix=replay_prefix,
+        )
         final_output_len = _final_output_len_if_repair_needed(
             req=req,
             req_i=req_i,
             seq_len=int(seq_len),
             accept_len=int(accept_len),
+            observed_output_len=observed_output_len,
             compact_output_token_ids_per_req=compact_output_token_ids_per_req,
         )
         if final_output_len is not None:
@@ -175,22 +182,15 @@ def _build_final_logprob_replay_plan(
     if not final_replay_specs:
         return None
 
-    # ForwardBatch currently derives req_pool_indices from the live ScheduleBatch.
-    # Keep the replay sequence count aligned with that live batch, and only emit
-    # repairs for requests that finish in this verify step.
     for req_i, (req, seq_len, accept_len) in enumerate(
         zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
     ):
         prompt_len = len(req.origin_input_ids)
         final_spec = final_replay_specs.get(req_i)
         if final_spec is None:
-            # Non-final rows are present only to keep replay metadata aligned with
-            # the live batch. Their existing prefix is sufficient; current
-            # accepted-token cache locs are owned by overlap bookkeeping and are
-            # not needed for final logprob repair.
-            replay_seq_len = int(seq_len)
-        else:
-            replay_seq_len = prompt_len + final_spec
+            continue
+
+        replay_seq_len = prompt_len + final_spec
 
         replay_ids = _final_replay_ids_for_req(
             req=req,
@@ -208,9 +208,10 @@ def _build_final_logprob_replay_plan(
         logprob_token_ids.append(0)
 
         extend_len = len(replay_ids)
+        req_indices.append(req_i)
         extend_lens_cpu.append(extend_len)
         final_seq_lens_cpu.append(extend_len)
-        if final_spec is not None and try_expect_req_final_logprob_repair(req):
+        if try_expect_req_final_logprob_repair(req):
             final_output_ids = replay_ids[prompt_len : prompt_len + final_spec]
             final_score_specs.append((req_i, req, replay_offset, final_output_ids))
 
@@ -218,6 +219,7 @@ def _build_final_logprob_replay_plan(
         return None
 
     return _DVRFinalLogprobReplayPlan(
+        req_indices=req_indices,
         input_ids=input_ids,
         logprob_token_ids=logprob_token_ids,
         extend_lens_cpu=extend_lens_cpu,
@@ -232,6 +234,7 @@ def _final_output_len_if_repair_needed(
     req_i: int,
     seq_len: int,
     accept_len: int,
+    observed_output_len: int,
     compact_output_token_ids_per_req: Optional[list[list[int]]],
 ) -> Optional[int]:
     """Return the final output length if this verify step finishes the request."""
@@ -246,6 +249,12 @@ def _final_output_len_if_repair_needed(
     prompt_len = len(req.origin_input_ids)
     prefix_output_len = max(0, seq_len - prompt_len)
     max_new_tokens = int(max_new_tokens)
+    if observed_output_len >= max_new_tokens:
+        # The DVR replay stream is advanced from compact, client-visible
+        # accepted rows before final repair. In synchronous V2 the model-side
+        # seq_len can be stale or already preclaimed around the final step, so
+        # use the observed output stream as the authoritative finish signal.
+        return max_new_tokens
     if prefix_output_len >= max_new_tokens:
         return None
 
@@ -271,6 +280,17 @@ def _final_output_len_if_repair_needed(
     if stop_pos is not None and stop_pos < accept_len:
         return prefix_output_len + stop_pos + 1
     return None
+
+
+def _observed_output_len_for_final_replay(
+    *,
+    req: Any,
+    replay_prefix: DVRReplayPrefixTracker,
+) -> int:
+    """Return the best client-visible output length known to DVR repair."""
+
+    stream = replay_prefix.stream_for_req(req, initialize_from_req_output=True)
+    return max(len(req.output_ids), len(stream))
 
 
 def _final_replay_ids_for_req(
@@ -407,8 +427,12 @@ def _run_final_logprob_replay(
     linear_state_ctx: Any,
     replay_plan: _DVRFinalLogprobReplayPlan,
 ) -> torch.Tensor:
+    replay_batch = _build_final_logprob_replay_batch(batch, replay_plan)
+    replay_linear_state_ctx = _subset_linear_state_ctx(
+        linear_state_ctx, replay_plan.req_indices
+    )
     with _temporary_final_replay_cache_mapping(
-        batch,
+        replay_batch,
         replay_plan,
     ) as temp_cache_locs:
         replay_spec = DVRTargetReplaySpec(
@@ -421,27 +445,117 @@ def _run_final_logprob_replay(
             extend_input_logprob_token_ids=replay_plan.logprob_token_ids,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             return_logprob=True,
-            mamba_clear_indices=linear_state_ctx.live_indices,
+            mamba_clear_indices=replay_linear_state_ctx.live_indices,
             multimodal_inputs=[None for _ in replay_plan.extend_lens_cpu],
         )
 
         with (
             envs.SGLANG_EAGER_INPUT_NO_COPY.override(True),
             linear_state_replay_context(
-                linear_state_ctx,
+                replay_linear_state_ctx,
                 clear_state_input_window=True,
                 restore_live_state=True,
             ),
-            target_extend_replay_batch(batch, replay_spec),
+            target_extend_replay_batch(replay_batch, replay_spec),
         ):
             score_output = target_worker.forward_batch_generation(
-                batch=batch,
+                batch=replay_batch,
                 is_verify=True,
             )
             input_token_logprobs = score_output.logits_output.input_token_logprobs
+            if input_token_logprobs is not None:
+                # Materialize replay scores before restoring req-to-token
+                # mappings and freeing temporary KV slots. Some attention/GDN
+                # kernels may still have outstanding reads from those slots
+                # when the tensor object is returned to Python.
+                input_token_logprobs = input_token_logprobs.detach().cpu()
         if input_token_logprobs is None:
             raise RuntimeError("DVR final logprob replay did not return logprobs.")
         return input_token_logprobs
+
+
+def _build_final_logprob_replay_batch(
+    batch: ScheduleBatch,
+    replay_plan: _DVRFinalLogprobReplayPlan,
+) -> ScheduleBatch:
+    """Create a narrow batch so final scoring cannot perturb continuing rows."""
+
+    device = batch.seq_lens.device
+    reqs = [batch.reqs[i] for i in replay_plan.req_indices]
+    req_pool_indices = torch.tensor(
+        [req.req_pool_idx for req in reqs], dtype=torch.int64, device=device
+    )
+    final_seq_lens = torch.tensor(
+        replay_plan.final_seq_lens_cpu, dtype=torch.int64, device=device
+    )
+    return ScheduleBatch(
+        reqs=reqs,
+        req_to_token_pool=batch.req_to_token_pool,
+        token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+        tree_cache=batch.tree_cache,
+        model_config=batch.model_config,
+        enable_overlap=batch.enable_overlap,
+        device=batch.device,
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=torch.tensor(
+            replay_plan.input_ids, dtype=torch.int64, device=device
+        ),
+        req_pool_indices=req_pool_indices,
+        req_pool_indices_cpu=req_pool_indices.cpu(),
+        seq_lens=final_seq_lens,
+        seq_lens_cpu=final_seq_lens.cpu(),
+        seq_lens_sum=sum(replay_plan.final_seq_lens_cpu),
+        out_cache_loc=None,
+        return_logprob=True,
+        top_logprobs_nums=[0 for _ in reqs],
+        token_ids_logprobs=[None for _ in reqs],
+        global_num_tokens=batch.global_num_tokens,
+        global_num_tokens_for_logprob=batch.global_num_tokens_for_logprob,
+        is_extend_in_batch=True,
+        all_extend_in_batch=True,
+        can_run_dp_cuda_graph=False,
+        can_run_dp_breakable_cuda_graph=False,
+        extend_num_tokens=len(replay_plan.input_ids),
+        extend_lens=replay_plan.extend_lens_cpu,
+        prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
+        extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
+        extend_input_logprob_token_ids=None,
+        multimodal_inputs=[None for _ in reqs],
+        encoder_cached=None,
+        encoder_lens=None,
+        encoder_lens_cpu=None,
+        encoder_out_cache_loc=None,
+        sampling_info=None,
+        orig_seq_lens=final_seq_lens.to(dtype=torch.int32),
+        input_embeds=None,
+        ne_token_table=None,
+        spec_algorithm=batch.spec_algorithm,
+        spec_info=None,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        hicache_consumer_index=-1,
+        is_prefill_only=True,
+        dllm_config=batch.dllm_config,
+        has_grammar=False,
+        return_hidden_states=False,
+        return_hidden_states_before_norm=False,
+    )
+
+
+def _subset_linear_state_ctx(linear_state_ctx: Any, req_indices: list[int]) -> Any:
+    """Restrict replay state backup/clear/restore to final-response rows."""
+
+    index = torch.tensor(
+        req_indices, dtype=torch.long, device=linear_state_ctx.live_indices.device
+    )
+    boundary_indices = getattr(linear_state_ctx, "boundary_indices", None)
+    if boundary_indices is not None:
+        boundary_indices = boundary_indices[index]
+    return replace(
+        linear_state_ctx,
+        state_input_indices=linear_state_ctx.state_input_indices[index],
+        live_indices=linear_state_ctx.live_indices[index],
+        boundary_indices=boundary_indices,
+    )
 
 
 @contextmanager
@@ -489,8 +603,7 @@ def _can_reuse_live_cache_locs_for_final_replay(
 ) -> bool:
     """Return whether final scoring may overwrite live request KV slots."""
 
-    final_req_indices = {req_i for req_i, *_ in replay_plan.final_score_specs}
-    return final_req_indices == set(range(len(replay_plan.extend_lens_cpu)))
+    return len(replay_plan.final_score_specs) == len(replay_plan.extend_lens_cpu)
 
 
 def _is_kv_allocation_failure(exc: RuntimeError) -> bool:
