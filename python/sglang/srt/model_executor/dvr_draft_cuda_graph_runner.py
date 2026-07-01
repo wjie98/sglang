@@ -359,6 +359,10 @@ class DVRDraftDecodeCudaGraphRunner:
         ):
             self.runner = CudaGraphRunner(model_runner)
 
+    @property
+    def capture_bs(self):
+        return self.runner.capture_bs
+
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         if getattr(forward_batch, "dvr_disable_draft_cuda_graph", False):
             return False

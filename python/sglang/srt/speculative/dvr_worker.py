@@ -26,6 +26,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     dvr_self_draft_decode_context,
+    _min_seq_len_cpu,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_linear_state_worker import DVRLinearStateReplayMixin
@@ -609,12 +610,31 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def _draft_decode_forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        graph_disabled_for_prompt = getattr(
+            forward_batch, "dvr_disable_draft_cuda_graph", False
+        )
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_decode is not None
             and self.cuda_graph_runner_for_draft_decode.can_run(forward_batch)
         )
         if can_cuda_graph:
             return self.cuda_graph_runner_for_draft_decode.replay(forward_batch)
+
+        if (
+            self._requires_self_draft_cuda_graph()
+            and not graph_disabled_for_prompt
+            and _min_seq_len_cpu(forward_batch) > 2
+        ):
+            capture_bs = []
+            if self.cuda_graph_runner_for_draft_decode is not None:
+                capture_bs = self.cuda_graph_runner_for_draft_decode.capture_bs
+            raise RuntimeError(
+                "DVR self-draft decode requires the dedicated CUDA graph for "
+                "gated linear-state models. The current batch cannot run it: "
+                f"batch_size={forward_batch.batch_size}, capture_bs={capture_bs}. "
+                "Use the default CUDA graph batch sizes or include the running "
+                "batch size in --cuda-graph-bs/--cuda-graph-max-bs."
+            )
 
         with dvr_self_draft_decode_context(
             self.model_runner,
@@ -625,6 +645,9 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         ):
             forward_batch.can_run_dp_cuda_graph = False
             return self.model_runner.forward(forward_batch).logits_output
+
+    def _requires_self_draft_cuda_graph(self) -> bool:
+        return getattr(self.model_runner, "hybrid_gdn_config", None) is not None
 
     def get_draft_sampling_probs(
         self, forward_batch: ForwardBatch, sampling_probs: torch.Tensor

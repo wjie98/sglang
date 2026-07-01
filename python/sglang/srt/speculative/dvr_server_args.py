@@ -151,6 +151,8 @@ def handle_dvr_speculative_decoding(server_args):
             "this by explicitly setting --max-running-requests."
         )
 
+    _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
+
     if is_dvr_eagle_enabled(server_args):
         if not envs.SGLANG_ENABLE_SPEC_V2.get():
             server_args.disable_overlap_schedule = True
@@ -174,6 +176,69 @@ def handle_dvr_speculative_decoding(server_args):
         )
     server_args.enable_mixed_chunk = False
     logger.warning("Mixed chunked prefill is disabled for DVR.")
+
+
+def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
+    """Keep GDN self-draft on the existing CUDA graph decode contract.
+
+    DVR self-draft for gated linear-state models must use the dedicated draft
+    decode graph for normal prompts.  With CUDA graph padding enabled, SGLang
+    only needs a captured max batch size; with padding disabled, every exact
+    batch size must be captured.  Reuse those existing semantics instead of
+    adding a DVR-specific server argument.
+    """
+
+    if not is_dvr_self_draft_enabled(server_args):
+        return
+    if not _is_dvr_gated_linear_state_model_safe(server_args):
+        return
+
+    if getattr(server_args, "disable_cuda_graph", False) or getattr(
+        server_args, "disable_draft_cuda_graph", False
+    ):
+        raise ValueError(
+            "DVR self-draft for gated linear-state models requires draft CUDA "
+            "graphs. Remove --disable-cuda-graph/--disable-draft-cuda-graph "
+            "or use a non-self-draft DVR mode."
+        )
+
+    cuda_graph_bs = getattr(server_args, "cuda_graph_bs", None)
+    max_running_requests = getattr(server_args, "max_running_requests", None)
+    if max_running_requests is None:
+        return
+
+    max_running_requests = int(max_running_requests)
+    if max_running_requests <= 0:
+        return
+
+    if cuda_graph_bs is None:
+        cuda_graph_max_bs = getattr(server_args, "cuda_graph_max_bs", None)
+        if (
+            cuda_graph_max_bs is not None
+            and int(cuda_graph_max_bs) < max_running_requests
+        ):
+            server_args.cuda_graph_max_bs = max_running_requests
+        return
+
+    graph_bs = {int(bs) for bs in cuda_graph_bs if int(bs) > 0}
+    if not graph_bs:
+        return
+
+    if getattr(server_args, "disable_cuda_graph_padding", False):
+        graph_bs.update(range(1, max_running_requests + 1))
+    elif max(graph_bs) < max_running_requests:
+        graph_bs.add(max_running_requests)
+    else:
+        return
+
+    server_args.cuda_graph_bs = sorted(graph_bs)
+    server_args.cuda_graph_max_bs = max(server_args.cuda_graph_bs)
+
+
+def _is_dvr_gated_linear_state_model_safe(server_args):
+    if not hasattr(server_args, "get_model_config"):
+        return False
+    return _is_dvr_gated_linear_state_model(server_args)
 
 
 def _is_dvr_gated_linear_state_model(server_args):
