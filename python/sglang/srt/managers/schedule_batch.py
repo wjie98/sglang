@@ -929,6 +929,10 @@ class Req(ReqDllmMixin):
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
 
+        # Per-request count of useful proposed draft tokens (excludes the bonus
+        # token and draft slots beyond the request's remaining output budget).
+        self.spec_num_proposed_drafts = 0
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
@@ -1053,6 +1057,33 @@ class Req(ReqDllmMixin):
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
         self.spec_correct_drafts_histogram[num_correct_drafts] += 1
+
+    def record_spec_verify_metrics(
+        self,
+        num_correct_drafts: int,
+        num_proposed_drafts: Optional[int] = None,
+    ):
+        """Record one speculative verify step.
+
+        `num_proposed_drafts` is optional for legacy paths; when it is provided
+        it should count only drafts that could affect the visible output.
+        """
+        num_correct_drafts = max(0, int(num_correct_drafts))
+        self.spec_verify_ct += 1
+        self.spec_num_correct_drafts += num_correct_drafts
+        if num_proposed_drafts is not None:
+            self.spec_num_proposed_drafts += max(0, int(num_proposed_drafts))
+        self.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+    def useful_spec_proposed_drafts(self, proposed_per_verify: int) -> int:
+        """Return draft proposals that can still affect visible output.
+
+        The last verify call may have fewer than a full draft window left before
+        `max_new_tokens`; proposal slots beyond that boundary should not lower
+        the request-level acceptance-rate metric.
+        """
+        remaining_output = self.sampling_params.max_new_tokens - len(self.output_ids)
+        return min(max(0, int(proposed_per_verify)), max(0, remaining_output - 1))
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:

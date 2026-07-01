@@ -102,6 +102,37 @@ def test_dvr_self_draft_reuses_target_kv_pool():
     assert not SpeculativeAlgorithm.EAGLE.uses_target_kv_pool_for_draft()
 
 
+def test_spec_accept_rate_proposal_width_policy():
+    assert (
+        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK.proposed_draft_tokens_per_verify(
+            speculative_num_steps=15,
+            speculative_num_draft_tokens=16,
+        )
+        == 15
+    )
+    assert (
+        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE.proposed_draft_tokens_per_verify(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+        == 3
+    )
+    assert (
+        SpeculativeAlgorithm.EAGLE.proposed_draft_tokens_per_verify(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=8,
+        )
+        == 3
+    )
+    assert (
+        SpeculativeAlgorithm.DFLASH.proposed_draft_tokens_per_verify(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=8,
+        )
+        == 7
+    )
+
+
 def test_draft_decode_context_is_noop_for_regular_eagle():
     runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.EAGLE)
     with draft_decode_performance_context(runner) as ctx:

@@ -564,6 +564,10 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        proposed_per_verify = batch.spec_algorithm.proposed_draft_tokens_per_verify(
+            speculative_num_steps=self.server_args.speculative_num_steps,
+            speculative_num_draft_tokens=stride,
+        )
 
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(
@@ -581,11 +585,13 @@ class SchedulerBatchResultProcessor:
 
             # -1 because prepare_for_decode pre-claimed the bonus slot.
             req.kv_committed_len += accept_lens[i] - 1
-            req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-            req.spec_num_correct_drafts += num_correct_drafts
-            req.update_spec_correct_drafts_histogram(num_correct_drafts)
+            num_proposed_drafts = req.useful_spec_proposed_drafts(proposed_per_verify)
+            req.record_spec_verify_metrics(
+                num_correct_drafts=min(num_correct_drafts, num_proposed_drafts),
+                num_proposed_drafts=num_proposed_drafts,
+            )
 
         return predict_tokens
 

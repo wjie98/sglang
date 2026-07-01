@@ -246,6 +246,37 @@ class SpecAlgorithmPolicy:
             return bool(method()) if method is not None else False
         return self.is_dvr_self_draft()
 
+    def proposed_draft_tokens_per_verify(
+        self,
+        *,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+    ) -> int:
+        """Return strict proposed-draft count per verify step.
+
+        ``accept_rate`` should exclude the target bonus token.  Chain-style
+        verifiers propose ``speculative_num_steps`` drafts per verify even when
+        their internal tree/window tensor has ``speculative_num_draft_tokens``
+        rows.  Keep this in the algorithm policy so tokenizer-side metrics do
+        not need to understand each spec worker's layout.
+        """
+
+        if not _is_builtin_algorithm(self.algorithm):
+            method = getattr(
+                self.algorithm, "proposed_draft_tokens_per_verify", None
+            )
+            if method is not None:
+                return int(
+                    method(
+                        speculative_num_steps=speculative_num_steps,
+                        speculative_num_draft_tokens=speculative_num_draft_tokens,
+                    )
+                )
+
+        if self.is_eagle() or self.is_dvr() or self.is_standalone():
+            return max(0, int(speculative_num_steps))
+        return max(0, int(speculative_num_draft_tokens) - 1)
+
 
 def get_spec_algorithm_policy(algorithm: Any) -> SpecAlgorithmPolicy:
     return SpecAlgorithmPolicy(algorithm)

@@ -125,6 +125,14 @@ class CustomSpecAlgo:
     def uses_target_kv_pool_for_draft(self) -> bool:
         return False
 
+    def proposed_draft_tokens_per_verify(
+        self,
+        *,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+    ) -> int:
+        return max(0, int(speculative_num_draft_tokens) - 1)
+
     def create_worker(self, server_args: "ServerArgs") -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(

@@ -165,6 +165,9 @@ class NgramVerifyInput(SpecInput):
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            num_proposed_drafts = req.useful_spec_proposed_drafts(
+                max(0, self.draft_token_num - 1)
+            )
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
@@ -189,12 +192,15 @@ class NgramVerifyInput(SpecInput):
                                 f"{self.predict=}\n"
                             )
                             raise e
-            req.spec_verify_ct += 1
             num_correct_drafts_this_req = (
                 sum(1 for idx in accept_index_row if idx != -1) - 1
             )
-            req.spec_num_correct_drafts += num_correct_drafts_this_req
-            req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
+            req.record_spec_verify_metrics(
+                num_correct_drafts=min(
+                    num_correct_drafts_this_req, num_proposed_drafts
+                ),
+                num_proposed_drafts=num_proposed_drafts,
+            )
 
         if has_finished:
             self.num_correct_drafts = (self.accept_indices != -1).sum(dim=1) - 1

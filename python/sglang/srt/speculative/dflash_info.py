@@ -393,6 +393,7 @@ class DFlashVerifyInput(SpecInput):
         new_bonus_tokens_list: List[int] = []
 
         for i, req in enumerate(batch.reqs):
+            num_proposed_drafts = req.useful_spec_proposed_drafts(max_acc)
             acc_len = int(packed[i, max_acc].item())
             proposed = packed[i, :acc_len].tolist() + [
                 int(packed[i, max_acc + 1].item())
@@ -422,8 +423,12 @@ class DFlashVerifyInput(SpecInput):
             commit_lens_cpu.append(appended)
             new_bonus_tokens_list.append(new_bonus_token)
             num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
-            req.spec_verify_ct += 1
-            req.spec_num_correct_drafts += num_correct_drafts_per_req_cpu[-1]
+            req.record_spec_verify_metrics(
+                num_correct_drafts=min(
+                    num_correct_drafts_per_req_cpu[-1], num_proposed_drafts
+                ),
+                num_proposed_drafts=num_proposed_drafts,
+            )
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_bonus_tokens = torch.tensor(

@@ -241,6 +241,19 @@ class SpeculativeAlgorithm(Enum):
 
         return get_spec_algorithm_policy(self).uses_target_kv_pool_for_draft()
 
+    def proposed_draft_tokens_per_verify(
+        self,
+        *,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+    ) -> int:
+        """Strict proposed draft-token count for acceptance-rate metrics."""
+
+        return get_spec_algorithm_policy(self).proposed_draft_tokens_per_verify(
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:
