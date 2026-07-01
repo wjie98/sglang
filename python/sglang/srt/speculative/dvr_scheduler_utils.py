@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.mamba_radix_cache_policy import (
 from sglang.srt.speculative.output_policy import (
     allow_req_non_streaming_logprob_output,
 )
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 
 
 @dataclass
@@ -193,6 +194,42 @@ class DVRReplayPrefixTracker:
         include_full_untruncated_fill_ids: bool = False,
         error_prefix: str,
     ) -> list[int]:
+        token_ids = self.try_request_token_ids(
+            req,
+            seq_len,
+            initialize_from_req_output=initialize_from_req_output,
+            include_full_untruncated_fill_ids=include_full_untruncated_fill_ids,
+        )
+        if token_ids is not None:
+            return token_ids
+
+        stream = self.stream_for_req(
+            req, initialize_from_req_output=initialize_from_req_output
+        )
+        raise RuntimeError(
+            f"{error_prefix} replay cannot reconstruct the verified prefix: "
+            f"rid={req.rid}, origin_tokens={len(req.origin_input_ids)}, "
+            f"req_output_tokens={len(req.output_ids)}, "
+            f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
+        )
+
+    def try_request_token_ids(
+        self,
+        req: Any,
+        seq_len: int,
+        *,
+        initialize_from_req_output: bool,
+        include_full_untruncated_fill_ids: bool = False,
+    ) -> Optional[list[int]]:
+        """Best-effort prefix reconstruction without raising.
+
+        Strict replay call sites should use ``request_token_ids`` so failures
+        include enough request state for debugging.  Optional fast paths, such
+        as final logprob repair, use this helper to test whether a tracked
+        overlap prefix is already complete before falling back to current-step
+        accepted tokens.
+        """
+
         origin_input_ids = list(req.origin_input_ids)
         output_len = seq_len - len(origin_input_ids)
         if output_len <= 0:
@@ -220,11 +257,87 @@ class DVRReplayPrefixTracker:
                 if len(fill_ids) >= seq_len:
                     return fill_ids
 
-        raise RuntimeError(
-            f"{error_prefix} replay cannot reconstruct the verified prefix: "
-            f"rid={req.rid}, origin_tokens={len(origin_input_ids)}, "
-            f"req_output_tokens={len(req.output_ids)}, "
-            f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
+        return None
+
+    def request_verifier_prefix_token_ids(
+        self,
+        req: Any,
+        seq_len: int,
+        *,
+        error_prefix: str,
+    ) -> list[int]:
+        """Reconstruct the verifier-side token prefix.
+
+        Self-DVR and DVR-EAGLE verifier replay can run before accepted tokens
+        are materialized in ``Req.output_ids``.  This stream is therefore owned
+        by the DVR worker and only falls back to scheduler fields when it has
+        not yet observed a token.
+        """
+
+        return self.request_token_ids(
+            req,
+            seq_len,
+            initialize_from_req_output=False,
+            include_full_untruncated_fill_ids=True,
+            error_prefix=error_prefix,
+        )
+
+    def request_output_prefix_token_ids(
+        self,
+        req: Any,
+        seq_len: int,
+        *,
+        error_prefix: str,
+    ) -> list[int]:
+        """Reconstruct the client-visible output prefix.
+
+        EAGLE verification has a verifier prefix and a client output stream
+        with different token semantics.  Final logprob repair must score the
+        latter, so this helper intentionally seeds from ``Req.output_ids`` when
+        the scheduler has already materialized those tokens.
+        """
+
+        return self.request_token_ids(
+            req,
+            seq_len,
+            initialize_from_req_output=True,
+            include_full_untruncated_fill_ids=True,
+            error_prefix=error_prefix,
+        )
+
+    def request_self_draft_prefix_token_ids(
+        self,
+        req: Any,
+        seq_len: int,
+        *,
+        error_prefix: str,
+    ) -> list[int]:
+        """Reconstruct the self-DVR spec-v2 replay prefix.
+
+        Self-DVR uses the target model as its draft path, so its overlap replay
+        stream follows the same client-visible tokens that the scheduler will
+        eventually materialize into ``Req.output_ids``.  Seed from Req output to
+        bridge the window where overlap has already published the previous step.
+        """
+
+        return self.request_output_prefix_token_ids(
+            req,
+            seq_len,
+            error_prefix=error_prefix,
+        )
+
+    def try_request_output_prefix_token_ids(
+        self,
+        req: Any,
+        seq_len: int,
+    ) -> Optional[list[int]]:
+        """Best-effort client-visible output prefix reconstruction."""
+
+        return self.try_request_token_ids(
+            req,
+            seq_len,
+            initialize_from_req_output=True,
+            include_full_untruncated_fill_ids=True,
         )
 
     def append_output_tokens(
@@ -255,6 +368,15 @@ class DVRReplayPrefixTracker:
                 token_ids,
                 initialize_from_req_output=initialize_from_req_output,
             )
+
+    def append_self_draft_output_tokens(self, batch: Any, tokens_per_req) -> None:
+        """Advance the self-DVR spec-v2 client-visible replay stream."""
+
+        self.append_batch_output_tokens(
+            batch,
+            tokens_per_req,
+            initialize_from_req_output=True,
+        )
 
     def align_req_to_output_len(
         self,
@@ -373,7 +495,9 @@ def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
     should_cache_unfinished = not batch.decoding_reqs or req not in batch.decoding_reqs
     is_dvr_spec_v2 = (
         batch.is_spec_v2
-        and batch.spec_algorithm.needs_mamba_radix_snapshot_for_spec_v2()
+        and get_spec_algorithm_policy(
+            batch.spec_algorithm
+        ).needs_mamba_radix_snapshot_for_spec_v2()
     )
     if is_dvr_spec_v2 and not should_cache_unfinished:
         scheduled_extend_len = (

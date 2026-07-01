@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -43,7 +44,12 @@ def defer_dvr_non_streaming_logprob_output_until_finish(
     *,
     base_seq_lens_cpu: Optional[list[int]] = None,
 ) -> None:
-    """Hold non-streaming DVR logprob chunks until final repair can overwrite them."""
+    """Hold non-streaming DVR logprob chunks until final repair can overwrite them.
+
+    Streaming logprob chunks are intentionally excluded: once emitted, they
+    cannot be repaired at the final response, so workers must use their per-step
+    oracle path for streaming exact logprobs.
+    """
 
     for req_i, req in enumerate(batch.reqs):
         if req.return_logprob and not req.stream:
@@ -68,7 +74,7 @@ def score_dvr_final_logprob_repairs(
     linear_state_ctx: Any,
     base_seq_lens_cpu: list[int],
     accept_lens_cpu: list[int],
-    accepted_token_ids_per_req: Optional[list[list[int]]] = None,
+    compact_output_token_ids_per_req: Optional[list[list[int]]] = None,
     error_prefix: str,
 ) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
     """Score final non-streaming DVR output logprobs with one full-prefill replay.
@@ -89,7 +95,7 @@ def score_dvr_final_logprob_repairs(
         replay_prefix=replay_prefix,
         base_seq_lens_cpu=base_seq_lens_cpu,
         accept_lens_cpu=accept_lens_cpu,
-        accepted_token_ids_per_req=accepted_token_ids_per_req,
+        compact_output_token_ids_per_req=compact_output_token_ids_per_req,
         error_prefix=error_prefix,
     )
     if replay_plan is None:
@@ -108,13 +114,42 @@ def score_dvr_final_logprob_repairs(
     )
 
 
+def defer_and_score_dvr_final_logprob_repairs(
+    *,
+    batch: ScheduleBatch,
+    target_worker: Any,
+    replay_prefix: DVRReplayPrefixTracker,
+    linear_state_ctx: Any,
+    base_seq_lens_cpu: list[int],
+    accept_lens_cpu: list[int],
+    compact_output_token_ids_per_req: Optional[list[list[int]]] = None,
+    error_prefix: str,
+) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
+    """Defer non-streaming chunks and score exact final DVR output logprobs."""
+
+    defer_dvr_non_streaming_logprob_output_until_finish(
+        batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+    )
+    return score_dvr_final_logprob_repairs(
+        batch=batch,
+        target_worker=target_worker,
+        replay_prefix=replay_prefix,
+        linear_state_ctx=linear_state_ctx,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        accept_lens_cpu=accept_lens_cpu,
+        compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+        error_prefix=error_prefix,
+    )
+
+
 def _build_final_logprob_replay_plan(
     *,
     batch: ScheduleBatch,
     replay_prefix: DVRReplayPrefixTracker,
     base_seq_lens_cpu: list[int],
     accept_lens_cpu: list[int],
-    accepted_token_ids_per_req: Optional[list[list[int]]],
+    compact_output_token_ids_per_req: Optional[list[list[int]]],
     error_prefix: str,
 ) -> Optional[_DVRFinalLogprobReplayPlan]:
     input_ids: list[int] = []
@@ -127,51 +162,15 @@ def _build_final_logprob_replay_plan(
     for req_i, (req, seq_len, accept_len) in enumerate(
         zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
     ):
-        if not req.return_logprob or req.stream:
-            continue
-
-        max_new_tokens = req.sampling_params.max_new_tokens
-        if max_new_tokens is None:
-            continue
-
-        prompt_len = len(req.origin_input_ids)
-        prefix_output_len = max(0, int(seq_len) - prompt_len)
-        accept_len = int(accept_len)
-        if prefix_output_len >= max_new_tokens:
-            continue
-
-        final_output_len: Optional[int] = None
-        accepted_in_final_step: Optional[int] = None
-        length_remaining = int(max_new_tokens) - prefix_output_len
-        if length_remaining <= accept_len:
-            # Req.update_finish_state checks the length cap before token-based
-            # EOS/stop handling, so mirror that priority here.
-            final_output_len = int(max_new_tokens)
-            accepted_in_final_step = length_remaining
-        elif length_remaining == accept_len + 1:
-            # Spec-v2 overlap preclaims one bonus slot.  At the final step the
-            # model-side seq_len can be one token behind the scheduler-visible
-            # output, while the replay prefix already has the full token stream.
-            final_output_len = int(max_new_tokens)
-            accepted_in_final_step = accept_len
-        elif accepted_token_ids_per_req is not None:
-            stop_pos = _first_token_finish_pos(
-                req,
-                accepted_token_ids_per_req[req_i],
-            )
-            if stop_pos is not None and stop_pos < accept_len:
-                final_output_len = prefix_output_len + stop_pos + 1
-                accepted_in_final_step = stop_pos + 1
-
-        if final_output_len is None or accepted_in_final_step is None:
-            continue
-
-        if accepted_in_final_step <= 0:
-            continue
-        if not try_expect_req_final_logprob_repair(req):
-            continue
-
-        final_replay_specs[req_i] = final_output_len
+        final_output_len = _final_output_len_if_repair_needed(
+            req=req,
+            req_i=req_i,
+            seq_len=int(seq_len),
+            accept_len=int(accept_len),
+            compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+        )
+        if final_output_len is not None:
+            final_replay_specs[req_i] = final_output_len
 
     if not final_replay_specs:
         return None
@@ -193,14 +192,15 @@ def _build_final_logprob_replay_plan(
         else:
             replay_seq_len = prompt_len + final_spec
 
-        token_ids = replay_prefix.request_token_ids(
-            req,
-            replay_seq_len,
-            initialize_from_req_output=False,
-            include_full_untruncated_fill_ids=True,
+        replay_ids = _final_replay_ids_for_req(
+            req=req,
+            req_i=req_i,
+            replay_prefix=replay_prefix,
+            base_seq_len=int(seq_len),
+            replay_seq_len=replay_seq_len,
+            compact_output_token_ids_per_req=compact_output_token_ids_per_req,
             error_prefix=error_prefix,
         )
-        replay_ids = token_ids[:replay_seq_len]
         replay_offset = len(input_ids)
 
         input_ids.extend(replay_ids)
@@ -210,9 +210,12 @@ def _build_final_logprob_replay_plan(
         extend_len = len(replay_ids)
         extend_lens_cpu.append(extend_len)
         final_seq_lens_cpu.append(extend_len)
-        if final_spec is not None:
+        if final_spec is not None and try_expect_req_final_logprob_repair(req):
             final_output_ids = replay_ids[prompt_len : prompt_len + final_spec]
             final_score_specs.append((req_i, req, replay_offset, final_output_ids))
+
+    if not final_score_specs:
+        return None
 
     return _DVRFinalLogprobReplayPlan(
         input_ids=input_ids,
@@ -221,6 +224,152 @@ def _build_final_logprob_replay_plan(
         final_seq_lens_cpu=final_seq_lens_cpu,
         final_score_specs=final_score_specs,
     )
+
+
+def _final_output_len_if_repair_needed(
+    *,
+    req: Any,
+    req_i: int,
+    seq_len: int,
+    accept_len: int,
+    compact_output_token_ids_per_req: Optional[list[list[int]]],
+) -> Optional[int]:
+    """Return the final output length if this verify step finishes the request."""
+
+    if not req.return_logprob or req.stream:
+        return None
+
+    max_new_tokens = req.sampling_params.max_new_tokens
+    if max_new_tokens is None:
+        return None
+
+    prompt_len = len(req.origin_input_ids)
+    prefix_output_len = max(0, seq_len - prompt_len)
+    max_new_tokens = int(max_new_tokens)
+    if prefix_output_len >= max_new_tokens:
+        return None
+
+    length_remaining = max_new_tokens - prefix_output_len
+    if length_remaining <= accept_len:
+        # Req.update_finish_state checks the length cap before token-based
+        # EOS/stop handling, so mirror that priority here.
+        return max_new_tokens if length_remaining > 0 else None
+
+    if length_remaining == accept_len + 1:
+        # Spec-v2 overlap preclaims one bonus slot. At the final step the
+        # model-side seq_len can be one token behind the scheduler-visible
+        # output, while the replay prefix already has the full token stream.
+        return max_new_tokens if accept_len > 0 else None
+
+    if compact_output_token_ids_per_req is None:
+        return None
+
+    stop_pos = _first_token_finish_pos(
+        req,
+        compact_output_token_ids_per_req[req_i],
+    )
+    if stop_pos is not None and stop_pos < accept_len:
+        return prefix_output_len + stop_pos + 1
+    return None
+
+
+def _final_replay_ids_for_req(
+    *,
+    req: Any,
+    req_i: int,
+    replay_prefix: DVRReplayPrefixTracker,
+    base_seq_len: int,
+    replay_seq_len: int,
+    compact_output_token_ids_per_req: Optional[list[list[int]]],
+    error_prefix: str,
+) -> list[int]:
+    """Build a final replay row from the stable prefix plus current emissions.
+
+    In overlap and DVR-EAGLE, Req.output_ids may still lag while final exact
+    logprobs are scored.  The replay prefix can reconstruct the pre-verify
+    prefix; the worker-provided accepted-token rows are the authoritative tokens
+    emitted by this verify step.  These rows must already be compact: no padded
+    verify tail tokens should be present.
+    """
+
+    if replay_seq_len <= base_seq_len:
+        token_ids = replay_prefix.request_output_prefix_token_ids(
+            req,
+            replay_seq_len,
+            error_prefix=error_prefix,
+        )
+        return token_ids[:replay_seq_len]
+
+    token_ids = replay_prefix.try_request_output_prefix_token_ids(
+        req,
+        replay_seq_len,
+    )
+    if token_ids is not None and len(token_ids) >= replay_seq_len:
+        return token_ids[:replay_seq_len]
+
+    stable_seq_len = _stable_materialized_replay_seq_len(
+        req,
+        base_seq_len=base_seq_len,
+        replay_seq_len=replay_seq_len,
+    )
+    base_ids = _materialized_or_replay_prefix_ids(
+        req=req,
+        replay_prefix=replay_prefix,
+        seq_len=stable_seq_len,
+        error_prefix=error_prefix,
+    )
+
+    current_needed = replay_seq_len - stable_seq_len
+    if current_needed == 0:
+        return base_ids
+    if compact_output_token_ids_per_req is not None and req_i < len(
+        compact_output_token_ids_per_req
+    ):
+        current_tokens = compact_output_token_ids_per_req[req_i]
+        if len(current_tokens) >= current_needed:
+            return base_ids + [int(x) for x in current_tokens[:current_needed]]
+
+    token_ids = replay_prefix.request_output_prefix_token_ids(
+        req,
+        replay_seq_len,
+        error_prefix=error_prefix,
+    )
+    return token_ids[:replay_seq_len]
+
+
+def _stable_materialized_replay_seq_len(
+    req: Any,
+    *,
+    base_seq_len: int,
+    replay_seq_len: int,
+) -> int:
+    prompt_len = len(req.origin_input_ids)
+    materialized_seq_len = prompt_len + len(req.output_ids)
+    return min(replay_seq_len, max(base_seq_len, materialized_seq_len))
+
+
+def _materialized_or_replay_prefix_ids(
+    *,
+    req: Any,
+    replay_prefix: DVRReplayPrefixTracker,
+    seq_len: int,
+    error_prefix: str,
+) -> list[int]:
+    prompt_len = len(req.origin_input_ids)
+    output_len = seq_len - prompt_len
+    # DVR-EAGLE's replay tracker stores the verifier prefix, which can differ
+    # from already-materialized client output by one bonus token.  The final
+    # response repair must match Req.output_ids exactly, so prefer that stable
+    # materialized prefix when it covers the requested length.
+    if output_len > 0 and len(req.output_ids) >= output_len:
+        return list(req.origin_input_ids) + list(req.output_ids[:output_len])
+
+    token_ids = replay_prefix.request_output_prefix_token_ids(
+        req,
+        seq_len,
+        error_prefix=error_prefix,
+    )
+    return token_ids[:seq_len]
 
 
 def _first_token_finish_pos(req: Any, token_ids: list[int]) -> Optional[int]:
@@ -258,54 +407,66 @@ def _run_final_logprob_replay(
     linear_state_ctx: Any,
     replay_plan: _DVRFinalLogprobReplayPlan,
 ) -> torch.Tensor:
-    temp_cache_locs = _alloc_final_replay_cache_locs(batch, replay_plan)
-    replay_spec = DVRTargetReplaySpec(
-        input_ids=replay_plan.input_ids,
-        out_cache_locs=[temp_cache_locs.to(torch.long)],
-        prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
-        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-        final_seq_lens=replay_plan.final_seq_lens_cpu,
-        extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
-        extend_input_logprob_token_ids=replay_plan.logprob_token_ids,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-        return_logprob=True,
-        mamba_clear_indices=linear_state_ctx.live_indices,
-        multimodal_inputs=[None for _ in replay_plan.extend_lens_cpu],
-    )
-
-    with (
-        envs.SGLANG_EAGER_INPUT_NO_COPY.override(True),
-        linear_state_replay_context(
-            linear_state_ctx,
-            clear_state_input_window=True,
-            restore_live_state=True,
-        ),
-        target_extend_replay_batch(batch, replay_spec),
-    ):
-        write_rows, write_offsets = _final_replay_req_to_token_indices(
-            batch, replay_plan
+    with _temporary_final_replay_cache_mapping(
+        batch,
+        replay_plan,
+    ) as temp_cache_locs:
+        replay_spec = DVRTargetReplaySpec(
+            input_ids=replay_plan.input_ids,
+            out_cache_locs=[temp_cache_locs.to(torch.long)],
+            prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
+            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+            final_seq_lens=replay_plan.final_seq_lens_cpu,
+            extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
+            extend_input_logprob_token_ids=replay_plan.logprob_token_ids,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_logprob=True,
+            mamba_clear_indices=linear_state_ctx.live_indices,
+            multimodal_inputs=[None for _ in replay_plan.extend_lens_cpu],
         )
-        saved_locs = batch.req_to_token_pool.req_to_token[
-            write_rows, write_offsets
-        ].clone()
-        try:
-            # The final replay is a scoring oracle.  It temporarily maps the
-            # full replay rows so logprob metadata is valid, then restores the
-            # scheduler-owned mapping before result processing releases slots.
-            batch.req_to_token_pool.write(
-                (write_rows, write_offsets), temp_cache_locs.to(torch.int32)
-            )
+
+        with (
+            envs.SGLANG_EAGER_INPUT_NO_COPY.override(True),
+            linear_state_replay_context(
+                linear_state_ctx,
+                clear_state_input_window=True,
+                restore_live_state=True,
+            ),
+            target_extend_replay_batch(batch, replay_spec),
+        ):
             score_output = target_worker.forward_batch_generation(
                 batch=batch,
                 is_verify=True,
             )
             input_token_logprobs = score_output.logits_output.input_token_logprobs
-            if input_token_logprobs is None:
-                raise RuntimeError("DVR final logprob replay did not return logprobs.")
-            return input_token_logprobs
-        finally:
-            batch.req_to_token_pool.write((write_rows, write_offsets), saved_locs)
-            batch.token_to_kv_pool_allocator.free(temp_cache_locs)
+        if input_token_logprobs is None:
+            raise RuntimeError("DVR final logprob replay did not return logprobs.")
+        return input_token_logprobs
+
+
+@contextmanager
+def _temporary_final_replay_cache_mapping(
+    batch: ScheduleBatch,
+    replay_plan: _DVRFinalLogprobReplayPlan,
+):
+    temp_cache_locs = _alloc_final_replay_cache_locs(batch, replay_plan)
+    write_rows, write_offsets = _final_replay_req_to_token_indices(
+        batch, replay_plan
+    )
+    saved_locs = batch.req_to_token_pool.req_to_token[
+        write_rows, write_offsets
+    ].clone()
+    try:
+        # The final replay is a scoring oracle. It temporarily maps full replay
+        # rows so logprob metadata is valid, then restores scheduler ownership
+        # before result processing releases the live request slots.
+        batch.req_to_token_pool.write(
+            (write_rows, write_offsets), temp_cache_locs.to(torch.int32)
+        )
+        yield temp_cache_locs
+    finally:
+        batch.req_to_token_pool.write((write_rows, write_offsets), saved_locs)
+        batch.token_to_kv_pool_allocator.free(temp_cache_locs)
 
 
 def _alloc_final_replay_cache_locs(

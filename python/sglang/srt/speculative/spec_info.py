@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
@@ -16,6 +15,7 @@ from sglang.srt.speculative.spec_registry import get_spec as _get_registered_spe
 from sglang.srt.speculative.spec_registry import (
     register_algorithm as _register_algorithm,
 )
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -162,33 +162,19 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def supports_spec_v2(self) -> bool:
-        return (
-            (self.is_eagle() and not self.is_frozen_kv_mtp())
-            or self.is_standalone()
-            or self.is_decode_verify_rollback()
-        )
+        return get_spec_algorithm_policy(self).supports_spec_v2()
 
     def uses_spec_v2(self, enable_overlap: bool) -> bool:
         """Return whether the scheduler should use the v2 worker/schema."""
 
-        if self.is_decode_verify_rollback_eagle():
-            return True
-        if self.is_decode_verify_rollback_self_draft():
-            return enable_overlap
-        return self.supports_spec_v2()
+        return get_spec_algorithm_policy(self).uses_spec_v2(enable_overlap)
 
     def prepare_cuda_graph_verify_input(self, verify_input: SpecInput) -> SpecInput:
         """Let algorithms specialize the generic EAGLE verify graph input."""
 
-        if self.is_decode_verify_rollback_eagle():
-            from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
-
-            return DVREagleVerifyInput.from_eagle_verify_input(verify_input)
-        if self.is_decode_verify_rollback_self_draft():
-            from sglang.srt.speculative.dvr_worker import DVRSelfDraftVerifyInput
-
-            return DVRSelfDraftVerifyInput.from_eagle_verify_input(verify_input)
-        return verify_input
+        return get_spec_algorithm_policy(self).prepare_cuda_graph_verify_input(
+            verify_input
+        )
 
     def target_verify_capture_hidden_mode(
         self,
@@ -203,28 +189,16 @@ class SpeculativeAlgorithm(Enum):
         capture can use a cheaper NULL mode in the cuda graph runner path.
         """
 
-        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
-        if self.is_decode_verify_rollback_self_draft():
-            return CaptureHiddenMode.NULL
-        if null_for_standalone and self.is_standalone():
-            return CaptureHiddenMode.NULL
-        return default_mode
+        return get_spec_algorithm_policy(self).target_verify_capture_hidden_mode(
+            default_mode,
+            null_for_standalone=null_for_standalone,
+        )
 
     def uses_eagle_style_target_verify_input(self) -> bool:
-        return (
-            self.is_eagle()
-            or self.is_standalone()
-            or self.is_decode_verify_rollback()
-        )
+        return get_spec_algorithm_policy(self).uses_eagle_style_target_verify_input()
 
     def target_verify_graph_bs_uses_token_count(self) -> bool:
-        return (
-            self.is_eagle()
-            or self.is_standalone()
-            or self.is_dflash()
-            or self.is_decode_verify_rollback()
-        )
+        return get_spec_algorithm_policy(self).target_verify_graph_bs_uses_token_count()
 
     def create_target_verify_cuda_graph_input(
         self,
@@ -238,57 +212,34 @@ class SpeculativeAlgorithm(Enum):
     ) -> Optional[SpecInput]:
         """Build verify graph metadata for algorithms sharing EAGLE layout."""
 
-        if not self.uses_eagle_style_target_verify_input():
-            return None
-
-        from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
-        spec_info = EagleVerifyInput(
-            draft_token=None,
+        return get_spec_algorithm_policy(self).create_target_verify_cuda_graph_input(
             custom_mask=custom_mask,
-            positions=None,
-            retrieve_index=None,
-            retrieve_next_token=None,
-            retrieve_next_sibling=None,
-            retrieve_cum_len=None,
             spec_steps=spec_steps,
             topk=topk,
             draft_token_num=draft_token_num,
-            capture_hidden_mode=self.target_verify_capture_hidden_mode(
-                default_capture_hidden_mode,
-                null_for_standalone=null_for_standalone,
-            ),
-            seq_lens_sum=None,
-            seq_lens_cpu=None,
+            default_capture_hidden_mode=default_capture_hidden_mode,
+            null_for_standalone=null_for_standalone,
         )
-        return self.prepare_cuda_graph_verify_input(spec_info)
 
     def uses_draft_decode_custom_all_reduce(self) -> bool:
-        return self.is_decode_verify_rollback()
+        return get_spec_algorithm_policy(self).uses_draft_decode_custom_all_reduce()
 
     def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
         """Whether spec-v2 scheduling must preserve mamba radix checkpoints."""
 
-        return self.is_decode_verify_rollback()
+        return get_spec_algorithm_policy(self).needs_mamba_radix_snapshot_for_spec_v2()
 
     def linear_speculative_state_extension_factory(self, model_runner):
         """Return an optional linear-state cache extension factory."""
 
-        if not self.is_decode_verify_rollback():
-            return None
-        if model_runner.hybrid_gdn_config is None:
-            return None
-
-        from sglang.srt.layers.attention.linear.dvr_gdn_state import (
-            create_dvr_gdn_speculative_state_extension,
-        )
-
-        return create_dvr_gdn_speculative_state_extension
+        return get_spec_algorithm_policy(
+            self
+        ).linear_speculative_state_extension_factory(model_runner)
 
     def uses_target_kv_pool_for_draft(self) -> bool:
         """Whether the draft path reuses the target KV pool."""
 
-        return self.is_decode_verify_rollback_self_draft()
+        return get_spec_algorithm_policy(self).uses_target_kv_pool_for_draft()
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -449,5 +400,7 @@ class SpecInput(ABC):
         fallback_custom_mask=None,
     ):
         """Scoped metadata patching for algorithms with graph-only invariants."""
+
+        from contextlib import nullcontext
 
         return nullcontext()

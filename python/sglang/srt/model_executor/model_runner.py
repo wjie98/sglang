@@ -199,6 +199,9 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_policy import (
+    create_target_verify_cuda_graph_input_for_runner,
+)
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.state_capturer.indexer_topk import (
     create_indexer_capturer,
@@ -2787,11 +2790,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             global_num_tokens_cpu = None
 
         def get_spec_info():
-            spec_info = self.spec_algorithm.create_target_verify_cuda_graph_input(
+            spec_info = create_target_verify_cuda_graph_input_for_runner(
+                self,
                 custom_mask=buffers.custom_mask,
-                spec_steps=self.server_args.speculative_num_steps,
-                topk=self.server_args.speculative_eagle_topk,
-                draft_token_num=self.server_args.speculative_num_draft_tokens,
                 default_capture_hidden_mode=CaptureHiddenMode.FULL,
             )
             if spec_info is not None:

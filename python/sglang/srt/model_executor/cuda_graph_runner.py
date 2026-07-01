@@ -70,6 +70,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import share_input_buffers_in
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.speculative.spec_policy import (
+    create_target_verify_cuda_graph_input_for_runner,
+)
 from sglang.srt.true_on_policy import (
     patch_prefill_only_deterministic_inference_for_cuda_graph,
 )
@@ -648,10 +651,7 @@ class CudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if (
-                    self.model_runner.spec_algorithm
-                    .target_verify_graph_bs_uses_token_count()
-                )
+                if self.model_runner.spec_algorithm.target_verify_graph_bs_uses_token_count()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1126,10 +1126,7 @@ class CudaGraphRunner:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
-                if (
-                    self.model_runner.spec_algorithm
-                    .target_verify_graph_bs_uses_token_count()
-                )
+                if self.model_runner.spec_algorithm.target_verify_graph_bs_uses_token_count()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1275,15 +1272,13 @@ class CudaGraphRunner:
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
-        spec_info = (
-            self.model_runner.spec_algorithm.create_target_verify_cuda_graph_input(
-                custom_mask=self.buffers.custom_mask,
-                spec_steps=self.speculative_num_steps,
-                topk=self.model_runner.server_args.speculative_eagle_topk,
-                draft_token_num=self.speculative_num_draft_tokens,
-                default_capture_hidden_mode=CaptureHiddenMode.FULL,
-                null_for_standalone=True,
-            )
+        spec_info = create_target_verify_cuda_graph_input_for_runner(
+            self.model_runner,
+            custom_mask=self.buffers.custom_mask,
+            spec_steps=self.speculative_num_steps,
+            draft_token_num=self.speculative_num_draft_tokens,
+            default_capture_hidden_mode=CaptureHiddenMode.FULL,
+            null_for_standalone=True,
         )
         if spec_info is not None:
             if self.model_runner.is_draft_worker:

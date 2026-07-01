@@ -21,8 +21,7 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     dvr_spec_aux_from_pending_mamba_checkpoints,
 )
 from sglang.srt.speculative.dvr_logprob_repair import (
-    defer_dvr_non_streaming_logprob_output_until_finish,
-    score_dvr_final_logprob_repairs,
+    defer_and_score_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_linear_state_worker import DVRSpecV2LinearStateMixin
 from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
@@ -118,10 +117,9 @@ class DecodeVerifyRollbackWorkerV2(
         )
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
-        return self.dvr_replay_prefix.request_token_ids(
+        return self.dvr_replay_prefix.request_self_draft_prefix_token_ids(
             req,
             boundary_seqlen,
-            initialize_from_req_output=True,
             error_prefix="DVR spec-v2",
         )
 
@@ -129,10 +127,9 @@ class DecodeVerifyRollbackWorkerV2(
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
-        self.dvr_replay_prefix.append_batch_output_tokens(
+        self.dvr_replay_prefix.append_self_draft_output_tokens(
             batch,
             tokens_per_req,
-            initialize_from_req_output=True,
         )
 
     def forward_batch_generation(
@@ -307,7 +304,8 @@ class DecodeVerifyRollbackWorkerV2(
         )
         if batch.return_logprob and streaming_return_logprob:
             # Streaming logprob chunks cannot be repaired after the final response
-            # is materialized, so keep the conservative oracle only for that case.
+            # is materialized. Non-streaming requests use final-response repair
+            # below; streaming keeps the conservative per-step oracle.
             oracle_logits = self._target_suffix_extend_verify_logits(
                 batch=batch,
                 spec_info=spec_info,
@@ -326,14 +324,9 @@ class DecodeVerifyRollbackWorkerV2(
 
         if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
             base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
-            if batch.return_logprob:
-                defer_dvr_non_streaming_logprob_output_until_finish(
-                    batch,
-                    base_seq_lens_cpu=base_seq_lens_cpu,
-                )
             predict_cpu = predict.detach().cpu().tolist()
             accept_lens_cpu = accept_lens.detach().cpu().tolist()
-            accepted_token_ids_per_req = [
+            compact_output_token_ids_per_req = [
                 predict_cpu[
                     req_i * self.num_draft_tokens : req_i * self.num_draft_tokens
                     + int(accept_len)
@@ -342,17 +335,17 @@ class DecodeVerifyRollbackWorkerV2(
             ]
             self._advance_v2_replay_prefix(
                 batch,
-                accepted_token_ids_per_req,
+                compact_output_token_ids_per_req,
             )
             if batch.return_logprob:
-                final_logprob_repairs = score_dvr_final_logprob_repairs(
+                final_logprob_repairs = defer_and_score_dvr_final_logprob_repairs(
                     batch=batch,
                     target_worker=self.target_worker,
                     replay_prefix=self.dvr_replay_prefix,
                     linear_state_ctx=linear_state_ctx,
                     base_seq_lens_cpu=base_seq_lens_cpu,
                     accept_lens_cpu=accept_lens_cpu,
-                    accepted_token_ids_per_req=accepted_token_ids_per_req,
+                    compact_output_token_ids_per_req=compact_output_token_ids_per_req,
                     error_prefix="DVR spec-v2 final logprob",
                 )
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
 
 import torch
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
@@ -19,13 +18,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
-    DVRFinalLogprobRepair,
     DVRReplayPrefixTracker,
     dvr_spec_aux_from_pending_mamba_checkpoints,
 )
-from sglang.srt.speculative.dvr_logprob_repair import (
-    defer_dvr_non_streaming_logprob_output_until_finish,
-    score_dvr_final_logprob_repairs,
+from sglang.srt.speculative.dvr_output_replay import (
+    DVRClientOutputReplayTracker,
+    compact_output_token_rows,
 )
 from sglang.srt.speculative.dvr_target_replay import (
     DVRTargetReplaySpec,
@@ -43,9 +41,6 @@ from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
-from sglang.srt.speculative.output_policy import (
-    defer_req_non_streaming_logprob_output,
-)
 from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     record_stream_each,
@@ -72,25 +67,6 @@ _ATTN_BACKEND_CHILD_LIST_ATTRS = (
 )
 
 
-@dataclass
-class _DVREagleAcceptedLogprobReplayPlan:
-    """Full-prefix replay plan for exact DVR-EAGLE returned logprobs."""
-
-    bs: int
-    draft_token_num: int
-    base_seq_lens_cpu: list[int]
-    accept_lens_cpu: list[int]
-    input_ids: list[int]
-    logprob_token_ids: list[int]
-    out_cache_locs: list[torch.Tensor]
-    extend_lens_cpu: list[int]
-    final_seq_lens_cpu: list[int]
-    final_score_specs: list[tuple]
-    write_rows: list[torch.Tensor]
-    write_offsets: list[torch.Tensor]
-    write_locs: list[torch.Tensor]
-
-
 class DecodeVerifyRollbackEagleWorkerV2(
     DVRLinearStateReplayMixin, DVRSpecV2LinearStateMixin, EAGLEWorkerV2
 ):
@@ -114,6 +90,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             model_runner=self.model_runner,
         )
         self.dvr_replay_prefix = DVRReplayPrefixTracker()
+        self.dvr_output_replay = DVRClientOutputReplayTracker()
         self.cuda_graph_runner_for_target_verify = None
         if not self.server_args.disable_cuda_graph and (
             self.server_args.model_impl != "mindspore"
@@ -208,11 +185,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
         return DVREagleVerifyInput.from_eagle_verify_input(verify_input)
 
     def _request_token_ids_for_eagle_replay(self, req, seq_len: int):
-        return self.dvr_replay_prefix.request_token_ids(
+        return self.dvr_replay_prefix.request_verifier_prefix_token_ids(
             req,
             seq_len,
-            initialize_from_req_output=False,
-            include_full_untruncated_fill_ids=True,
             error_prefix="DVR EAGLE",
         )
 
@@ -476,324 +451,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 None,
             )
 
-    def _target_full_prefix_score_accepted_logprobs(
-        self,
-        *,
-        batch: ScheduleBatch,
-        verify_input: DVREagleVerifyInput,
-        linear_state_ctx,
-        predict: torch.Tensor,
-        accept_lens: torch.Tensor,
-        draft_token_num: int,
-    ) -> tuple[torch.Tensor | None, list[DVRFinalLogprobRepair | None] | None]:
-        """Score emitted EAGLE tokens with the same full-prefill oracle as KL tests.
-
-        EAGLE's verify matrix mixes accepted draft tokens and a target bonus
-        token.  Their row semantics differ enough that reconstructing returned
-        logprobs from verify rows is fragile.  For strict return_logprob
-        requests, replay the full prefix plus the actually emitted tokens and
-        read SGLang's standard input-logprob slice.  This path is intentionally
-        outside the no-logprob hot path.
-        """
-
-        if batch.forward_mode.is_idle() or linear_state_ctx is None:
-            return None
-
-        replay_plan = self._build_accepted_logprob_replay_plan(
-            batch=batch,
-            verify_input=verify_input,
-            predict=predict,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
-        if replay_plan is None:
-            return None, None
-
-        input_token_logprobs = self._run_accepted_logprob_replay(
-            batch=batch,
-            linear_state_ctx=linear_state_ctx,
-            replay_plan=replay_plan,
-        )
-        return self._accepted_logprob_rows_from_replay(
-            replay_plan=replay_plan,
-            input_token_logprobs=input_token_logprobs,
-        )
-
-    def _build_accepted_logprob_replay_plan(
-        self,
-        *,
-        batch: ScheduleBatch,
-        verify_input: DVREagleVerifyInput,
-        predict: torch.Tensor,
-        accept_lens: torch.Tensor,
-        draft_token_num: int,
-    ) -> _DVREagleAcceptedLogprobReplayPlan | None:
-        bs = len(batch.seq_lens)
-        base_seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if batch.seq_lens_cpu is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
-        accept_lens_cpu = accept_lens.detach().cpu().tolist()
-        predict_cpu = predict.detach().cpu().tolist()
-        draft_tokens_cpu = (
-            verify_input.draft_token.reshape(bs, draft_token_num)
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
-        input_ids = []
-        logprob_token_ids = []
-        out_cache_locs = []
-        extend_lens_cpu = []
-        final_seq_lens_cpu = []
-        final_score_specs = []
-        write_rows = []
-        write_offsets = []
-        write_locs = []
-        flat_cache_locs = batch.out_cache_loc.to(torch.long)
-
-        for req_i, (req, seq_len, accept_len) in enumerate(
-            zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
-        ):
-            accept_len = int(accept_len)
-            compact_start = req_i * draft_token_num
-            token_ids = self._request_token_ids_for_eagle_replay(req, int(seq_len))
-            prompt_len = len(req.origin_input_ids)
-            prefix_output_len = max(0, int(seq_len) - prompt_len)
-            max_new_tokens = req.sampling_params.max_new_tokens
-            final_output_len = None
-            if (
-                not req.stream
-                and req.send_output_token_logprobs_offset == 0
-                and max_new_tokens is not None
-                and prefix_output_len < max_new_tokens
-                and prefix_output_len + accept_len >= max_new_tokens
-            ):
-                final_output_len = int(max_new_tokens)
-
-            if final_output_len is not None:
-                # For GDN models, logprobs inside an unclosed chunk are only
-                # strictly comparable to the final full-prefill oracle once the
-                # whole generated suffix is known.  Non-streaming requests have
-                # not sent output logprobs yet.  Use the DVR replay prefix stream:
-                # in overlap, Req.output_ids can lag behind seq_len, and EAGLE's
-                # emitted stream is not simply the target predict tensor.
-                final_curr_len = max(0, final_output_len - prefix_output_len)
-                final_token_ids = self.dvr_replay_prefix.request_token_ids(
-                    req,
-                    prompt_len + final_output_len,
-                    initialize_from_req_output=False,
-                    include_full_untruncated_fill_ids=True,
-                    error_prefix="DVR EAGLE final logprob",
-                )
-                final_output_ids = final_token_ids[
-                    prompt_len : prompt_len + final_output_len
-                ]
-                replay_ids = final_token_ids[: prompt_len + final_output_len]
-                logprob_token_ids.extend(replay_ids[1:])
-                logprob_token_ids.append(0)
-                final_score_specs.append(
-                    (
-                        req_i,
-                        req,
-                        prefix_output_len,
-                        final_curr_len,
-                        final_output_ids,
-                    )
-                )
-            else:
-                # DVR-EAGLE's recurrent/KV state advances over the accepted
-                # draft prefix, while Spec v2 emits the one-token-shifted
-                # stream.  Replay the accepted draft prefix as context and ask
-                # input-logprob to score the shifted tokens: draft[1:] plus the
-                # target bonus.
-                replay_tokens = [
-                    int(token) for token in draft_tokens_cpu[req_i][:accept_len]
-                ]
-                bonus_token = int(predict_cpu[compact_start + accept_len - 1])
-                replay_ids = token_ids[: int(seq_len)] + replay_tokens
-                logprob_token_ids.extend(replay_ids[1:])
-                logprob_token_ids.append(bonus_token)
-
-            input_ids.extend(replay_ids)
-
-            if int(seq_len) > 0:
-                out_cache_locs.append(
-                    batch.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, : int(seq_len)
-                    ].to(torch.long)
-                )
-            current_write_len = (
-                accept_len if final_output_len is None else final_curr_len
-            )
-            accepted_locs = flat_cache_locs[
-                compact_start : compact_start + current_write_len
-            ]
-            out_cache_locs.append(accepted_locs)
-
-            req_row = torch.full(
-                (current_write_len,),
-                int(req.req_pool_idx),
-                dtype=torch.long,
-                device=batch.seq_lens.device,
-            )
-            req_offsets = torch.arange(
-                int(seq_len),
-                int(seq_len) + current_write_len,
-                dtype=torch.long,
-                device=batch.seq_lens.device,
-            )
-            if current_write_len > 0:
-                write_rows.append(req_row)
-                write_offsets.append(req_offsets)
-                write_locs.append(accepted_locs.to(device=batch.seq_lens.device))
-
-            extend_len = len(replay_ids)
-            extend_lens_cpu.append(extend_len)
-            final_seq_lens_cpu.append(extend_len)
-
-        if not input_ids:
-            return None
-
-        return _DVREagleAcceptedLogprobReplayPlan(
-            bs=bs,
-            draft_token_num=draft_token_num,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            accept_lens_cpu=accept_lens_cpu,
-            input_ids=input_ids,
-            logprob_token_ids=logprob_token_ids,
-            out_cache_locs=out_cache_locs,
-            extend_lens_cpu=extend_lens_cpu,
-            final_seq_lens_cpu=final_seq_lens_cpu,
-            final_score_specs=final_score_specs,
-            write_rows=write_rows,
-            write_offsets=write_offsets,
-            write_locs=write_locs,
-        )
-
-    def _run_accepted_logprob_replay(
-        self,
-        *,
-        batch: ScheduleBatch,
-        linear_state_ctx,
-        replay_plan: _DVREagleAcceptedLogprobReplayPlan,
-    ) -> torch.Tensor:
-        replay_spec = DVRTargetReplaySpec(
-            input_ids=replay_plan.input_ids,
-            out_cache_locs=replay_plan.out_cache_locs,
-            prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
-            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-            final_seq_lens=replay_plan.final_seq_lens_cpu,
-            extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
-            extend_input_logprob_token_ids=replay_plan.logprob_token_ids,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            return_logprob=True,
-            mamba_clear_indices=linear_state_ctx.live_indices,
-            multimodal_inputs=[None for _ in replay_plan.extend_lens_cpu],
-        )
-
-        with (
-            linear_state_replay_context(
-                linear_state_ctx,
-                clear_state_input_window=True,
-                restore_live_state=True,
-            ),
-            target_extend_replay_batch(batch, replay_spec),
-        ):
-            if replay_plan.write_rows:
-                batch.req_to_token_pool.write(
-                    (
-                        torch.cat(replay_plan.write_rows),
-                        torch.cat(replay_plan.write_offsets),
-                    ),
-                    torch.cat(replay_plan.write_locs).to(torch.int32),
-                )
-
-            forward_batch = ForwardBatch.init_new(
-                batch, self.target_worker.model_runner
-            )
-            score_output = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=forward_batch,
-                is_verify=True,
-            )
-            input_token_logprobs = score_output.logits_output.input_token_logprobs
-            if input_token_logprobs is None:
-                raise RuntimeError(
-                    "DVR EAGLE full-prefix accepted-token scoring did not return "
-                    "input_token_logprobs."
-                )
-            return input_token_logprobs
-
-    @staticmethod
-    def _accepted_logprob_rows_from_replay(
-        *,
-        replay_plan: _DVREagleAcceptedLogprobReplayPlan,
-        input_token_logprobs: torch.Tensor,
-    ) -> tuple[torch.Tensor, list[DVRFinalLogprobRepair | None] | None]:
-        """Map full-prefix input-logprob rows back to compact spec-v2 outputs."""
-
-        final_score_req_indices = {spec[0] for spec in replay_plan.final_score_specs}
-        padded = torch.zeros(
-            (replay_plan.bs, replay_plan.draft_token_num),
-            dtype=input_token_logprobs.dtype,
-            device=input_token_logprobs.device,
-        )
-        offset = 0
-        for req_i, (seq_len, extend_len, accept_len) in enumerate(
-            zip(
-                replay_plan.base_seq_lens_cpu,
-                replay_plan.extend_lens_cpu,
-                replay_plan.accept_lens_cpu,
-                strict=True,
-            )
-        ):
-            if req_i in final_score_req_indices:
-                offset += int(extend_len)
-                continue
-            start = offset + int(seq_len)
-            end = start + int(accept_len)
-            padded[req_i, : int(accept_len)] = input_token_logprobs[start:end]
-            offset += int(extend_len)
-
-        final_logprob_repairs = (
-            [None for _ in range(replay_plan.bs)]
-            if replay_plan.final_score_specs
-            else None
-        )
-        for (
-            req_i,
-            req,
-            prefix_output_len,
-            final_curr_len,
-            final_output_ids,
-        ) in replay_plan.final_score_specs:
-            prompt_len = len(req.origin_input_ids)
-            req_offset = sum(replay_plan.extend_lens_cpu[:req_i])
-            output_logprob_start = req_offset + prompt_len - 1
-            output_logprob_end = output_logprob_start + len(final_output_ids)
-            final_logprobs = input_token_logprobs[
-                output_logprob_start:output_logprob_end
-            ]
-            if final_logprob_repairs is not None:
-                final_logprob_repairs[req_i] = DVRFinalLogprobRepair(
-                    output_ids=final_output_ids,
-                    output_logprobs=final_logprobs.detach().cpu().tolist(),
-                )
-            if final_curr_len > 0:
-                padded[req_i, :final_curr_len] = final_logprobs[
-                    prefix_output_len : prefix_output_len + final_curr_len
-                ]
-        return padded, final_logprob_repairs
-
-    @staticmethod
-    def _defer_non_streaming_logprob_output_until_finish(batch: ScheduleBatch) -> None:
-        for req in batch.reqs:
-            if req.return_logprob and not req.stream:
-                defer_req_non_streaming_logprob_output(req)
-
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             target_capture_mode = (
@@ -805,6 +462,15 @@ class DecodeVerifyRollbackEagleWorkerV2(
             batch_output = self.target_worker.forward_batch_generation(batch)
             batch_output.new_seq_lens = batch.seq_lens
             self._prepare_dvr_boundary_for_prefill_draft(batch)
+            if batch.return_logprob:
+                # This target token is the first client-visible output for a
+                # prefill/extend step.  In overlap it can be consumed by the
+                # first verify before Req.output_ids is materialized, so the
+                # DVR-EAGLE final-logprob stream must learn it here.
+                self.dvr_output_replay.seed_from_target_extend(
+                    batch=batch,
+                    next_token_ids=batch_output.next_token_ids,
+                )
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
@@ -932,8 +598,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
         oracle_output = None
         if batch.return_logprob or logits_output.hidden_states is None:
             # EAGLE needs replay logits and replay hidden states from the same
-            # suffix EXTEND so returned logprobs and the next MTP draft seed stay
-            # paired without replaying the already-closed prefix chunks.
+            # suffix EXTEND so streaming logprobs and the next MTP draft seed
+            # stay paired without replaying already-closed prefix chunks. Final
+            # full-prefill repair below is only for non-streaming responses.
             oracle_output = self._target_suffix_extend_verify_output(
                 batch=batch,
                 verify_input=verify_input,
@@ -997,8 +664,13 @@ class DecodeVerifyRollbackEagleWorkerV2(
             accept_tokens = None
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
+        compact_output_token_ids_per_req = compact_output_token_rows(
+            accept_tokens,
+            accept_lens,
+        )
         final_logprob_repairs = None
         if batch.return_logprob and not batch.forward_mode.is_idle():
+            assert compact_output_token_ids_per_req is not None
             # DVR-EAGLE may rewrite previously collected output logprobs with a
             # final full-prefix oracle. Mark requests here so the generic
             # streamer only sees a request-level defer policy.
@@ -1007,29 +679,13 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 if batch.seq_lens_cpu is not None
                 else batch.seq_lens.detach().cpu().tolist()
             )
-            defer_dvr_non_streaming_logprob_output_until_finish(
-                batch,
-                base_seq_lens_cpu=base_seq_lens_cpu,
-            )
-            final_logprob_repairs = score_dvr_final_logprob_repairs(
+            final_logprob_repairs = self.dvr_output_replay.defer_and_score_final_logprob_repairs(
                 batch=batch,
                 target_worker=self.target_worker,
-                replay_prefix=self.dvr_replay_prefix,
                 linear_state_ctx=linear_state_ctx,
                 base_seq_lens_cpu=base_seq_lens_cpu,
                 accept_lens_cpu=accept_lens.detach().cpu().tolist(),
-                accepted_token_ids_per_req=(
-                    [
-                        row[: int(accept_len)]
-                        for row, accept_len in zip(
-                            accept_tokens.detach().cpu().tolist(),
-                            accept_lens.detach().cpu().tolist(),
-                            strict=True,
-                        )
-                    ]
-                    if accept_tokens is not None
-                    else None
-                ),
+                compact_output_token_ids_per_req=compact_output_token_ids_per_req,
                 error_prefix="DVR EAGLE final logprob",
             )
 
