@@ -19,11 +19,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
+    compact_output_token_rows,
     dvr_spec_aux_from_pending_mamba_checkpoints,
 )
-from sglang.srt.speculative.dvr_output_replay import (
-    DVRClientOutputReplayTracker,
-    compact_output_token_rows,
+from sglang.srt.speculative.dvr_logprob_repair import (
+    defer_and_score_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_target_replay import (
     DVRTargetReplaySpec,
@@ -90,7 +90,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             model_runner=self.model_runner,
         )
         self.dvr_replay_prefix = DVRReplayPrefixTracker()
-        self.dvr_output_replay = DVRClientOutputReplayTracker()
+        self.dvr_output_replay_prefix = DVRReplayPrefixTracker()
         self.cuda_graph_runner_for_target_verify = None
         if not self.server_args.disable_cuda_graph and (
             self.server_args.model_impl != "mindspore"
@@ -467,7 +467,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 # prefill/extend step.  In overlap it can be consumed by the
                 # first verify before Req.output_ids is materialized, so the
                 # DVR-EAGLE final-logprob stream must learn it here.
-                self.dvr_output_replay.seed_from_target_extend(
+                self.dvr_output_replay_prefix.seed_from_target_extend(
                     batch=batch,
                     next_token_ids=batch_output.next_token_ids,
                 )
@@ -679,9 +679,15 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 if batch.seq_lens_cpu is not None
                 else batch.seq_lens.detach().cpu().tolist()
             )
-            final_logprob_repairs = self.dvr_output_replay.defer_and_score_final_logprob_repairs(
+            self.dvr_output_replay_prefix.advance_output_stream_from_compact_rows(
+                batch=batch,
+                compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+                error_prefix="DVR EAGLE final logprob output replay prefix",
+            )
+            final_logprob_repairs = defer_and_score_dvr_final_logprob_repairs(
                 batch=batch,
                 target_worker=self.target_worker,
+                replay_prefix=self.dvr_output_replay_prefix,
                 linear_state_ctx=linear_state_ctx,
                 base_seq_lens_cpu=base_seq_lens_cpu,
                 accept_lens_cpu=accept_lens.detach().cpu().tolist(),

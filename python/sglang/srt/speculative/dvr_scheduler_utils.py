@@ -79,6 +79,25 @@ class DVRSpecResultAux:
         )
 
 
+def compact_output_token_rows(
+    output_tokens: Any,
+    output_lens: Any,
+) -> Optional[list[list[int]]]:
+    """Return per-request output token rows without padded verify tail tokens."""
+
+    if output_tokens is None:
+        return None
+
+    output_lens_cpu = output_lens.detach().cpu().tolist()
+    output_tokens_cpu = output_tokens.detach().cpu().tolist()
+    return [
+        [int(token_id) for token_id in token_row[: int(output_len)]]
+        for token_row, output_len in zip(
+            output_tokens_cpu, output_lens_cpu, strict=True
+        )
+    ]
+
+
 def dvr_spec_aux_from_pending_mamba_checkpoints(
     track_indices: Optional[list[Optional[int]]],
     seqlens: Optional[list[Optional[int]]],
@@ -377,6 +396,70 @@ class DVRReplayPrefixTracker:
             tokens_per_req,
             initialize_from_req_output=True,
         )
+
+    def seed_from_target_extend(
+        self,
+        *,
+        batch: Any,
+        next_token_ids: Any,
+    ) -> None:
+        """Record target EXTEND's first client-visible output token."""
+
+        if batch.reqs is None or next_token_ids is None:
+            return
+
+        next_token_ids_cpu = next_token_ids.detach().cpu().tolist()
+        self.append_batch_output_tokens(
+            batch,
+            [[token_id] for token_id in next_token_ids_cpu],
+            initialize_from_req_output=True,
+        )
+
+    def advance_output_stream_from_compact_rows(
+        self,
+        *,
+        batch: Any,
+        compact_output_token_ids_per_req: list[list[int]],
+        error_prefix: str,
+    ) -> None:
+        """Append compact client-visible output rows for DVR-EAGLE repair."""
+
+        if batch.forward_mode.is_idle() or batch.reqs is None:
+            return
+
+        self.prune_to_batch(batch)
+
+        seq_lens_cpu = (
+            batch.seq_lens_cpu.tolist()
+            if batch.seq_lens_cpu is not None
+            else batch.seq_lens.detach().cpu().tolist()
+        )
+
+        for req, seq_len, compact_output_token_ids in zip(
+            batch.reqs,
+            seq_lens_cpu,
+            compact_output_token_ids_per_req,
+            strict=True,
+        ):
+            prompt_len = len(req.origin_input_ids)
+            stream = self.stream_for_req(
+                req,
+                initialize_from_req_output=True,
+            )
+            # In spec-v2 overlap, model-side seq_len can lag the
+            # client-visible output stream by one result. Do not truncate a
+            # prefix already learned from Req.output_ids/tracker state.
+            prefix_output_len = max(0, int(seq_len) - prompt_len, len(stream))
+            prefix_ids = self.request_output_prefix_token_ids(
+                req,
+                prompt_len + prefix_output_len,
+                error_prefix=error_prefix,
+            )
+            # Overlap can compute final repair before the prefill/previous
+            # decode result is materialized into Req.output_ids. Seed from the
+            # best known prefix, then append this verify's compact output rows.
+            stream[:] = prefix_ids[prompt_len:]
+            stream.extend(compact_output_token_ids)
 
     def align_req_to_output_len(
         self,

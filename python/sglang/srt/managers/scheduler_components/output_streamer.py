@@ -26,10 +26,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.output_policy import (
-    should_defer_finished_non_streaming_logprob_output,
-    should_emit_non_streaming_output_chunk,
-)
+from sglang.srt.speculative.output_policy import should_hold_non_streaming_logprob_output
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -328,9 +325,10 @@ class _GenerationStreamAccumulator:
             # For generation, keep finished non-streaming logprob responses
             # buffered until the producing algorithm clears the defer flag.
             if len(req.output_ids_through_stop) > 0 and (
-                should_defer_finished_non_streaming_logprob_output(
+                should_hold_non_streaming_logprob_output(
                     req=req,
                     return_logprob=self.return_logprob,
+                    require_final_repair=True,
                 )
             ):
                 return
@@ -359,11 +357,10 @@ class _GenerationStreamAccumulator:
                 # Some algorithms repair non-streaming logprobs at the final
                 # response. Defer those chunks through a request flag instead
                 # of making the streamer depend on a specific spec algorithm.
-                should_output = should_emit_non_streaming_output_chunk(
+                should_output = not should_hold_non_streaming_logprob_output(
                     req=req,
                     return_logprob=self.return_logprob,
-                    force_stream_interval=self.default_force_stream_interval,
-                )
+                ) and len(req.output_ids) % self.default_force_stream_interval == 0
 
         if not should_output:
             return

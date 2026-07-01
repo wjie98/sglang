@@ -32,50 +32,26 @@ def try_expect_req_final_logprob_repair(req: Any) -> bool:
     return True
 
 
-def should_defer_non_streaming_logprob_output(
+def should_hold_non_streaming_logprob_output(
     *,
     req: Any,
     return_logprob: bool,
+    require_final_repair: bool = False,
 ) -> bool:
-    """Return whether exact-logprob repair still owns this response."""
+    """Return whether exact-logprob repair still owns this response.
 
-    return (
+    This is intentionally request-level state, not a DVR/EAGLE branch in the
+    streamer.  The producing worker owns when to set and clear the flag.
+    """
+
+    should_hold = (
         return_logprob
         and req.return_logprob
         and not req.stream
         and getattr(req, _DEFER_NON_STREAMING_LOGPROB_OUTPUT_ATTR, False)
     )
-
-
-def should_defer_finished_non_streaming_logprob_output(
-    *,
-    req: Any,
-    return_logprob: bool,
-) -> bool:
-    """Return whether a finished response is waiting for final repair rows."""
-
-    return should_defer_non_streaming_logprob_output(
-        req=req,
-        return_logprob=return_logprob,
-    ) and getattr(req, _EXPECT_FINAL_LOGPROB_REPAIR_ATTR, False)
-
-
-def should_emit_non_streaming_output_chunk(
-    *,
-    req: Any,
-    return_logprob: bool,
-    force_stream_interval: int,
-) -> bool:
-    """Return whether a non-streaming generation chunk can be sent now.
-
-    Some speculative algorithms repair exact logprobs at the final response.
-    They set a request-level defer flag; the streamer only follows that generic
-    flag and does not depend on an algorithm-specific module.
-    """
-
-    if should_defer_non_streaming_logprob_output(
-        req=req,
-        return_logprob=return_logprob,
-    ):
+    if not should_hold:
         return False
-    return len(req.output_ids) % force_stream_interval == 0
+    return not require_final_repair or getattr(
+        req, _EXPECT_FINAL_LOGPROB_REPAIR_ATTR, False
+    )

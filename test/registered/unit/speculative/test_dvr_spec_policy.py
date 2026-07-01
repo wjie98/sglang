@@ -11,18 +11,17 @@ from sglang.srt.speculative.dvr_logprob_repair import (
     _final_output_len_if_repair_needed,
     _is_kv_allocation_failure,
 )
-from sglang.srt.speculative.dvr_output_replay import compact_output_token_rows
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
     DVRReplayPrefixTracker,
     DVRSpecResultAux,
     apply_dvr_final_logprob_repairs_from_result,
+    compact_output_token_rows,
 )
 from sglang.srt.speculative.output_policy import (
     allow_req_non_streaming_logprob_output,
     defer_req_non_streaming_logprob_output,
-    should_defer_finished_non_streaming_logprob_output,
-    should_emit_non_streaming_output_chunk,
+    should_hold_non_streaming_logprob_output,
     try_expect_req_final_logprob_repair,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -151,17 +150,15 @@ def test_output_policy_defer_non_streaming_logprob():
         output_ids=[1, 2],
     )
 
-    assert should_emit_non_streaming_output_chunk(
+    assert not should_hold_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
-        force_stream_interval=2,
     )
 
     defer_req_non_streaming_logprob_output(req)
-    assert not should_emit_non_streaming_output_chunk(
+    assert should_hold_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
-        force_stream_interval=2,
     )
 
 
@@ -175,15 +172,17 @@ def test_output_policy_final_logprob_repair_claim_is_once_only():
     defer_req_non_streaming_logprob_output(req)
     assert try_expect_req_final_logprob_repair(req)
     assert not try_expect_req_final_logprob_repair(req)
-    assert should_defer_finished_non_streaming_logprob_output(
+    assert should_hold_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
+        require_final_repair=True,
     )
 
     allow_req_non_streaming_logprob_output(req)
-    assert not should_defer_finished_non_streaming_logprob_output(
+    assert not should_hold_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
+        require_final_repair=True,
     )
     assert not try_expect_req_final_logprob_repair(req)
 
