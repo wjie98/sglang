@@ -109,6 +109,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs.shape, dtype=torch.float32, device=batch.device
         )
 
+    def _sampling_uniforms(self, candidates: torch.Tensor, batch):
+        return (
+            torch.rand_like(candidates, dtype=torch.float32, device=batch.device),
+            torch.rand((candidates.shape[0],), dtype=torch.float32, device=batch.device),
+        )
+
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
         return cls(
@@ -393,13 +399,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_probs, batch
             )
 
-            # coins for rejection sampling
-            coins = torch.rand_like(
-                candidates, dtype=torch.float32, device=batch.device
-            )
-            # coins for final sampling
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device=batch.device
+            coins, coins_for_final_sampling = self._sampling_uniforms(
+                candidates, batch
             )
             sampling_fn(
                 predicts=predict,  # mutable

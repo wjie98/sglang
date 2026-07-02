@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
     dvr_spec_aux_from_pending_mamba_checkpoints,
@@ -24,7 +25,10 @@ from sglang.srt.speculative.dvr_logprob_repair import (
     defer_and_score_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_linear_state_worker import DVRSpecV2LinearStateMixin
-from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
+from sglang.srt.speculative.dvr_utils import (
+    chain_speculative_sampling,
+    dvr_chain_uniform_samples,
+)
 from sglang.srt.speculative.dvr_worker import (
     DVRSelfDraftVerifyInput,
     DecodeVerifyRollbackWorker,
@@ -333,12 +337,42 @@ class DecodeVerifyRollbackWorkerV2(
         pending_track_indices = None
         pending_track_seqlens = None
         if linear_state_ctx is not None:
+            live_state_already_replayed = None
+            if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
+                partial_accept = torch.any(accept_lens < self.num_draft_tokens).item()
+                if partial_accept:
+                    accept_lens_cpu = accept_lens.detach().cpu().tolist()
+                    max_accept = accept_index.shape[1]
+                    valid_accept = torch.arange(
+                        max_accept, dtype=torch.long, device=self.device
+                    ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
+                    compact_predict_indices = self._spec_v2_compact_output_indices(
+                        accept_index=accept_index,
+                        max_accept=max_accept,
+                        device=self.device,
+                    )
+                    accepted_ids = predict[compact_predict_indices[valid_accept]]
+                    accepted_cache_locs = batch.out_cache_loc[
+                        accept_index.clamp_min(0).long()[valid_accept]
+                    ]
+                    if accepted_ids.numel() > 0:
+                        live_state_already_replayed = (
+                            self._replay_accepted_suffix_for_partial_verify(
+                                batch=batch,
+                                spec_info=spec_info,
+                                linear_state_ctx=linear_state_ctx,
+                                accepted_token_counts_cpu=accept_lens_cpu,
+                                accepted_ids=accepted_ids,
+                                accepted_cache_locs=accepted_cache_locs,
+                            )
+                        )
             pending_track_indices, pending_track_seqlens = (
                 self._commit_linear_state_after_verify_v2(
                     batch=batch,
                     accepted_token_counts=accept_lens.to(torch.long),
                     accepted_steps=(accept_lens - 1).to(torch.long),
                     ctx=linear_state_ctx,
+                    live_state_already_replayed=live_state_already_replayed,
                 )
             )
 
@@ -428,6 +462,20 @@ class DecodeVerifyRollbackWorkerV2(
                 num_tokens_in_batch=self.num_draft_tokens,
             )
 
+        if sampling_info.acc_additive_penalties is not None:
+            next_token_logits.add_(
+                torch.repeat_interleave(
+                    sampling_info.acc_additive_penalties, self.num_draft_tokens, dim=0
+                )
+            )
+        if sampling_info.acc_scaling_penalties is not None:
+            apply_scaling_penalties(
+                next_token_logits,
+                torch.repeat_interleave(
+                    sampling_info.acc_scaling_penalties, self.num_draft_tokens, dim=0
+                ),
+            )
+
         penalizer_orchestrator = sampling_info.penalizer_orchestrator
         if penalizer_orchestrator is not None and penalizer_orchestrator.is_required:
             penalizer_orchestrator.apply(next_token_logits, repeat=self.num_draft_tokens)
@@ -490,6 +538,14 @@ class DecodeVerifyRollbackWorkerV2(
                 if spec_info.draft_probs is not None
                 else tree_speculative_sampling_target_only
             )
+            uniform_samples, uniform_samples_for_final_sampling = (
+                dvr_chain_uniform_samples(candidates, batch)
+                if spec_info.draft_probs is not None
+                else (
+                    torch.rand_like(candidates, dtype=torch.float32),
+                    torch.rand((bs,), dtype=torch.float32, device=self.device),
+                )
+            )
             sampling_fn(
                 predicts=predict,
                 accept_index=accept_index,
@@ -498,10 +554,8 @@ class DecodeVerifyRollbackWorkerV2(
                 retrive_index=spec_info.retrieve_index,
                 retrive_next_token=spec_info.retrieve_next_token,
                 retrive_next_sibling=spec_info.retrieve_next_sibling,
-                uniform_samples=torch.rand_like(candidates, dtype=torch.float32),
-                uniform_samples_for_final_sampling=torch.rand(
-                    (bs,), dtype=torch.float32, device=self.device
-                ),
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
                 threshold_single=self.server_args.speculative_accept_threshold_single,

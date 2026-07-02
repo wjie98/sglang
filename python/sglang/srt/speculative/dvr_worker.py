@@ -42,7 +42,10 @@ from sglang.srt.speculative.dvr_target_replay import (
     linear_state_replay_context,
     target_extend_replay_batch,
 )
-from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
+from sglang.srt.speculative.dvr_utils import (
+    chain_speculative_sampling,
+    dvr_chain_uniform_samples,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -125,6 +128,9 @@ class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
         if self.draft_probs is None:
             return super()._sampling_fn_and_draft_probs(target_probs, batch)
         return chain_speculative_sampling, self.draft_probs
+
+    def _sampling_uniforms(self, candidates: torch.Tensor, batch):
+        return dvr_chain_uniform_samples(candidates, batch)
 
 
 DVRVerifyInput = DVRSelfDraftVerifyInput
@@ -863,9 +869,11 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         *,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
-        verify_output: EagleVerifyOutput,
         linear_state_ctx,
         accepted_token_counts_cpu: List[int],
+        verify_output: Optional[EagleVerifyOutput] = None,
+        accepted_ids: Optional[torch.Tensor] = None,
+        accepted_cache_locs: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Refresh live GDN state with the exact accepted-token suffix.
 
@@ -879,11 +887,18 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         if batch.forward_mode.is_idle() or linear_state_ctx is None:
             return None
 
-        accepted_ids = verify_output.draft_extend_input.input_ids
+        if accepted_ids is None:
+            assert verify_output is not None
+            accepted_ids = verify_output.draft_extend_input.input_ids
+        if accepted_cache_locs is None:
+            accepted_cache_locs = batch.out_cache_loc
         if accepted_ids is None or accepted_ids.numel() == 0:
             return None
         total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
-        if accepted_ids.numel() != total_accepted or batch.out_cache_loc.numel() != total_accepted:
+        if (
+            accepted_ids.numel() != total_accepted
+            or accepted_cache_locs.numel() != total_accepted
+        ):
             return None
 
         live_indices = linear_state_ctx.live_indices
@@ -907,7 +922,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             base_seq_lens_cpu=base_seq_lens_cpu,
             boundary_lens=boundary_lens,
             accepted_tokens=accepted_ids,
-            accepted_cache_locs=batch.out_cache_loc,
+            accepted_cache_locs=accepted_cache_locs,
             accepted_token_counts_cpu=accepted_token_counts_cpu,
             num_draft_tokens=self.num_draft_tokens,
             request_token_ids_for_replay=self._request_token_ids_for_replay,
@@ -1075,7 +1090,11 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 verify_output, linear_state_ctx.live_indices.device
             )
             accepted_replay = None
-            if not isinstance(spec_info, DVRSelfDraftVerifyInput):
+            partial_accept = any(
+                int(count) < self.num_draft_tokens
+                for count in accepted_token_counts_cpu
+            )
+            if not isinstance(spec_info, DVRSelfDraftVerifyInput) or partial_accept:
                 accepted_replay = self._replay_accepted_suffix_for_partial_verify(
                     batch=batch,
                     spec_info=spec_info,
@@ -1093,8 +1112,9 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 accepted_token_counts_cpu=accepted_token_counts_cpu,
                 ctx=linear_state_ctx,
                 live_state_already_replayed=live_state_already_replayed,
-                use_fast_self_draft_commit=isinstance(
-                    spec_info, DVRSelfDraftVerifyInput
+                use_fast_self_draft_commit=(
+                    isinstance(spec_info, DVRSelfDraftVerifyInput)
+                    and not partial_accept
                 ),
             )
         if batch.return_logprob:

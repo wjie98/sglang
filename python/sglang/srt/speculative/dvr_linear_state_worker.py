@@ -118,6 +118,7 @@ class DVRSpecV2LinearStateMixin:
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
         ctx,
+        live_state_already_replayed: torch.Tensor = None,
     ):
         pending_track_indices = [None] * len(batch.reqs)
         pending_track_seqlens = [None] * len(batch.reqs)
@@ -166,6 +167,7 @@ class DVRSpecV2LinearStateMixin:
             accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
             boundary_already_tracked=boundary_already_tracked,
+            live_state_already_replayed=live_state_already_replayed,
         )
 
         for i, (req, verified_tail_len, accepted_token_num) in enumerate(

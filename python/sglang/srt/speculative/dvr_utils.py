@@ -4,6 +4,8 @@ from contextlib import contextmanager
 
 import torch
 
+from sglang.srt.layers.utils.hash import murmur_hash32
+
 try:
     import triton
     import triton.language as tl
@@ -66,6 +68,35 @@ def dvr_causal_verify_cuda_graph_metadata(
                     metadata.custom_mask = None
                 if hasattr(metadata, "mask_indptr"):
                     metadata.mask_indptr = None
+
+
+def dvr_chain_uniform_samples(
+    candidates: torch.Tensor,
+    batch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return accept/reject uniforms for DVR chain sampling.
+
+    Normal sampling honors ``sampling_seed`` through SGLang's hash-based
+    deterministic sampler. DVR chain verification has its own rejection coins,
+    so generate those coins from the same seed source instead of using
+    process-global ``torch.rand``. The hash column separates per-draft-step
+    coins from the final residual-sampling coin for each request.
+    """
+
+    sampling_seed = getattr(batch.sampling_info, "sampling_seed", None)
+    if sampling_seed is None:
+        return (
+            torch.rand_like(candidates, dtype=torch.float32),
+            torch.rand((candidates.shape[0],), dtype=torch.float32, device=batch.device),
+        )
+
+    bs, num_slots = candidates.shape
+    del bs
+    seed = sampling_seed.to(device=candidates.device)
+    positions = batch.seq_lens.to(device=candidates.device, dtype=torch.int64)
+    cols = torch.arange(num_slots + 1, dtype=torch.int32, device=candidates.device)
+    uniforms = murmur_hash32(seed, positions, cols).to(torch.float32) / 4294967296.0
+    return uniforms[:, :num_slots], uniforms[:, num_slots].contiguous()
 
 
 if triton is not None:
