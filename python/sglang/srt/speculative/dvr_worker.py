@@ -31,6 +31,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_linear_state_worker import DVRLinearStateReplayMixin
 from sglang.srt.speculative.dvr_logprob_repair import (
+    defer_dvr_non_streaming_logprob_output_until_finish,
     score_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_scheduler_utils import DVRReplayPrefixTracker
@@ -1077,6 +1078,13 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         batch.spec_info = spec_info
         linear_state_ctx = self.linear_state.restore_for_verify(batch)
         base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
+        if batch.return_logprob and linear_state_ctx is not None:
+            # Spec-v1 may stream non-streaming chunks before final result assembly.
+            # Hold them until the full-prefix repair below installs exact logprobs.
+            defer_dvr_non_streaming_logprob_output_until_finish(
+                batch,
+                base_seq_lens_cpu=base_seq_lens_cpu,
+            )
 
         batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -1104,6 +1112,24 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         )
 
         self._select_accepted_verify_outputs(logits_output, verify_output)
+        if batch.return_logprob:
+            add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
+            accept_lens_cpu = [
+                int(num_correct) + 1
+                for num_correct in verify_output.num_correct_drafts_per_req_cpu
+            ]
+            self._repair_final_logprobs_for_spec_v1(
+                batch=batch,
+                linear_state_ctx=linear_state_ctx,
+                base_seq_lens_cpu=base_seq_lens_cpu,
+                accept_lens_cpu=accept_lens_cpu,
+                compact_output_token_ids_per_req=(
+                    self._compact_accept_tokens_for_repair(
+                        verify_output,
+                        accept_lens_cpu,
+                    )
+                ),
+            )
         if linear_state_ctx is not None:
             (
                 accepted_token_counts,
@@ -1138,24 +1164,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 use_fast_self_draft_commit=(
                     isinstance(spec_info, DVRSelfDraftVerifyInput)
                     and not partial_accept
-                ),
-            )
-        if batch.return_logprob:
-            add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
-            accept_lens_cpu = [
-                int(num_correct) + 1
-                for num_correct in verify_output.num_correct_drafts_per_req_cpu
-            ]
-            self._repair_final_logprobs_for_spec_v1(
-                batch=batch,
-                linear_state_ctx=linear_state_ctx,
-                base_seq_lens_cpu=base_seq_lens_cpu,
-                accept_lens_cpu=accept_lens_cpu,
-                compact_output_token_ids_per_req=(
-                    self._compact_accept_tokens_for_repair(
-                        verify_output,
-                        accept_lens_cpu,
-                    )
                 ),
             )
         self.postprocess_for_verify(batch, verify_output)
