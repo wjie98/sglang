@@ -1138,12 +1138,18 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             ) = self._accepted_token_counts_and_steps(
                 verify_output, linear_state_ctx.live_indices.device
             )
-            accepted_replay = None
+            is_self_dvr = isinstance(spec_info, DVRSelfDraftVerifyInput)
             partial_accept = any(
                 int(count) < self.num_draft_tokens
                 for count in accepted_token_counts_cpu
             )
-            if not isinstance(spec_info, DVRSelfDraftVerifyInput) or partial_accept:
+            # return_logprob must not change the self-draft state lifecycle.
+            # Exact logprobs are repaired separately; using accepted-suffix
+            # replay as the commit path changes the next draft state and
+            # regresses the self-DVR acceptance rate.
+            use_self_logprob_replay = False
+            accepted_replay = None
+            if not is_self_dvr or use_self_logprob_replay:
                 accepted_replay = self._replay_accepted_suffix_for_partial_verify(
                     batch=batch,
                     spec_info=spec_info,
@@ -1161,10 +1167,8 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 accepted_token_counts_cpu=accepted_token_counts_cpu,
                 ctx=linear_state_ctx,
                 live_state_already_replayed=live_state_already_replayed,
-                use_fast_self_draft_commit=(
-                    isinstance(spec_info, DVRSelfDraftVerifyInput)
-                    and not partial_accept
-                ),
+                use_fast_self_draft_commit=is_self_dvr
+                and not use_self_logprob_replay,
             )
         self.postprocess_for_verify(batch, verify_output)
         return logits_output, verify_output, can_run_cuda_graph

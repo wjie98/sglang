@@ -699,6 +699,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 accept_lens_cpu=accept_lens.detach().cpu().tolist(),
                 compact_output_token_ids_per_req=compact_output_token_ids_per_req,
                 error_prefix="DVR EAGLE final logprob",
+                allow_preclaimed_final_token=True,
             )
 
         pending_track_indices = None

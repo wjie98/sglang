@@ -232,3 +232,28 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.benc
 For every throughput run, keep the raw benchmark JSONL and server log.  The
 server log is the source of DVR accept rate and verifies whether draft decode
 uses CUDA graph and non-deterministic decode performance knobs.
+
+## Regression note: returned logprobs
+
+`return_logprob=True` is part of the deterministic-inference validation surface,
+not an optional slow path that can be ignored for throughput.  It must not change
+the DVR state lifecycle or the draft input state used by the next iteration.
+
+For self-DVR, exact logprob repair must stay side-effect-free: keep live GDN
+state commit on the same fast self-draft path as `return_logprob=False`, and
+repair final output logprobs with an external scoring replay only.  Do not use
+accepted-suffix replay as the self-DVR commit path just because returned
+logprobs are requested; that changes the next draft state, lowers the
+acceptance rate, and cuts long-output throughput.
+
+The fixed 80B ShareGPT 16x1024 reference results are:
+
+```text
+spec-v1 return_logprob=True: 152.62 tok/s, accept length 14.58
+spec-v2 return_logprob=True: 154.08 tok/s, accept length 14.75
+spec-v1 return_logprob=False: 159.91 tok/s, accept length 14.58
+spec-v2 return_logprob=False: 159.65 tok/s, accept length 14.68
+```
+
+The expected overhead of returned logprobs is only the scoring/output overhead;
+the accept length should remain aligned with the no-logprob run.

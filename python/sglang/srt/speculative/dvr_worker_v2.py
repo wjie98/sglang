@@ -336,15 +336,24 @@ class DecodeVerifyRollbackWorkerV2(
                     accept_lens_cpu=accept_lens_cpu,
                     compact_output_token_ids_per_req=compact_output_token_ids_per_req,
                     error_prefix="DVR spec-v2 final logprob",
+                    allow_preclaimed_final_token=True,
                 )
 
         pending_track_indices = None
         pending_track_seqlens = None
         if linear_state_ctx is not None:
+            is_self_dvr = isinstance(spec_info, DVRSelfDraftVerifyInput)
             live_state_already_replayed = None
-            if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
+            if (
+                not batch.forward_mode.is_idle()
+                and accept_lens.numel() > 0
+            ):
                 partial_accept = torch.any(accept_lens < self.num_draft_tokens).item()
-                if partial_accept:
+                # return_logprob is an output-scoring concern.  Keep self-DVR
+                # on the same fast state commit path as no-logprob so enabling
+                # logprobs does not change the next draft state or acceptance.
+                use_self_logprob_replay = False
+                if partial_accept and (not is_self_dvr or use_self_logprob_replay):
                     accept_lens_cpu = accept_lens.detach().cpu().tolist()
                     max_accept = accept_index.shape[1]
                     valid_accept = torch.arange(
@@ -377,6 +386,8 @@ class DecodeVerifyRollbackWorkerV2(
                     accepted_steps=(accept_lens - 1).to(torch.long),
                     ctx=linear_state_ctx,
                     live_state_already_replayed=live_state_already_replayed,
+                    use_fast_self_draft_commit=is_self_dvr
+                    and not use_self_logprob_replay,
                 )
             )
 
