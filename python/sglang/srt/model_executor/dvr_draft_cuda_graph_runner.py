@@ -242,6 +242,40 @@ def _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr):
     patch_attr(global_server_args, "mamba_scheduler_strategy", "no_buffer")
 
 
+def _assert_draft_decode_performance_state(model_runner, extra_attn_backends):
+    """Fail fast if deterministic target settings leak into draft decode."""
+
+    if getattr(model_runner.server_args, "enable_deterministic_inference", False):
+        raise RuntimeError("DVR draft decode must run with deterministic inference off.")
+    if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        raise RuntimeError("DVR draft decode env still enables deterministic inference.")
+
+    for backend_root in (model_runner.attn_backend, *(extra_attn_backends or ())):
+        for backend in _iter_attention_backends(backend_root):
+            if getattr(backend, "enable_deterministic", False):
+                raise RuntimeError(
+                    "DVR draft decode backend still has enable_deterministic=True."
+                )
+            if (
+                _uses_init_time_deterministic_num_splits(backend)
+                and hasattr(backend, "num_splits")
+                and getattr(backend, "num_splits") != 0
+            ):
+                raise RuntimeError(
+                    "DVR draft decode backend still uses deterministic num_splits."
+                )
+            if hasattr(backend, "decode_split_tile_size") and getattr(
+                backend, "decode_split_tile_size"
+            ) is not None:
+                raise RuntimeError(
+                    "DVR draft decode backend still uses deterministic split tile size."
+                )
+            if getattr(backend, "disable_cuda_graph_kv_split", False):
+                raise RuntimeError(
+                    "DVR draft decode backend still disables CUDA graph KV split."
+                )
+
+
 @contextmanager
 def dvr_self_draft_decode_context(
     model_runner,
@@ -301,6 +335,8 @@ def dvr_self_draft_decode_context(
             _patch_draft_mamba_tracking(
                 model_runner, global_server_args, patch_attr
             )
+
+        _assert_draft_decode_performance_state(model_runner, extra_attn_backends)
 
         with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
             yield

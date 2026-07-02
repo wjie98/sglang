@@ -193,6 +193,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             and not server_args.disable_draft_cuda_graph
         ):
             self.cuda_graph_runner_for_draft_decode = DVRDraftDecodeCudaGraphRunner(self)
+        self._logged_dvr_draft_graph_skip_reasons = set()
 
         logger.info(
             "Initialized DVR self-decode worker: num_steps=%s, num_draft_tokens=%s",
@@ -417,9 +418,17 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         # the self-draft CUDA graph still observes a state-input boundary that
         # can illegal-access. Keep this edge inside DVR and use eager draft for
         # the request; normal prompts continue to use the graph.
-        forward_batch.dvr_disable_draft_cuda_graph = self._has_one_token_real_prompt(
-            batch
-        )
+        skip_reason = None
+        if self._has_one_token_real_prompt(batch):
+            skip_reason = "one-token prompt GDN state-input graph boundary"
+        forward_batch.dvr_draft_cuda_graph_skip_reason = skip_reason
+        forward_batch.dvr_disable_draft_cuda_graph = skip_reason is not None
+
+    def _log_dvr_draft_graph_skip_once(self, reason: str) -> None:
+        if reason in self._logged_dvr_draft_graph_skip_reasons:
+            return
+        self._logged_dvr_draft_graph_skip_reasons.add(reason)
+        logger.warning("DVR self-draft CUDA graph skipped: %s", reason)
 
     def _forward_target_verify_for_dvr(
         self, batch: ScheduleBatch
@@ -616,8 +625,8 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def _draft_decode_forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        graph_disabled_for_prompt = getattr(
-            forward_batch, "dvr_disable_draft_cuda_graph", False
+        graph_skip_reason = getattr(
+            forward_batch, "dvr_draft_cuda_graph_skip_reason", None
         )
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_decode is not None
@@ -626,10 +635,13 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         if can_cuda_graph:
             return self.cuda_graph_runner_for_draft_decode.replay(forward_batch)
 
+        min_seq_len = _min_seq_len_cpu(forward_batch)
+        if graph_skip_reason is None and min_seq_len <= 2:
+            graph_skip_reason = "seq_len<=2 initial GDN state-input graph boundary"
+
         if (
             self._requires_self_draft_cuda_graph()
-            and not graph_disabled_for_prompt
-            and _min_seq_len_cpu(forward_batch) > 2
+            and graph_skip_reason is None
         ):
             capture_bs = []
             if self.cuda_graph_runner_for_draft_decode is not None:
@@ -637,10 +649,14 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             raise RuntimeError(
                 "DVR self-draft decode requires the dedicated CUDA graph for "
                 "gated linear-state models. The current batch cannot run it: "
-                f"batch_size={forward_batch.batch_size}, capture_bs={capture_bs}. "
+                f"batch_size={forward_batch.batch_size}, "
+                f"min_seq_len={min_seq_len}, capture_bs={capture_bs}. "
                 "Use the default CUDA graph batch sizes or include the running "
                 "batch size in --cuda-graph-bs/--cuda-graph-max-bs."
             )
+
+        if graph_skip_reason is not None:
+            self._log_dvr_draft_graph_skip_once(graph_skip_reason)
 
         with dvr_self_draft_decode_context(
             self.model_runner,
