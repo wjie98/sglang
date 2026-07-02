@@ -88,6 +88,13 @@ class SpecAlgorithmPolicy:
         )
 
     def uses_spec_v2(self, enable_overlap: bool) -> bool:
+        """Return whether this algorithm uses the spec-v2 worker/schema.
+
+        DVR self-draft keeps v5's spec-v1 path when overlap is disabled. DVR-EAGLE
+        is implemented on EAGLE's v2 worker only; disabling overlap selects the
+        synchronous v2 path, not a separate EAGLE-v1 implementation.
+        """
+
         if not _is_builtin_algorithm(self.algorithm):
             method = getattr(self.algorithm, "uses_spec_v2", None)
             return (

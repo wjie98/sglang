@@ -25,16 +25,23 @@ from sglang.srt.speculative.output_policy import (
     try_expect_req_final_logprob_repair,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
+
+
+def _policy(algorithm):
+    return get_spec_algorithm_policy(algorithm)
 
 
 def test_dvr_spec_v2_policy():
     self_draft = SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
     eagle_draft = SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
 
-    assert self_draft.uses_spec_v2(enable_overlap=True)
-    assert not self_draft.uses_spec_v2(enable_overlap=False)
-    assert eagle_draft.uses_spec_v2(enable_overlap=True)
-    assert eagle_draft.uses_spec_v2(enable_overlap=False)
+    assert _policy(self_draft).uses_spec_v2(enable_overlap=True)
+    assert not _policy(self_draft).uses_spec_v2(enable_overlap=False)
+    # DVR-EAGLE is implemented on EAGLE's v2 schema only. Disabling overlap
+    # selects synchronous v2, not a separate EAGLE-v1 worker.
+    assert _policy(eagle_draft).uses_spec_v2(enable_overlap=True)
+    assert _policy(eagle_draft).uses_spec_v2(enable_overlap=False)
 
 
 def test_dvr_target_verify_capture_hidden_policy():
@@ -43,19 +50,19 @@ def test_dvr_target_verify_capture_hidden_policy():
     standalone = SpeculativeAlgorithm.STANDALONE
 
     assert (
-        self_draft.target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
+        _policy(self_draft).target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
         == CaptureHiddenMode.NULL
     )
     assert (
-        eagle_draft.target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
+        _policy(eagle_draft).target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
         == CaptureHiddenMode.FULL
     )
     assert (
-        standalone.target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
+        _policy(standalone).target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
         == CaptureHiddenMode.FULL
     )
     assert (
-        standalone.target_verify_capture_hidden_mode(
+        _policy(standalone).target_verify_capture_hidden_mode(
             CaptureHiddenMode.FULL,
             null_for_standalone=True,
         )
@@ -65,13 +72,17 @@ def test_dvr_target_verify_capture_hidden_policy():
 
 def test_dvr_mamba_radix_snapshot_policy():
     assert (
-        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK.needs_mamba_radix_snapshot_for_spec_v2()
+        _policy(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+        ).needs_mamba_radix_snapshot_for_spec_v2()
     )
     assert (
-        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE.needs_mamba_radix_snapshot_for_spec_v2()
+        _policy(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
+        ).needs_mamba_radix_snapshot_for_spec_v2()
     )
-    assert not SpeculativeAlgorithm.EAGLE.needs_mamba_radix_snapshot_for_spec_v2()
-    assert not SpeculativeAlgorithm.NONE.needs_mamba_radix_snapshot_for_spec_v2()
+    assert not _policy(SpeculativeAlgorithm.EAGLE).needs_mamba_radix_snapshot_for_spec_v2()
+    assert not _policy(SpeculativeAlgorithm.NONE).needs_mamba_radix_snapshot_for_spec_v2()
 
 
 def test_dvr_linear_state_extension_policy():
@@ -79,19 +90,23 @@ def test_dvr_linear_state_extension_policy():
     runner_with_gdn = SimpleNamespace(hybrid_gdn_config=object())
 
     assert (
-        SpeculativeAlgorithm.EAGLE.linear_speculative_state_extension_factory(
+        _policy(SpeculativeAlgorithm.EAGLE).linear_speculative_state_extension_factory(
             runner_with_gdn
         )
         is None
     )
     assert (
-        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK.linear_speculative_state_extension_factory(
+        _policy(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+        ).linear_speculative_state_extension_factory(
             runner_without_gdn
         )
         is None
     )
     assert (
-        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK.linear_speculative_state_extension_factory(
+        _policy(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+        ).linear_speculative_state_extension_factory(
             runner_with_gdn
         )
         is not None
@@ -99,37 +114,45 @@ def test_dvr_linear_state_extension_policy():
 
 
 def test_dvr_self_draft_reuses_target_kv_pool():
-    assert SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK.uses_target_kv_pool_for_draft()
+    assert _policy(
+        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+    ).uses_target_kv_pool_for_draft()
     assert (
-        not SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE.uses_target_kv_pool_for_draft()
+        not _policy(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
+        ).uses_target_kv_pool_for_draft()
     )
-    assert not SpeculativeAlgorithm.EAGLE.uses_target_kv_pool_for_draft()
+    assert not _policy(SpeculativeAlgorithm.EAGLE).uses_target_kv_pool_for_draft()
 
 
 def test_spec_accept_rate_proposal_width_policy():
     assert (
-        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK.proposed_draft_tokens_per_verify(
+        _policy(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+        ).proposed_draft_tokens_per_verify(
             speculative_num_steps=15,
             speculative_num_draft_tokens=16,
         )
         == 15
     )
     assert (
-        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE.proposed_draft_tokens_per_verify(
+        _policy(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
+        ).proposed_draft_tokens_per_verify(
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
         )
         == 3
     )
     assert (
-        SpeculativeAlgorithm.EAGLE.proposed_draft_tokens_per_verify(
+        _policy(SpeculativeAlgorithm.EAGLE).proposed_draft_tokens_per_verify(
             speculative_num_steps=3,
             speculative_num_draft_tokens=8,
         )
         == 3
     )
     assert (
-        SpeculativeAlgorithm.DFLASH.proposed_draft_tokens_per_verify(
+        _policy(SpeculativeAlgorithm.DFLASH).proposed_draft_tokens_per_verify(
             speculative_num_steps=3,
             speculative_num_draft_tokens=8,
         )
