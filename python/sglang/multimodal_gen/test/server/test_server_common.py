@@ -138,10 +138,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
 
-    # Strict ports: fail immediately if port is occupied instead of silently
-    # picking another one (which causes the test client to connect to the wrong server).
-    extra_args += " --strict-ports"
-
     for arg in server_args.extras:
         extra_args += f" {arg}"
 
