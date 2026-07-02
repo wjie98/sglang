@@ -206,6 +206,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        self._uses_dvr_draft_decode_context = (
+            self.speculative_algorithm.is_decode_verify_rollback_eagle()
+        )
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -226,7 +229,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
         self._draft_extend_selected_logits = (
-            self.topk == 1
+            self._uses_dvr_draft_decode_context
+            and self.topk == 1
             and not require_gathered_buffer(self.draft_runner.server_args)
             and getattr(
                 self.draft_runner.model,
@@ -236,6 +240,8 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
     def _draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
+        if not self._uses_dvr_draft_decode_context:
+            return empty_context()
         return draft_decode_performance_context(
             self.draft_runner,
             clear_kernel_config_caches=clear_kernel_config_caches,

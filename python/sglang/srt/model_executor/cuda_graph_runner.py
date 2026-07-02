@@ -72,6 +72,7 @@ from sglang.srt.model_executor.input_buffers import share_input_buffers_in
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.speculative.spec_policy import (
     create_target_verify_cuda_graph_input_for_runner,
+    get_spec_algorithm_policy,
 )
 from sglang.srt.true_on_policy import (
     patch_prefill_only_deterministic_inference_for_cuda_graph,
@@ -651,7 +652,9 @@ class CudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.target_verify_graph_bs_uses_token_count()
+                if get_spec_algorithm_policy(
+                    self.model_runner.spec_algorithm
+                ).target_verify_graph_bs_uses_token_count()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1126,7 +1129,9 @@ class CudaGraphRunner:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.target_verify_graph_bs_uses_token_count()
+                if get_spec_algorithm_policy(
+                    self.model_runner.spec_algorithm
+                ).target_verify_graph_bs_uses_token_count()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)

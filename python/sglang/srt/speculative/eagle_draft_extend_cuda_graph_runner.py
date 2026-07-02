@@ -95,7 +95,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.dp_size = self.model_runner.dp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.use_selected_logits = (
-            self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+            model_runner.spec_algorithm.is_decode_verify_rollback_eagle()
+            and self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
             and self.topk == 1
             and not self.require_gathered_buffer
             and getattr(

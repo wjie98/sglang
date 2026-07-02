@@ -31,6 +31,7 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     cache_unfinished_prefill_req_with_dvr_mamba_snapshot,
     maybe_handle_dvr_mamba_checkpoint_after_decode,
 )
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -564,7 +565,9 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
-        proposed_per_verify = batch.spec_algorithm.proposed_draft_tokens_per_verify(
+        proposed_per_verify = get_spec_algorithm_policy(
+            batch.spec_algorithm
+        ).proposed_draft_tokens_per_verify(
             speculative_num_steps=self.server_args.speculative_num_steps,
             speculative_num_draft_tokens=stride,
         )

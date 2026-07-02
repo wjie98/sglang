@@ -106,6 +106,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -2290,7 +2291,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             speculative_algorithm = SpeculativeAlgorithm.from_string(
                 self.server_args.speculative_algorithm
             )
-            proposed_per_verify = speculative_algorithm.proposed_draft_tokens_per_verify(
+            proposed_per_verify = get_spec_algorithm_policy(
+                speculative_algorithm
+            ).proposed_draft_tokens_per_verify(
                 speculative_num_steps=self.server_args.speculative_num_steps,
                 speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             )

@@ -4339,10 +4339,15 @@ class ServerArgs:
                         and not self.disable_custom_all_reduce
                     ):
                         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+                        from sglang.srt.speculative.spec_policy import (
+                            get_spec_algorithm_policy,
+                        )
 
                         use_draft_decode_custom_all_reduce = (
-                            SpeculativeAlgorithm.from_string(
-                                self.speculative_algorithm
+                            get_spec_algorithm_policy(
+                                SpeculativeAlgorithm.from_string(
+                                    self.speculative_algorithm
+                                )
                             ).uses_draft_decode_custom_all_reduce()
                         )
                     else:

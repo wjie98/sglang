@@ -29,6 +29,7 @@ from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 
 if TYPE_CHECKING:
 
@@ -54,7 +55,7 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
-    if spec_algorithm.uses_target_kv_pool_for_draft():
+    if get_spec_algorithm_policy(spec_algorithm).uses_target_kv_pool_for_draft():
         # DVR self-draft reuses the target model runner and target KV pool. There
         # is no independent draft KV pool to register for disaggregation/HiCache.
         return None, None

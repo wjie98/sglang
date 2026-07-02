@@ -90,49 +90,6 @@ class CustomSpecAlgo:
     def supports_spec_v2(self) -> bool:
         return self.supports_overlap
 
-    def uses_spec_v2(self, enable_overlap: bool) -> bool:
-        return self.supports_spec_v2()
-
-    def prepare_cuda_graph_verify_input(self, verify_input: "SpecInput") -> "SpecInput":
-        return verify_input
-
-    def target_verify_capture_hidden_mode(
-        self,
-        default_mode,
-        *,
-        null_for_standalone: bool = False,
-    ):
-        return default_mode
-
-    def uses_eagle_style_target_verify_input(self) -> bool:
-        return False
-
-    def target_verify_graph_bs_uses_token_count(self) -> bool:
-        return False
-
-    def create_target_verify_cuda_graph_input(self, **kwargs) -> Optional["SpecInput"]:
-        return None
-
-    def uses_draft_decode_custom_all_reduce(self) -> bool:
-        return False
-
-    def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
-        return False
-
-    def linear_speculative_state_extension_factory(self, model_runner):
-        return None
-
-    def uses_target_kv_pool_for_draft(self) -> bool:
-        return False
-
-    def proposed_draft_tokens_per_verify(
-        self,
-        *,
-        speculative_num_steps: int,
-        speculative_num_draft_tokens: int,
-    ) -> int:
-        return max(0, int(speculative_num_draft_tokens) - 1)
-
     def create_worker(self, server_args: "ServerArgs") -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(

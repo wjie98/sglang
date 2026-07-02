@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -364,7 +365,9 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
-                    linear_speculative_state_extension_factory=self.spec_algorithm.linear_speculative_state_extension_factory(
+                    linear_speculative_state_extension_factory=get_spec_algorithm_policy(
+                        self.spec_algorithm
+                    ).linear_speculative_state_extension_factory(
                         self
                     ),
                 )
