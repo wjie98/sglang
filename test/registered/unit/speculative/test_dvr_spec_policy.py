@@ -162,6 +162,34 @@ def test_output_policy_defer_non_streaming_logprob():
     )
 
 
+def test_output_policy_does_not_defer_streaming_or_non_logprob_output():
+    streaming_req = SimpleNamespace(
+        return_logprob=True,
+        stream=True,
+        output_ids=[1, 2],
+    )
+    defer_req_non_streaming_logprob_output(streaming_req)
+    assert not should_hold_non_streaming_logprob_output(
+        req=streaming_req,
+        return_logprob=True,
+    )
+
+    no_logprob_req = SimpleNamespace(
+        return_logprob=False,
+        stream=False,
+        output_ids=[1, 2],
+    )
+    defer_req_non_streaming_logprob_output(no_logprob_req)
+    assert not should_hold_non_streaming_logprob_output(
+        req=no_logprob_req,
+        return_logprob=True,
+    )
+    assert not should_hold_non_streaming_logprob_output(
+        req=no_logprob_req,
+        return_logprob=False,
+    )
+
+
 def test_output_policy_final_logprob_repair_claim_is_once_only():
     req = SimpleNamespace(
         return_logprob=True,
