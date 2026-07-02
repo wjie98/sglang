@@ -81,6 +81,10 @@ class DecodeVerifyRollbackWorkerV2(
     ) -> None:
         return None
 
+    def clear_cache_pool(self):
+        super().clear_cache_pool()
+        self.dvr_replay_prefix.clear()
+
     def _draft_cache_locs_from_req_to_token(
         self, batch: ScheduleBatch
     ) -> torch.Tensor:

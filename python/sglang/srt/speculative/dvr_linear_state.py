@@ -47,6 +47,13 @@ class DVRLinearStateLifecycle:
         self.suffix_replay_boundary_track_mask = None
         self.validate_args()
 
+    def clear_cache_state(self):
+        self.boundary_seqlen.clear()
+        self.boundary_track_idx.clear()
+        self.boundary_backup = None
+        self.live_backup = None
+        self.suffix_replay_boundary_track_mask = None
+
     def validate_args(self):
         if self.state_adapter() is None:
             return

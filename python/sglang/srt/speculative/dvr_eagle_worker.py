@@ -99,6 +99,12 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 DVREagleTargetVerifyCudaGraphRunner(self)
             )
 
+    def clear_cache_pool(self):
+        super().clear_cache_pool()
+        self.linear_state.clear_cache_state()
+        self.dvr_replay_prefix.clear()
+        self.dvr_output_replay_prefix.clear()
+
     @staticmethod
     def _has_one_token_real_prompt(batch: ScheduleBatch) -> bool:
         return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)

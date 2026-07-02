@@ -540,16 +540,14 @@ class EagleVerifyInputV2Mixin:
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-            draft_probs = torch.zeros_like(target_probs)
-
-            # coins for rejection sampling
-            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-            # coins for final sampling
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device=device
+            sampling_fn, draft_probs = self._sampling_fn_and_draft_probs(
+                target_probs, batch
+            )
+            coins, coins_for_final_sampling = self._sampling_uniforms(
+                candidates, batch
             )
 
-            tree_speculative_sampling_target_only(
+            sampling_fn(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=num_correct_drafts,  # mutable

@@ -114,6 +114,12 @@ class DVRTargetVerifyMixin:
 class DVREagleVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
     """DVR target verify with a standard EAGLE target-only sampler."""
 
+    def _sampling_uniforms(self, candidates: torch.Tensor, batch):
+        # EAGLE target-only verification has rejection/final-sampling coins
+        # outside the normal sampler. Honor request-level sampling_seed here so
+        # DVR-EAGLE sync/overlap comparisons are reproducible under sampling.
+        return dvr_chain_uniform_samples(candidates, batch)
+
 
 class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
     """DVR verify input with classic chain speculative sampling.
@@ -244,6 +250,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         return getattr(self.target_worker, name)
 
     def clear_cache_pool(self):
+        self.linear_state.clear_cache_state()
         return None
 
     # Public worker entrypoints. The shape follows EAGLE: normal extend produces

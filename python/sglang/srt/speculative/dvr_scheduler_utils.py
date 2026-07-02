@@ -234,6 +234,9 @@ class DVRReplayPrefixTracker:
     def __init__(self) -> None:
         self._output_ids_by_rid: dict[Any, list[int]] = {}
 
+    def clear(self) -> None:
+        self._output_ids_by_rid.clear()
+
     def prune_to_batch(self, batch: Any) -> None:
         if batch.reqs is None:
             self._output_ids_by_rid.clear()
