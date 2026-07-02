@@ -1,0 +1,234 @@
+# DVR validation matrix
+
+This file records the fixed validation protocol used while polishing the DVR
+integration.  The tests are intentionally split into server launch commands and
+small clients, because the 35B and 80B cases are machine dependent and should
+reuse SGLang's normal server and benchmark tooling.
+
+## Environment
+
+Use the development environment and model paths below unless a machine-specific
+note says otherwise.
+
+```bash
+conda activate dvr_dev
+export PYTHONPATH=python
+export SGLANG_RETURN_ORIGINAL_LOGPROB=True
+```
+
+Models:
+
+```text
+/mnt/data/hwj/Qwen3.5-0.8B
+/mnt/data/hwj/Qwen3.5-35B-A3B
+/mnt/data/hwj/Qwen3-Next-80B-A3B-Instruct
+```
+
+Datasets:
+
+```text
+/mnt/data/hwj/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json
+/mnt/data/hwj/LongBench-v2/data.json
+```
+
+## Static checks
+
+Run these before and after each code batch.
+
+```bash
+git diff --check
+conda run --no-capture-output -n dvr_dev python -m py_compile \
+  python/sglang/srt/speculative/dvr_*.py \
+  python/sglang/srt/speculative/eagle_info_v2.py \
+  python/sglang/srt/model_executor/dvr_*.py
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m pytest \
+  test/registered/unit/speculative/test_dvr_spec_policy.py \
+  test/registered/unit/server_args/test_dvr_server_args.py \
+  test/registered/unit/layers/test_dvr_gdn_state_input_cache.py
+```
+
+## 0.8B self-DVR KL smoke
+
+Run both spec-v1 compatibility mode and spec-v2 overlap mode.  The expected
+result is `ALL_OK True` with `maxdiff=0.0` and `kl_proxy=0.0`.
+
+Server:
+
+```bash
+SGLANG_ENABLE_SPEC_V2=<0-or-1> \
+SGLANG_RETURN_ORIGINAL_LOGPROB=True \
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
+  --model-path /mnt/data/hwj/Qwen3.5-0.8B \
+  --host 127.0.0.1 --port 30124 \
+  --speculative-algorithm DECODE_VERIFY_ROLLBACK \
+  --speculative-num-draft-tokens 16 \
+  --page-size 1 \
+  --mem-fraction-static 0.45 \
+  --attention-backend triton \
+  --linear-attn-backend triton \
+  --sampling-backend pytorch \
+  --enable-deterministic-inference \
+  --cuda-graph-bs 1 2 4 \
+  --cuda-graph-max-bs 4 \
+  --max-running-requests 8 \
+  --skip-server-warmup
+```
+
+Client:
+
+```bash
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
+  test/manual/dvr/test_dvr_batch_kl.py \
+  --base-url http://127.0.0.1:30124 \
+  --request-modes concurrent,batch \
+  --prompt-token-lengths 1,2,63,64,65 \
+  --max-new 1,8,16,17,63,64,65 \
+  --limit-cases 12 \
+  --concurrent-workers 4 \
+  --ignore-eos
+```
+
+For a long-sequence check, remove `--limit-cases` and include
+`--max-new 512,513`.
+
+## 35B self-DVR and DVR-EAGLE
+
+Use the 35B model for MTP/EAGLE first.  Qwen3.5 35B has MTP weights and is the
+smallest local model that exercises the target plus MTP path.
+
+Self-DVR server:
+
+```bash
+SGLANG_ENABLE_SPEC_V2=<0-or-1> \
+SGLANG_RETURN_ORIGINAL_LOGPROB=True \
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
+  --model-path /mnt/data/hwj/Qwen3.5-35B-A3B \
+  --host 127.0.0.1 --port 30135 \
+  --tp-size 4 \
+  --speculative-algorithm DECODE_VERIFY_ROLLBACK \
+  --speculative-num-draft-tokens 16 \
+  --page-size 1 \
+  --context-length 4096 \
+  --max-total-tokens 8192 \
+  --mem-fraction-static 0.72 \
+  --attention-backend triton \
+  --linear-attn-backend triton \
+  --sampling-backend pytorch \
+  --enable-deterministic-inference \
+  --cuda-graph-bs 1 2 4 \
+  --cuda-graph-max-bs 4 \
+  --max-running-requests 4 \
+  --skip-server-warmup
+```
+
+DVR-EAGLE server:
+
+```bash
+SGLANG_ENABLE_SPEC_V2=<0-or-1> \
+SGLANG_RETURN_ORIGINAL_LOGPROB=True \
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
+  --model-path /mnt/data/hwj/Qwen3.5-35B-A3B \
+  --host 127.0.0.1 --port 30135 \
+  --tp-size 4 \
+  --speculative-algorithm DECODE_VERIFY_ROLLBACK_EAGLE \
+  --speculative-draft-model-path /mnt/data/hwj/Qwen3.5-35B-A3B \
+  --speculative-num-draft-tokens 4 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --page-size 1 \
+  --context-length 4096 \
+  --max-total-tokens 8192 \
+  --mem-fraction-static 0.72 \
+  --attention-backend triton \
+  --linear-attn-backend triton \
+  --sampling-backend pytorch \
+  --enable-deterministic-inference \
+  --cuda-graph-bs 1 2 4 \
+  --cuda-graph-max-bs 4 \
+  --max-running-requests 4 \
+  --skip-server-warmup
+```
+
+EAGLE client, returned-logprob path:
+
+```bash
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
+  test/manual/dvr/test_dvr_eagle_acceptance.py \
+  --base-url http://127.0.0.1:30135 \
+  --prompt-token-lengths 63,64,65 \
+  --max-new 4,16,65 \
+  --cache-mode flush-each \
+  --check-kl \
+  --ignore-eos \
+  --seed 2032
+```
+
+EAGLE client, no returned-logprob output path:
+
+```bash
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
+  test/manual/dvr/test_dvr_eagle_acceptance.py \
+  --base-url http://127.0.0.1:30135 \
+  --prompt-token-lengths 63,64,65 \
+  --max-new 4,16,65 \
+  --cache-mode flush-each \
+  --no-return-logprob \
+  --ignore-eos \
+  --seed 2032
+```
+
+The sync and overlap DVR-EAGLE modes are both spec-v2 semantics.  In this tree
+`SGLANG_ENABLE_SPEC_V2=0` selects synchronous v2 execution for DVR-EAGLE, and
+`SGLANG_ENABLE_SPEC_V2=1` selects overlap v2 execution.  DVR-EAGLE v1 is not a
+supported matrix entry.
+
+## 80B self-DVR throughput
+
+Use Qwen3-Next 80B for long-output self-DVR throughput.  Compare every DVR run
+with a no-DVR baseline launched with the same backend, TP size, context length,
+request rate, request count, and output length.  Report:
+
+```text
+effective_dvr_throughput = output_throughput * accept_rate
+dvr_ratio = effective_dvr_throughput / no_dvr_output_throughput
+```
+
+ShareGPT client:
+
+```bash
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.bench_serving \
+  --backend sglang \
+  --base-url http://127.0.0.1:30180 \
+  --dataset-name sharegpt \
+  --dataset-path /mnt/data/hwj/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --tokenizer /mnt/data/hwj/Qwen3-Next-80B-A3B-Instruct \
+  --num-prompts 32 \
+  --sharegpt-output-len 1024 \
+  --request-rate inf \
+  --max-concurrency 4 \
+  --disable-tqdm \
+  --disable-stream \
+  --extra-request-body '{"sampling_params":{"ignore_eos":true}}'
+```
+
+LongBench client:
+
+```bash
+PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.bench_serving \
+  --backend sglang \
+  --base-url http://127.0.0.1:30180 \
+  --dataset-name longbench_v2 \
+  --dataset-path /mnt/data/hwj/LongBench-v2/data.json \
+  --tokenizer /mnt/data/hwj/Qwen3-Next-80B-A3B-Instruct \
+  --num-prompts 32 \
+  --sharegpt-output-len 1024 \
+  --request-rate inf \
+  --max-concurrency 4 \
+  --disable-tqdm \
+  --disable-stream \
+  --extra-request-body '{"sampling_params":{"ignore_eos":true}}'
+```
+
+For every throughput run, keep the raw benchmark JSONL and server log.  The
+server log is the source of DVR accept rate and verifies whether draft decode
+uses CUDA graph and non-deterministic decode performance knobs.
