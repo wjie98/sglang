@@ -210,6 +210,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.state_capturer.routed_experts import (
     RoutedExpertsCapturer,
+    disable_routed_experts_capture_for_draft,
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
@@ -697,6 +698,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
+        # Must run before backend/graph init so no draft graph records a
+        # routed-experts capture-write kernel.
+        if self.is_draft_worker:
+            disable_routed_experts_capture_for_draft(self.model)
+
         # Load the expert backup client
         self.expert_backup_client = (
             ExpertBackupClient(self.server_args, self)
@@ -925,6 +931,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
     def init_routed_experts_capturer(self):
+        if self.is_draft_worker:
+            # Capture is target-only. The draft worker runs in the same process
+            # as its target and inits after it, so installing a capturer here
+            # would overwrite the target's process-global one.
+            return
+
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -3805,9 +3817,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-    def check_weights(self, action: str, allow_quant_error: bool = False):
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ):
         return self._weight_checker.handle(
-            action=action, allow_quant_error=allow_quant_error
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_tensor_list=skip_tensor_list,
         )
 
     def update_weights_from_ipc(self, recv_req):
