@@ -14,6 +14,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 
 
+# Suffix replay still reuses the live ScheduleBatch and restores the fields
+# below after the oracle EXTEND. Keep this list local and explicit: it marks the
+# production-hardening boundary to replace with a narrow replay batch, similar
+# to final-logprob repair, without hiding side effects behind generic mutation.
 _TEMP_EXTEND_BATCH_FIELDS = (
     "forward_mode",
     "global_forward_mode",

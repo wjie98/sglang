@@ -89,8 +89,13 @@ class DecodeVerifyRollbackEagleWorkerV2(
             server_args=self.server_args,
             model_runner=self.model_runner,
         )
-        self.dvr_replay_prefix = DVRReplayPrefixTracker()
-        self.dvr_output_replay_prefix = DVRReplayPrefixTracker()
+        # EAGLE/MTP has two logical token streams:
+        # - verifier prefix: accepted draft/input tokens used to reconstruct the
+        #   next deterministic target verify replay.
+        # - client output prefix: target predictions exposed to the user, used
+        #   only by final exact logprob repair.
+        self.dvr_verifier_replay_prefix = DVRReplayPrefixTracker()
+        self.dvr_client_output_replay_prefix = DVRReplayPrefixTracker()
         self.cuda_graph_runner_for_target_verify = None
         if not self.server_args.disable_cuda_graph and (
             self.server_args.model_impl != "mindspore"
@@ -102,11 +107,14 @@ class DecodeVerifyRollbackEagleWorkerV2(
     def clear_cache_pool(self):
         super().clear_cache_pool()
         self.linear_state.clear_cache_state()
-        self.dvr_replay_prefix.clear()
-        self.dvr_output_replay_prefix.clear()
+        self.dvr_verifier_replay_prefix.clear()
+        self.dvr_client_output_replay_prefix.clear()
 
     @staticmethod
-    def _has_one_token_real_prompt(batch: ScheduleBatch) -> bool:
+    def _has_graph_unsafe_short_prompt(batch: ScheduleBatch) -> bool:
+        # A one-token prompt currently reaches the target-verify graph through a
+        # page-padded GDN state-input boundary that can illegal-access. Keep this
+        # edge explicit so normal prompts remain on the DVR-EAGLE graph path.
         return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
 
     @contextmanager
@@ -191,7 +199,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         return DVREagleVerifyInput.from_eagle_verify_input(verify_input)
 
     def _request_token_ids_for_eagle_replay(self, req, seq_len: int):
-        return self.dvr_replay_prefix.request_verifier_prefix_token_ids(
+        return self.dvr_verifier_replay_prefix.request_verifier_prefix_token_ids(
             req,
             seq_len,
             error_prefix="DVR EAGLE",
@@ -220,7 +228,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
-        self.dvr_replay_prefix.prune_to_batch(batch)
+        self.dvr_verifier_replay_prefix.prune_to_batch(batch)
 
         bs = len(batch.seq_lens)
         draft_token_num = verify_input.draft_token_num
@@ -249,7 +257,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             strict=True,
         ):
             prefix_output_len = max(0, int(seq_len) - len(req.origin_input_ids))
-            self.dvr_replay_prefix.align_req_to_output_len(
+            self.dvr_verifier_replay_prefix.align_req_to_output_len(
                 req,
                 prefix_output_len,
                 error_prefix="DVR EAGLE replay prefix",
@@ -258,7 +266,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             accepted_token_ids = [
                 int(token_id) for token_id in draft_tokens[: int(accepted_len)]
             ]
-            self.dvr_replay_prefix.append_output_tokens(
+            self.dvr_verifier_replay_prefix.append_output_tokens(
                 req,
                 accepted_token_ids,
                 initialize_from_req_output=False,
@@ -473,7 +481,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 # prefill/extend step.  In overlap it can be consumed by the
                 # first verify before Req.output_ids is materialized, so the
                 # DVR-EAGLE final-logprob stream must learn it here.
-                self.dvr_output_replay_prefix.seed_from_target_extend(
+                self.dvr_client_output_replay_prefix.seed_from_target_extend(
                     batch=batch,
                     next_token_ids=batch_output.next_token_ids,
                 )
@@ -547,7 +555,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
-        disable_verify_graph = self._has_one_token_real_prompt(batch)
+        disable_verify_graph = self._has_graph_unsafe_short_prompt(batch)
         with self._target_verify_prepare_context(
             disable_cuda_graph=disable_verify_graph
         ) as prepared_on_plan_stream:
@@ -685,7 +693,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 if batch.seq_lens_cpu is not None
                 else batch.seq_lens.detach().cpu().tolist()
             )
-            self.dvr_output_replay_prefix.advance_output_stream_from_compact_rows(
+            self.dvr_client_output_replay_prefix.advance_output_stream_from_compact_rows(
                 batch=batch,
                 compact_output_token_ids_per_req=compact_output_token_ids_per_req,
                 error_prefix="DVR EAGLE final logprob output replay prefix",
@@ -693,7 +701,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             final_logprob_repairs = defer_and_score_dvr_final_logprob_repairs(
                 batch=batch,
                 target_worker=self.target_worker,
-                replay_prefix=self.dvr_output_replay_prefix,
+                replay_prefix=self.dvr_client_output_replay_prefix,
                 linear_state_ctx=linear_state_ctx,
                 base_seq_lens_cpu=base_seq_lens_cpu,
                 accept_lens_cpu=accept_lens.detach().cpu().tolist(),
