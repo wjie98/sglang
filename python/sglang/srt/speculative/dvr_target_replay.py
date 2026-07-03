@@ -132,6 +132,23 @@ class DVRBoundaryReplayPlan:
     boundary_indices: torch.Tensor
 
 
+def _snapshot_temp_extend_batch_fields(batch) -> dict[str, Any]:
+    """Snapshot the live ScheduleBatch fields that suffix replay overwrites.
+
+    This keeps the risky live-batch mutation contract local to DVR replay and
+    fails at the replay boundary if upstream changes remove one of the fields.
+    """
+
+    return {name: getattr(batch, name) for name in _TEMP_EXTEND_BATCH_FIELDS}
+
+
+def _restore_temp_extend_batch_fields(batch, saved_fields: dict[str, Any]) -> None:
+    """Restore fields saved by _snapshot_temp_extend_batch_fields."""
+
+    for name, value in saved_fields.items():
+        setattr(batch, name, value)
+
+
 @contextmanager
 def linear_state_replay_context(
     linear_state_ctx,
@@ -547,7 +564,7 @@ def draft_row_logits_from_replay_hidden_states(
 def target_extend_replay_batch(batch, spec: DVRTargetReplaySpec):
     """Run a target EXTEND replay without leaking mutations to the live batch."""
 
-    saved_fields = {name: getattr(batch, name) for name in _TEMP_EXTEND_BATCH_FIELDS}
+    saved_fields = _snapshot_temp_extend_batch_fields(batch)
     device = batch.seq_lens.device
     try:
         batch.forward_mode = ForwardMode.EXTEND
@@ -605,5 +622,4 @@ def target_extend_replay_batch(batch, spec: DVRTargetReplaySpec):
 
         yield DVRTargetReplayContext(saved_fields=saved_fields)
     finally:
-        for name, value in saved_fields.items():
-            setattr(batch, name, value)
+        _restore_temp_extend_batch_fields(batch, saved_fields)
