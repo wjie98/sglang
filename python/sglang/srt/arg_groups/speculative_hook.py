@@ -94,9 +94,11 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
 
     if server_args.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 
         algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+        algo_policy = get_spec_algorithm_policy(algo)
 
         # TODO: move the per-algorithm validation below into spec module hooks.
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
@@ -108,12 +110,7 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
             f"speculative_algorithm == EAGLE, got {server_args.speculative_algorithm}."
         )
 
-    if (
-        server_args.speculative_algorithm is not None
-        and SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        ).is_decode_verify_rollback()
-    ):
+    if server_args.speculative_algorithm is not None and algo_policy.is_dvr():
         from sglang.srt.speculative.dvr_server_args import (
             handle_dvr_speculative_decoding,
         )
@@ -148,10 +145,11 @@ def handle_speculative_defaults(server_args: "ServerArgs") -> None:
     server_args.speculative_algorithm = server_args.speculative_algorithm.upper()
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 
-    if SpeculativeAlgorithm.from_string(
-        server_args.speculative_algorithm
-    ).is_decode_verify_rollback():
+    if get_spec_algorithm_policy(
+        SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    ).is_dvr():
         from sglang.srt.speculative.dvr_server_args import handle_dvr_defaults
 
         handle_dvr_defaults(server_args)
