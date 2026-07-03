@@ -171,6 +171,17 @@ def dvr_spec_aux_from_pending_mamba_checkpoints(
     )
 
 
+def apply_dvr_spec_result_aux_after_materialize(batch: Any, result: Any) -> None:
+    """Apply DVR worker aux data after scheduler materializes accepted tokens.
+
+    The scheduler should not know which exact DVR side channel is present in
+    ``GenerationBatchResult.spec_aux``. Keep the decode-output boundary here so
+    future DVR aux fields do not add more branches to batch result processing.
+    """
+
+    apply_dvr_final_logprob_repairs_from_result(batch, result)
+
+
 def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
     """Apply DVR exact final logprob repairs after Spec-v2 output materializes."""
 
@@ -598,7 +609,7 @@ def maybe_handle_dvr_mamba_checkpoint_after_decode(
 ) -> bool:
     """Handle DVR's decode-time mamba checkpoint commit if applicable."""
 
-    if not batch.spec_algorithm.is_decode_verify_rollback():
+    if not get_spec_algorithm_policy(batch.spec_algorithm).is_dvr():
         return False
 
     mark_req_skip_mamba_radix_finished_insert(req)
