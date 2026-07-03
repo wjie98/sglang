@@ -40,7 +40,8 @@ git diff --check
 conda run --no-capture-output -n dvr_dev python -m py_compile \
   python/sglang/srt/speculative/dvr_*.py \
   python/sglang/srt/speculative/eagle_info_v2.py \
-  python/sglang/srt/model_executor/dvr_*.py
+  python/sglang/srt/model_executor/dvr_*.py \
+  python/sglang/srt/layers/attention/linear/dvr_*.py
 PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m pytest \
   test/registered/unit/speculative/test_dvr_spec_policy.py \
   test/registered/unit/server_args/test_dvr_server_args.py \

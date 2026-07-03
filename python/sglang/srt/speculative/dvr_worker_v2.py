@@ -348,12 +348,12 @@ class DecodeVerifyRollbackWorkerV2(
                 not batch.forward_mode.is_idle()
                 and accept_lens.numel() > 0
             ):
-                partial_accept = torch.any(accept_lens < self.num_draft_tokens).item()
                 # return_logprob is an output-scoring concern.  Keep self-DVR
                 # on the same fast state commit path as no-logprob so enabling
                 # logprobs does not change the next draft state or acceptance.
-                use_self_logprob_replay = False
-                if partial_accept and (not is_self_dvr or use_self_logprob_replay):
+                if not is_self_dvr and torch.any(
+                    accept_lens < self.num_draft_tokens
+                ).item():
                     accept_lens_cpu = accept_lens.detach().cpu().tolist()
                     max_accept = accept_index.shape[1]
                     valid_accept = torch.arange(
@@ -386,8 +386,7 @@ class DecodeVerifyRollbackWorkerV2(
                     accepted_steps=(accept_lens - 1).to(torch.long),
                     ctx=linear_state_ctx,
                     live_state_already_replayed=live_state_already_replayed,
-                    use_fast_self_draft_commit=is_self_dvr
-                    and not use_self_logprob_replay,
+                    use_fast_self_draft_commit=is_self_dvr,
                 )
             )
 
