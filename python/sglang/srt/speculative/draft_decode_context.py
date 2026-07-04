@@ -19,7 +19,9 @@ def draft_decode_performance_context(
     generic EAGLE workers do not import DVR graph-runner internals directly.
     """
 
-    if model_runner.spec_algorithm.is_decode_verify_rollback_eagle():
+    from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
+
+    if get_spec_algorithm_policy(model_runner.spec_algorithm).is_dvr_eagle():
         from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
             dvr_eagle_draft_decode_context,
         )

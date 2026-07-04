@@ -66,6 +66,7 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     generate_token_bitmask,
@@ -206,9 +207,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self._uses_dvr_draft_decode_context = (
-            self.speculative_algorithm.is_decode_verify_rollback_eagle()
-        )
+        self._uses_dvr_draft_decode_context = get_spec_algorithm_policy(
+            self.speculative_algorithm
+        ).is_dvr_eagle()
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),

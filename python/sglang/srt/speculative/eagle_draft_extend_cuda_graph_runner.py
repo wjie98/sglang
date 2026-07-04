@@ -31,6 +31,7 @@ from sglang.srt.speculative.draft_decode_context import (
     draft_decode_performance_context,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     is_hip,
@@ -95,7 +96,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.dp_size = self.model_runner.dp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.use_selected_logits = (
-            model_runner.spec_algorithm.is_decode_verify_rollback_eagle()
+            get_spec_algorithm_policy(model_runner.spec_algorithm).is_dvr_eagle()
             and self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
             and self.topk == 1
             and not self.require_gathered_buffer

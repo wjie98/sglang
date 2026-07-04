@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-_MAMBA_RADIX_CACHE_POLICY_ATTR = "_mamba_radix_cache_policy"
-
 
 @dataclass
 class MambaRadixInsertSnapshot:
@@ -29,10 +27,10 @@ class MambaRadixCachePolicy:
 def _get_req_mamba_radix_cache_policy(
     req: Any, *, create: bool = False
 ) -> Optional[MambaRadixCachePolicy]:
-    policy = getattr(req, _MAMBA_RADIX_CACHE_POLICY_ATTR, None)
+    policy = getattr(req, "mamba_radix_cache_policy", None)
     if policy is None and create:
         policy = MambaRadixCachePolicy()
-        setattr(req, _MAMBA_RADIX_CACHE_POLICY_ATTR, policy)
+        setattr(req, "mamba_radix_cache_policy", policy)
     return policy
 
 
@@ -62,5 +60,6 @@ def clear_req_mamba_radix_insert_snapshot(req: Any) -> None:
 
 
 def reset_req_mamba_radix_cache_policy(req: Any) -> None:
-    if hasattr(req, _MAMBA_RADIX_CACHE_POLICY_ATTR):
-        delattr(req, _MAMBA_RADIX_CACHE_POLICY_ATTR)
+    policy = _get_req_mamba_radix_cache_policy(req, create=True)
+    policy.skip_finished_insert = False
+    policy.insert_snapshot = None

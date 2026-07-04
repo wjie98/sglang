@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import torch
 
 from sglang.srt.layers.utils.hash import murmur_hash32
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 
 try:
     import triton
@@ -29,7 +30,7 @@ def dvr_causal_verify_cuda_graph_metadata(
     old_custom_mask = getattr(spec_info, "custom_mask", None)
     should_clear_custom_mask = (
         (
-            model_runner.spec_algorithm.is_decode_verify_rollback_self_draft()
+            get_spec_algorithm_policy(model_runner.spec_algorithm).is_dvr_self_draft()
             or getattr(model_runner, "enable_dvr_target_verify_cuda_graph", False)
         )
         and forward_mode.is_target_verify()
