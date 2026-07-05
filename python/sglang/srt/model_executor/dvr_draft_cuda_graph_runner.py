@@ -245,6 +245,11 @@ def _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr):
 def _assert_draft_decode_performance_state(model_runner, extra_attn_backends):
     """Fail fast if deterministic target settings leak into draft decode."""
 
+    # These checks deliberately run on every DVR draft decode context entry.
+    # The draft path is only provisional, so running deterministic target
+    # kernels here is pure overhead and was the source of earlier throughput
+    # regressions. Raising early is preferable to silently falling back to the
+    # deterministic verify profile.
     if getattr(model_runner.server_args, "enable_deterministic_inference", False):
         raise RuntimeError("DVR draft decode must run with deterministic inference off.")
     if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():

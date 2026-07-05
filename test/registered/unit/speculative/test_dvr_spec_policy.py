@@ -4,6 +4,9 @@ import pytest
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    _spec_draft_proposals_per_round,
+)
 from sglang.srt.speculative.draft_decode_context import draft_decode_performance_context
 from sglang.srt.speculative.dvr_logprob_repair import (
     _DVRFinalLogprobReplayPlan,
@@ -155,6 +158,33 @@ def test_spec_accept_rate_proposal_width_policy():
         _policy(SpeculativeAlgorithm.DFLASH).proposed_draft_tokens_per_verify(
             speculative_num_steps=3,
             speculative_num_draft_tokens=8,
+        )
+        == 7
+    )
+
+
+def test_scheduler_spec_accept_rate_uses_policy_width():
+    assert (
+        _spec_draft_proposals_per_round(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+            num_steps=15,
+            num_draft_tokens=16,
+        )
+        == 15
+    )
+    assert (
+        _spec_draft_proposals_per_round(
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
+            num_steps=3,
+            num_draft_tokens=4,
+        )
+        == 3
+    )
+    assert (
+        _spec_draft_proposals_per_round(
+            SpeculativeAlgorithm.DFLASH,
+            num_steps=3,
+            num_draft_tokens=8,
         )
         == 7
     )

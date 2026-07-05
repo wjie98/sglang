@@ -14,10 +14,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 
 
-# Suffix replay still reuses the live ScheduleBatch and restores the fields
-# below after the oracle EXTEND. Keep this list local and explicit: it marks the
-# production-hardening boundary to replace with a narrow replay batch, similar
-# to final-logprob repair, without hiding side effects behind generic mutation.
+# Some replay callers still use a temporary EXTEND context over a private replay
+# batch. Keep the overwritten fields local and explicit so this helper never
+# becomes a hidden generic mutation layer for live scheduler batches.
 _TEMP_EXTEND_BATCH_FIELDS = (
     "forward_mode",
     "global_forward_mode",
@@ -531,6 +530,106 @@ def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleB
         mamba_track_seqlens=torch.tensor(
             plan.final_seq_lens, dtype=torch.int64, device=device
         ),
+    )
+
+
+def build_target_extend_replay_batch(
+    batch,
+    spec: DVRTargetReplaySpec,
+    *,
+    reqs: Optional[list[Any]] = None,
+) -> ScheduleBatch:
+    """Create a narrow EXTEND batch for DVR target replay oracles.
+
+    Suffix replay only needs request slots, cache pools, sequence lengths, and
+    the explicit GDN/Mamba state ops carried by ``spec``.  Building a private
+    batch keeps the live scheduler batch out of the oracle forward path.
+    """
+
+    replay_reqs = batch.reqs if reqs is None else reqs
+    device = batch.seq_lens.device
+    global_num_tokens = None
+    global_num_tokens_for_logprob = None
+    if batch.global_num_tokens is not None:
+        dp_world = len(batch.global_num_tokens)
+        global_num_tokens = [len(spec.input_ids)] * dp_world
+        global_num_tokens_for_logprob = [len(spec.input_ids)] * dp_world
+
+    return ScheduleBatch(
+        reqs=replay_reqs,
+        req_to_token_pool=batch.req_to_token_pool,
+        token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
+        tree_cache=batch.tree_cache,
+        model_config=batch.model_config,
+        enable_overlap=batch.enable_overlap,
+        device=batch.device,
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=torch.tensor(spec.input_ids, dtype=torch.int64, device=device),
+        req_pool_indices=torch.tensor(
+            [req.req_pool_idx for req in replay_reqs],
+            dtype=torch.int64,
+            device=device,
+        ),
+        seq_lens=torch.tensor(spec.final_seq_lens, dtype=torch.int64, device=device),
+        out_cache_loc=torch.cat(spec.out_cache_locs).to(device=device),
+        seq_lens_cpu=torch.tensor(spec.final_seq_lens, dtype=torch.int64),
+        seq_lens_sum=sum(spec.final_seq_lens),
+        return_logprob=spec.return_logprob,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        global_num_tokens=global_num_tokens,
+        global_num_tokens_for_logprob=global_num_tokens_for_logprob,
+        is_extend_in_batch=True,
+        all_extend_in_batch=True,
+        can_run_dp_cuda_graph=False,
+        tbo_split_seq_index=None,
+        global_forward_mode=None,
+        extend_num_tokens=len(spec.input_ids),
+        extend_lens=[int(x) for x in spec.extend_lens],
+        prefix_lens=[int(x) for x in spec.prefix_lens],
+        extend_logprob_start_lens=[
+            int(x) for x in spec.extend_logprob_start_lens
+        ],
+        extend_input_logprob_token_ids=(
+            None
+            if spec.extend_input_logprob_token_ids is None
+            else torch.tensor(
+                spec.extend_input_logprob_token_ids,
+                dtype=torch.int64,
+                device=device,
+            )
+        ),
+        multimodal_inputs=(
+            [req.multimodal_inputs for req in replay_reqs]
+            if spec.multimodal_inputs is None
+            else spec.multimodal_inputs
+        ),
+        encoder_cached=None,
+        encoder_lens=None,
+        encoder_lens_cpu=None,
+        encoder_out_cache_loc=None,
+        sampling_info=None,
+        orig_seq_lens=torch.tensor(
+            spec.final_seq_lens, dtype=torch.int32, device=device
+        ),
+        input_embeds=None,
+        ne_token_table=None,
+        spec_algorithm=batch.spec_algorithm,
+        spec_info=None,
+        capture_hidden_mode=spec.capture_hidden_mode,
+        hicache_consumer_index=-1,
+        is_prefill_only=batch.is_prefill_only,
+        dllm_config=batch.dllm_config,
+        has_grammar=False,
+        return_hidden_states=False,
+        return_hidden_states_before_norm=False,
+        mamba_track_indices=spec.mamba_track_indices,
+        mamba_track_mask=spec.mamba_track_mask,
+        mamba_track_seqlens=spec.mamba_track_seqlens,
+        mamba_track_cache_seqlens=None,
+        mamba_cow_src_indices=spec.mamba_cow_src_indices,
+        mamba_cow_dst_indices=spec.mamba_cow_dst_indices,
+        mamba_clear_indices=spec.mamba_clear_indices,
     )
 
 

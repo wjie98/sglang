@@ -39,9 +39,9 @@ from sglang.srt.speculative.dvr_target_replay import (
     DVRTargetReplaySpec,
     build_accepted_suffix_replay_plan,
     build_suffix_draft_replay_plan,
+    build_target_extend_replay_batch,
     draft_row_logits_from_replay_hidden_states,
     linear_state_replay_context,
-    target_extend_replay_batch,
 )
 from sglang.srt.speculative.dvr_utils import (
     chain_speculative_sampling,
@@ -856,29 +856,28 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             mamba_clear_indices=live_indices if full_prefix_replay else None,
         )
 
-        with (
-            linear_state_replay_context(
-                linear_state_ctx,
-                clear_state_input_window=full_prefix_replay,
-                restore_live_state=True,
-            ),
-            target_extend_replay_batch(batch, replay_spec),
+        replay_batch = build_target_extend_replay_batch(batch, replay_spec)
+
+        with linear_state_replay_context(
+            linear_state_ctx,
+            clear_state_input_window=full_prefix_replay,
+            restore_live_state=True,
         ):
             # The suffix EXTEND must see draft KV at absolute positions
             # base_seq_len..base_seq_len+draft.  These are the same slots the
             # real verify path owns, so publishing them in req_to_token_pool is
-            # intentional even though the rest of ScheduleBatch is restored.
-            batch.req_to_token_pool.write(
+            # intentional.  The replay itself now runs on a private batch.
+            replay_batch.req_to_token_pool.write(
                 (replay_plan.draft_rows, replay_plan.draft_offsets),
                 replay_plan.draft_cache_locs.to(torch.int32),
             )
 
             oracle_output = self.target_worker.forward_batch_generation(
-                batch=batch,
+                batch=replay_batch,
                 is_verify=True,
             )
             forward_batch = ForwardBatch.init_new(
-                batch, self.target_worker.model_runner
+                replay_batch, self.target_worker.model_runner
             )
             draft_logits, _ = draft_row_logits_from_replay_hidden_states(
                 target_worker=self.target_worker,
@@ -970,18 +969,21 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             mamba_cow_dst_indices=live_indices,
         )
 
-        with (
-            linear_state_replay_context(linear_state_ctx, restore_live_state=False),
-            target_extend_replay_batch(batch, replay_spec),
+        replay_batch = build_target_extend_replay_batch(batch, replay_spec)
+
+        with linear_state_replay_context(
+            linear_state_ctx, restore_live_state=False
         ):
             if replay_plan.accepted_rows is not None:
-                batch.req_to_token_pool.write(
+                replay_batch.req_to_token_pool.write(
                     (replay_plan.accepted_rows, replay_plan.accepted_offsets),
                     replay_plan.accepted_cache_locs.to(
-                        device=batch.seq_lens.device, dtype=torch.int32
+                        device=replay_batch.seq_lens.device, dtype=torch.int32
                     ),
                 )
-            self.target_worker.forward_batch_generation(batch=batch, is_verify=True)
+            self.target_worker.forward_batch_generation(
+                batch=replay_batch, is_verify=True
+            )
             return torch.ones(
                 len(batch.reqs), dtype=torch.bool, device=live_indices.device
             )

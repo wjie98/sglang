@@ -28,9 +28,9 @@ from sglang.srt.speculative.dvr_logprob_repair import (
 from sglang.srt.speculative.dvr_target_replay import (
     DVRTargetReplaySpec,
     build_suffix_draft_replay_plan,
+    build_target_extend_replay_batch,
     draft_row_logits_from_replay_hidden_states,
     linear_state_replay_context,
-    target_extend_replay_batch,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_linear_state_worker import (
@@ -367,13 +367,12 @@ class DecodeVerifyRollbackEagleWorkerV2(
             mamba_clear_indices=live_indices if full_prefix_replay else None,
         )
 
-        with (
-            linear_state_replay_context(
-                linear_state_ctx,
-                clear_state_input_window=full_prefix_replay,
-                restore_live_state=True,
-            ),
-            target_extend_replay_batch(batch, replay_spec) as replay_ctx,
+        replay_batch = build_target_extend_replay_batch(batch, replay_spec)
+
+        with linear_state_replay_context(
+            linear_state_ctx,
+            clear_state_input_window=full_prefix_replay,
+            restore_live_state=True,
         ):
             if not full_prefix_replay:
                 self.linear_state.restore_boundary_state_for_suffix_replay(
@@ -383,18 +382,18 @@ class DecodeVerifyRollbackEagleWorkerV2(
             # The suffix EXTEND must see draft KV at absolute positions
             # base_seq_len..base_seq_len+draft.  These are the same slots the
             # real verify path owns, so publishing them in req_to_token_pool is
-            # intentional even though the rest of ScheduleBatch is restored.
-            batch.req_to_token_pool.write(
+            # intentional.  The replay itself now runs on a private batch.
+            replay_batch.req_to_token_pool.write(
                 (replay_plan.draft_rows, replay_plan.draft_offsets),
                 replay_plan.draft_cache_locs.to(torch.int32),
             )
 
             forward_batch = ForwardBatch.init_new(
-                batch, self.target_worker.model_runner
+                replay_batch, self.target_worker.model_runner
             )
             if self.target_worker.model_runner.model_is_mrope:
                 mrope_chunks = []
-                mm_inputs = replay_ctx.saved_fields["multimodal_inputs"]
+                mm_inputs = replay_batch.multimodal_inputs
                 for req_i, (seq_len, boundary, tail_len) in enumerate(
                     zip(
                         replay_plan.base_seq_lens_cpu,
@@ -428,7 +427,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                                 start,
                                 int(seq_len),
                                 dtype=torch.long,
-                                device=batch.seq_lens.device,
+                                device=replay_batch.seq_lens.device,
                             )
                             .unsqueeze(0)
                             .repeat(3, 1)
@@ -439,7 +438,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                             int(seq_len),
                             int(seq_len) + draft_token_num,
                             dtype=torch.long,
-                            device=batch.seq_lens.device,
+                            device=replay_batch.seq_lens.device,
                         )
                         .unsqueeze(0)
                         .repeat(3, 1)

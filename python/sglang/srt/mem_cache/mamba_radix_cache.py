@@ -517,6 +517,31 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
+    def _invalid_mamba_track_checkpoint(self, cache_len: int, num_token_ids: int) -> bool:
+        """Return whether a tracked mamba checkpoint cannot be inserted.
+
+        Mamba radix entries must point to a materialized, page-aligned prefix.
+        Overlap output processing can briefly observe a future checkpoint before
+        the token slots for that prefix are committed, so keep this guard close
+        to radix insertion as the final consistency check.
+        """
+
+        return self.enable_mamba_extra_buffer and (
+            cache_len > num_token_ids
+            or (self.page_size != 1 and cache_len % self.page_size != 0)
+        )
+
+    def _page_aligned_kv_indices(self, kv_indices: torch.Tensor):
+        if self.page_size != 1:
+            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+        else:
+            page_aligned_len = len(kv_indices)
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        return page_aligned_len, page_aligned_kv_indices
+
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
@@ -549,9 +574,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             if cache_len is None:
                 cache_len = 0
-            invalid_tracked_checkpoint = self.enable_mamba_extra_buffer and (
-                cache_len > len(token_ids)
-                or (self.page_size != 1 and cache_len % self.page_size != 0)
+            invalid_tracked_checkpoint = self._invalid_mamba_track_checkpoint(
+                cache_len, len(token_ids)
             )
             if invalid_tracked_checkpoint:
                 self.token_to_kv_pool_allocator.free(
@@ -565,18 +589,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 kv_indices = kv_indices[:cache_len]
 
             if not invalid_tracked_checkpoint:
-                if self.page_size != 1:
-                    page_aligned_len = (
-                        len(kv_indices) // self.page_size * self.page_size
-                    )
-                    page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
-                        dtype=torch.int64, copy=True
-                    )
-                else:
-                    page_aligned_len = len(kv_indices)
-                    page_aligned_kv_indices = kv_indices.to(
-                        dtype=torch.int64, copy=True
-                    )
+                page_aligned_len, page_aligned_kv_indices = (
+                    self._page_aligned_kv_indices(kv_indices)
+                )
 
                 assert (
                     cache_len == page_aligned_len
@@ -669,27 +684,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             kv_indices_orig = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(token_ids)
             ]
-            if self.enable_mamba_extra_buffer:
-                # The tracked checkpoint must correspond to an already
-                # materialized page-aligned prefix. With overlap scheduling,
-                # output processing can observe a later tracking boundary before
-                # this request has written that many token slots.
-                if cache_len > len(token_ids) or (
-                    self.page_size != 1 and cache_len % self.page_size != 0
-                ):
-                    req.mamba_last_track_seqlen = None
-                    return _skip_cache_unfinished_req(req)
+            if self._invalid_mamba_track_checkpoint(cache_len, len(token_ids)):
+                req.mamba_last_track_seqlen = None
+                return _skip_cache_unfinished_req(req)
 
             # kv_indices is the kv indices to be cached
             kv_indices = kv_indices_orig[:cache_len]
-            if self.page_size != 1:
-                page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-                page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
-                    dtype=torch.int64, copy=True
-                )
-            else:
-                page_aligned_len = len(kv_indices)
-                page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            page_aligned_len, page_aligned_kv_indices = self._page_aligned_kv_indices(
+                kv_indices
+            )
 
             assert page_aligned_len == len(
                 kv_indices

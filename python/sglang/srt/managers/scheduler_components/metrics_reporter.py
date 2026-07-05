@@ -51,6 +51,22 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
+def _spec_draft_proposals_per_round(
+    spec_algorithm,
+    *,
+    num_steps: int,
+    num_draft_tokens: int,
+) -> int:
+    """Return the draft-token denominator used for scheduler spec metrics."""
+
+    from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
+
+    return get_spec_algorithm_policy(spec_algorithm).proposed_draft_tokens_per_verify(
+        speculative_num_steps=num_steps,
+        speculative_num_draft_tokens=num_draft_tokens,
+    )
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -710,12 +726,14 @@ class SchedulerMetricsReporter:
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
-            if self.scheduler.server_args.speculative_num_draft_tokens:
-                draft_per_round = (
-                    self.scheduler.server_args.speculative_num_draft_tokens - 1
-                )
-            else:
-                draft_per_round = self.scheduler.server_args.speculative_num_steps or 0
+            spec_snapshot = self._active_spec_config_snapshot()
+            spec_num_steps = spec_snapshot["num_steps"]
+            spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
+            draft_per_round = _spec_draft_proposals_per_round(
+                self.scheduler.spec_algorithm,
+                num_steps=spec_num_steps,
+                num_draft_tokens=spec_num_draft_tokens,
+            )
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
@@ -724,11 +742,6 @@ class SchedulerMetricsReporter:
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
-
-            if self.current_scheduler_metrics_enabled:
-                spec_snapshot = self._active_spec_config_snapshot()
-                spec_num_steps = spec_snapshot["num_steps"]
-                spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
         cache_hit_rate = 0.0
 
