@@ -4,10 +4,14 @@ import pytest
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+    DVRDraftDecodeCudaGraphRunner,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     _spec_draft_proposals_per_round,
 )
 from sglang.srt.speculative.draft_decode_context import draft_decode_performance_context
+from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_logprob_repair import (
     _DVRFinalLogprobReplayPlan,
     _can_reuse_live_cache_locs_for_final_replay,
@@ -194,6 +198,36 @@ def test_draft_decode_context_is_noop_for_regular_eagle():
     runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.EAGLE)
     with draft_decode_performance_context(runner) as ctx:
         assert ctx is None
+
+
+def test_dvr_self_draft_graph_runner_only_skips_known_short_boundary():
+    graph_runner = object.__new__(DVRDraftDecodeCudaGraphRunner)
+    graph_runner.runner = SimpleNamespace(can_run=lambda forward_batch: True)
+
+    assert not graph_runner.can_run(
+        SimpleNamespace(
+            dvr_disable_draft_cuda_graph=True,
+            seq_lens_cpu=torch.tensor([4]),
+            batch_size=1,
+        )
+    )
+    assert not graph_runner.can_run(
+        SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
+    )
+    assert graph_runner.can_run(
+        SimpleNamespace(seq_lens_cpu=torch.tensor([3]), batch_size=1)
+    )
+
+
+def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
+    worker = object.__new__(DecodeVerifyRollbackWorker)
+    worker.cuda_graph_runner_for_draft_decode = None
+    worker.model_runner = SimpleNamespace(hybrid_gdn_config=object())
+
+    with pytest.raises(RuntimeError, match="requires the dedicated CUDA graph"):
+        worker._draft_decode_forward(
+            SimpleNamespace(seq_lens_cpu=torch.tensor([3]), batch_size=1)
+        )
 
 
 def test_output_policy_defer_non_streaming_logprob():
