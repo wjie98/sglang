@@ -21,9 +21,8 @@ from sglang.srt.speculative.draft_decode_context import draft_decode_performance
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_logprob_repair import (
     _DVRFinalLogprobReplayPlan,
-    _can_reuse_live_cache_locs_for_final_replay,
     _final_output_len_if_repair_needed,
-    _is_kv_allocation_failure,
+    _should_reuse_live_cache_locs_after_alloc_failure,
 )
 from sglang.srt.arg_groups.speculative_hook import (
     speculative_uses_draft_decode_custom_all_reduce,
@@ -617,7 +616,11 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
     )
 
 
-def test_dvr_final_logprob_replay_reuses_live_slots_only_for_all_final_rows():
+def test_dvr_final_logprob_replay_reuses_live_slots_only_after_allocator_oom():
+    allocator_oom = RuntimeError(
+        "Prefill out of memory. Try to lower your batch size.\n"
+        "Try to allocate 725 tokens."
+    )
     all_final = _DVRFinalLogprobReplayPlan(
         req_indices=[0, 1],
         input_ids=[],
@@ -643,19 +646,16 @@ def test_dvr_final_logprob_replay_reuses_live_slots_only_for_all_final_rows():
         final_score_specs=[(0, object(), 2, [10, 11])],
     )
 
-    assert _can_reuse_live_cache_locs_for_final_replay(all_final)
-    assert _can_reuse_live_cache_locs_for_final_replay(single_final)
-    assert not _can_reuse_live_cache_locs_for_final_replay(malformed_partial_final)
-
-
-def test_dvr_final_logprob_replay_identifies_allocator_oom():
-    assert _is_kv_allocation_failure(
-        RuntimeError(
-            "Prefill out of memory. Try to lower your batch size.\n"
-            "Try to allocate 725 tokens."
-        )
+    assert _should_reuse_live_cache_locs_after_alloc_failure(allocator_oom, all_final)
+    assert _should_reuse_live_cache_locs_after_alloc_failure(
+        allocator_oom, single_final
     )
-    assert not _is_kv_allocation_failure(RuntimeError("CUDA out of memory"))
+    assert not _should_reuse_live_cache_locs_after_alloc_failure(
+        allocator_oom, malformed_partial_final
+    )
+    assert not _should_reuse_live_cache_locs_after_alloc_failure(
+        RuntimeError("CUDA out of memory"), all_final
+    )
 
 
 def test_dvr_eagle_compacts_accepted_output_rows():

@@ -612,10 +612,7 @@ def _temporary_final_replay_cache_mapping(
         temp_cache_locs = _alloc_final_replay_cache_locs(batch, replay_plan)
         allocated_cache_locs = temp_cache_locs
     except RuntimeError as exc:
-        if not (
-            _is_kv_allocation_failure(exc)
-            and _can_reuse_live_cache_locs_for_final_replay(replay_plan)
-        ):
+        if not _should_reuse_live_cache_locs_after_alloc_failure(exc, replay_plan):
             raise
         # This replay is a final-response scoring oracle and every row belongs
         # to a request that will finish in this verify step.  Reuse the live KV
@@ -642,17 +639,18 @@ def _temporary_final_replay_cache_mapping(
             batch.token_to_kv_pool_allocator.free(allocated_cache_locs)
 
 
-def _can_reuse_live_cache_locs_for_final_replay(
+def _should_reuse_live_cache_locs_after_alloc_failure(
+    exc: RuntimeError,
     replay_plan: _DVRFinalLogprobReplayPlan,
 ) -> bool:
-    """Return whether final scoring may overwrite live request KV slots."""
+    """Return whether final scoring may fall back to live request KV slots."""
 
-    return len(replay_plan.final_score_specs) == len(replay_plan.extend_lens_cpu)
-
-
-def _is_kv_allocation_failure(exc: RuntimeError) -> bool:
     message = str(exc).lower()
-    return "out of memory" in message and "try to allocate" in message
+    return (
+        "out of memory" in message
+        and "try to allocate" in message
+        and len(replay_plan.final_score_specs) == len(replay_plan.extend_lens_cpu)
+    )
 
 
 def _live_cache_locs_for_final_replay(
