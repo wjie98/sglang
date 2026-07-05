@@ -107,6 +107,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.dvr_scheduler_utils import (
     is_dvr_spec_v2_finished_by_published_seq_len,
+    should_resolve_dvr_spec_v2_seq_lens_before_filter,
 )
 from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils import flatten_nested_list
@@ -2522,6 +2523,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # non-overlap path also drives the V2 worker, just synchronously.
         return get_spec_algorithm_policy(self.spec_algorithm).uses_spec_v2(
             self.enable_overlap
+        )
+
+    def requires_seq_lens_cpu_before_filter(self, *, enable_overlap: bool) -> bool:
+        """Return whether filter_batch needs published CPU seq_lens first.
+
+        Scheduler owns when seq_lens are resolved; speculative algorithms own
+        the rule for whether a delayed result can make a row logically finished
+        before Req.output_ids is materialized.
+        """
+
+        return should_resolve_dvr_spec_v2_seq_lens_before_filter(
+            batch=self,
+            enable_overlap=enable_overlap,
         )
 
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):

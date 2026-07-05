@@ -238,9 +238,6 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.dvr_scheduler_utils import (
-    should_resolve_dvr_spec_v2_seq_lens_before_filter,
-)
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -2861,10 +2858,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        if should_resolve_dvr_spec_v2_seq_lens_before_filter(
-            batch=batch,
-            enable_overlap=self.enable_overlap,
-        ):
+        if batch.requires_seq_lens_cpu_before_filter(enable_overlap=self.enable_overlap):
             self.future_map.resolve_seq_lens_cpu(batch)
 
         batch.filter_batch(v1_spec_info_filtered=True)
