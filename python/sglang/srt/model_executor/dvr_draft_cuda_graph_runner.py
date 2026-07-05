@@ -215,19 +215,17 @@ def _patch_graph_capture_extras(
     model_runner,
     patch_attr,
     *,
-    patch_spec_algorithm_for_graph: bool,
-    skip_graph_state_init: bool,
+    self_draft_graph: bool,
 ):
     # Custom all-reduce is unsafe for deterministic DVR prefill/verify, but the
     # self-draft decode graph can capture it for speed.
     for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
         patch_attr(ca_comm, "disabled", False)
-    if patch_spec_algorithm_for_graph:
+    if self_draft_graph:
         # The target runner already initialized attention backend graph buffers
         # for TARGET_VERIFY. Capture DVR self-draft as ordinary DECODE without
         # reinitializing those shared buffers.
         patch_attr(model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE)
-    if skip_graph_state_init:
         patch_attr(
             model_runner.attn_backend,
             "init_cuda_graph_state",
@@ -282,28 +280,25 @@ def _assert_draft_decode_performance_state(model_runner, extra_attn_backends):
 
 
 @contextmanager
-def dvr_self_draft_decode_context(
+def _dvr_draft_decode_context(
     model_runner,
     *,
-    graph_capture: bool = False,
+    capture_mode: str | None = None,
     disable_model_runner_graph: bool = False,
     disable_batch_invariant_ops: bool = False,
     clear_kernel_config_caches: bool = False,
     disable_mamba_tracking: bool = False,
-    patch_spec_algorithm_for_graph: bool = True,
-    skip_graph_state_init: bool = True,
     extra_attn_backends=(),
 ):
-    """Temporarily switch the target runner into DVR self-draft decode mode.
+    """Temporarily switch a DVR draft runner into performance-first decode mode.
 
-    DVR verifies proposals with the deterministic target path afterwards, so the
-    provisional self-draft path can use normal decode kernels, avoid
-    batch-invariant linear ops, and skip mamba prefix tracking when requested.
-    All mutations are restored before target verify runs.
+    This is intentionally private: callers should use one of the fixed semantic
+    wrappers below instead of composing graph/determinism/mamba knobs manually.
     """
 
     patched_attrs = []
     global_server_args = get_global_server_args()
+    graph_capture = capture_mode is not None
 
     def patch_attr(obj, attr_name, value):
         if obj is None or not hasattr(obj, attr_name):
@@ -332,8 +327,7 @@ def dvr_self_draft_decode_context(
             _patch_graph_capture_extras(
                 model_runner,
                 patch_attr,
-                patch_spec_algorithm_for_graph=patch_spec_algorithm_for_graph,
-                skip_graph_state_init=skip_graph_state_init,
+                self_draft_graph=(capture_mode == "self"),
             )
 
         if graph_capture or disable_mamba_tracking:
@@ -353,7 +347,36 @@ def dvr_self_draft_decode_context(
         env_override.__exit__(None, None, None)
 
 
-@contextmanager
+def dvr_self_draft_graph_capture_context(model_runner):
+    """Capture the dedicated DVR self-draft decode CUDA graph."""
+
+    return _dvr_draft_decode_context(
+        model_runner,
+        capture_mode="self",
+        disable_batch_invariant_ops=True,
+        clear_kernel_config_caches=True,
+        disable_mamba_tracking=True,
+    )
+
+
+def dvr_self_draft_graph_replay_context(model_runner):
+    """Replay the DVR self-draft graph without mamba tracking side effects."""
+
+    return _dvr_draft_decode_context(model_runner, disable_mamba_tracking=True)
+
+
+def dvr_self_draft_eager_context(model_runner):
+    """Run the explicit DVR self-draft eager fallback for graph-unsafe edges."""
+
+    return _dvr_draft_decode_context(
+        model_runner,
+        disable_model_runner_graph=True,
+        disable_batch_invariant_ops=True,
+        clear_kernel_config_caches=True,
+        disable_mamba_tracking=True,
+    )
+
+
 def dvr_eagle_draft_decode_context(
     model_runner,
     *,
@@ -361,24 +384,16 @@ def dvr_eagle_draft_decode_context(
     clear_kernel_config_caches: bool = False,
     attn_backends=(),
 ):
-    """Run DVR-EAGLE/MTP draft as provisional, performance-first decode.
+    """Run DVR-EAGLE/MTP draft as provisional, performance-first decode."""
 
-    EAGLE draft keeps its own speculative metadata and graph-state buffers, so
-    this context only restores normal decode kernel choices and disables draft
-    tracking side effects. Target prefill/verify still run deterministically.
-    """
-
-    with dvr_self_draft_decode_context(
+    return _dvr_draft_decode_context(
         model_runner,
-        graph_capture=graph_capture,
+        capture_mode="eagle" if graph_capture else None,
         disable_batch_invariant_ops=True,
         clear_kernel_config_caches=clear_kernel_config_caches,
         disable_mamba_tracking=True,
-        patch_spec_algorithm_for_graph=False,
-        skip_graph_state_init=False,
         extra_attn_backends=attn_backends,
-    ):
-        yield
+    )
 
 
 class DVRDraftDecodeCudaGraphRunner:
@@ -392,12 +407,7 @@ class DVRDraftDecodeCudaGraphRunner:
     def __init__(self, dvr_worker):
         self.dvr_worker = dvr_worker
         model_runner = dvr_worker.model_runner
-        with dvr_self_draft_decode_context(
-            model_runner,
-            graph_capture=True,
-            disable_batch_invariant_ops=True,
-            clear_kernel_config_caches=True,
-        ):
+        with dvr_self_draft_graph_capture_context(model_runner):
             self.runner = CudaGraphRunner(model_runner)
 
     @property
@@ -417,8 +427,5 @@ class DVRDraftDecodeCudaGraphRunner:
         return self.runner.can_run(forward_batch)
 
     def replay(self, forward_batch: ForwardBatch):
-        with dvr_self_draft_decode_context(
-            self.dvr_worker.model_runner,
-            disable_mamba_tracking=True,
-        ):
+        with dvr_self_draft_graph_replay_context(self.dvr_worker.model_runner):
             return self.runner.replay(forward_batch)

@@ -25,7 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
-    dvr_self_draft_decode_context,
+    dvr_self_draft_eager_context,
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
@@ -659,13 +659,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         if graph_skip_reason is not None:
             self._log_dvr_draft_graph_skip_once(graph_skip_reason)
 
-        with dvr_self_draft_decode_context(
-            self.model_runner,
-            disable_model_runner_graph=True,
-            disable_batch_invariant_ops=True,
-            clear_kernel_config_caches=True,
-            disable_mamba_tracking=True,
-        ):
+        with dvr_self_draft_eager_context(self.model_runner):
             forward_batch.can_run_dp_cuda_graph = False
             return self.model_runner.forward(forward_batch).logits_output
 
