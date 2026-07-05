@@ -105,10 +105,6 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.speculative.dvr_scheduler_utils import (
-    is_dvr_spec_v2_finished_by_published_seq_len,
-    should_resolve_dvr_spec_v2_seq_lens_before_filter,
-)
 from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -2533,7 +2529,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         before Req.output_ids is materialized.
         """
 
-        return should_resolve_dvr_spec_v2_seq_lens_before_filter(
+        return get_spec_algorithm_policy(
+            self.spec_algorithm
+        ).requires_seq_lens_cpu_before_filter(
             batch=self,
             enable_overlap=enable_overlap,
         )
@@ -2685,7 +2683,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and not is_dvr_spec_v2_finished_by_published_seq_len(self, i)
+                and not get_spec_algorithm_policy(
+                    self.spec_algorithm
+                ).is_finished_by_published_seq_len(self, i)
                 and self.reqs[i] not in chunked_req_to_exclude
             ]
 

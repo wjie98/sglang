@@ -224,6 +224,45 @@ class SpecAlgorithmPolicy:
             return bool(method()) if method is not None else False
         return self.is_dvr()
 
+    def requires_seq_lens_cpu_before_filter(
+        self, *, batch: Any, enable_overlap: bool
+    ) -> bool:
+        if not _is_builtin_algorithm(self.algorithm):
+            method = getattr(
+                self.algorithm, "requires_seq_lens_cpu_before_filter", None
+            )
+            return (
+                bool(method(batch=batch, enable_overlap=enable_overlap))
+                if method is not None
+                else False
+            )
+        if not self.is_dvr():
+            return False
+
+        from sglang.srt.speculative.dvr_scheduler_utils import (
+            should_resolve_dvr_spec_v2_seq_lens_before_filter,
+        )
+
+        return should_resolve_dvr_spec_v2_seq_lens_before_filter(
+            batch=batch,
+            enable_overlap=enable_overlap,
+        )
+
+    def is_finished_by_published_seq_len(self, batch: Any, req_index: int) -> bool:
+        if not _is_builtin_algorithm(self.algorithm):
+            method = getattr(self.algorithm, "is_finished_by_published_seq_len", None)
+            return (
+                bool(method(batch, req_index)) if method is not None else False
+            )
+        if not self.is_dvr():
+            return False
+
+        from sglang.srt.speculative.dvr_scheduler_utils import (
+            is_dvr_spec_v2_finished_by_published_seq_len,
+        )
+
+        return is_dvr_spec_v2_finished_by_published_seq_len(batch, req_index)
+
     def linear_speculative_state_extension_factory(self, model_runner: Any):
         if not _is_builtin_algorithm(self.algorithm):
             method = getattr(
