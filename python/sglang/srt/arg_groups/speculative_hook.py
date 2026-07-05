@@ -155,6 +155,27 @@ def handle_speculative_defaults(server_args: "ServerArgs") -> None:
         handle_dvr_defaults(server_args)
 
 
+def speculative_uses_draft_decode_custom_all_reduce(
+    speculative_algorithm: Optional[str],
+) -> bool:
+    """Return whether spec draft decode may use custom all-reduce.
+
+    Deterministic server setup owns the global NCCL/custom-all-reduce knobs, but
+    the algorithm policy owns whether draft decode can temporarily opt back into
+    the faster path.
+    """
+
+    if speculative_algorithm is None:
+        return False
+
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
+
+    return get_spec_algorithm_policy(
+        SpeculativeAlgorithm.from_string(speculative_algorithm)
+    ).uses_draft_decode_custom_all_reduce()
+
+
 def _handle_dflash(server_args: "ServerArgs") -> None:
     if server_args.enable_dp_attention:
         raise ValueError(

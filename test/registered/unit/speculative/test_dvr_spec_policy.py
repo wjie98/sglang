@@ -25,6 +25,9 @@ from sglang.srt.speculative.dvr_logprob_repair import (
     _final_output_len_if_repair_needed,
     _is_kv_allocation_failure,
 )
+from sglang.srt.arg_groups.speculative_hook import (
+    speculative_uses_draft_decode_custom_all_reduce,
+)
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
     DVRReplayPrefixTracker,
@@ -182,6 +185,15 @@ def test_dvr_self_draft_reuses_target_kv_pool():
         ).uses_target_kv_pool_for_draft()
     )
     assert not _policy(SpeculativeAlgorithm.EAGLE).uses_target_kv_pool_for_draft()
+
+
+def test_dvr_draft_decode_custom_all_reduce_policy_hook():
+    assert speculative_uses_draft_decode_custom_all_reduce("DECODE_VERIFY_ROLLBACK")
+    assert speculative_uses_draft_decode_custom_all_reduce(
+        "DECODE_VERIFY_ROLLBACK_EAGLE"
+    )
+    assert not speculative_uses_draft_decode_custom_all_reduce("EAGLE")
+    assert not speculative_uses_draft_decode_custom_all_reduce(None)
 
 
 def test_spec_accept_rate_proposal_width_policy():
