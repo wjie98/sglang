@@ -196,41 +196,33 @@ def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None
         if req_i >= len(repairs):
             break
         repair = repairs[req_i]
-        if repair is None:
+        if repair is None or not req.return_logprob:
             continue
-        _apply_final_logprob_repair(req, repair)
 
+        output_len = len(repair.output_ids)
+        if output_len != len(repair.output_logprobs):
+            raise RuntimeError(
+                "DVR final logprob repair has inconsistent ids/logprobs length: "
+                f"rid={req.rid}, output_len={output_len}, "
+                f"logprob_len={len(repair.output_logprobs)}."
+            )
 
-def _apply_final_logprob_repair(req: Any, repair: DVRFinalLogprobRepair) -> None:
-    if not req.return_logprob:
-        return
+        # Spec-v2 applies accepted tokens after the worker returns.  Repair only
+        # the exact materialized prefix; a mismatch here means worker replay and
+        # scheduler-owned output have diverged.
+        materialized_output_ids = list(req.output_ids[:output_len])
+        if materialized_output_ids != repair.output_ids:
+            raise RuntimeError(
+                "DVR final logprob repair no longer matches materialized output ids: "
+                f"rid={req.rid}, materialized_tail={materialized_output_ids[-8:]}, "
+                f"repair_tail={repair.output_ids[-8:]}, repair_len={output_len}, "
+                f"req_output_len={len(req.output_ids)}."
+            )
 
-    output_len = len(repair.output_ids)
-    if output_len != len(repair.output_logprobs):
-        raise RuntimeError(
-            "DVR final logprob repair has inconsistent ids/logprobs length: "
-            f"rid={req.rid}, output_len={output_len}, "
-            f"logprob_len={len(repair.output_logprobs)}."
-        )
-
-    # Spec-v2 applies accepted tokens after the worker returns.  Repair only the
-    # exact materialized prefix; a mismatch here means the worker replay stream
-    # and scheduler-owned output stream have diverged.
-    materialized_output_ids = list(req.output_ids[:output_len])
-    if materialized_output_ids != repair.output_ids:
-        raise RuntimeError(
-            "DVR final logprob repair no longer matches materialized output ids: "
-            f"rid={req.rid}, materialized_tail={materialized_output_ids[-8:]}, "
-            f"repair_tail={repair.output_ids[-8:]}, repair_len={output_len}, "
-            f"req_output_len={len(req.output_ids)}."
-        )
-
-    if req.logprob.output_token_logprobs_val is None:
+        if req.logprob.output_token_logprobs_val is not None:
+            req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
+            req.logprob.output_token_logprobs_idx[:] = repair.output_ids
         allow_req_non_streaming_logprob_output(req)
-        return
-    req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
-    req.logprob.output_token_logprobs_idx[:] = repair.output_ids
-    allow_req_non_streaming_logprob_output(req)
 
 
 class DVRReplayPrefixTracker:
