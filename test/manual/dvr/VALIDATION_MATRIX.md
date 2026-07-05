@@ -36,22 +36,19 @@ Datasets:
 Run these before and after each code batch.
 
 ```bash
-git diff --check
-conda run --no-capture-output -n dvr_dev python -m py_compile \
-  python/sglang/srt/speculative/dvr_*.py \
-  python/sglang/srt/speculative/eagle_info_v2.py \
-  python/sglang/srt/model_executor/dvr_*.py \
-  python/sglang/srt/layers/attention/linear/dvr_*.py
-PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m pytest \
-  test/registered/unit/speculative/test_dvr_spec_policy.py \
-  test/registered/unit/server_args/test_dvr_server_args.py \
-  test/registered/unit/layers/test_dvr_gdn_state_input_cache.py
+test/manual/dvr/scripts/run_static_unit_checks.sh
 ```
 
 ## 0.8B self-DVR KL smoke
 
 Run both spec-v1 compatibility mode and spec-v2 overlap mode.  The expected
 result is `ALL_OK True` with `maxdiff=0.0` and `kl_proxy=0.0`.
+
+Fixed script:
+
+```bash
+test/manual/dvr/scripts/run_0p8b_self_dvr_kl.sh
+```
 
 Server:
 
@@ -96,6 +93,12 @@ For a long-sequence check, remove `--limit-cases` and include
 
 Use the 35B model for MTP/EAGLE first.  Qwen3.5 35B has MTP weights and is the
 smallest local model that exercises the target plus MTP path.
+
+Fixed EAGLE/MTP smoke script:
+
+```bash
+test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
+```
 
 Self-DVR server:
 
@@ -185,49 +188,24 @@ supported matrix entry.
 
 ## 80B self-DVR throughput
 
-Use Qwen3-Next 80B for long-output self-DVR throughput.  Compare every DVR run
-with a no-DVR baseline launched with the same backend, TP size, context length,
-request rate, request count, and output length.  Report:
+Use Qwen3-Next 80B for long-output self-DVR throughput.  The fixed script is
+the source of truth for this matrix:
+
+```bash
+test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh
+```
+
+The reproduced口径 is 16 requests, 1024 generated tokens, ShareGPT
+`max_concurrency=3`, and fixed LongBench custom-cache input with
+`max_concurrency=2`.  The server command pins `--max-mamba-cache-size 16`; do
+not omit it when comparing against the reference numbers.
+
+Compare every DVR run with a no-DVR baseline launched with the same backend, TP
+size, context length, request rate, request count, and output length.  Report:
 
 ```text
 effective_dvr_throughput = output_throughput * accept_rate
 dvr_ratio = effective_dvr_throughput / no_dvr_output_throughput
-```
-
-ShareGPT client:
-
-```bash
-PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.bench_serving \
-  --backend sglang \
-  --base-url http://127.0.0.1:30180 \
-  --dataset-name sharegpt \
-  --dataset-path /mnt/data/hwj/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --tokenizer /mnt/data/hwj/Qwen3-Next-80B-A3B-Instruct \
-  --num-prompts 32 \
-  --sharegpt-output-len 1024 \
-  --request-rate inf \
-  --max-concurrency 4 \
-  --disable-tqdm \
-  --disable-stream \
-  --extra-request-body '{"sampling_params":{"ignore_eos":true}}'
-```
-
-LongBench client:
-
-```bash
-PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.bench_serving \
-  --backend sglang \
-  --base-url http://127.0.0.1:30180 \
-  --dataset-name longbench_v2 \
-  --dataset-path /mnt/data/hwj/LongBench-v2/data.json \
-  --tokenizer /mnt/data/hwj/Qwen3-Next-80B-A3B-Instruct \
-  --num-prompts 32 \
-  --sharegpt-output-len 1024 \
-  --request-rate inf \
-  --max-concurrency 4 \
-  --disable-tqdm \
-  --disable-stream \
-  --extra-request-body '{"sampling_params":{"ignore_eos":true}}'
 ```
 
 For every throughput run, keep the raw benchmark JSONL and server log.  The
