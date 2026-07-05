@@ -46,6 +46,7 @@ from sglang.srt.speculative.dvr_target_replay import (
 from sglang.srt.speculative.dvr_utils import (
     chain_speculative_sampling,
     dvr_chain_uniform_samples,
+    dvr_has_graph_unsafe_short_prompt,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
@@ -415,19 +416,11 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             f"boundary_seqlen={boundary_seqlen}."
         )
 
-    @staticmethod
-    def _has_graph_unsafe_short_prompt(batch: ScheduleBatch) -> bool:
-        # A one-token prompt currently reaches DVR/GDN graph replay through a
-        # page-padded state-input boundary that can illegal-access. Keep the
-        # eager fallback explicit and local; all normal prompts should use the
-        # dedicated self-draft graph and fail fast if it is missing.
-        return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
-
     def _prepare_dvr_draft_forward_batch(
         self, batch: ScheduleBatch, forward_batch: ForwardBatch
     ) -> None:
         skip_reason = None
-        if self._has_graph_unsafe_short_prompt(batch):
+        if dvr_has_graph_unsafe_short_prompt(batch):
             skip_reason = "one-token prompt GDN state-input graph boundary"
         forward_batch.dvr_draft_cuda_graph_skip_reason = skip_reason
         forward_batch.dvr_disable_draft_cuda_graph = skip_reason is not None
@@ -446,7 +439,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         # accept/reject and GDN state commit, so keep its logprob metadata path
         # disabled.
         need_return_logprob = batch.return_logprob
-        disable_verify_graph = self._has_graph_unsafe_short_prompt(batch)
+        disable_verify_graph = dvr_has_graph_unsafe_short_prompt(batch)
         saved_graph_runner = None
         batch.return_logprob = False
         if disable_verify_graph:

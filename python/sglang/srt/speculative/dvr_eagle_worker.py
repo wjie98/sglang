@@ -38,6 +38,7 @@ from sglang.srt.speculative.dvr_linear_state_worker import (
     DVRSpecV2LinearStateMixin,
 )
 from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
+from sglang.srt.speculative.dvr_utils import dvr_has_graph_unsafe_short_prompt
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -109,13 +110,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
         self.linear_state.clear_cache_state()
         self.dvr_verifier_replay_prefix.clear()
         self.dvr_client_output_replay_prefix.clear()
-
-    @staticmethod
-    def _has_graph_unsafe_short_prompt(batch: ScheduleBatch) -> bool:
-        # A one-token prompt currently reaches the target-verify graph through a
-        # page-padded GDN state-input boundary that can illegal-access. Keep this
-        # edge explicit so normal prompts remain on the DVR-EAGLE graph path.
-        return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
 
     @contextmanager
     def _target_verify_graph_runner_context(self, disable_cuda_graph: bool = False):
@@ -554,7 +548,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
-        disable_verify_graph = self._has_graph_unsafe_short_prompt(batch)
+        disable_verify_graph = dvr_has_graph_unsafe_short_prompt(batch)
         with self._target_verify_prepare_context(
             disable_cuda_graph=disable_verify_graph
         ) as prepared_on_plan_stream:

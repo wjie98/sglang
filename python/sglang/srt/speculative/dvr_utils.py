@@ -71,6 +71,12 @@ def dvr_causal_verify_cuda_graph_metadata(
                     metadata.mask_indptr = None
 
 
+def dvr_has_graph_unsafe_short_prompt(batch) -> bool:
+    """Return whether DVR/GDN graph replay should skip the one-token edge."""
+
+    return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
+
+
 def dvr_chain_uniform_samples(
     candidates: torch.Tensor,
     batch,
