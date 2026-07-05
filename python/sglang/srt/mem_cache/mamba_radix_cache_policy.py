@@ -57,9 +57,3 @@ def clear_req_mamba_radix_insert_snapshot(req: Any) -> None:
     policy = _get_req_mamba_radix_cache_policy(req)
     if policy is not None:
         policy.insert_snapshot = None
-
-
-def reset_req_mamba_radix_cache_policy(req: Any) -> None:
-    policy = _get_req_mamba_radix_cache_policy(req, create=True)
-    policy.skip_finished_insert = False
-    policy.insert_snapshot = None

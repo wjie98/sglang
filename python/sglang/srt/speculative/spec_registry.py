@@ -69,15 +69,6 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
-    def is_decode_verify_rollback(self) -> bool:
-        return False
-
-    def is_decode_verify_rollback_self_draft(self) -> bool:
-        return False
-
-    def is_decode_verify_rollback_eagle(self) -> bool:
-        return False
-
     def is_standalone(self) -> bool:
         return False
 

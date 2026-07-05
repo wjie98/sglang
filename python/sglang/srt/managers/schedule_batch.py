@@ -86,7 +86,6 @@ from sglang.srt.mem_cache.common import (
     get_alloc_reserve_per_decode,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.mamba_radix_cache_policy import MambaRadixCachePolicy
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
@@ -109,7 +108,6 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.dvr_scheduler_utils import (
     is_dvr_spec_v2_finished_by_published_seq_len,
 )
-from sglang.srt.speculative.output_policy import SpeculativeOutputPolicyState
 from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -938,11 +936,6 @@ class Req(ReqDllmMixin):
         # Per-request count of useful proposed draft tokens (excludes the bonus
         # token and draft slots beyond the request's remaining output budget).
         self.spec_num_proposed_drafts = 0
-
-        # Speculative algorithms can attach small request-local policies without
-        # making streamers or cache implementations branch on a concrete method.
-        self.speculative_output_policy = SpeculativeOutputPolicyState()
-        self.mamba_radix_cache_policy = MambaRadixCachePolicy()
 
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.

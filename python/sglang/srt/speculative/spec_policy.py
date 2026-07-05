@@ -45,19 +45,13 @@ class SpecAlgorithmPolicy:
         return _algo_name(self.algorithm)
 
     def is_dvr(self) -> bool:
-        return self.name in _DVR_ALGOS or _custom_bool(
-            self.algorithm, "is_decode_verify_rollback"
-        )
+        return self.name in _DVR_ALGOS
 
     def is_dvr_self_draft(self) -> bool:
-        return self.name == _DVR_SELF_DRAFT or _custom_bool(
-            self.algorithm, "is_decode_verify_rollback_self_draft"
-        )
+        return self.name == _DVR_SELF_DRAFT
 
     def is_dvr_eagle(self) -> bool:
-        return self.name == _DVR_EAGLE or _custom_bool(
-            self.algorithm, "is_decode_verify_rollback_eagle"
-        )
+        return self.name == _DVR_EAGLE
 
     def is_eagle(self) -> bool:
         return self.name in _EAGLE_ALGOS or _custom_bool(
