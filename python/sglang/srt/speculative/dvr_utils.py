@@ -92,11 +92,24 @@ def dvr_chain_uniform_samples(
         )
 
     bs, num_slots = candidates.shape
-    del bs
-    seed = sampling_seed.to(device=candidates.device)
-    positions = batch.seq_lens.to(device=candidates.device, dtype=torch.int64)
-    cols = torch.arange(num_slots + 1, dtype=torch.int32, device=candidates.device)
-    uniforms = murmur_hash32(seed, positions, cols).to(torch.float32) / 4294967296.0
+    device = candidates.device
+    seed = sampling_seed.to(device=device).repeat_interleave(num_slots + 1)
+    # Speculative verify consumes one random stream per generated token position.
+    # Use the same position progression as the normal seeded sampler instead of
+    # deriving every verify coin from the pre-verify sequence length.
+    slot_offsets = torch.arange(num_slots + 1, dtype=torch.int64, device=device)
+    positions = (
+        batch.seq_lens.to(device=device, dtype=torch.int64).unsqueeze(1) + slot_offsets
+    ).reshape(-1)
+    # A scalar rejection/residual coin has no vocabulary column. Keep col=0 and
+    # put all per-slot separation in the token position above.
+    cols = torch.zeros((1,), dtype=torch.int32, device=device)
+    uniforms = (
+        murmur_hash32(seed, positions, cols)
+        .reshape(bs, num_slots + 1)
+        .to(torch.float32)
+        / 4294967296.0
+    )
     return uniforms[:, :num_slots], uniforms[:, num_slots].contiguous()
 
 

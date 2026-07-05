@@ -609,11 +609,18 @@ class DecodeVerifyRollbackEagleWorkerV2(
             )
         logits_output = forward_batch_output.logits_output
         oracle_output = None
-        if batch.return_logprob or logits_output.hidden_states is None:
+        if (
+            linear_state_ctx is not None
+            or batch.return_logprob
+            or logits_output.hidden_states is None
+        ):
             # EAGLE needs replay logits and replay hidden states from the same
-            # suffix EXTEND so streaming logprobs and the next MTP draft seed
-            # stay paired without replaying already-closed prefix chunks. Final
-            # full-prefill repair below is only for non-streaming responses.
+            # suffix EXTEND so the next MTP draft seed is paired with the
+            # verifier logits. For GDN models this must not depend on
+            # return_logprob: TARGET_VERIFY hidden states come from the
+            # state-input verify window and are not a prefill-equivalent MTP
+            # seed after chunk-boundary rollback. The replay is still only the
+            # unclosed tail plus draft tokens, not the full prefix.
             oracle_output = self._target_suffix_extend_verify_output(
                 batch=batch,
                 verify_input=verify_input,
@@ -653,10 +660,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
             batch, logits_output, vocab_mask
         )
         new_seq_lens = batch.seq_lens + accept_lens
-        # The fast no-logprob graph path consumes target verify hidden states
-        # directly.  Replay-prefix tracking is only needed when strict logprob
-        # requests or graph/eager fallback may reconstruct a suffix oracle; it
-        # copies accepted draft tokens to CPU, so keep it off the hot path.
+        # Replay-prefix tracking is needed whenever suffix replay may reconstruct
+        # the next deterministic tail. It copies accepted draft tokens to CPU,
+        # so non-GDN no-oracle EAGLE paths still keep it off the hot path.
         if batch.return_logprob or used_suffix_oracle or not can_run_cuda_graph:
             self._advance_eagle_replay_prefix(
                 batch=batch,
