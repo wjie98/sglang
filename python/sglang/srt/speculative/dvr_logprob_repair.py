@@ -223,10 +223,8 @@ def _build_final_logprob_replay_plan(
     for req_i, (req, seq_len, accept_len) in enumerate(
         zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
     ):
-        observed_output_len = _observed_output_len_for_final_replay(
-            req=req,
-            replay_prefix=replay_prefix,
-        )
+        stream = replay_prefix.stream_for_req(req, initialize_from_req_output=True)
+        observed_output_len = max(len(req.output_ids), len(stream))
         final_output_len = _final_output_len_if_repair_needed(
             req=req,
             req_i=req_i,
@@ -343,17 +341,6 @@ def _final_output_len_if_repair_needed(
     return None
 
 
-def _observed_output_len_for_final_replay(
-    *,
-    req: Any,
-    replay_prefix: DVRReplayPrefixTracker,
-) -> int:
-    """Return the best client-visible output length known to DVR repair."""
-
-    stream = replay_prefix.stream_for_req(req, initialize_from_req_output=True)
-    return max(len(req.output_ids), len(stream))
-
-
 def _final_replay_ids_for_req(
     *,
     req: Any,
@@ -388,11 +375,9 @@ def _final_replay_ids_for_req(
     if token_ids is not None and len(token_ids) >= replay_seq_len:
         return token_ids[:replay_seq_len]
 
-    stable_seq_len = _stable_materialized_replay_seq_len(
-        req,
-        base_seq_len=base_seq_len,
-        replay_seq_len=replay_seq_len,
-    )
+    prompt_len = len(req.origin_input_ids)
+    materialized_seq_len = prompt_len + len(req.output_ids)
+    stable_seq_len = min(replay_seq_len, max(base_seq_len, materialized_seq_len))
     base_ids = _materialized_or_replay_prefix_ids(
         req=req,
         replay_prefix=replay_prefix,
@@ -416,17 +401,6 @@ def _final_replay_ids_for_req(
         error_prefix=error_prefix,
     )
     return token_ids[:replay_seq_len]
-
-
-def _stable_materialized_replay_seq_len(
-    req: Any,
-    *,
-    base_seq_len: int,
-    replay_seq_len: int,
-) -> int:
-    prompt_len = len(req.origin_input_ids)
-    materialized_seq_len = prompt_len + len(req.output_ids)
-    return min(replay_seq_len, max(base_seq_len, materialized_seq_len))
 
 
 def _materialized_or_replay_prefix_ids(
