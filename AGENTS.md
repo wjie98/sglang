@@ -18,6 +18,8 @@ Use these entry points:
 - `test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh`
   - 35B Qwen3.5 MTP/DVR-EAGLE sync-v2 and overlap-v2 smoke
   - covers `return_logprob=True` KL and `return_logprob=False` output path
+  - includes the seeded `prompt_len=65`, `max_new=65` boundary acceptance
+    regression and fails if reported accept rate drops below `0.99`
 - `test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh`
   - Qwen3-Next 80B self-DVR spec v1/v2 long-output throughput
   - covers ShareGPT and fixed LongBench custom-cache inputs
