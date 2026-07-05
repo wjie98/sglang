@@ -17,11 +17,7 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
     DVRReplayPrefixTracker,
 )
-from sglang.srt.speculative.dvr_target_replay import (
-    DVRTargetReplaySpec,
-    linear_state_replay_context,
-    target_extend_replay_batch,
-)
+from sglang.srt.speculative.dvr_target_replay import linear_state_replay_context
 from sglang.srt.speculative.output_policy import (
     defer_req_non_streaming_logprob_output,
     try_expect_req_final_logprob_repair,
@@ -500,19 +496,14 @@ def _run_final_logprob_replay(
         replay_batch,
         replay_plan,
     ) as temp_cache_locs:
-        replay_spec = DVRTargetReplaySpec(
-            input_ids=replay_plan.input_ids,
-            out_cache_locs=[temp_cache_locs.to(torch.long)],
-            prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
-            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-            final_seq_lens=replay_plan.final_seq_lens_cpu,
-            extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
-            extend_input_logprob_token_ids=replay_plan.logprob_token_ids,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            return_logprob=True,
-            mamba_clear_indices=replay_linear_state_ctx.live_indices,
-            multimodal_inputs=[None for _ in replay_plan.extend_lens_cpu],
+        device = replay_batch.seq_lens.device
+        replay_batch.out_cache_loc = temp_cache_locs.to(
+            device=device, dtype=torch.long
         )
+        replay_batch.extend_input_logprob_token_ids = torch.tensor(
+            replay_plan.logprob_token_ids, dtype=torch.long, device=device
+        )
+        replay_batch.mamba_clear_indices = replay_linear_state_ctx.live_indices
 
         with (
             envs.SGLANG_EAGER_INPUT_NO_COPY.override(True),
@@ -521,7 +512,6 @@ def _run_final_logprob_replay(
                 clear_state_input_window=True,
                 restore_live_state=True,
             ),
-            target_extend_replay_batch(replay_batch, replay_spec),
         ):
             # This is an external scoring oracle equivalent to
             # max_new_tokens=0, not a target-verify pass.  Keep is_verify=False
@@ -555,6 +545,12 @@ def _build_final_logprob_replay_batch(
     final_seq_lens = torch.tensor(
         replay_plan.final_seq_lens_cpu, dtype=torch.int64, device=device
     )
+    global_num_tokens = None
+    global_num_tokens_for_logprob = None
+    if batch.global_num_tokens is not None:
+        dp_world = len(batch.global_num_tokens)
+        global_num_tokens = [len(replay_plan.input_ids)] * dp_world
+        global_num_tokens_for_logprob = [len(replay_plan.input_ids)] * dp_world
     replay_batch = ScheduleBatch(
         reqs=reqs,
         req_to_token_pool=batch.req_to_token_pool,
@@ -576,8 +572,8 @@ def _build_final_logprob_replay_batch(
         return_logprob=True,
         top_logprobs_nums=[0 for _ in reqs],
         token_ids_logprobs=[None for _ in reqs],
-        global_num_tokens=batch.global_num_tokens,
-        global_num_tokens_for_logprob=batch.global_num_tokens_for_logprob,
+        global_num_tokens=global_num_tokens,
+        global_num_tokens_for_logprob=global_num_tokens_for_logprob,
         is_extend_in_batch=True,
         all_extend_in_batch=True,
         can_run_dp_cuda_graph=False,

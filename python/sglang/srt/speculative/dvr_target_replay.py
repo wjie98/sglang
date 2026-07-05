@@ -14,45 +14,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 
 
-# Some replay callers still use a temporary EXTEND context over a private replay
-# batch. Keep the overwritten fields local and explicit so this helper never
-# becomes a hidden generic mutation layer for live scheduler batches.
-_TEMP_EXTEND_BATCH_FIELDS = (
-    "forward_mode",
-    "global_forward_mode",
-    "input_ids",
-    "input_embeds",
-    "replace_embeds",
-    "replace_positions",
-    "out_cache_loc",
-    "seq_lens",
-    "seq_lens_cpu",
-    "seq_lens_sum",
-    "prefix_lens",
-    "extend_lens",
-    "extend_num_tokens",
-    "extend_logprob_start_lens",
-    "extend_input_logprob_token_ids",
-    "global_num_tokens",
-    "global_num_tokens_for_logprob",
-    "is_extend_in_batch",
-    "all_extend_in_batch",
-    "spec_info",
-    "capture_hidden_mode",
-    "return_hidden_states",
-    "return_hidden_states_before_norm",
-    "return_logprob",
-    "mamba_track_indices",
-    "mamba_track_mask",
-    "mamba_track_seqlens",
-    "mamba_track_cache_seqlens",
-    "mamba_cow_src_indices",
-    "mamba_cow_dst_indices",
-    "mamba_clear_indices",
-    "multimodal_inputs",
-)
-
-
 @dataclass
 class DVRTargetReplaySpec:
     input_ids: list[int]
@@ -71,11 +32,6 @@ class DVRTargetReplaySpec:
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
     multimodal_inputs: Optional[list[Any]] = None
-
-
-@dataclass
-class DVRTargetReplayContext:
-    saved_fields: dict[str, Any]
 
 
 @dataclass
@@ -129,23 +85,6 @@ class DVRBoundaryReplayPlan:
     extend_lens: list[int]
     final_seq_lens: list[int]
     boundary_indices: torch.Tensor
-
-
-def _snapshot_temp_extend_batch_fields(batch) -> dict[str, Any]:
-    """Snapshot the live ScheduleBatch fields that suffix replay overwrites.
-
-    This keeps the risky live-batch mutation contract local to DVR replay and
-    fails at the replay boundary if upstream changes remove one of the fields.
-    """
-
-    return {name: getattr(batch, name) for name in _TEMP_EXTEND_BATCH_FIELDS}
-
-
-def _restore_temp_extend_batch_fields(batch, saved_fields: dict[str, Any]) -> None:
-    """Restore fields saved by _snapshot_temp_extend_batch_fields."""
-
-    for name, value in saved_fields.items():
-        setattr(batch, name, value)
 
 
 @contextmanager
@@ -657,68 +596,3 @@ def draft_row_logits_from_replay_hidden_states(
         logits_metadata,
     )
     return draft_logits, draft_hidden_states
-
-
-@contextmanager
-def target_extend_replay_batch(batch, spec: DVRTargetReplaySpec):
-    """Run a target EXTEND replay without leaking mutations to the live batch."""
-
-    saved_fields = _snapshot_temp_extend_batch_fields(batch)
-    device = batch.seq_lens.device
-    try:
-        batch.forward_mode = ForwardMode.EXTEND
-        batch.global_forward_mode = None
-        batch.input_ids = torch.tensor(spec.input_ids, dtype=torch.long, device=device)
-        batch.input_embeds = None
-        batch.replace_embeds = None
-        batch.replace_positions = None
-        batch.out_cache_loc = torch.cat(spec.out_cache_locs).to(device=device)
-        batch.prefix_lens = [int(x) for x in spec.prefix_lens]
-        batch.extend_lens = [int(x) for x in spec.extend_lens]
-        batch.extend_num_tokens = len(spec.input_ids)
-        batch.extend_logprob_start_lens = [
-            int(x) for x in spec.extend_logprob_start_lens
-        ]
-        batch.extend_input_logprob_token_ids = (
-            None
-            if spec.extend_input_logprob_token_ids is None
-            else torch.tensor(
-                spec.extend_input_logprob_token_ids,
-                dtype=torch.long,
-                device=device,
-            )
-        )
-        if saved_fields["global_num_tokens"] is not None:
-            dp_world = len(saved_fields["global_num_tokens"])
-            batch.global_num_tokens = [len(spec.input_ids)] * dp_world
-            batch.global_num_tokens_for_logprob = [len(spec.input_ids)] * dp_world
-        batch.seq_lens = torch.tensor(
-            spec.final_seq_lens,
-            dtype=torch.long,
-            device=saved_fields["seq_lens"].device,
-        )
-        batch.seq_lens_cpu = torch.tensor(spec.final_seq_lens, dtype=torch.long)
-        batch.seq_lens_sum = sum(spec.final_seq_lens)
-        batch.is_extend_in_batch = True
-        batch.all_extend_in_batch = True
-        batch.spec_info = None
-        batch.capture_hidden_mode = spec.capture_hidden_mode
-        batch.return_hidden_states = False
-        batch.return_hidden_states_before_norm = False
-        batch.return_logprob = spec.return_logprob
-        batch.mamba_track_indices = spec.mamba_track_indices
-        batch.mamba_track_mask = spec.mamba_track_mask
-        batch.mamba_track_seqlens = spec.mamba_track_seqlens
-        batch.mamba_track_cache_seqlens = None
-        batch.mamba_cow_src_indices = spec.mamba_cow_src_indices
-        batch.mamba_cow_dst_indices = spec.mamba_cow_dst_indices
-        batch.mamba_clear_indices = spec.mamba_clear_indices
-        batch.multimodal_inputs = (
-            saved_fields["multimodal_inputs"]
-            if spec.multimodal_inputs is None
-            else spec.multimodal_inputs
-        )
-
-        yield DVRTargetReplayContext(saved_fields=saved_fields)
-    finally:
-        _restore_temp_extend_batch_fields(batch, saved_fields)
