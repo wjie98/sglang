@@ -34,11 +34,7 @@ from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorker,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
-    build_tree_kernel_efficient,
-    verify_tree_greedy_func,
-)
+from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
@@ -227,41 +223,15 @@ class DecodeVerifyRollbackWorkerV2(
         finally:
             batch.return_logprob = saved_return_logprob
 
-        (
-            _tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            self._draft_anchor_tokens(spec_info),
-            parent_list,
-            top_scores_index,
-            draft_tokens.to(torch.long),
-            batch.seq_lens,
-            batch.seq_lens_sum,
-            self.topk,
-            self.num_draft_steps,
-            self.num_draft_tokens,
-            tree_mask_mode=TreeMaskMode.QLEN_ONLY,
-        )
-
-        return DVRSelfDraftVerifyInput(
-            draft_token=draft_tokens.to(torch.long),
-            custom_mask=None,
-            positions=positions,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            retrieve_cum_len=None,
-            spec_steps=self.num_draft_steps,
-            topk=self.topk,
-            draft_token_num=self.num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+        return self._build_self_draft_verify_input(
+            batch=batch,
+            spec_info=spec_info,
+            parent_list=parent_list,
+            top_scores_index=top_scores_index,
+            draft_tokens=draft_tokens,
+            draft_probs=draft_probs,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
-            draft_probs=draft_probs,
         )
 
     def verify_v2(

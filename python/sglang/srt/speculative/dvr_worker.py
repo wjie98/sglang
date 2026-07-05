@@ -455,6 +455,59 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             if disable_verify_graph:
                 self.model_runner.graph_runner = saved_graph_runner
 
+    def _build_self_draft_verify_input(
+        self,
+        *,
+        batch: ScheduleBatch,
+        spec_info: EagleDraftInput,
+        parent_list,
+        top_scores_index,
+        draft_tokens: torch.Tensor,
+        draft_probs: Optional[torch.Tensor],
+        seq_lens_sum,
+        seq_lens_cpu,
+    ) -> DVRSelfDraftVerifyInput:
+        (
+            _tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            self._draft_anchor_tokens(spec_info),
+            parent_list,
+            top_scores_index,
+            draft_tokens.to(torch.long),
+            batch.seq_lens,
+            batch.seq_lens_sum,
+            self.topk,
+            self.num_draft_steps,
+            self.num_draft_tokens,
+            tree_mask_mode=TreeMaskMode.QLEN_ONLY,
+        )
+
+        return DVRSelfDraftVerifyInput(
+            draft_token=draft_tokens.to(torch.long),
+            # DVR uses topk=1 chain verify. The tree builder is still reused
+            # for token order/retrieve metadata, but attention itself should
+            # stay on the ordinary causal path instead of a backend-specific
+            # custom tree-mask path.
+            custom_mask=None,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=self.num_draft_steps,
+            topk=self.topk,
+            draft_token_num=self.num_draft_tokens,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            draft_probs=draft_probs,
+        )
+
     def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -488,46 +541,15 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             forward_batch
         )
 
-        (
-            _tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            self._draft_anchor_tokens(spec_info),
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            batch.seq_lens,
-            batch.seq_lens_sum,
-            self.topk,
-            self.num_draft_steps,
-            self.num_draft_tokens,
-            tree_mask_mode=TreeMaskMode.QLEN_ONLY,
-        )
-        draft_tokens = draft_tokens.to(torch.long)
-
-        return DVRSelfDraftVerifyInput(
-            draft_token=draft_tokens,
-            # DVR uses topk=1 chain verify. The tree builder is still reused
-            # for token order/retrieve metadata, but attention itself should
-            # stay on the ordinary causal path instead of a backend-specific
-            # custom tree-mask path.
-            custom_mask=None,
-            positions=positions,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            retrieve_cum_len=None,
-            spec_steps=self.num_draft_steps,
-            topk=self.topk,
-            draft_token_num=self.num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+        return self._build_self_draft_verify_input(
+            batch=batch,
+            spec_info=spec_info,
+            parent_list=parent_list,
+            top_scores_index=top_scores_index,
+            draft_tokens=draft_tokens,
+            draft_probs=draft_probs,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
-            draft_probs=draft_probs,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
