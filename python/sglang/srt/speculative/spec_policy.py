@@ -216,6 +216,34 @@ class SpecAlgorithmPolicy:
             return bool(method()) if method is not None else False
         return self.is_dvr()
 
+    def uses_draft_extend_selected_logits(
+        self,
+        *,
+        topk: Optional[int],
+        model: Any,
+        is_v2: bool,
+        requires_gathered_buffer: bool,
+    ) -> bool:
+        if not _is_builtin_algorithm(self.algorithm):
+            method = getattr(self.algorithm, "uses_draft_extend_selected_logits", None)
+            if method is not None:
+                return bool(
+                    method(
+                        topk=topk,
+                        model=model,
+                        is_v2=is_v2,
+                        requires_gathered_buffer=requires_gathered_buffer,
+                    )
+                )
+
+        return (
+            self.is_eagle()
+            and is_v2
+            and topk == 1
+            and not requires_gathered_buffer
+            and getattr(model, "supports_draft_extend_selected_logits", False)
+        )
+
     def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
         if not _is_builtin_algorithm(self.algorithm):
             method = getattr(

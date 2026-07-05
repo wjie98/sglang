@@ -207,9 +207,8 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        self._uses_dvr_draft_decode_context = get_spec_algorithm_policy(
-            self.speculative_algorithm
-        ).is_dvr_eagle()
+        spec_policy = get_spec_algorithm_policy(self.speculative_algorithm)
+        self._uses_dvr_draft_decode_context = spec_policy.is_dvr_eagle()
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -229,15 +228,13 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-        self._draft_extend_selected_logits = (
-            self._uses_dvr_draft_decode_context
-            and self.topk == 1
-            and not require_gathered_buffer(self.draft_runner.server_args)
-            and getattr(
-                self.draft_runner.model,
-                "supports_draft_extend_selected_logits",
-                False,
-            )
+        self._draft_extend_selected_logits = spec_policy.uses_draft_extend_selected_logits(
+            topk=self.topk,
+            model=self.draft_runner.model,
+            is_v2=True,
+            requires_gathered_buffer=require_gathered_buffer(
+                self.draft_runner.server_args
+            ),
         )
 
     def _draft_decode_context(self, *, clear_kernel_config_caches: bool = False):

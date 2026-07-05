@@ -95,16 +95,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
-        self.use_selected_logits = (
-            get_spec_algorithm_policy(model_runner.spec_algorithm).is_dvr_eagle()
-            and self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
-            and self.topk == 1
-            and not self.require_gathered_buffer
-            and getattr(
-                model_runner.model,
-                "supports_draft_extend_selected_logits",
-                False,
-            )
+        self.use_selected_logits = get_spec_algorithm_policy(
+            model_runner.spec_algorithm
+        ).uses_draft_extend_selected_logits(
+            topk=self.topk,
+            model=model_runner.model,
+            is_v2=self.forward_mode == ForwardMode.DRAFT_EXTEND_V2,
+            requires_gathered_buffer=self.require_gathered_buffer,
         )
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps

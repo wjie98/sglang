@@ -196,6 +196,47 @@ def test_dvr_draft_decode_custom_all_reduce_policy_hook():
     assert not speculative_uses_draft_decode_custom_all_reduce(None)
 
 
+def test_draft_extend_selected_logits_policy_is_capability_gated():
+    model = SimpleNamespace(supports_draft_extend_selected_logits=True)
+    model_without_capability = SimpleNamespace()
+
+    for algorithm in (
+        SpeculativeAlgorithm.EAGLE,
+        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
+    ):
+        assert _policy(algorithm).uses_draft_extend_selected_logits(
+            topk=1,
+            model=model,
+            is_v2=True,
+            requires_gathered_buffer=False,
+        )
+        assert not _policy(algorithm).uses_draft_extend_selected_logits(
+            topk=2,
+            model=model,
+            is_v2=True,
+            requires_gathered_buffer=False,
+        )
+        assert not _policy(algorithm).uses_draft_extend_selected_logits(
+            topk=1,
+            model=model_without_capability,
+            is_v2=True,
+            requires_gathered_buffer=False,
+        )
+        assert not _policy(algorithm).uses_draft_extend_selected_logits(
+            topk=1,
+            model=model,
+            is_v2=True,
+            requires_gathered_buffer=True,
+        )
+
+    assert not _policy(SpeculativeAlgorithm.NONE).uses_draft_extend_selected_logits(
+        topk=1,
+        model=model,
+        is_v2=True,
+        requires_gathered_buffer=False,
+    )
+
+
 def test_spec_accept_rate_proposal_width_policy():
     assert (
         _policy(
