@@ -537,7 +537,7 @@ def test_dvr_eagle_replay_prefix_splits_verifier_and_output_streams():
     ) == [101, 102, 103, 748, 749, 750]
 
 
-def test_dvr_self_draft_replay_prefix_tracks_client_visible_output():
+def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
     req = SimpleNamespace(
         rid="r0",
         origin_input_ids=[101, 102],
@@ -546,15 +546,19 @@ def test_dvr_self_draft_replay_prefix_tracks_client_visible_output():
     batch = SimpleNamespace(reqs=[req])
     prefix = DVRReplayPrefixTracker()
 
-    assert prefix.request_self_draft_prefix_token_ids(
+    assert prefix.request_output_prefix_token_ids(
         req,
         3,
         error_prefix="DVR spec-v2",
     ) == [101, 102, 201]
 
-    prefix.append_self_draft_output_tokens(batch, [[202, 203]])
+    prefix.append_batch_output_tokens(
+        batch,
+        [[202, 203]],
+        initialize_from_req_output=True,
+    )
 
-    assert prefix.request_self_draft_prefix_token_ids(
+    assert prefix.request_output_prefix_token_ids(
         req,
         5,
         error_prefix="DVR spec-v2",

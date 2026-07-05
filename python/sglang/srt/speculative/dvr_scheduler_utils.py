@@ -382,27 +382,6 @@ class DVRReplayPrefixTracker:
             error_prefix=error_prefix,
         )
 
-    def request_self_draft_prefix_token_ids(
-        self,
-        req: Any,
-        seq_len: int,
-        *,
-        error_prefix: str,
-    ) -> list[int]:
-        """Reconstruct the self-DVR spec-v2 replay prefix.
-
-        Self-DVR uses the target model as its draft path, so its overlap replay
-        stream follows the same client-visible tokens that the scheduler will
-        eventually materialize into ``Req.output_ids``.  Seed from Req output to
-        bridge the window where overlap has already published the previous step.
-        """
-
-        return self.request_output_prefix_token_ids(
-            req,
-            seq_len,
-            error_prefix=error_prefix,
-        )
-
     def try_request_output_prefix_token_ids(
         self,
         req: Any,
@@ -445,15 +424,6 @@ class DVRReplayPrefixTracker:
                 token_ids,
                 initialize_from_req_output=initialize_from_req_output,
             )
-
-    def append_self_draft_output_tokens(self, batch: Any, tokens_per_req) -> None:
-        """Advance the self-DVR spec-v2 client-visible replay stream."""
-
-        self.append_batch_output_tokens(
-            batch,
-            tokens_per_req,
-            initialize_from_req_output=True,
-        )
 
     def seed_from_target_extend(
         self,

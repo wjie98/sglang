@@ -192,15 +192,12 @@ class DecodeVerifyRollbackEagleWorkerV2(
             return verify_input
         return DVREagleVerifyInput.from_eagle_verify_input(verify_input)
 
-    def _request_token_ids_for_eagle_replay(self, req, seq_len: int):
+    def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
         return self.dvr_verifier_replay_prefix.request_verifier_prefix_token_ids(
             req,
-            seq_len,
+            boundary_seqlen,
             error_prefix="DVR EAGLE",
         )
-
-    def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
-        return self._request_token_ids_for_eagle_replay(req, boundary_seqlen)
 
     def _advance_eagle_replay_prefix(
         self,
@@ -285,9 +282,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
             )
         self.linear_state.finish_prepare_for_draft(batch)
 
-    def _prepare_dvr_boundary_for_prefill_draft(self, batch: ScheduleBatch) -> None:
-        self._prepare_dvr_boundary_for_verify(batch)
-
     def _target_suffix_extend_verify_output(
         self,
         *,
@@ -336,7 +330,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             boundary_lens=boundary_lens,
             draft_tokens=verify_input.draft_token,
             draft_cache_locs=batch.out_cache_loc,
-            request_token_ids_for_replay=self._request_token_ids_for_eagle_replay,
+            request_token_ids_for_replay=self._request_token_ids_for_replay,
         )
         if replay_plan is None:
             return None
@@ -468,7 +462,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
             batch_output.new_seq_lens = batch.seq_lens
-            self._prepare_dvr_boundary_for_prefill_draft(batch)
+            self._prepare_dvr_boundary_for_verify(batch)
             if batch.return_logprob:
                 # This target token is the first client-visible output for a
                 # prefill/extend step.  In overlap it can be consumed by the

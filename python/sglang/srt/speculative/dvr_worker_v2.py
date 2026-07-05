@@ -97,7 +97,7 @@ class DecodeVerifyRollbackWorkerV2(
         )
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
-        return self.dvr_replay_prefix.request_self_draft_prefix_token_ids(
+        return self.dvr_replay_prefix.request_output_prefix_token_ids(
             req,
             boundary_seqlen,
             error_prefix="DVR spec-v2",
@@ -107,9 +107,10 @@ class DecodeVerifyRollbackWorkerV2(
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
-        self.dvr_replay_prefix.append_self_draft_output_tokens(
+        self.dvr_replay_prefix.append_batch_output_tokens(
             batch,
             tokens_per_req,
+            initialize_from_req_output=True,
         )
 
     def forward_batch_generation(
