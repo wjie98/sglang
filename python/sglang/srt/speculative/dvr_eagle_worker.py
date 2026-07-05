@@ -27,6 +27,7 @@ from sglang.srt.speculative.dvr_logprob_repair import (
 )
 from sglang.srt.speculative.dvr_target_replay import (
     DVRTargetReplaySpec,
+    build_suffix_draft_mrope_positions,
     build_suffix_draft_replay_plan,
     build_target_extend_replay_batch,
     draft_row_logits_from_replay_hidden_states,
@@ -313,7 +314,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
         if boundary_indices is None:
             return None
 
-        draft_token_num = verify_input.draft_token_num
         base_seq_lens_cpu = (
             batch.seq_lens_cpu.tolist()
             if batch.seq_lens_cpu is not None
@@ -380,60 +380,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 replay_batch, self.target_worker.model_runner
             )
             if self.target_worker.model_runner.model_is_mrope:
-                mrope_chunks = []
-                mm_inputs = replay_batch.multimodal_inputs
-                for req_i, (seq_len, boundary, tail_len) in enumerate(
-                    zip(
-                        replay_plan.base_seq_lens_cpu,
-                        replay_plan.boundary_lens,
-                        replay_plan.tail_lens_cpu,
-                        strict=True,
-                    )
-                ):
-                    mm_input = (
-                        None
-                        if mm_inputs is None or req_i >= len(mm_inputs)
-                        else mm_inputs[req_i]
-                    )
-                    mm_positions = getattr(mm_input, "mrope_positions", None)
-                    chunk_parts = []
-                    if mm_positions is not None:
-                        tail_positions = mm_positions[
-                            :, int(boundary) : int(seq_len)
-                        ].to(device=batch.seq_lens.device, dtype=torch.long)
-                        if tail_positions.shape[1] > 0:
-                            chunk_parts.append(tail_positions)
-                    filled_tail = (
-                        sum(part.shape[1] for part in chunk_parts)
-                        if chunk_parts
-                        else 0
-                    )
-                    if filled_tail < int(tail_len):
-                        start = int(boundary) + filled_tail
-                        fallback_tail = (
-                            torch.arange(
-                                start,
-                                int(seq_len),
-                                dtype=torch.long,
-                                device=replay_batch.seq_lens.device,
-                            )
-                            .unsqueeze(0)
-                            .repeat(3, 1)
-                        )
-                        chunk_parts.append(fallback_tail)
-                    draft_positions = (
-                        torch.arange(
-                            int(seq_len),
-                            int(seq_len) + draft_token_num,
-                            dtype=torch.long,
-                            device=replay_batch.seq_lens.device,
-                        )
-                        .unsqueeze(0)
-                        .repeat(3, 1)
-                    )
-                    chunk_parts.append(draft_positions)
-                    mrope_chunks.append(torch.cat(chunk_parts, dim=1))
-                forward_batch.mrope_positions = torch.cat(mrope_chunks, dim=1)
+                forward_batch.mrope_positions = build_suffix_draft_mrope_positions(
+                    replay_batch, replay_plan
+                )
 
             oracle_output = self.target_worker.forward_batch_generation(
                 batch=None,
