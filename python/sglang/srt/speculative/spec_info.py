@@ -113,18 +113,6 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
-    def is_decode_verify_rollback(self) -> bool:
-        return self in (
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
-        )
-
-    def is_decode_verify_rollback_self_draft(self) -> bool:
-        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-
-    def is_decode_verify_rollback_eagle(self) -> bool:
-        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
-
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -182,6 +170,7 @@ class SpeculativeAlgorithm(Enum):
         ), "Cannot create worker for NONE speculative algorithm."
 
         enable_overlap = not server_args.disable_overlap_schedule
+        spec_policy = get_spec_algorithm_policy(self)
 
         if self.is_dflash():
             if enable_overlap:
@@ -205,14 +194,14 @@ class SpeculativeAlgorithm(Enum):
 
             return FrozenKVMTPWorker
 
-        if self.is_decode_verify_rollback_eagle():
+        if spec_policy.is_dvr_eagle():
             from sglang.srt.speculative.dvr_eagle_worker import (
                 DecodeVerifyRollbackEagleWorkerV2,
             )
 
             return DecodeVerifyRollbackEagleWorkerV2
 
-        if self.is_decode_verify_rollback_self_draft():
+        if spec_policy.is_dvr_self_draft():
             if enable_overlap:
                 from sglang.srt.speculative.dvr_worker_v2 import (
                     DecodeVerifyRollbackWorkerV2,

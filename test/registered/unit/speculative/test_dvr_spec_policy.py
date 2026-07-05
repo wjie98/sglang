@@ -10,6 +10,13 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     _spec_draft_proposals_per_round,
 )
+from sglang.srt.mem_cache.mamba_radix_cache_policy import (
+    get_req_mamba_radix_insert_snapshot,
+    get_unfinished_insert_plan,
+    mark_req_skip_mamba_radix_finished_insert,
+    set_req_mamba_radix_insert_snapshot,
+    should_insert_finished_req,
+)
 from sglang.srt.speculative.draft_decode_context import draft_decode_performance_context
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_logprob_repair import (
@@ -90,6 +97,51 @@ def test_dvr_mamba_radix_snapshot_policy():
     )
     assert not _policy(SpeculativeAlgorithm.EAGLE).needs_mamba_radix_snapshot_for_spec_v2()
     assert not _policy(SpeculativeAlgorithm.NONE).needs_mamba_radix_snapshot_for_spec_v2()
+
+
+def test_mamba_radix_request_policy_helpers():
+    req = SimpleNamespace()
+
+    assert should_insert_finished_req(req, default_is_insert=True)
+    assert not should_insert_finished_req(req, default_is_insert=False)
+    assert get_req_mamba_radix_insert_snapshot(req) is None
+
+    mark_req_skip_mamba_radix_finished_insert(req)
+    assert not should_insert_finished_req(req, default_is_insert=True)
+
+    set_req_mamba_radix_insert_snapshot(req, indices="idx", seqlen=64)
+    snapshot = get_req_mamba_radix_insert_snapshot(req)
+    assert snapshot.indices == "idx"
+    assert snapshot.seqlen == 64
+
+
+def test_mamba_radix_unfinished_insert_plan_prefers_snapshot():
+    req = SimpleNamespace(mamba_last_track_seqlen=32)
+
+    plan = get_unfinished_insert_plan(
+        req,
+        enable_mamba_extra_buffer=True,
+        token_count=96,
+    )
+    assert plan.cache_len == 32
+    assert plan.snapshot_indices is None
+
+    set_req_mamba_radix_insert_snapshot(req, indices="snapshot_idx", seqlen=64)
+    plan = get_unfinished_insert_plan(
+        req,
+        enable_mamba_extra_buffer=True,
+        token_count=96,
+    )
+    assert plan.cache_len == 64
+    assert plan.snapshot_indices == "snapshot_idx"
+
+    plan = get_unfinished_insert_plan(
+        req,
+        enable_mamba_extra_buffer=False,
+        token_count=96,
+    )
+    assert plan.cache_len == 96
+    assert plan.snapshot_indices is None
 
 
 def test_dvr_linear_state_extension_policy():

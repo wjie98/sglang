@@ -51,7 +51,8 @@ from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.mem_cache.mamba_radix_cache_policy import (
     clear_req_mamba_radix_insert_snapshot,
-    get_req_mamba_radix_cache_policy,
+    get_unfinished_insert_plan,
+    should_insert_finished_req,
 )
 
 if TYPE_CHECKING:
@@ -545,13 +546,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
         kv_committed_len = req.pop_committed_kv_cache()
-        cache_policy = get_req_mamba_radix_cache_policy(req)
-        if cache_policy.skip_finished_insert:
-            # Some overlap verify paths keep post-verify Mamba checkpoints
-            # request-local. Prefill/unfinished-cache entries are still
-            # reusable, but the generated suffix is not inserted until
-            # generated-prefix checkpoint ownership is proven end-to-end.
-            is_insert = False
+        is_insert = should_insert_finished_req(req, default_is_insert=is_insert)
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -660,23 +655,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
-        cache_policy = get_req_mamba_radix_cache_policy(req)
-        insert_snapshot = cache_policy.insert_snapshot
-        insert_mamba_indices = (
-            None if insert_snapshot is None else insert_snapshot.indices
+        insert_plan = get_unfinished_insert_plan(
+            req,
+            enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
+            token_count=len(token_ids),
         )
-        insert_mamba_seqlen = None if insert_snapshot is None else insert_snapshot.seqlen
-        cache_len = (
-            insert_mamba_seqlen
-            if self.enable_mamba_extra_buffer
-            and insert_mamba_indices is not None
-            and insert_mamba_seqlen is not None
-            else (
-                req.mamba_last_track_seqlen
-                if self.enable_mamba_extra_buffer
-                else len(token_ids)
-            )
-        )
+        cache_len = insert_plan.cache_len
+        insert_mamba_indices = insert_plan.snapshot_indices
         try:
             if self.disable or cache_len is None:
                 return _skip_cache_unfinished_req(req)
