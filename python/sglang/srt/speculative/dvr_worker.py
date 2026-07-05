@@ -36,9 +36,9 @@ from sglang.srt.speculative.dvr_logprob_repair import (
 )
 from sglang.srt.speculative.dvr_scheduler_utils import DVRReplayPrefixTracker
 from sglang.srt.speculative.dvr_target_replay import (
-    DVRTargetReplaySpec,
     build_accepted_suffix_replay_plan,
     build_suffix_draft_replay_plan,
+    build_suffix_target_replay_spec,
     build_target_extend_replay_batch,
     draft_row_logits_from_replay_hidden_states,
     linear_state_replay_context,
@@ -848,15 +848,9 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         # materialize chunk-boundary checkpoints instead of publishing one as a
         # side effect of this temporary EXTEND replay.
         self.linear_state.set_suffix_replay_boundary_track_mask(None)
-        replay_spec = DVRTargetReplaySpec(
-            input_ids=replay_plan.input_ids,
-            out_cache_locs=replay_plan.out_cache_locs,
-            prefix_lens=[int(x) for x in replay_plan.boundary_lens],
-            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-            final_seq_lens=replay_plan.final_seq_lens_cpu,
-            extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        replay_spec = build_suffix_target_replay_spec(
+            replay_plan,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            return_logprob=False,
             # Cached-prefix prefill can leave deferred Mamba COW/clear tensors
             # on ScheduleBatch after the real forward consumed its ForwardBatch
             # copy.  Replay owns the restore operation explicitly below.
@@ -965,15 +959,9 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         # Accepted-suffix replay is a commit repair, not a checkpoint publisher.
         # It intentionally leaves the live recurrent slot updated by the replay.
         self.linear_state.set_suffix_replay_boundary_track_mask(None)
-        replay_spec = DVRTargetReplaySpec(
-            input_ids=replay_plan.input_ids,
-            out_cache_locs=replay_plan.out_cache_locs,
-            prefix_lens=[int(x) for x in replay_plan.boundary_lens],
-            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-            final_seq_lens=replay_plan.final_seq_lens_cpu,
-            extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        replay_spec = build_suffix_target_replay_spec(
+            replay_plan,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            return_logprob=False,
             mamba_cow_src_indices=boundary_indices,
             mamba_cow_dst_indices=live_indices,
         )

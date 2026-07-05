@@ -301,6 +301,32 @@ def build_suffix_draft_mrope_positions(
     return torch.cat(mrope_chunks, dim=1)
 
 
+def build_suffix_target_replay_spec(
+    replay_plan: DVRSuffixDraftReplayPlan | DVRAcceptedSuffixReplayPlan,
+    *,
+    capture_hidden_mode: CaptureHiddenMode,
+    return_logprob: bool = False,
+    mamba_cow_src_indices: Optional[torch.Tensor] = None,
+    mamba_cow_dst_indices: Optional[torch.Tensor] = None,
+    mamba_clear_indices: Optional[torch.Tensor] = None,
+) -> DVRTargetReplaySpec:
+    """Map a suffix replay plan to the private target EXTEND batch spec."""
+
+    return DVRTargetReplaySpec(
+        input_ids=replay_plan.input_ids,
+        out_cache_locs=replay_plan.out_cache_locs,
+        prefix_lens=[int(x) for x in replay_plan.boundary_lens],
+        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        final_seq_lens=replay_plan.final_seq_lens_cpu,
+        extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        capture_hidden_mode=capture_hidden_mode,
+        return_logprob=return_logprob,
+        mamba_cow_src_indices=mamba_cow_src_indices,
+        mamba_cow_dst_indices=mamba_cow_dst_indices,
+        mamba_clear_indices=mamba_clear_indices,
+    )
+
+
 def build_accepted_suffix_replay_plan(
     *,
     batch,

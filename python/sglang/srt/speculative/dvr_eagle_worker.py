@@ -26,9 +26,9 @@ from sglang.srt.speculative.dvr_logprob_repair import (
     defer_and_score_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_target_replay import (
-    DVRTargetReplaySpec,
     build_suffix_draft_mrope_positions,
     build_suffix_draft_replay_plan,
+    build_suffix_target_replay_spec,
     build_target_extend_replay_batch,
     draft_row_logits_from_replay_hidden_states,
     linear_state_replay_context,
@@ -340,15 +340,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
         # EXTEND forward.
         self.linear_state.set_suffix_replay_boundary_track_mask(None)
 
-        replay_spec = DVRTargetReplaySpec(
-            input_ids=replay_plan.input_ids,
-            out_cache_locs=replay_plan.out_cache_locs,
-            prefix_lens=[int(x) for x in replay_plan.boundary_lens],
-            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-            final_seq_lens=replay_plan.final_seq_lens_cpu,
-            extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        replay_spec = build_suffix_target_replay_spec(
+            replay_plan,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            return_logprob=False,
             # Suffix replay starts from DVR-managed recurrent state. Do not
             # re-apply cached-prefix deferred Mamba COW/clear ops that were
             # already consumed by the real prefill/verify forward.
