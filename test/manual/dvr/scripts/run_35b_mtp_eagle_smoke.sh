@@ -65,6 +65,7 @@ run_one_mode() {
     --max-new 4,16,65 \
     --cache-mode flush-each \
     --check-kl \
+    --min-accept-rate 0.99 \
     --ignore-eos \
     --seed 2032 \
     2>&1 | tee "${kl_log}"
@@ -77,6 +78,7 @@ run_one_mode() {
     --max-new 4,16,65 \
     --cache-mode flush-each \
     --no-return-logprob \
+    --min-accept-rate 0.99 \
     --ignore-eos \
     --seed 2032 \
     2>&1 | tee "${no_logprob_log}"

@@ -163,6 +163,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
   --max-new 4,16,65 \
   --cache-mode flush-each \
   --check-kl \
+  --min-accept-rate 0.99 \
   --ignore-eos \
   --seed 2032
 ```
@@ -177,6 +178,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
   --max-new 4,16,65 \
   --cache-mode flush-each \
   --no-return-logprob \
+  --min-accept-rate 0.99 \
   --ignore-eos \
   --seed 2032
 ```
@@ -185,6 +187,13 @@ The sync and overlap DVR-EAGLE modes are both spec-v2 semantics.  In this tree
 `SGLANG_ENABLE_SPEC_V2=0` selects synchronous v2 execution for DVR-EAGLE, and
 `SGLANG_ENABLE_SPEC_V2=1` selects overlap v2 execution.  DVR-EAGLE v1 is not a
 supported matrix entry.
+
+The `--seed 2032`, `prompt_len=65`, `max_new=65` entry is the fixed regression
+for seeded MTP boundary acceptance.  It crosses the GDN chunk boundary and must
+keep `accept_rate >= 0.99` in both returned-logprob and no-return-logprob
+paths.  A lower value usually means the deterministic verify coin stream or the
+MTP suffix-boundary hidden/state seed no longer matches target prefill
+semantics.
 
 ## 80B self-DVR throughput
 

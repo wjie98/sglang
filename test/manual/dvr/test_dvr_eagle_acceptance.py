@@ -215,6 +215,12 @@ def main() -> None:
     )
     parser.add_argument("--check-kl", action="store_true")
     parser.add_argument("--kl-tol", type=float, default=0.0)
+    parser.add_argument(
+        "--min-accept-rate",
+        type=float,
+        default=None,
+        help="Fail if any reported speculative accept rate is below this value.",
+    )
     parser.add_argument("--no-return-logprob", action="store_true")
     args = parser.parse_args()
 
@@ -258,13 +264,20 @@ def main() -> None:
                     params,
                     args.kl_tol,
                 )
+            accept_rate = meta.get("spec_accept_rate")
+            accept_ok = (
+                args.min_accept_rate is None
+                or accept_rate is None
+                or float(accept_rate) >= args.min_accept_rate
+            )
             row = {
                 "case": case_id,
                 "prompt_len": case.prompt_len,
                 "max_new": case.max_new,
                 "gen": meta.get("completion_tokens", len(output_ids)),
                 "cached": meta.get("cached_tokens"),
-                "accept_rate": meta.get("spec_accept_rate"),
+                "accept_rate": accept_rate,
+                "accept_ok": accept_ok,
                 "accept_length": meta.get("spec_accept_length"),
                 "correct_drafts": meta.get("spec_num_correct_drafts"),
                 "proposed_drafts": meta.get("spec_num_proposed_drafts"),
@@ -281,8 +294,18 @@ def main() -> None:
             case_id += 1
 
     failed = [row for row in rows if row["kl_ok"] is False]
-    print("SUMMARY " + json.dumps({"cases": len(rows), "kl_failed": len(failed)}))
-    if failed:
+    accept_failed = [row for row in rows if row["accept_ok"] is False]
+    print(
+        "SUMMARY "
+        + json.dumps(
+            {
+                "cases": len(rows),
+                "kl_failed": len(failed),
+                "accept_failed": len(accept_failed),
+            }
+        )
+    )
+    if failed or accept_failed:
         raise SystemExit(1)
 
 
