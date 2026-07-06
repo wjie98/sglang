@@ -15,6 +15,50 @@ except ImportError:  # pragma: no cover - non-CUDA builds use the torch fallback
     tl = None
 
 
+_ATTN_BACKEND_CHILD_ATTRS = (
+    "decode_backend",
+    "prefill_backend",
+    "full_attn_backend",
+    "linear_attn_backend",
+    "primary",
+)
+_ATTN_BACKEND_CHILD_LIST_ATTRS = (
+    "attn_backend_list",
+    "attn_backends",
+    "backends",
+    "children",
+)
+
+
+def iter_dvr_attention_backends(attn_backend):
+    """Yield a DVR-relevant attention backend wrapper tree.
+
+    Hybrid Qwen3.5/Next models wrap the real full-attention backend inside
+    hybrid linear-attention containers.  DVR self-draft and DVR-EAGLE target
+    verify both need to patch or notify that inner backend, so keep the wrapper
+    traversal in one place.
+    """
+
+    if attn_backend is None:
+        return
+
+    seen = set()
+    stack = [attn_backend]
+    while stack:
+        backend = stack.pop()
+        if backend is None or id(backend) in seen:
+            continue
+        seen.add(id(backend))
+        yield backend
+
+        for attr_name in _ATTN_BACKEND_CHILD_ATTRS:
+            stack.append(getattr(backend, attr_name, None))
+
+        for attr_name in _ATTN_BACKEND_CHILD_LIST_ATTRS:
+            for child in getattr(backend, attr_name, None) or ():
+                stack.append(child)
+
+
 @contextmanager
 def dvr_causal_verify_cuda_graph_metadata(
     model_runner, attn_backend, forward_mode, spec_info, fallback_custom_mask=None

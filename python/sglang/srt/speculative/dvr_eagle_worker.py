@@ -36,7 +36,10 @@ from sglang.srt.speculative.dvr_linear_state_worker import (
     DVRSpecV2LinearStateMixin,
 )
 from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
-from sglang.srt.speculative.dvr_utils import dvr_has_graph_unsafe_short_prompt
+from sglang.srt.speculative.dvr_utils import (
+    dvr_has_graph_unsafe_short_prompt,
+    iter_dvr_attention_backends,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -49,21 +52,6 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
-
-
-_ATTN_BACKEND_CHILD_ATTRS = (
-    "decode_backend",
-    "prefill_backend",
-    "full_attn_backend",
-    "linear_attn_backend",
-    "primary",
-)
-_ATTN_BACKEND_CHILD_LIST_ATTRS = (
-    "attn_backend_list",
-    "attn_backends",
-    "backends",
-    "children",
-)
 
 
 class DecodeVerifyRollbackEagleWorkerV2(
@@ -154,26 +142,13 @@ class DecodeVerifyRollbackEagleWorkerV2(
         )
         return None if runner is None else runner.bs
 
-    def _iter_target_attention_backends(self):
-        seen = set()
-        stack = [self.target_worker.model_runner.attn_backend]
-        while stack:
-            backend = stack.pop()
-            if backend is None or id(backend) in seen:
-                continue
-            seen.add(id(backend))
-            yield backend
-
-            for attr_name in _ATTN_BACKEND_CHILD_ATTRS:
-                stack.append(getattr(backend, attr_name, None))
-            for attr_name in _ATTN_BACKEND_CHILD_LIST_ATTRS:
-                stack.extend(getattr(backend, attr_name, None) or ())
-
     def _update_verify_buffers_to_fill_after_draft(
         self, verify_input: DVREagleVerifyInput, can_run_cuda_graph: bool
     ):
         cuda_graph_bs = self._target_verify_graph_runner_bs(can_run_cuda_graph)
-        for backend in self._iter_target_attention_backends():
+        for backend in iter_dvr_attention_backends(
+            self.target_worker.model_runner.attn_backend
+        ):
             try:
                 backend.update_verify_buffers_to_fill_after_draft(
                     verify_input, cuda_graph_bs

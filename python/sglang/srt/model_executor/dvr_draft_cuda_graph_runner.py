@@ -7,52 +7,8 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.dvr_utils import iter_dvr_attention_backends
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-_BACKEND_CHILD_ATTRS = (
-    "decode_backend",
-    "prefill_backend",
-    "full_attn_backend",
-    "linear_attn_backend",
-    "primary",
-)
-_BACKEND_CHILD_LIST_ATTRS = (
-    "attn_backend_list",
-    "attn_backends",
-    "backends",
-    "children",
-)
-
-
-def _iter_attention_backends(attn_backend):
-    """Yield a backend tree rooted at model_runner.attn_backend.
-
-    Attention backends may be wrapped by HybridAttnBackend, HybridLinearAttnBackend,
-    multi-step speculative containers, or TBO. DVR self-draft decode needs to patch
-    the real full-attention backend inside those wrappers, not just the top-level
-    object. PDMUX is intentionally excluded because its per-stream decode backends
-    live on model_runner.decode_attn_backend_group, outside this object tree, and
-    that graph-state path needs separate validation.
-    """
-
-    if attn_backend is None:
-        return
-
-    seen = set()
-    stack = [attn_backend]
-    while stack:
-        backend = stack.pop()
-        if backend is None or id(backend) in seen:
-            continue
-        seen.add(id(backend))
-        yield backend
-
-        for attr_name in _BACKEND_CHILD_ATTRS:
-            stack.append(getattr(backend, attr_name, None))
-
-        for attr_name in _BACKEND_CHILD_LIST_ATTRS:
-            for child in getattr(backend, attr_name, None) or ():
-                stack.append(child)
 
 
 @contextmanager
@@ -206,7 +162,7 @@ def _patch_draft_decode_backend_tree(model_runner, extra_attn_backends, patch_at
         if backend_root is None or id(backend_root) in seen_backend_roots:
             continue
         seen_backend_roots.add(id(backend_root))
-        for backend in _iter_attention_backends(backend_root):
+        for backend in iter_dvr_attention_backends(backend_root):
             patch_attr(backend, "enable_deterministic", False)
             _patch_self_draft_decode_backend_defaults(backend, patch_attr)
 
@@ -254,7 +210,7 @@ def _assert_draft_decode_performance_state(model_runner, extra_attn_backends):
         raise RuntimeError("DVR draft decode env still enables deterministic inference.")
 
     for backend_root in (model_runner.attn_backend, *(extra_attn_backends or ())):
-        for backend in _iter_attention_backends(backend_root):
+        for backend in iter_dvr_attention_backends(backend_root):
             if getattr(backend, "enable_deterministic", False):
                 raise RuntimeError(
                     "DVR draft decode backend still has enable_deterministic=True."
