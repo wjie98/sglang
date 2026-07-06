@@ -12,12 +12,15 @@ from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
     DVRReplayPrefixTracker,
 )
-from sglang.srt.speculative.dvr_target_replay import linear_state_replay_context
+from sglang.srt.speculative.dvr_target_replay import (
+    DVRPrivateExtendBatchSpec,
+    build_private_extend_batch,
+    linear_state_replay_context,
+)
 from sglang.srt.speculative.output_policy import (
     defer_req_non_streaming_logprob_output,
     try_expect_req_final_logprob_repair,
@@ -462,7 +465,26 @@ def _run_final_logprob_replay(
     linear_state_ctx: Any,
     replay_plan: _DVRFinalLogprobReplayPlan,
 ) -> torch.Tensor:
-    replay_batch = _build_final_logprob_replay_batch(batch, replay_plan)
+    reqs = [batch.reqs[i] for i in replay_plan.req_indices]
+    replay_batch = build_private_extend_batch(
+        batch,
+        DVRPrivateExtendBatchSpec(
+            reqs=reqs,
+            input_ids=replay_plan.input_ids,
+            out_cache_locs=None,
+            prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
+            extend_lens=replay_plan.extend_lens_cpu,
+            final_seq_lens=replay_plan.final_seq_lens_cpu,
+            return_logprob=True,
+            top_logprobs_nums=[0 for _ in reqs],
+            token_ids_logprobs=[None for _ in reqs],
+            extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
+            extend_input_logprob_token_ids=replay_plan.logprob_token_ids,
+            multimodal_inputs=[None for _ in reqs],
+            is_prefill_only=True,
+            with_sampling_info=True,
+        ),
+    )
     replay_linear_state_ctx = _subset_linear_state_ctx(
         linear_state_ctx, replay_plan.req_indices
     )
@@ -473,9 +495,6 @@ def _run_final_logprob_replay(
         device = replay_batch.seq_lens.device
         replay_batch.out_cache_loc = temp_cache_locs.to(
             device=device, dtype=torch.long
-        )
-        replay_batch.extend_input_logprob_token_ids = torch.tensor(
-            replay_plan.logprob_token_ids, dtype=torch.long, device=device
         )
         replay_batch.mamba_clear_indices = replay_linear_state_ctx.live_indices
 
@@ -503,86 +522,6 @@ def _run_final_logprob_replay(
         if input_token_logprobs is None:
             raise RuntimeError("DVR final logprob replay did not return logprobs.")
         return input_token_logprobs
-
-
-def _build_final_logprob_replay_batch(
-    batch: ScheduleBatch,
-    replay_plan: _DVRFinalLogprobReplayPlan,
-) -> ScheduleBatch:
-    """Create a narrow batch so final scoring cannot perturb continuing rows."""
-
-    device = batch.seq_lens.device
-    reqs = [batch.reqs[i] for i in replay_plan.req_indices]
-    req_pool_indices = torch.tensor(
-        [req.req_pool_idx for req in reqs], dtype=torch.int64, device=device
-    )
-    final_seq_lens = torch.tensor(
-        replay_plan.final_seq_lens_cpu, dtype=torch.int64, device=device
-    )
-    global_num_tokens = None
-    global_num_tokens_for_logprob = None
-    if batch.global_num_tokens is not None:
-        dp_world = len(batch.global_num_tokens)
-        global_num_tokens = [len(replay_plan.input_ids)] * dp_world
-        global_num_tokens_for_logprob = [len(replay_plan.input_ids)] * dp_world
-    replay_batch = ScheduleBatch(
-        reqs=reqs,
-        req_to_token_pool=batch.req_to_token_pool,
-        token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
-        tree_cache=batch.tree_cache,
-        model_config=batch.model_config,
-        enable_overlap=batch.enable_overlap,
-        device=batch.device,
-        forward_mode=ForwardMode.EXTEND,
-        input_ids=torch.tensor(
-            replay_plan.input_ids, dtype=torch.int64, device=device
-        ),
-        req_pool_indices=req_pool_indices,
-        req_pool_indices_cpu=req_pool_indices.cpu(),
-        seq_lens=final_seq_lens,
-        seq_lens_cpu=final_seq_lens.cpu(),
-        seq_lens_sum=sum(replay_plan.final_seq_lens_cpu),
-        out_cache_loc=None,
-        return_logprob=True,
-        top_logprobs_nums=[0 for _ in reqs],
-        token_ids_logprobs=[None for _ in reqs],
-        global_num_tokens=global_num_tokens,
-        global_num_tokens_for_logprob=global_num_tokens_for_logprob,
-        is_extend_in_batch=True,
-        all_extend_in_batch=True,
-        can_run_dp_cuda_graph=False,
-        can_run_dp_breakable_cuda_graph=False,
-        extend_num_tokens=len(replay_plan.input_ids),
-        extend_lens=replay_plan.extend_lens_cpu,
-        prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
-        extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
-        extend_input_logprob_token_ids=None,
-        multimodal_inputs=[None for _ in reqs],
-        encoder_cached=None,
-        encoder_lens=None,
-        encoder_lens_cpu=None,
-        encoder_out_cache_loc=None,
-        sampling_info=None,
-        orig_seq_lens=final_seq_lens.to(dtype=torch.int32),
-        input_embeds=None,
-        ne_token_table=None,
-        spec_algorithm=batch.spec_algorithm,
-        spec_info=None,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-        hicache_consumer_index=-1,
-        is_prefill_only=True,
-        dllm_config=batch.dllm_config,
-        has_grammar=False,
-        return_hidden_states=False,
-        return_hidden_states_before_norm=False,
-    )
-    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-
-    replay_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-        replay_batch,
-        batch.model_config.vocab_size,
-    )
-    return replay_batch
 
 
 def _subset_linear_state_ctx(linear_state_ctx: Any, req_indices: list[int]) -> Any:

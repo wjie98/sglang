@@ -35,6 +35,41 @@ class DVRTargetReplaySpec:
 
 
 @dataclass
+class DVRPrivateExtendBatchSpec:
+    """Inputs for a DVR-owned EXTEND batch detached from scheduler mutation.
+
+    DVR uses private EXTEND batches for target verify oracles, boundary-state
+    materialization, and final logprob scoring.  Keeping their ScheduleBatch
+    construction in one place avoids three copies of upstream-sensitive field
+    plumbing while leaving each replay path responsible for its own semantics.
+    """
+
+    reqs: list[Any]
+    input_ids: list[int]
+    out_cache_locs: Optional[list[torch.Tensor] | torch.Tensor]
+    prefix_lens: list[int]
+    extend_lens: list[int]
+    final_seq_lens: list[int]
+    return_logprob: bool = False
+    top_logprobs_nums: Optional[list[int]] = None
+    token_ids_logprobs: Optional[list[Any]] = None
+    extend_logprob_start_lens: Optional[list[int]] = None
+    extend_input_logprob_token_ids: Optional[list[int]] = None
+    multimodal_inputs: Optional[list[Any]] = None
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    is_extend_in_batch: bool = True
+    all_extend_in_batch: bool = True
+    is_prefill_only: Optional[bool] = None
+    with_sampling_info: bool = False
+    mamba_track_indices: Optional[torch.Tensor] = None
+    mamba_track_mask: Optional[torch.Tensor] = None
+    mamba_track_seqlens: Optional[torch.Tensor] = None
+    mamba_cow_src_indices: Optional[torch.Tensor] = None
+    mamba_cow_dst_indices: Optional[torch.Tensor] = None
+    mamba_clear_indices: Optional[torch.Tensor] = None
+
+
+@dataclass
 class DVRLinearStateReplayContext:
     live_backup: Optional[Any]
     saved_tail_lens: Optional[torch.Tensor]
@@ -494,63 +529,27 @@ def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleB
     """Create the narrow ScheduleBatch used for boundary checkpoint replay."""
 
     device = batch.device
-    return ScheduleBatch(
-        reqs=plan.reqs,
-        req_to_token_pool=batch.req_to_token_pool,
-        token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
-        tree_cache=batch.tree_cache,
-        model_config=batch.model_config,
-        enable_overlap=batch.enable_overlap,
-        device=batch.device,
-        forward_mode=ForwardMode.EXTEND,
-        input_ids=torch.tensor(plan.input_ids, dtype=torch.int64, device=device),
-        req_pool_indices=torch.tensor(
-            [req.req_pool_idx for req in plan.reqs],
-            dtype=torch.int64,
-            device=device,
-        ),
-        seq_lens=torch.tensor(plan.final_seq_lens, dtype=torch.int64, device=device),
-        out_cache_loc=torch.cat(plan.out_cache_locs).to(device=device),
-        seq_lens_cpu=torch.tensor(plan.final_seq_lens, dtype=torch.int64),
-        seq_lens_sum=sum(plan.final_seq_lens),
-        return_logprob=False,
-        top_logprobs_nums=None,
-        token_ids_logprobs=None,
-        global_num_tokens=None,
-        global_num_tokens_for_logprob=None,
-        is_extend_in_batch=False,
-        all_extend_in_batch=False,
-        can_run_dp_cuda_graph=False,
-        tbo_split_seq_index=None,
-        global_forward_mode=None,
-        extend_num_tokens=len(plan.input_ids),
-        extend_lens=plan.extend_lens,
-        prefix_lens=plan.prefix_lens,
-        extend_logprob_start_lens=plan.prefix_lens,
-        extend_input_logprob_token_ids=None,
-        multimodal_inputs=[req.multimodal_inputs for req in plan.reqs],
-        encoder_cached=None,
-        encoder_lens=None,
-        encoder_lens_cpu=None,
-        encoder_out_cache_loc=None,
-        sampling_info=None,
-        orig_seq_lens=torch.tensor(plan.final_seq_lens, dtype=torch.int32, device=device),
-        input_embeds=None,
-        ne_token_table=None,
-        spec_algorithm=batch.spec_algorithm,
-        spec_info=None,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-        hicache_consumer_index=-1,
-        is_prefill_only=True,
-        dllm_config=batch.dllm_config,
-        has_grammar=False,
-        return_hidden_states_before_norm=False,
-        mamba_track_indices=plan.boundary_indices,
-        mamba_track_mask=torch.ones(
-            len(plan.reqs), dtype=torch.bool, device=device
-        ),
-        mamba_track_seqlens=torch.tensor(
-            plan.final_seq_lens, dtype=torch.int64, device=device
+    return build_private_extend_batch(
+        batch,
+        DVRPrivateExtendBatchSpec(
+            reqs=plan.reqs,
+            input_ids=plan.input_ids,
+            out_cache_locs=plan.out_cache_locs,
+            prefix_lens=plan.prefix_lens,
+            extend_lens=plan.extend_lens,
+            final_seq_lens=plan.final_seq_lens,
+            extend_logprob_start_lens=plan.prefix_lens,
+            multimodal_inputs=[req.multimodal_inputs for req in plan.reqs],
+            is_extend_in_batch=False,
+            all_extend_in_batch=False,
+            is_prefill_only=True,
+            mamba_track_indices=plan.boundary_indices,
+            mamba_track_mask=torch.ones(
+                len(plan.reqs), dtype=torch.bool, device=device
+            ),
+            mamba_track_seqlens=torch.tensor(
+                plan.final_seq_lens, dtype=torch.int64, device=device
+            ),
         ),
     )
 
@@ -569,6 +568,43 @@ def build_target_extend_replay_batch(
     """
 
     replay_reqs = batch.reqs if reqs is None else reqs
+    return build_private_extend_batch(
+        batch,
+        DVRPrivateExtendBatchSpec(
+            reqs=replay_reqs,
+            input_ids=spec.input_ids,
+            out_cache_locs=spec.out_cache_locs,
+            prefix_lens=[int(x) for x in spec.prefix_lens],
+            extend_lens=[int(x) for x in spec.extend_lens],
+            final_seq_lens=spec.final_seq_lens,
+            return_logprob=spec.return_logprob,
+            extend_logprob_start_lens=[
+                int(x) for x in spec.extend_logprob_start_lens
+            ],
+            extend_input_logprob_token_ids=spec.extend_input_logprob_token_ids,
+            multimodal_inputs=(
+                [req.multimodal_inputs for req in replay_reqs]
+                if spec.multimodal_inputs is None
+                else spec.multimodal_inputs
+            ),
+            capture_hidden_mode=spec.capture_hidden_mode,
+            is_prefill_only=batch.is_prefill_only,
+            mamba_track_indices=spec.mamba_track_indices,
+            mamba_track_mask=spec.mamba_track_mask,
+            mamba_track_seqlens=spec.mamba_track_seqlens,
+            mamba_cow_src_indices=spec.mamba_cow_src_indices,
+            mamba_cow_dst_indices=spec.mamba_cow_dst_indices,
+            mamba_clear_indices=spec.mamba_clear_indices,
+        ),
+    )
+
+
+def build_private_extend_batch(
+    batch,
+    spec: DVRPrivateExtendBatchSpec,
+) -> ScheduleBatch:
+    """Create a DVR-owned EXTEND batch with upstream ScheduleBatch plumbing."""
+
     device = batch.seq_lens.device
     global_num_tokens = None
     global_num_tokens_for_logprob = None
@@ -577,8 +613,27 @@ def build_target_extend_replay_batch(
         global_num_tokens = [len(spec.input_ids)] * dp_world
         global_num_tokens_for_logprob = [len(spec.input_ids)] * dp_world
 
-    return ScheduleBatch(
-        reqs=replay_reqs,
+    req_pool_indices = torch.tensor(
+        [req.req_pool_idx for req in spec.reqs],
+        dtype=torch.int64,
+        device=device,
+    )
+    final_seq_lens = torch.tensor(spec.final_seq_lens, dtype=torch.int64, device=device)
+    out_cache_loc = None
+    if spec.out_cache_locs is not None:
+        out_cache_loc = (
+            torch.cat(spec.out_cache_locs)
+            if isinstance(spec.out_cache_locs, list)
+            else spec.out_cache_locs
+        ).to(device=device)
+    extend_logprob_start_lens = (
+        spec.prefix_lens
+        if spec.extend_logprob_start_lens is None
+        else spec.extend_logprob_start_lens
+    )
+
+    replay_batch = ScheduleBatch(
+        reqs=spec.reqs,
         req_to_token_pool=batch.req_to_token_pool,
         token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
         tree_cache=batch.tree_cache,
@@ -587,31 +642,27 @@ def build_target_extend_replay_batch(
         device=batch.device,
         forward_mode=ForwardMode.EXTEND,
         input_ids=torch.tensor(spec.input_ids, dtype=torch.int64, device=device),
-        req_pool_indices=torch.tensor(
-            [req.req_pool_idx for req in replay_reqs],
-            dtype=torch.int64,
-            device=device,
-        ),
-        seq_lens=torch.tensor(spec.final_seq_lens, dtype=torch.int64, device=device),
-        out_cache_loc=torch.cat(spec.out_cache_locs).to(device=device),
-        seq_lens_cpu=torch.tensor(spec.final_seq_lens, dtype=torch.int64),
+        req_pool_indices=req_pool_indices,
+        req_pool_indices_cpu=req_pool_indices.cpu(),
+        seq_lens=final_seq_lens,
+        out_cache_loc=out_cache_loc,
+        seq_lens_cpu=final_seq_lens.cpu(),
         seq_lens_sum=sum(spec.final_seq_lens),
         return_logprob=spec.return_logprob,
-        top_logprobs_nums=None,
-        token_ids_logprobs=None,
+        top_logprobs_nums=spec.top_logprobs_nums,
+        token_ids_logprobs=spec.token_ids_logprobs,
         global_num_tokens=global_num_tokens,
         global_num_tokens_for_logprob=global_num_tokens_for_logprob,
-        is_extend_in_batch=True,
-        all_extend_in_batch=True,
+        is_extend_in_batch=spec.is_extend_in_batch,
+        all_extend_in_batch=spec.all_extend_in_batch,
         can_run_dp_cuda_graph=False,
+        can_run_dp_breakable_cuda_graph=False,
         tbo_split_seq_index=None,
         global_forward_mode=None,
         extend_num_tokens=len(spec.input_ids),
-        extend_lens=[int(x) for x in spec.extend_lens],
-        prefix_lens=[int(x) for x in spec.prefix_lens],
-        extend_logprob_start_lens=[
-            int(x) for x in spec.extend_logprob_start_lens
-        ],
+        extend_lens=spec.extend_lens,
+        prefix_lens=spec.prefix_lens,
+        extend_logprob_start_lens=extend_logprob_start_lens,
         extend_input_logprob_token_ids=(
             None
             if spec.extend_input_logprob_token_ids is None
@@ -621,26 +672,24 @@ def build_target_extend_replay_batch(
                 device=device,
             )
         ),
-        multimodal_inputs=(
-            [req.multimodal_inputs for req in replay_reqs]
-            if spec.multimodal_inputs is None
-            else spec.multimodal_inputs
-        ),
+        multimodal_inputs=spec.multimodal_inputs,
         encoder_cached=None,
         encoder_lens=None,
         encoder_lens_cpu=None,
         encoder_out_cache_loc=None,
         sampling_info=None,
-        orig_seq_lens=torch.tensor(
-            spec.final_seq_lens, dtype=torch.int32, device=device
-        ),
+        orig_seq_lens=final_seq_lens.to(dtype=torch.int32),
         input_embeds=None,
         ne_token_table=None,
         spec_algorithm=batch.spec_algorithm,
         spec_info=None,
         capture_hidden_mode=spec.capture_hidden_mode,
         hicache_consumer_index=-1,
-        is_prefill_only=batch.is_prefill_only,
+        is_prefill_only=(
+            batch.is_prefill_only
+            if spec.is_prefill_only is None
+            else spec.is_prefill_only
+        ),
         dllm_config=batch.dllm_config,
         has_grammar=False,
         return_hidden_states=False,
@@ -653,6 +702,14 @@ def build_target_extend_replay_batch(
         mamba_cow_dst_indices=spec.mamba_cow_dst_indices,
         mamba_clear_indices=spec.mamba_clear_indices,
     )
+    if spec.with_sampling_info:
+        from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+        replay_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            replay_batch,
+            batch.model_config.vocab_size,
+        )
+    return replay_batch
 
 
 def draft_row_logits_from_replay_hidden_states(
