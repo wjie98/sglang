@@ -13,7 +13,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
@@ -84,13 +83,8 @@ class DecodeVerifyRollbackWorkerV2(
     def _draft_cache_locs_from_req_to_token(
         self, batch: ScheduleBatch
     ) -> torch.Tensor:
-        offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
-            self.num_draft_tokens, dtype=torch.long, device=batch.seq_lens.device
-        ).unsqueeze(0)
-        req_pool_indices = batch.req_pool_indices.to(torch.long).unsqueeze(1)
-        return self.req_to_token_pool.req_to_token[req_pool_indices, offsets].reshape(
-            -1
-        )
+        rows, offsets = self._dvr_draft_rows_and_offsets(batch)
+        return self.req_to_token_pool.req_to_token[rows, offsets].reshape(-1)
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
         return self.dvr_replay_prefix.request_output_prefix_token_ids(
@@ -138,31 +132,20 @@ class DecodeVerifyRollbackWorkerV2(
     def forward_target_extend_v2(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
-        batch.capture_hidden_mode = CaptureHiddenMode.NULL
-        batch_result = self.target_worker.forward_batch_generation(batch)
-        batch_result.new_seq_lens = batch.seq_lens
-        next_token_ids = batch_result.next_token_ids
+        logits_output, next_token_ids, can_run_cuda_graph = self.forward_target_extend(
+            batch
+        )
         self._advance_v2_replay_prefix(
             batch,
             [[token_id] for token_id in next_token_ids.detach().cpu().tolist()],
         )
-        topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
-        batch_result.next_draft_input = EagleDraftInput(
-            hidden_states=self._dummy_hidden_states(
-                next_token_ids.shape[0], device=next_token_ids.device
-            ),
-            bonus_tokens=next_token_ids,
-            topk_p=torch.ones(
-                (next_token_ids.shape[0], self.topk),
-                dtype=torch.float32,
-                device=next_token_ids.device,
-            ),
-            topk_index=topk_index,
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            can_run_cuda_graph=can_run_cuda_graph,
+            next_draft_input=batch.spec_info,
+            new_seq_lens=batch.seq_lens,
         )
-        return batch_result
 
     def _draft_preprocess_decode_v2(self, batch: ScheduleBatch):
         spec_info = batch.spec_info
@@ -175,11 +158,7 @@ class DecodeVerifyRollbackWorkerV2(
             )
 
         batch.out_cache_loc = self._draft_cache_locs_from_req_to_token(batch)
-        batch.return_hidden_states = False
-        batch.mamba_track_indices = None
-        batch.mamba_track_mask = None
-        batch.mamba_track_seqlens = None
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
+        self._finish_dvr_draft_preprocess_decode(batch, spec_info)
 
     def draft_v2(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
@@ -204,34 +183,17 @@ class DecodeVerifyRollbackWorkerV2(
 
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-        spec_info.num_tokens_per_req = self.topk
-        spec_info.num_tokens_for_logprob_per_req = self.topk
-        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         # Self-draft only proposes token ids. Keep user-visible exact logprobs
         # on the target verify path; carrying return_logprob into draft decode
         # adds unnecessary logits metadata and can perturb the overlap GDN state
         # lifecycle before verify repairs it.
-        saved_return_logprob = batch.return_logprob
-        batch.return_logprob = False
-        try:
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
-            self._prepare_dvr_draft_forward_batch(batch, forward_batch)
-            parent_list, top_scores_index, draft_tokens, draft_probs = (
-                self.draft_forward(forward_batch)
-            )
-        finally:
-            batch.return_logprob = saved_return_logprob
-
-        return self._build_self_draft_verify_input(
-            batch=batch,
-            spec_info=spec_info,
-            parent_list=parent_list,
-            top_scores_index=top_scores_index,
-            draft_tokens=draft_tokens,
-            draft_probs=draft_probs,
+        return self._run_self_draft_and_build_verify_input(
+            batch,
+            spec_info,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
+            suppress_return_logprob=True,
         )
 
     def verify_v2(

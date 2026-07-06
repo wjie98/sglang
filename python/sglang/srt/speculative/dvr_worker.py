@@ -341,6 +341,29 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             num_seqs * self.num_draft_tokens * self.topk,
         )
 
+    def _dvr_draft_rows_and_offsets(
+        self, batch: ScheduleBatch, num_tokens: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return req_to_token rows/columns for the self-draft verify window."""
+
+        num_tokens = self.num_draft_tokens if num_tokens is None else num_tokens
+        offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
+            num_tokens, dtype=torch.long, device=batch.seq_lens.device
+        ).unsqueeze(0)
+        rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
+        return rows, offsets
+
+    def _finish_dvr_draft_preprocess_decode(
+        self, batch: ScheduleBatch, spec_info: EagleDraftInput
+    ) -> None:
+        """Apply decode metadata common to DVR self-draft v1 and v2."""
+
+        batch.return_hidden_states = False
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
+        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
+
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
         for req in batch.reqs:
@@ -365,11 +388,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
 
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        batch.return_hidden_states = False
-        batch.mamba_track_indices = None
-        batch.mamba_track_mask = None
-        batch.mamba_track_seqlens = None
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
+        self._finish_dvr_draft_preprocess_decode(batch, spec_info)
 
     def _assign_dvr_draft_cache_locs(
         self, batch: ScheduleBatch, out_cache_loc: torch.Tensor
@@ -383,10 +402,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         kernel and keeps ownership identical to the original DVR path.
         """
 
-        cols = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
-            self.num_draft_tokens, dtype=torch.long, device=batch.seq_lens.device
-        ).unsqueeze(0)
-        rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
+        rows, cols = self._dvr_draft_rows_and_offsets(batch)
         batch.req_to_token_pool.req_to_token[rows, cols] = out_cache_loc.reshape(
             batch.batch_size(), self.num_draft_tokens
         ).to(torch.int32)
@@ -508,6 +524,50 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             draft_probs=draft_probs,
         )
 
+    def _run_self_draft_and_build_verify_input(
+        self,
+        batch: ScheduleBatch,
+        spec_info: EagleDraftInput,
+        *,
+        seq_lens_sum: Optional[int] = None,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+        suppress_return_logprob: bool = False,
+    ) -> EagleVerifyInput:
+        """Run DVR self-draft and return the EAGLE-compatible verify input."""
+
+        spec_info.num_tokens_per_req = self.topk
+        spec_info.num_tokens_for_logprob_per_req = self.topk
+        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+        batch.return_hidden_states = False
+
+        saved_return_logprob = batch.return_logprob
+        if suppress_return_logprob:
+            batch.return_logprob = False
+        try:
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            self._prepare_dvr_draft_forward_batch(batch, forward_batch)
+            parent_list, top_scores_index, draft_tokens, draft_probs = (
+                self.draft_forward(forward_batch)
+            )
+        finally:
+            if suppress_return_logprob:
+                batch.return_logprob = saved_return_logprob
+
+        return self._build_self_draft_verify_input(
+            batch=batch,
+            spec_info=spec_info,
+            parent_list=parent_list,
+            top_scores_index=top_scores_index,
+            draft_tokens=draft_tokens,
+            draft_probs=draft_probs,
+            seq_lens_sum=(
+                forward_batch.seq_lens_sum if seq_lens_sum is None else seq_lens_sum
+            ),
+            seq_lens_cpu=(
+                forward_batch.seq_lens_cpu if seq_lens_cpu is None else seq_lens_cpu
+            ),
+        )
+
     def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -529,28 +589,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         self._draft_preprocess_decode(batch)
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-
-        spec_info.num_tokens_per_req = self.topk
-        spec_info.num_tokens_for_logprob_per_req = self.topk
-        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-        batch.return_hidden_states = False
-
-        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
-        self._prepare_dvr_draft_forward_batch(batch, forward_batch)
-        parent_list, top_scores_index, draft_tokens, draft_probs = self.draft_forward(
-            forward_batch
-        )
-
-        return self._build_self_draft_verify_input(
-            batch=batch,
-            spec_info=spec_info,
-            parent_list=parent_list,
-            top_scores_index=top_scores_index,
-            draft_tokens=draft_tokens,
-            draft_probs=draft_probs,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-        )
+        return self._run_self_draft_and_build_verify_input(batch, spec_info)
 
     def draft_forward(self, forward_batch: ForwardBatch):
         spec_info = forward_batch.spec_info
