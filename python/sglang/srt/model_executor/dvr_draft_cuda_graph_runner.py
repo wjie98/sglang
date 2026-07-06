@@ -243,7 +243,6 @@ def _dvr_draft_decode_context(
     disable_model_runner_graph: bool = False,
     disable_batch_invariant_ops: bool = False,
     clear_kernel_config_caches: bool = False,
-    disable_mamba_tracking: bool = False,
     extra_attn_backends=(),
 ):
     """Temporarily switch a DVR draft runner into performance-first decode mode.
@@ -286,10 +285,7 @@ def _dvr_draft_decode_context(
                 self_draft_graph=(capture_mode == "self"),
             )
 
-        if graph_capture or disable_mamba_tracking:
-            _patch_draft_mamba_tracking(
-                model_runner, global_server_args, patch_attr
-            )
+        _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr)
 
         _assert_draft_decode_performance_state(model_runner, extra_attn_backends)
 
@@ -311,14 +307,13 @@ def dvr_self_draft_graph_capture_context(model_runner):
         capture_mode="self",
         disable_batch_invariant_ops=True,
         clear_kernel_config_caches=True,
-        disable_mamba_tracking=True,
     )
 
 
 def dvr_self_draft_graph_replay_context(model_runner):
     """Replay the DVR self-draft graph without mamba tracking side effects."""
 
-    return _dvr_draft_decode_context(model_runner, disable_mamba_tracking=True)
+    return _dvr_draft_decode_context(model_runner)
 
 
 def dvr_self_draft_eager_context(model_runner):
@@ -329,7 +324,6 @@ def dvr_self_draft_eager_context(model_runner):
         disable_model_runner_graph=True,
         disable_batch_invariant_ops=True,
         clear_kernel_config_caches=True,
-        disable_mamba_tracking=True,
     )
 
 
@@ -347,7 +341,6 @@ def dvr_eagle_draft_decode_context(
         capture_mode="eagle" if graph_capture else None,
         disable_batch_invariant_ops=True,
         clear_kernel_config_caches=clear_kernel_config_caches,
-        disable_mamba_tracking=True,
         extra_attn_backends=attn_backends,
     )
 
