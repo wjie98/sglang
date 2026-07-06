@@ -262,50 +262,16 @@ class DVRReplayPrefixTracker:
             stream[:] = list(req.output_ids)
         return stream
 
-    def request_token_ids(
+    def _prefix_token_ids(
         self,
         req: Any,
         seq_len: int,
         *,
         initialize_from_req_output: bool,
         include_full_untruncated_fill_ids: bool = False,
-        error_prefix: str,
-    ) -> list[int]:
-        token_ids = self.try_request_token_ids(
-            req,
-            seq_len,
-            initialize_from_req_output=initialize_from_req_output,
-            include_full_untruncated_fill_ids=include_full_untruncated_fill_ids,
-        )
-        if token_ids is not None:
-            return token_ids
-
-        stream = self.stream_for_req(
-            req, initialize_from_req_output=initialize_from_req_output
-        )
-        raise RuntimeError(
-            f"{error_prefix} replay cannot reconstruct the verified prefix: "
-            f"rid={req.rid}, origin_tokens={len(req.origin_input_ids)}, "
-            f"req_output_tokens={len(req.output_ids)}, "
-            f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
-        )
-
-    def try_request_token_ids(
-        self,
-        req: Any,
-        seq_len: int,
-        *,
-        initialize_from_req_output: bool,
-        include_full_untruncated_fill_ids: bool = False,
+        error_prefix: Optional[str] = None,
     ) -> Optional[list[int]]:
-        """Best-effort prefix reconstruction without raising.
-
-        Strict replay call sites should use ``request_token_ids`` so failures
-        include enough request state for debugging.  Optional fast paths, such
-        as final logprob repair, use this helper to test whether a tracked
-        overlap prefix is already complete before falling back to current-step
-        accepted tokens.
-        """
+        """Reconstruct a DVR replay prefix, optionally raising on misses."""
 
         origin_input_ids = list(req.origin_input_ids)
         output_len = seq_len - len(origin_input_ids)
@@ -334,6 +300,13 @@ class DVRReplayPrefixTracker:
                 if len(fill_ids) >= seq_len:
                     return fill_ids
 
+        if error_prefix is not None:
+            raise RuntimeError(
+                f"{error_prefix} replay cannot reconstruct the verified prefix: "
+                f"rid={req.rid}, origin_tokens={len(req.origin_input_ids)}, "
+                f"req_output_tokens={len(req.output_ids)}, "
+                f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
+            )
         return None
 
     def request_verifier_prefix_token_ids(
@@ -351,7 +324,7 @@ class DVRReplayPrefixTracker:
         not yet observed a token.
         """
 
-        return self.request_token_ids(
+        return self._prefix_token_ids(
             req,
             seq_len,
             initialize_from_req_output=False,
@@ -374,7 +347,7 @@ class DVRReplayPrefixTracker:
         the scheduler has already materialized those tokens.
         """
 
-        return self.request_token_ids(
+        return self._prefix_token_ids(
             req,
             seq_len,
             initialize_from_req_output=True,
@@ -389,7 +362,7 @@ class DVRReplayPrefixTracker:
     ) -> Optional[list[int]]:
         """Best-effort client-visible output prefix reconstruction."""
 
-        return self.try_request_token_ids(
+        return self._prefix_token_ids(
             req,
             seq_len,
             initialize_from_req_output=True,
