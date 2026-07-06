@@ -977,16 +977,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 compact_tokens.append([int(x) for x in token_ids[start:end]])
         return compact_tokens
 
-    @staticmethod
-    def _compact_accept_tokens_for_repair(
-        verify_output: EagleVerifyOutput,
-        accept_lens_cpu: list[int],
-    ) -> list[list[int]]:
-        return DecodeVerifyRollbackWorker._compact_flat_tokens_by_accept_lens(
-            verify_output.accept_tokens,
-            accept_lens_cpu,
-        )
-
     def _repair_final_logprobs_for_spec_v1(
         self,
         *,
@@ -1100,8 +1090,8 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 base_seq_lens_cpu=base_seq_lens_cpu,
                 accept_lens_cpu=accept_lens_cpu,
                 compact_output_token_ids_per_req=(
-                    self._compact_accept_tokens_for_repair(
-                        verify_output,
+                    self._compact_flat_tokens_by_accept_lens(
+                        verify_output.accept_tokens,
                         accept_lens_cpu,
                     )
                 ),
@@ -1139,10 +1129,5 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 live_state_already_replayed=live_state_already_replayed,
                 use_fast_self_draft_commit=is_self_dvr,
             )
-        self.postprocess_for_verify(batch, verify_output)
-        return logits_output, verify_output, can_run_cuda_graph
-
-    def postprocess_for_verify(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
-    ):
         self._prepare_next_draft_after_verify(batch, verify_output)
+        return logits_output, verify_output, can_run_cuda_graph
