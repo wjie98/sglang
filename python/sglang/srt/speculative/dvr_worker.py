@@ -827,15 +827,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         to target prefill without replaying the full prefix on every step.
         """
 
-        base_seq_lens_cpu = (
-            spec_info.seq_lens_cpu.tolist()
-            if getattr(spec_info, "seq_lens_cpu", None) is not None
-            else (
-                batch.seq_lens_cpu.tolist()
-                if batch.seq_lens_cpu is not None
-                else batch.seq_lens.detach().cpu().tolist()
-            )
-        )
+        base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
         with suffix_draft_replay_batch_context(
             batch=batch,
             linear_state=self.linear_state,
@@ -906,15 +898,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         boundary_indices = linear_state_ctx.boundary_indices
         assert boundary_indices is not None
 
-        base_seq_lens_cpu = (
-            spec_info.seq_lens_cpu.tolist()
-            if getattr(spec_info, "seq_lens_cpu", None) is not None
-            else (
-                batch.seq_lens_cpu.tolist()
-                if batch.seq_lens_cpu is not None
-                else batch.seq_lens.detach().cpu().tolist()
-            )
-        )
+        base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
         boundary_lens = self.linear_state.boundary_lens_for_replay(
             batch, base_seq_lens_cpu
         )
@@ -1135,18 +1119,17 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             # Exact logprobs are repaired separately; using accepted-suffix
             # replay as the commit path changes the next draft state and
             # regresses the self-DVR acceptance rate.
-            accepted_replay = None
-            if not is_self_dvr:
-                accepted_replay = self._replay_accepted_suffix_for_partial_verify(
-                    batch=batch,
-                    spec_info=spec_info,
-                    verify_output=verify_output,
-                    linear_state_ctx=linear_state_ctx,
-                    accepted_token_counts_cpu=accepted_token_counts_cpu,
-                )
             live_state_already_replayed = None
-            if accepted_replay is not None:
-                live_state_already_replayed = accepted_replay
+            if not is_self_dvr:
+                live_state_already_replayed = (
+                    self._replay_accepted_suffix_for_partial_verify(
+                        batch=batch,
+                        spec_info=spec_info,
+                        verify_output=verify_output,
+                        linear_state_ctx=linear_state_ctx,
+                        accepted_token_counts_cpu=accepted_token_counts_cpu,
+                    )
+                )
             self.linear_state.commit_after_verify(
                 batch=batch,
                 accepted_token_counts=accepted_token_counts,

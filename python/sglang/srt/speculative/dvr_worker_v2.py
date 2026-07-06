@@ -286,7 +286,6 @@ class DecodeVerifyRollbackWorkerV2(
                 if not is_self_dvr and torch.any(
                     accept_lens < self.num_draft_tokens
                 ).item():
-                    accept_lens_cpu = accept_lens.detach().cpu().tolist()
                     max_accept = accept_index.shape[1]
                     valid_accept = torch.arange(
                         max_accept, dtype=torch.long, device=self.device
