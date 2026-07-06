@@ -20,7 +20,6 @@ from sglang.srt.mem_cache.mamba_radix_cache_policy import (
 from sglang.srt.speculative.draft_decode_context import draft_decode_performance_context
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_logprob_repair import (
-    _DVRFinalLogprobReplayPlan,
     _final_output_len_if_repair_needed,
     _should_reuse_live_cache_locs_after_alloc_failure,
 )
@@ -621,41 +620,10 @@ def test_dvr_final_logprob_replay_reuses_live_slots_only_after_allocator_oom():
         "Prefill out of memory. Try to lower your batch size.\n"
         "Try to allocate 725 tokens."
     )
-    all_final = _DVRFinalLogprobReplayPlan(
-        req_indices=[0, 1],
-        input_ids=[],
-        logprob_token_ids=[],
-        extend_lens_cpu=[8, 9],
-        final_seq_lens_cpu=[8, 9],
-        final_score_specs=[(0, object(), 2, [10, 11]), (1, object(), 1, [20])],
-    )
-    single_final = _DVRFinalLogprobReplayPlan(
-        req_indices=[0],
-        input_ids=[],
-        logprob_token_ids=[],
-        extend_lens_cpu=[8],
-        final_seq_lens_cpu=[8],
-        final_score_specs=[(0, object(), 2, [10, 11])],
-    )
-    malformed_partial_final = _DVRFinalLogprobReplayPlan(
-        req_indices=[0, 1],
-        input_ids=[],
-        logprob_token_ids=[],
-        extend_lens_cpu=[8, 9],
-        final_seq_lens_cpu=[8, 9],
-        final_score_specs=[(0, object(), 2, [10, 11])],
-    )
-
-    assert _should_reuse_live_cache_locs_after_alloc_failure(allocator_oom, all_final)
-    assert _should_reuse_live_cache_locs_after_alloc_failure(
-        allocator_oom, single_final
-    )
     assert not _should_reuse_live_cache_locs_after_alloc_failure(
-        allocator_oom, malformed_partial_final
+        RuntimeError("CUDA out of memory")
     )
-    assert not _should_reuse_live_cache_locs_after_alloc_failure(
-        RuntimeError("CUDA out of memory"), all_final
-    )
+    assert _should_reuse_live_cache_locs_after_alloc_failure(allocator_oom)
 
 
 def test_dvr_eagle_compacts_accepted_output_rows():

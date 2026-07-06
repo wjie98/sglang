@@ -28,15 +28,13 @@ from sglang.srt.speculative.output_policy import (
 
 
 @dataclass
-class _DVRFinalLogprobReplayPlan:
-    """Full-prefill scoring plan for final non-streaming DVR output logprobs."""
+class _DVRFinalLogprobReplayTask:
+    """Single-request full-prefill scoring task for final DVR logprobs."""
 
-    req_indices: list[int]
+    req_i: int
+    req: Any
     input_ids: list[int]
-    logprob_token_ids: list[int]
-    extend_lens_cpu: list[int]
-    final_seq_lens_cpu: list[int]
-    final_score_specs: list[tuple[int, Any, int, list[int]]]
+    final_output_ids: list[int]
 
 
 def defer_dvr_non_streaming_logprob_output_until_finish(
@@ -92,7 +90,7 @@ def score_dvr_final_logprob_repairs(
     if batch.forward_mode.is_idle() or linear_state_ctx is None:
         return None
 
-    replay_plan = _build_final_logprob_replay_plan(
+    replay_tasks = _build_final_logprob_replay_tasks(
         batch=batch,
         replay_prefix=replay_prefix,
         base_seq_lens_cpu=base_seq_lens_cpu,
@@ -101,23 +99,23 @@ def score_dvr_final_logprob_repairs(
         error_prefix=error_prefix,
         allow_preclaimed_final_token=allow_preclaimed_final_token,
     )
-    if replay_plan is None:
+    if not replay_tasks:
         return None
 
-    return _score_final_logprob_repairs_row_by_row(
+    return _score_final_logprob_repair_tasks(
         batch=batch,
         target_worker=target_worker,
         linear_state_ctx=linear_state_ctx,
-        replay_plan=replay_plan,
+        replay_tasks=replay_tasks,
     )
 
 
-def _score_final_logprob_repairs_row_by_row(
+def _score_final_logprob_repair_tasks(
     *,
     batch: ScheduleBatch,
     target_worker: Any,
     linear_state_ctx: Any,
-    replay_plan: _DVRFinalLogprobReplayPlan,
+    replay_tasks: list[_DVRFinalLogprobReplayTask],
 ) -> list[Optional[DVRFinalLogprobRepair]]:
     """Score final repairs with the public single-request oracle.
 
@@ -130,34 +128,18 @@ def _score_final_logprob_repairs_row_by_row(
     repairs: list[Optional[DVRFinalLogprobRepair]] = [
         None for _ in range(len(batch.reqs))
     ]
-    req_to_plan_row = {
-        req_i: row for row, req_i in enumerate(replay_plan.req_indices)
-    }
-    for req_i, req, replay_offset, final_output_ids in replay_plan.final_score_specs:
-        plan_row = req_to_plan_row[req_i]
-        extend_len = int(replay_plan.extend_lens_cpu[plan_row])
-        row_input_ids = replay_plan.input_ids[
-            replay_offset : replay_offset + extend_len
-        ]
-        row_plan = _DVRFinalLogprobReplayPlan(
-            req_indices=[req_i],
-            input_ids=row_input_ids,
-            logprob_token_ids=row_input_ids[1:] + [0],
-            extend_lens_cpu=[extend_len],
-            final_seq_lens_cpu=[extend_len],
-            final_score_specs=[(req_i, req, 0, final_output_ids)],
-        )
+    for task in replay_tasks:
         input_token_logprobs = _run_final_logprob_replay(
             batch=batch,
             target_worker=target_worker,
             linear_state_ctx=linear_state_ctx,
-            replay_plan=row_plan,
+            replay_task=task,
         )
-        prompt_len = len(req.origin_input_ids)
+        prompt_len = len(task.req.origin_input_ids)
         output_logprob_start = prompt_len - 1
-        output_logprob_end = output_logprob_start + len(final_output_ids)
-        repairs[req_i] = DVRFinalLogprobRepair(
-            output_ids=final_output_ids,
+        output_logprob_end = output_logprob_start + len(task.final_output_ids)
+        repairs[task.req_i] = DVRFinalLogprobRepair(
+            output_ids=task.final_output_ids,
             output_logprobs=input_token_logprobs[
                 output_logprob_start:output_logprob_end
             ]
@@ -199,7 +181,7 @@ def defer_and_score_dvr_final_logprob_repairs(
     )
 
 
-def _build_final_logprob_replay_plan(
+def _build_final_logprob_replay_tasks(
     *,
     batch: ScheduleBatch,
     replay_prefix: DVRReplayPrefixTracker,
@@ -208,15 +190,8 @@ def _build_final_logprob_replay_plan(
     compact_output_token_ids_per_req: Optional[list[list[int]]],
     error_prefix: str,
     allow_preclaimed_final_token: bool,
-) -> Optional[_DVRFinalLogprobReplayPlan]:
-    req_indices: list[int] = []
-    input_ids: list[int] = []
-    logprob_token_ids: list[int] = []
-    extend_lens_cpu: list[int] = []
-    final_seq_lens_cpu: list[int] = []
-    final_score_specs: list[tuple[int, Any, int, list[int]]] = []
-
-    final_replay_specs: dict[int, int] = {}
+) -> list[_DVRFinalLogprobReplayTask]:
+    tasks: list[_DVRFinalLogprobReplayTask] = []
     for req_i, (req, seq_len, accept_len) in enumerate(
         zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
     ):
@@ -231,21 +206,11 @@ def _build_final_logprob_replay_plan(
             compact_output_token_ids_per_req=compact_output_token_ids_per_req,
             allow_preclaimed_final_token=allow_preclaimed_final_token,
         )
-        if final_output_len is not None:
-            final_replay_specs[req_i] = final_output_len
-
-    if not final_replay_specs:
-        return None
-
-    for req_i, (req, seq_len, accept_len) in enumerate(
-        zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
-    ):
-        prompt_len = len(req.origin_input_ids)
-        final_spec = final_replay_specs.get(req_i)
-        if final_spec is None:
+        if final_output_len is None:
             continue
 
-        replay_seq_len = prompt_len + final_spec
+        prompt_len = len(req.origin_input_ids)
+        replay_seq_len = prompt_len + final_output_len
 
         replay_ids = _final_replay_ids_for_req(
             req=req,
@@ -256,31 +221,19 @@ def _build_final_logprob_replay_plan(
             compact_output_token_ids_per_req=compact_output_token_ids_per_req,
             error_prefix=error_prefix,
         )
-        replay_offset = len(input_ids)
-
-        input_ids.extend(replay_ids)
-        logprob_token_ids.extend(replay_ids[1:])
-        logprob_token_ids.append(0)
-
-        extend_len = len(replay_ids)
-        req_indices.append(req_i)
-        extend_lens_cpu.append(extend_len)
-        final_seq_lens_cpu.append(extend_len)
         if try_expect_req_final_logprob_repair(req):
-            final_output_ids = replay_ids[prompt_len : prompt_len + final_spec]
-            final_score_specs.append((req_i, req, replay_offset, final_output_ids))
+            tasks.append(
+                _DVRFinalLogprobReplayTask(
+                    req_i=req_i,
+                    req=req,
+                    input_ids=replay_ids,
+                    final_output_ids=replay_ids[
+                        prompt_len : prompt_len + final_output_len
+                    ],
+                )
+            )
 
-    if not final_score_specs:
-        return None
-
-    return _DVRFinalLogprobReplayPlan(
-        req_indices=req_indices,
-        input_ids=input_ids,
-        logprob_token_ids=logprob_token_ids,
-        extend_lens_cpu=extend_lens_cpu,
-        final_seq_lens_cpu=final_seq_lens_cpu,
-        final_score_specs=final_score_specs,
-    )
+    return tasks
 
 
 def _final_output_len_if_repair_needed(
@@ -457,34 +410,34 @@ def _run_final_logprob_replay(
     batch: ScheduleBatch,
     target_worker: Any,
     linear_state_ctx: Any,
-    replay_plan: _DVRFinalLogprobReplayPlan,
+    replay_task: _DVRFinalLogprobReplayTask,
 ) -> torch.Tensor:
-    reqs = [batch.reqs[i] for i in replay_plan.req_indices]
+    extend_len = len(replay_task.input_ids)
     replay_batch = build_private_extend_batch(
         batch,
         DVRPrivateExtendBatchSpec(
-            reqs=reqs,
-            input_ids=replay_plan.input_ids,
+            reqs=[replay_task.req],
+            input_ids=replay_task.input_ids,
             out_cache_locs=None,
-            prefix_lens=[0 for _ in replay_plan.extend_lens_cpu],
-            extend_lens=replay_plan.extend_lens_cpu,
-            final_seq_lens=replay_plan.final_seq_lens_cpu,
+            prefix_lens=[0],
+            extend_lens=[extend_len],
+            final_seq_lens=[extend_len],
             return_logprob=True,
-            top_logprobs_nums=[0 for _ in reqs],
-            token_ids_logprobs=[None for _ in reqs],
-            extend_logprob_start_lens=[0 for _ in replay_plan.extend_lens_cpu],
-            extend_input_logprob_token_ids=replay_plan.logprob_token_ids,
-            multimodal_inputs=[None for _ in reqs],
+            top_logprobs_nums=[0],
+            token_ids_logprobs=[None],
+            extend_logprob_start_lens=[0],
+            extend_input_logprob_token_ids=replay_task.input_ids[1:] + [0],
+            multimodal_inputs=[None],
             is_prefill_only=True,
             with_sampling_info=True,
         ),
     )
     replay_linear_state_ctx = _subset_linear_state_ctx(
-        linear_state_ctx, replay_plan.req_indices
+        linear_state_ctx, [replay_task.req_i]
     )
     with _temporary_final_replay_cache_mapping(
         replay_batch,
-        replay_plan,
+        extend_len,
     ) as temp_cache_locs:
         device = replay_batch.seq_lens.device
         replay_batch.out_cache_loc = temp_cache_locs.to(
@@ -538,23 +491,21 @@ def _subset_linear_state_ctx(linear_state_ctx: Any, req_indices: list[int]) -> A
 @contextmanager
 def _temporary_final_replay_cache_mapping(
     batch: ScheduleBatch,
-    replay_plan: _DVRFinalLogprobReplayPlan,
+    extend_len: int,
 ):
     allocated_cache_locs = None
     try:
-        temp_cache_locs = _alloc_final_replay_cache_locs(batch, replay_plan)
+        temp_cache_locs = _alloc_final_replay_cache_locs(batch, extend_len)
         allocated_cache_locs = temp_cache_locs
     except RuntimeError as exc:
-        if not _should_reuse_live_cache_locs_after_alloc_failure(exc, replay_plan):
+        if not _should_reuse_live_cache_locs_after_alloc_failure(exc):
             raise
         # This replay is a final-response scoring oracle and every row belongs
         # to a request that will finish in this verify step.  Reuse the live KV
         # slots instead of requiring a second full-prefix copy; this keeps exact
         # logprob repair viable under tight 80B token budgets.
-        temp_cache_locs = _live_cache_locs_for_final_replay(batch, replay_plan)
-    write_rows, write_offsets = _final_replay_req_to_token_indices(
-        batch, replay_plan
-    )
+        temp_cache_locs = _live_cache_locs_for_final_replay(batch, extend_len)
+    write_rows, write_offsets = _final_replay_req_to_token_indices(batch, extend_len)
     saved_locs = batch.req_to_token_pool.req_to_token[
         write_rows, write_offsets
     ].clone()
@@ -572,36 +523,23 @@ def _temporary_final_replay_cache_mapping(
             batch.token_to_kv_pool_allocator.free(allocated_cache_locs)
 
 
-def _should_reuse_live_cache_locs_after_alloc_failure(
-    exc: RuntimeError,
-    replay_plan: _DVRFinalLogprobReplayPlan,
-) -> bool:
+def _should_reuse_live_cache_locs_after_alloc_failure(exc: RuntimeError) -> bool:
     """Return whether final scoring may fall back to live request KV slots."""
 
     message = str(exc).lower()
-    return (
-        "out of memory" in message
-        and "try to allocate" in message
-        and len(replay_plan.final_score_specs) == len(replay_plan.extend_lens_cpu)
-    )
+    return "out of memory" in message and "try to allocate" in message
 
 
 def _live_cache_locs_for_final_replay(
     batch: ScheduleBatch,
-    replay_plan: _DVRFinalLogprobReplayPlan,
+    extend_len: int,
 ) -> torch.Tensor:
     """Return the existing per-request KV slots for final full-prefix replay."""
 
-    cache_locs = []
-    for req, extend_len in zip(
-        batch.reqs, replay_plan.extend_lens_cpu, strict=True
-    ):
-        cache_locs.append(
-            batch.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : int(extend_len)
-            ].to(torch.long)
-        )
-    cache_locs = torch.cat(cache_locs)
+    req = batch.reqs[0]
+    cache_locs = batch.req_to_token_pool.req_to_token[
+        req.req_pool_idx, : int(extend_len)
+    ].to(torch.long)
     if torch.any(cache_locs <= 0):
         raise RuntimeError(
             "DVR final logprob repair cannot reuse live KV slots because the "
@@ -612,22 +550,21 @@ def _live_cache_locs_for_final_replay(
 
 def _alloc_final_replay_cache_locs(
     batch: ScheduleBatch,
-    replay_plan: _DVRFinalLogprobReplayPlan,
+    extend_len: int,
 ) -> torch.Tensor:
     """Allocate temporary KV slots for side-effect-free final logprob replay."""
 
-    num_tokens = len(replay_plan.input_ids)
     page_size = getattr(batch.tree_cache, "page_size", 1)
     if page_size == 1:
-        return alloc_token_slots(batch.tree_cache, num_tokens)
+        return alloc_token_slots(batch.tree_cache, extend_len)
 
     device = batch.seq_lens.device
-    prefix_lens_cpu = torch.zeros(len(replay_plan.extend_lens_cpu), dtype=torch.int64)
-    seq_lens_cpu = torch.tensor(replay_plan.final_seq_lens_cpu, dtype=torch.int64)
+    prefix_lens_cpu = torch.zeros(1, dtype=torch.int64)
+    seq_lens_cpu = torch.tensor([extend_len], dtype=torch.int64)
     prefix_lens = prefix_lens_cpu.to(device=device, non_blocking=True)
     seq_lens = seq_lens_cpu.to(device=device, non_blocking=True)
     last_loc = torch.full(
-        (len(replay_plan.extend_lens_cpu),),
+        (1,),
         -1,
         dtype=torch.long,
         device=device,
@@ -639,28 +576,21 @@ def _alloc_final_replay_cache_locs(
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,
         last_loc=last_loc,
-        extend_num_tokens=num_tokens,
+        extend_num_tokens=extend_len,
     )
 
 
 def _final_replay_req_to_token_indices(
     batch: ScheduleBatch,
-    replay_plan: _DVRFinalLogprobReplayPlan,
+    extend_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = []
-    offsets = []
     device = batch.seq_lens.device
-    for req, extend_len in zip(
-        batch.reqs, replay_plan.extend_lens_cpu, strict=True
-    ):
-        extend_len = int(extend_len)
-        rows.append(
-            torch.full(
-                (extend_len,),
-                int(req.req_pool_idx),
-                dtype=torch.long,
-                device=device,
-            )
-        )
-        offsets.append(torch.arange(extend_len, dtype=torch.long, device=device))
-    return torch.cat(rows), torch.cat(offsets)
+    req = batch.reqs[0]
+    rows = torch.full(
+        (int(extend_len),),
+        int(req.req_pool_idx),
+        dtype=torch.long,
+        device=device,
+    )
+    offsets = torch.arange(int(extend_len), dtype=torch.long, device=device)
+    return rows, offsets
