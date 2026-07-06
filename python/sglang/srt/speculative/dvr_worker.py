@@ -38,8 +38,8 @@ from sglang.srt.speculative.dvr_scheduler_utils import DVRReplayPrefixTracker
 from sglang.srt.speculative.dvr_target_replay import (
     build_accepted_suffix_replay_plan,
     build_suffix_target_replay_batch,
-    draft_row_logits_from_replay_hidden_states,
     linear_state_replay_context,
+    run_suffix_draft_replay_oracle,
     suffix_draft_replay_batch_context,
 )
 from sglang.srt.speculative.dvr_utils import (
@@ -846,18 +846,10 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             if replay is None:
                 return None
             replay_batch, replay_plan = replay
-            oracle_output = self.target_worker.forward_batch_generation(
-                batch=replay_batch,
-                is_verify=True,
-            )
-            forward_batch = ForwardBatch.init_new(
-                replay_batch, self.target_worker.model_runner
-            )
-            draft_logits, _ = draft_row_logits_from_replay_hidden_states(
+            draft_logits, _ = run_suffix_draft_replay_oracle(
                 target_worker=self.target_worker,
-                forward_batch=forward_batch,
-                hidden_states=oracle_output.logits_output.hidden_states,
-                hidden_gather_indices=replay_plan.hidden_gather_indices,
+                replay_batch=replay_batch,
+                replay_plan=replay_plan,
             )
             return draft_logits
 

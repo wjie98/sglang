@@ -10,6 +10,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
 )
 
@@ -737,3 +738,40 @@ def draft_row_logits_from_replay_hidden_states(
         logits_metadata,
     )
     return draft_logits, draft_hidden_states
+
+
+def run_suffix_draft_replay_oracle(
+    *,
+    target_worker,
+    replay_batch: ScheduleBatch,
+    replay_plan: DVRSuffixReplayPlan,
+    use_forward_batch: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a suffix+draft replay oracle and return only draft-row outputs."""
+
+    model_runner = target_worker.model_runner
+    if use_forward_batch:
+        forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
+        if model_runner.model_is_mrope:
+            forward_batch.mrope_positions = build_suffix_draft_mrope_positions(
+                replay_batch, replay_plan
+            )
+        oracle_output = target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=forward_batch,
+            is_verify=True,
+        )
+    else:
+        oracle_output = target_worker.forward_batch_generation(
+            batch=replay_batch,
+            is_verify=True,
+        )
+        forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
+
+    assert replay_plan.hidden_gather_indices is not None
+    return draft_row_logits_from_replay_hidden_states(
+        target_worker=target_worker,
+        forward_batch=forward_batch,
+        hidden_states=oracle_output.logits_output.hidden_states,
+        hidden_gather_indices=replay_plan.hidden_gather_indices,
+    )

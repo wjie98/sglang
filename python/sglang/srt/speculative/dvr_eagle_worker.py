@@ -15,7 +15,6 @@ from sglang.srt.model_executor.dvr_eagle_verify_cuda_graph_runner import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
@@ -27,8 +26,7 @@ from sglang.srt.speculative.dvr_logprob_repair import (
     score_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_target_replay import (
-    build_suffix_draft_mrope_positions,
-    draft_row_logits_from_replay_hidden_states,
+    run_suffix_draft_replay_oracle,
     suffix_draft_replay_batch_context,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
@@ -218,24 +216,11 @@ class DecodeVerifyRollbackEagleWorkerV2(
             if replay is None:
                 return None
             replay_batch, replay_plan = replay
-            forward_batch = ForwardBatch.init_new(
-                replay_batch, self.target_worker.model_runner
-            )
-            if self.target_worker.model_runner.model_is_mrope:
-                forward_batch.mrope_positions = build_suffix_draft_mrope_positions(
-                    replay_batch, replay_plan
-                )
-
-            oracle_output = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=forward_batch,
-                is_verify=True,
-            )
-            draft_logits, draft_hidden_states = draft_row_logits_from_replay_hidden_states(
+            draft_logits, draft_hidden_states = run_suffix_draft_replay_oracle(
                 target_worker=self.target_worker,
-                forward_batch=forward_batch,
-                hidden_states=oracle_output.logits_output.hidden_states,
-                hidden_gather_indices=replay_plan.hidden_gather_indices,
+                replay_batch=replay_batch,
+                replay_plan=replay_plan,
+                use_forward_batch=True,
             )
             return draft_logits, draft_hidden_states
 
