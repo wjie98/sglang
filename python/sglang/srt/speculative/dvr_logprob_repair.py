@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any, Optional
 
 import torch
@@ -25,16 +25,6 @@ from sglang.srt.speculative.output_policy import (
     defer_req_non_streaming_logprob_output,
     try_expect_req_final_logprob_repair,
 )
-
-
-@dataclass
-class _DVRFinalLogprobReplayTask:
-    """Single-request full-prefill scoring task for final DVR logprobs."""
-
-    req_i: int
-    req: Any
-    input_ids: list[int]
-    final_output_ids: list[int]
 
 
 def defer_dvr_non_streaming_logprob_output_until_finish(
@@ -90,88 +80,10 @@ def score_dvr_final_logprob_repairs(
     if batch.forward_mode.is_idle() or linear_state_ctx is None:
         return None
 
-    replay_tasks = _build_final_logprob_replay_tasks(
-        batch=batch,
-        replay_prefix=replay_prefix,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        accept_lens_cpu=accept_lens_cpu,
-        compact_output_token_ids_per_req=compact_output_token_ids_per_req,
-        error_prefix=error_prefix,
-        allow_preclaimed_final_token=allow_preclaimed_final_token,
-    )
-    if not replay_tasks:
-        return None
-
     repairs: list[Optional[DVRFinalLogprobRepair]] = [
         None for _ in range(len(batch.reqs))
     ]
-    for task in replay_tasks:
-        # The fixed KL guards catch batched final replay drifting from the
-        # per-request max_new_tokens=0 oracle on short prompts.  Keep final
-        # repair request-by-request; generation and verify stay batched.
-        input_token_logprobs = _run_final_logprob_replay(
-            batch=batch,
-            target_worker=target_worker,
-            linear_state_ctx=linear_state_ctx,
-            replay_task=task,
-        )
-        prompt_len = len(task.req.origin_input_ids)
-        output_logprob_start = prompt_len - 1
-        output_logprob_end = output_logprob_start + len(task.final_output_ids)
-        repairs[task.req_i] = DVRFinalLogprobRepair(
-            output_ids=task.final_output_ids,
-            output_logprobs=input_token_logprobs[
-                output_logprob_start:output_logprob_end
-            ]
-            .detach()
-            .cpu()
-            .tolist(),
-        )
-    return repairs
-
-
-def defer_and_score_dvr_final_logprob_repairs(
-    *,
-    batch: ScheduleBatch,
-    target_worker: Any,
-    replay_prefix: DVRReplayPrefixTracker,
-    linear_state_ctx: Any,
-    base_seq_lens_cpu: list[int],
-    accept_lens_cpu: list[int],
-    compact_output_token_ids_per_req: Optional[list[list[int]]] = None,
-    error_prefix: str,
-    allow_preclaimed_final_token: bool = False,
-) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
-    """Defer non-streaming chunks and score exact final DVR output logprobs."""
-
-    defer_dvr_non_streaming_logprob_output_until_finish(
-        batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-    )
-    return score_dvr_final_logprob_repairs(
-        batch=batch,
-        target_worker=target_worker,
-        replay_prefix=replay_prefix,
-        linear_state_ctx=linear_state_ctx,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        accept_lens_cpu=accept_lens_cpu,
-        compact_output_token_ids_per_req=compact_output_token_ids_per_req,
-        error_prefix=error_prefix,
-        allow_preclaimed_final_token=allow_preclaimed_final_token,
-    )
-
-
-def _build_final_logprob_replay_tasks(
-    *,
-    batch: ScheduleBatch,
-    replay_prefix: DVRReplayPrefixTracker,
-    base_seq_lens_cpu: list[int],
-    accept_lens_cpu: list[int],
-    compact_output_token_ids_per_req: Optional[list[list[int]]],
-    error_prefix: str,
-    allow_preclaimed_final_token: bool,
-) -> list[_DVRFinalLogprobReplayTask]:
-    tasks: list[_DVRFinalLogprobReplayTask] = []
+    has_repair = False
     for req_i, (req, seq_len, accept_len) in enumerate(
         zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
     ):
@@ -191,7 +103,6 @@ def _build_final_logprob_replay_tasks(
 
         prompt_len = len(req.origin_input_ids)
         replay_seq_len = prompt_len + final_output_len
-
         replay_ids = _final_replay_ids_for_req(
             req=req,
             req_i=req_i,
@@ -201,19 +112,34 @@ def _build_final_logprob_replay_tasks(
             compact_output_token_ids_per_req=compact_output_token_ids_per_req,
             error_prefix=error_prefix,
         )
-        if try_expect_req_final_logprob_repair(req):
-            tasks.append(
-                _DVRFinalLogprobReplayTask(
-                    req_i=req_i,
-                    req=req,
-                    input_ids=replay_ids,
-                    final_output_ids=replay_ids[
-                        prompt_len : prompt_len + final_output_len
-                    ],
-                )
-            )
+        if not try_expect_req_final_logprob_repair(req):
+            continue
 
-    return tasks
+        # The fixed KL guards catch batched final replay drifting from the
+        # per-request max_new_tokens=0 oracle on short prompts.  Keep final
+        # repair request-by-request; generation and verify stay batched.
+        input_token_logprobs = _run_final_logprob_replay(
+            batch=batch,
+            target_worker=target_worker,
+            linear_state_ctx=linear_state_ctx,
+            req_i=req_i,
+            req=req,
+            input_ids=replay_ids,
+        )
+        output_logprob_start = prompt_len - 1
+        final_output_ids = replay_ids[prompt_len : prompt_len + final_output_len]
+        output_logprob_end = output_logprob_start + len(final_output_ids)
+        repairs[req_i] = DVRFinalLogprobRepair(
+            output_ids=final_output_ids,
+            output_logprobs=input_token_logprobs[
+                output_logprob_start:output_logprob_end
+            ]
+            .detach()
+            .cpu()
+            .tolist(),
+        )
+        has_repair = True
+    return repairs if has_repair else None
 
 
 def _final_output_len_if_repair_needed(
@@ -373,14 +299,16 @@ def _run_final_logprob_replay(
     batch: ScheduleBatch,
     target_worker: Any,
     linear_state_ctx: Any,
-    replay_task: _DVRFinalLogprobReplayTask,
+    req_i: int,
+    req: Any,
+    input_ids: list[int],
 ) -> torch.Tensor:
-    extend_len = len(replay_task.input_ids)
+    extend_len = len(input_ids)
     replay_batch = build_private_extend_batch(
         batch,
         DVRPrivateExtendBatchSpec(
-            reqs=[replay_task.req],
-            input_ids=replay_task.input_ids,
+            reqs=[req],
+            input_ids=input_ids,
             out_cache_locs=None,
             prefix_lens=[0],
             extend_lens=[extend_len],
@@ -389,15 +317,13 @@ def _run_final_logprob_replay(
             top_logprobs_nums=[0],
             token_ids_logprobs=[None],
             extend_logprob_start_lens=[0],
-            extend_input_logprob_token_ids=replay_task.input_ids[1:] + [0],
+            extend_input_logprob_token_ids=input_ids[1:] + [0],
             multimodal_inputs=[None],
             is_prefill_only=True,
             with_sampling_info=True,
         ),
     )
-    replay_linear_state_ctx = _subset_linear_state_ctx(
-        linear_state_ctx, [replay_task.req_i]
-    )
+    replay_linear_state_ctx = _subset_linear_state_ctx(linear_state_ctx, [req_i])
     with _temporary_final_replay_cache_mapping(
         replay_batch,
         extend_len,
