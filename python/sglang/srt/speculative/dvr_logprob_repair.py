@@ -131,12 +131,12 @@ def _score_final_logprob_repairs_row_by_row(
     linear_state_ctx: Any,
     replay_plan: _DVRFinalLogprobReplayPlan,
 ) -> list[Optional[DVRFinalLogprobRepair]]:
-    """Score exact final logprobs with the same single-row oracle as clients.
+    """Score multi-row final repairs with the public single-request oracle.
 
-    Public KL checks score each completed request with one max_new_tokens=0
-    prefill.  GDN batched prefill can differ slightly from that single-row
-    oracle for short tails, so split only final logprob repair while leaving
-    generation and state commit on their normal batched paths.
+    The fixed 0.8B KL guard catches batched GDN final replay drifting from the
+    per-request max_new_tokens=0 oracle on short prompts.  Keep this split only
+    for final non-streaming logprob repair; generation, verify, and state commit
+    continue using the normal batched paths.
     """
 
     repairs: list[Optional[DVRFinalLogprobRepair]] = [
