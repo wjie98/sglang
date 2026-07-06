@@ -761,6 +761,25 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 verify_output.accept_indices
             ]
 
+    def _next_self_draft_input_from_bonus_tokens(
+        self, bonus_tokens: torch.Tensor
+    ) -> EagleDraftInput:
+        return EagleDraftInput(
+            hidden_states=self._dummy_hidden_states(
+                bonus_tokens.shape[0], device=bonus_tokens.device
+            ),
+            bonus_tokens=bonus_tokens,
+            topk_p=torch.ones(
+                (bonus_tokens.shape[0], self.topk),
+                dtype=torch.float32,
+                device=bonus_tokens.device,
+            ),
+            topk_index=bonus_tokens.to(torch.long).unsqueeze(-1),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+
     def _prepare_next_draft_after_verify(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
@@ -790,22 +809,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         )
         accept_end = torch.cumsum(num_accept_tokens, dim=0) - 1
         bonus_tokens = draft_extend_input.input_ids[accept_end]
-        batch.spec_info = EagleDraftInput(
-            hidden_states=self._dummy_hidden_states(
-                bonus_tokens.shape[0], device=bonus_tokens.device
-            ),
-            bonus_tokens=bonus_tokens,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
-        )
-        # Keep the next-draft inputs in the same compatibility shape as EAGLE.
-        batch.spec_info.topk_index = bonus_tokens.to(torch.long).unsqueeze(-1)
-        batch.spec_info.topk_p = torch.ones(
-            (bonus_tokens.shape[0], self.topk),
-            dtype=torch.float32,
-            device=bonus_tokens.device,
-        )
+        batch.spec_info = self._next_self_draft_input_from_bonus_tokens(bonus_tokens)
 
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.

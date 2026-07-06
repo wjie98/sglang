@@ -340,21 +340,7 @@ class DecodeVerifyRollbackWorkerV2(
                 batch, logits_output, predict, accept_index
             )
 
-        next_draft_input = EagleDraftInput(
-            hidden_states=self._dummy_hidden_states(
-                verified_id.shape[0], device=verified_id.device
-            ),
-            bonus_tokens=verified_id,
-            topk_p=torch.ones(
-                (verified_id.shape[0], self.topk),
-                dtype=torch.float32,
-                device=verified_id.device,
-            ),
-            topk_index=verified_id.to(torch.long).unsqueeze(-1),
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
+        next_draft_input = self._next_self_draft_input_from_bonus_tokens(verified_id)
 
         return GenerationBatchResult(
             logits_output=logits_output,
