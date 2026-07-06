@@ -50,13 +50,6 @@ class DVRPrivateExtendBatchSpec:
 
 
 @dataclass
-class DVRLinearStateReplayContext:
-    live_backup: Optional[Any]
-    saved_tail_lens: Optional[torch.Tensor]
-    saved_state_input_window: Any
-
-
-@dataclass
 class DVRSuffixReplayPlan:
     """Plan a target EXTEND replay over unclosed prefix tail plus appended rows.
 
@@ -139,11 +132,7 @@ def linear_state_replay_context(
         )
 
     try:
-        yield DVRLinearStateReplayContext(
-            live_backup=live_backup,
-            saved_tail_lens=saved_tail_lens,
-            saved_state_input_window=saved_state_input_window,
-        )
+        yield
     finally:
         if live_backup is not None:
             state_adapter.restore_recurrent_state(
