@@ -2529,9 +2529,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         before Req.output_ids is materialized.
         """
 
-        return get_spec_algorithm_policy(
-            self.spec_algorithm
-        ).requires_seq_lens_cpu_before_filter(
+        if not get_spec_algorithm_policy(self.spec_algorithm).is_dvr():
+            return False
+
+        from sglang.srt.speculative.dvr_scheduler_utils import (
+            should_resolve_dvr_spec_v2_seq_lens_before_filter,
+        )
+
+        return should_resolve_dvr_spec_v2_seq_lens_before_filter(
             batch=self,
             enable_overlap=enable_overlap,
         )
@@ -2679,15 +2684,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
-            keep_indices = [
-                i
-                for i in range(len(self.reqs))
-                if not self.reqs[i].finished()
-                and not get_spec_algorithm_policy(
-                    self.spec_algorithm
-                ).is_finished_by_published_seq_len(self, i)
-                and self.reqs[i] not in chunked_req_to_exclude
-            ]
+            is_dvr = get_spec_algorithm_policy(self.spec_algorithm).is_dvr()
+            dvr_finished_by_published_seq_len = None
+            if is_dvr:
+                from sglang.srt.speculative.dvr_scheduler_utils import (
+                    is_dvr_spec_v2_finished_by_published_seq_len,
+                )
+
+                dvr_finished_by_published_seq_len = (
+                    is_dvr_spec_v2_finished_by_published_seq_len
+                )
+            keep_indices = []
+            for i in range(len(self.reqs)):
+                if self.reqs[i] in chunked_req_to_exclude:
+                    continue
+                if self.reqs[i].finished():
+                    continue
+                if (
+                    dvr_finished_by_published_seq_len is not None
+                    and dvr_finished_by_published_seq_len(self, i)
+                ):
+                    continue
+                keep_indices.append(i)
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
