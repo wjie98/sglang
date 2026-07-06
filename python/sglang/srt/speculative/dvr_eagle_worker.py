@@ -197,8 +197,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         batch: ScheduleBatch,
         verify_input: DVREagleVerifyInput,
         linear_state_ctx,
-        full_prefix_replay: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Compute verifier outputs by replaying the deterministic suffix prefill.
 
         DVR correctness is defined by target prefill semantics.  For hybrid GDN
@@ -228,7 +227,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
             draft_tokens=verify_input.draft_token,
             draft_cache_locs=batch.out_cache_loc,
             request_token_ids_for_replay=self._request_token_ids_for_replay,
-            full_prefix_replay=full_prefix_replay,
             restore_boundary_state=True,
         ) as replay:
             if replay is None:
@@ -253,11 +251,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 hidden_states=oracle_output.logits_output.hidden_states,
                 hidden_gather_indices=replay_plan.hidden_gather_indices,
             )
-            return (
-                draft_logits,
-                draft_hidden_states,
-                None,
-            )
+            return draft_logits, draft_hidden_states
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -420,11 +414,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 batch=batch,
                 verify_input=verify_input,
                 linear_state_ctx=linear_state_ctx,
-                full_prefix_replay=False,
             )
-        oracle_input_logprobs = None
         if oracle_output is not None:
-            oracle_logits, oracle_hidden_states, oracle_input_logprobs = oracle_output
+            oracle_logits, oracle_hidden_states = oracle_output
             logits_output.next_token_logits = oracle_logits
             logits_output.hidden_states = oracle_hidden_states
         used_suffix_oracle = oracle_output is not None
