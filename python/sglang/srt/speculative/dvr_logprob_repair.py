@@ -78,14 +78,15 @@ def score_dvr_final_logprob_repairs(
     error_prefix: str,
     allow_preclaimed_final_token: bool = False,
 ) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
-    """Score final non-streaming DVR output logprobs with one full-prefill replay.
+    """Score final non-streaming DVR output logprobs with exact replay oracles.
 
     Spec-v2 materializes accepted tokens after the worker returns.  During
     generation we may record fast-path logprobs from target verify rows, but those
     rows are not guaranteed to be bitwise identical to the KL oracle at every GDN
-    chunk boundary.  Non-streaming responses can defer output, so repair only the
-    final response with one full-prefix replay instead of replaying the full
-    prefix after every verify step.
+    chunk boundary.  Non-streaming responses can defer output, so repair only
+    the final response.  Keep the final replay request-by-request: the fixed DVR
+    guards use this public single-request oracle as the exact reference, and it
+    avoids batched GDN replay edge cases at request boundaries.
     """
 
     if batch.forward_mode.is_idle() or linear_state_ctx is None:
@@ -103,24 +104,11 @@ def score_dvr_final_logprob_repairs(
     if replay_plan is None:
         return None
 
-    if len(replay_plan.final_score_specs) > 1:
-        return _score_final_logprob_repairs_row_by_row(
-            batch=batch,
-            target_worker=target_worker,
-            linear_state_ctx=linear_state_ctx,
-            replay_plan=replay_plan,
-        )
-
-    input_token_logprobs = _run_final_logprob_replay(
+    return _score_final_logprob_repairs_row_by_row(
         batch=batch,
         target_worker=target_worker,
         linear_state_ctx=linear_state_ctx,
         replay_plan=replay_plan,
-    )
-    return _final_logprob_repairs_from_replay(
-        batch=batch,
-        replay_plan=replay_plan,
-        input_token_logprobs=input_token_logprobs,
     )
 
 
@@ -131,7 +119,7 @@ def _score_final_logprob_repairs_row_by_row(
     linear_state_ctx: Any,
     replay_plan: _DVRFinalLogprobReplayPlan,
 ) -> list[Optional[DVRFinalLogprobRepair]]:
-    """Score multi-row final repairs with the public single-request oracle.
+    """Score final repairs with the public single-request oracle.
 
     The fixed 0.8B KL guard catches batched GDN final replay drifting from the
     per-request max_new_tokens=0 oracle on short prompts.  Keep this split only
@@ -165,12 +153,18 @@ def _score_final_logprob_repairs_row_by_row(
             linear_state_ctx=linear_state_ctx,
             replay_plan=row_plan,
         )
-        row_repairs = _final_logprob_repairs_from_replay(
-            batch=batch,
-            replay_plan=row_plan,
-            input_token_logprobs=input_token_logprobs,
+        prompt_len = len(req.origin_input_ids)
+        output_logprob_start = prompt_len - 1
+        output_logprob_end = output_logprob_start + len(final_output_ids)
+        repairs[req_i] = DVRFinalLogprobRepair(
+            output_ids=final_output_ids,
+            output_logprobs=input_token_logprobs[
+                output_logprob_start:output_logprob_end
+            ]
+            .detach()
+            .cpu()
+            .tolist(),
         )
-        repairs[req_i] = row_repairs[req_i]
     return repairs
 
 
@@ -670,26 +664,3 @@ def _final_replay_req_to_token_indices(
         )
         offsets.append(torch.arange(extend_len, dtype=torch.long, device=device))
     return torch.cat(rows), torch.cat(offsets)
-
-
-def _final_logprob_repairs_from_replay(
-    *,
-    batch: ScheduleBatch,
-    replay_plan: _DVRFinalLogprobReplayPlan,
-    input_token_logprobs: torch.Tensor,
-) -> list[Optional[DVRFinalLogprobRepair]]:
-    final_logprob_repairs: list[Optional[DVRFinalLogprobRepair]] = [
-        None for _ in range(len(batch.reqs))
-    ]
-    for req_i, req, replay_offset, final_output_ids in replay_plan.final_score_specs:
-        prompt_len = len(req.origin_input_ids)
-        output_logprob_start = replay_offset + prompt_len - 1
-        output_logprob_end = output_logprob_start + len(final_output_ids)
-        final_logprobs = input_token_logprobs[
-            output_logprob_start:output_logprob_end
-        ]
-        final_logprob_repairs[req_i] = DVRFinalLogprobRepair(
-            output_ids=final_output_ids,
-            output_logprobs=final_logprobs.detach().cpu().tolist(),
-        )
-    return final_logprob_repairs
