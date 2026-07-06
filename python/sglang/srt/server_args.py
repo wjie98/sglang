@@ -4350,8 +4350,8 @@ class ServerArgs:
                     else:
                         use_draft_decode_custom_all_reduce = False
 
+                    self.disable_custom_all_reduce = True
                     if use_draft_decode_custom_all_reduce:
-                        self.disable_custom_all_reduce = True
                         logger.warning(
                             "NCCL_ALGO is set to 'allreduce:tree'. Custom all reduce "
                             "is disabled for deterministic prefill and verify; the "
@@ -4359,7 +4359,6 @@ class ServerArgs:
                             "decode CUDA graphs."
                         )
                     else:
-                        self.disable_custom_all_reduce = True
                         logger.warning(
                             "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                         )
