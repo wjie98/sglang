@@ -9,8 +9,7 @@ class SpeculativeOutputPolicyState:
     """Request-local output policy state owned by speculative algorithms."""
 
     defer_non_streaming_logprob_output: bool = False
-    expect_final_logprob_repair: bool = False
-    final_logprob_repair_planned: bool = False
+    final_logprob_repair_claimed: bool = False
 
 
 def _get_req_output_policy(req: Any, *, create: bool = False):
@@ -32,18 +31,16 @@ def allow_req_non_streaming_logprob_output(req: Any) -> None:
 
     policy = _get_req_output_policy(req, create=True)
     policy.defer_non_streaming_logprob_output = False
-    policy.expect_final_logprob_repair = False
 
 
-def try_expect_req_final_logprob_repair(req: Any) -> bool:
+def try_claim_req_final_logprob_repair(req: Any) -> bool:
     """Claim the request's final logprob repair exactly once."""
 
     policy = _get_req_output_policy(req, create=True)
-    if policy.final_logprob_repair_planned:
+    if policy.final_logprob_repair_claimed:
         return False
 
-    policy.expect_final_logprob_repair = True
-    policy.final_logprob_repair_planned = True
+    policy.final_logprob_repair_claimed = True
     return True
 
 
@@ -68,4 +65,4 @@ def should_hold_non_streaming_logprob_output(
     )
     if not should_hold:
         return False
-    return not require_final_repair or policy.expect_final_logprob_repair
+    return not require_final_repair or policy.final_logprob_repair_claimed

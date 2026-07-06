@@ -37,7 +37,7 @@ from sglang.srt.speculative.output_policy import (
     allow_req_non_streaming_logprob_output,
     defer_req_non_streaming_logprob_output,
     should_hold_non_streaming_logprob_output,
-    try_expect_req_final_logprob_repair,
+    try_claim_req_final_logprob_repair,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
@@ -388,8 +388,8 @@ def test_output_policy_final_logprob_repair_claim_is_once_only():
     )
 
     defer_req_non_streaming_logprob_output(req)
-    assert try_expect_req_final_logprob_repair(req)
-    assert not try_expect_req_final_logprob_repair(req)
+    assert try_claim_req_final_logprob_repair(req)
+    assert not try_claim_req_final_logprob_repair(req)
     assert should_hold_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
@@ -402,7 +402,7 @@ def test_output_policy_final_logprob_repair_claim_is_once_only():
         return_logprob=True,
         require_final_repair=True,
     )
-    assert not try_expect_req_final_logprob_repair(req)
+    assert not try_claim_req_final_logprob_repair(req)
 
 
 def test_dvr_final_logprob_repair_applies_after_materialization():

@@ -23,7 +23,7 @@ from sglang.srt.speculative.dvr_target_replay import (
 )
 from sglang.srt.speculative.output_policy import (
     defer_req_non_streaming_logprob_output,
-    try_expect_req_final_logprob_repair,
+    try_claim_req_final_logprob_repair,
 )
 
 
@@ -112,7 +112,7 @@ def score_dvr_final_logprob_repairs(
             compact_output_token_ids_per_req=compact_output_token_ids_per_req,
             error_prefix=error_prefix,
         )
-        if not try_expect_req_final_logprob_repair(req):
+        if not try_claim_req_final_logprob_repair(req):
             continue
 
         # The fixed KL guards catch batched final replay drifting from the
