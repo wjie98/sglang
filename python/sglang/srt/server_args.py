@@ -4334,21 +4334,17 @@ class ServerArgs:
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
-                    if (
+                    from sglang.srt.arg_groups.speculative_hook import (
+                        speculative_uses_draft_decode_custom_all_reduce,
+                    )
+
+                    use_draft_decode_custom_all_reduce = (
                         self.speculative_algorithm is not None
                         and not self.disable_custom_all_reduce
-                    ):
-                        from sglang.srt.arg_groups.speculative_hook import (
-                            speculative_uses_draft_decode_custom_all_reduce,
+                        and speculative_uses_draft_decode_custom_all_reduce(
+                            self.speculative_algorithm
                         )
-
-                        use_draft_decode_custom_all_reduce = (
-                            speculative_uses_draft_decode_custom_all_reduce(
-                                self.speculative_algorithm
-                            )
-                        )
-                    else:
-                        use_draft_decode_custom_all_reduce = False
+                    )
 
                     self.disable_custom_all_reduce = True
                     if use_draft_decode_custom_all_reduce:
