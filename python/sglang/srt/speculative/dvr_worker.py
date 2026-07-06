@@ -682,7 +682,7 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             graph_skip_reason = "seq_len<=2 initial GDN state-input graph boundary"
 
         if (
-            self._requires_self_draft_cuda_graph()
+            getattr(self.model_runner, "hybrid_gdn_config", None) is not None
             and graph_skip_reason is None
         ):
             capture_bs = []
@@ -703,9 +703,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         with dvr_self_draft_eager_context(self.model_runner):
             forward_batch.can_run_dp_cuda_graph = False
             return self.model_runner.forward(forward_batch).logits_output
-
-    def _requires_self_draft_cuda_graph(self) -> bool:
-        return getattr(self.model_runner, "hybrid_gdn_config", None) is not None
 
     def get_draft_sampling_probs(
         self, forward_batch: ForwardBatch, sampling_probs: torch.Tensor
