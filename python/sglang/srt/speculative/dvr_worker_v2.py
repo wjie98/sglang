@@ -246,15 +246,14 @@ class DecodeVerifyRollbackWorkerV2(
 
         if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
             base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
-            predict_cpu = predict.detach().cpu().tolist()
             accept_lens_cpu = accept_lens.detach().cpu().tolist()
-            compact_output_token_ids_per_req = [
-                predict_cpu[
-                    req_i * self.num_draft_tokens : req_i * self.num_draft_tokens
-                    + int(accept_len)
-                ]
-                for req_i, accept_len in enumerate(accept_lens_cpu)
-            ]
+            compact_output_token_ids_per_req = (
+                self._compact_flat_tokens_by_accept_lens(
+                    predict,
+                    accept_lens_cpu,
+                    tokens_per_req=self.num_draft_tokens,
+                )
+            )
             self._advance_v2_replay_prefix(
                 batch,
                 compact_output_token_ids_per_req,

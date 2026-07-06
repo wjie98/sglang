@@ -971,18 +971,36 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
     @staticmethod
+    def _compact_flat_tokens_by_accept_lens(
+        flat_tokens: torch.Tensor,
+        accept_lens_cpu: list[int],
+        *,
+        tokens_per_req: Optional[int] = None,
+    ) -> list[list[int]]:
+        token_ids = flat_tokens.detach().cpu().tolist()
+        compact_tokens = []
+        if tokens_per_req is None:
+            offset = 0
+            for accept_len in accept_lens_cpu:
+                next_offset = offset + int(accept_len)
+                compact_tokens.append([int(x) for x in token_ids[offset:next_offset]])
+                offset = next_offset
+        else:
+            for req_i, accept_len in enumerate(accept_lens_cpu):
+                start = req_i * tokens_per_req
+                end = start + int(accept_len)
+                compact_tokens.append([int(x) for x in token_ids[start:end]])
+        return compact_tokens
+
+    @staticmethod
     def _compact_accept_tokens_for_repair(
         verify_output: EagleVerifyOutput,
         accept_lens_cpu: list[int],
     ) -> list[list[int]]:
-        accept_tokens = verify_output.accept_tokens.detach().cpu().tolist()
-        compact_tokens = []
-        offset = 0
-        for accept_len in accept_lens_cpu:
-            next_offset = offset + int(accept_len)
-            compact_tokens.append([int(x) for x in accept_tokens[offset:next_offset]])
-            offset = next_offset
-        return compact_tokens
+        return DecodeVerifyRollbackWorker._compact_flat_tokens_by_accept_lens(
+            verify_output.accept_tokens,
+            accept_lens_cpu,
+        )
 
     def _repair_final_logprobs_for_spec_v1(
         self,
