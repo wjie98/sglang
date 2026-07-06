@@ -158,13 +158,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 # the real full-attention backend owns this EAGLE overlap hook.
                 continue
 
-    def _as_dvr_verify_input(
-        self, verify_input: EagleVerifyInput
-    ) -> DVREagleVerifyInput:
-        if isinstance(verify_input, DVREagleVerifyInput):
-            return verify_input
-        return DVREagleVerifyInput.from_eagle_verify_input(verify_input)
-
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
         return self.dvr_verifier_replay_prefix.request_verifier_prefix_token_ids(
             req,
@@ -332,7 +325,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
 
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
-        verify_input = self._as_dvr_verify_input(batch.spec_info)
+        verify_input = batch.spec_info
+        if not isinstance(verify_input, DVREagleVerifyInput):
+            verify_input = DVREagleVerifyInput.from_eagle_verify_input(verify_input)
         batch.spec_info = verify_input
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
@@ -379,9 +374,10 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 verify_input.retrieve_next_token.shape
             ).cpu()
 
+        base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
         linear_state_ctx = self.linear_state.restore_for_verify(
             batch,
-            seq_lens_cpu=self._batch_seq_lens_cpu_list(batch),
+            seq_lens_cpu=base_seq_lens_cpu,
         )
 
         with self._target_verify_graph_runner_context(
@@ -478,7 +474,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
             # DVR-EAGLE may rewrite previously collected output logprobs with a
             # final full-prefix oracle. Mark requests here so the generic
             # streamer only sees a request-level defer policy.
-            base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
             self.dvr_client_output_replay_prefix.advance_output_stream_from_compact_rows(
                 batch=batch,
                 compact_output_token_ids_per_req=compact_output_token_ids_per_req,
