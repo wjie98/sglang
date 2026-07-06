@@ -2529,9 +2529,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         before Req.output_ids is materialized.
         """
 
-        if not get_spec_algorithm_policy(self.spec_algorithm).is_dvr():
-            return False
-
         from sglang.srt.speculative.dvr_scheduler_utils import (
             should_resolve_dvr_spec_v2_seq_lens_before_filter,
         )
@@ -2684,26 +2681,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
-            is_dvr = get_spec_algorithm_policy(self.spec_algorithm).is_dvr()
-            dvr_finished_by_published_seq_len = None
-            if is_dvr:
-                from sglang.srt.speculative.dvr_scheduler_utils import (
-                    is_dvr_spec_v2_finished_by_published_seq_len,
-                )
 
-                dvr_finished_by_published_seq_len = (
-                    is_dvr_spec_v2_finished_by_published_seq_len
-                )
+            from sglang.srt.speculative.dvr_scheduler_utils import (
+                is_dvr_spec_v2_finished_by_published_seq_len,
+            )
+
             keep_indices = []
             for i in range(len(self.reqs)):
                 if self.reqs[i] in chunked_req_to_exclude:
                     continue
                 if self.reqs[i].finished():
                     continue
-                if (
-                    dvr_finished_by_published_seq_len is not None
-                    and dvr_finished_by_published_seq_len(self, i)
-                ):
+                if is_dvr_spec_v2_finished_by_published_seq_len(self, i):
                     continue
                 keep_indices.append(i)
 
