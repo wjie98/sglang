@@ -117,7 +117,10 @@ import os
 base = os.environ["RESULT_ROOT"]
 for path in sorted(glob.glob(os.path.join(base, "results", "80b_*.jsonl"))):
     with open(path) as f:
-        row = json.loads(f.readline())
+        rows = [line for line in f if line.strip()]
+    if not rows:
+        continue
+    row = json.loads(rows[-1])
     print(
         "{} out={:.2f} accept={:.2f} completed={} duration={:.2f}".format(
             os.path.basename(path),
