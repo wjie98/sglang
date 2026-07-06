@@ -945,10 +945,11 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         with linear_state_replay_context(
             linear_state_ctx, restore_live_state=False
         ):
-            if replay_plan.accepted_rows is not None:
+            if replay_plan.append_rows is not None:
+                assert replay_plan.append_offsets is not None
                 replay_batch.req_to_token_pool.write(
-                    (replay_plan.accepted_rows, replay_plan.accepted_offsets),
-                    replay_plan.accepted_cache_locs.to(
+                    (replay_plan.append_rows, replay_plan.append_offsets),
+                    replay_plan.append_cache_locs.to(
                         device=replay_batch.seq_lens.device, dtype=torch.int32
                     ),
                 )

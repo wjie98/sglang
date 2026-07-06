@@ -57,8 +57,13 @@ class DVRLinearStateReplayContext:
 
 
 @dataclass
-class DVRSuffixDraftReplayPlan:
-    """Plan a target EXTEND oracle over unclosed prefix tail plus draft rows."""
+class DVRSuffixReplayPlan:
+    """Plan a target EXTEND replay over unclosed prefix tail plus appended rows.
+
+    The appended rows are draft rows for verifier oracles and accepted rows for
+    live-state repair.  Keeping one shape makes both paths share the same
+    suffix replay plumbing while preserving their different callers.
+    """
 
     base_seq_lens_cpu: list[int]
     boundary_lens: list[int]
@@ -67,26 +72,10 @@ class DVRSuffixDraftReplayPlan:
     final_seq_lens_cpu: list[int]
     input_ids: list[int]
     out_cache_locs: list[torch.Tensor]
-    draft_cache_locs: torch.Tensor
-    draft_rows: torch.Tensor
-    draft_offsets: torch.Tensor
-    hidden_gather_indices: torch.Tensor
-
-
-@dataclass
-class DVRAcceptedSuffixReplayPlan:
-    """Plan a target EXTEND replay over unclosed prefix tail plus accepted rows."""
-
-    base_seq_lens_cpu: list[int]
-    boundary_lens: list[int]
-    tail_lens_cpu: list[int]
-    extend_lens_cpu: list[int]
-    final_seq_lens_cpu: list[int]
-    input_ids: list[int]
-    out_cache_locs: list[torch.Tensor]
-    accepted_cache_locs: torch.Tensor
-    accepted_rows: Optional[torch.Tensor]
-    accepted_offsets: Optional[torch.Tensor]
+    append_cache_locs: torch.Tensor
+    append_rows: Optional[torch.Tensor] = None
+    append_offsets: Optional[torch.Tensor] = None
+    hidden_gather_indices: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -183,7 +172,7 @@ def build_suffix_draft_replay_plan(
     draft_tokens: torch.Tensor,
     draft_cache_locs: torch.Tensor,
     request_token_ids_for_replay,
-) -> Optional[DVRSuffixDraftReplayPlan]:
+) -> Optional[DVRSuffixReplayPlan]:
     """Build the common tail+draft replay shape for self-DVR and DVR-EAGLE."""
 
     bs = len(batch.seq_lens)
@@ -244,7 +233,7 @@ def build_suffix_draft_replay_plan(
         gather_indices, dtype=torch.long, device=batch.seq_lens.device
     )
 
-    return DVRSuffixDraftReplayPlan(
+    return DVRSuffixReplayPlan(
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
         tail_lens_cpu=tail_lens_cpu,
@@ -252,20 +241,20 @@ def build_suffix_draft_replay_plan(
         final_seq_lens_cpu=final_seq_lens_cpu,
         input_ids=input_ids,
         out_cache_locs=out_cache_locs,
-        draft_cache_locs=draft_cache_locs,
-        draft_rows=draft_rows,
-        draft_offsets=draft_offsets,
+        append_cache_locs=draft_cache_locs,
+        append_rows=draft_rows,
+        append_offsets=draft_offsets,
         hidden_gather_indices=hidden_gather_indices,
     )
 
 
 def build_suffix_draft_mrope_positions(
     replay_batch: ScheduleBatch,
-    replay_plan: DVRSuffixDraftReplayPlan,
+    replay_plan: DVRSuffixReplayPlan,
 ) -> torch.Tensor:
     """Build flattened mrope positions matching suffix tail+draft input order."""
 
-    draft_token_num = int(replay_plan.draft_cache_locs.shape[1])
+    draft_token_num = int(replay_plan.append_cache_locs.shape[1])
     device = replay_batch.seq_lens.device
     mrope_chunks = []
     mm_inputs = replay_batch.multimodal_inputs
@@ -318,7 +307,7 @@ def build_suffix_draft_mrope_positions(
 
 def build_suffix_target_replay_batch(
     batch,
-    replay_plan: DVRSuffixDraftReplayPlan | DVRAcceptedSuffixReplayPlan,
+    replay_plan: DVRSuffixReplayPlan,
     *,
     capture_hidden_mode: CaptureHiddenMode,
     return_logprob: bool = False,
@@ -361,7 +350,7 @@ def build_accepted_suffix_replay_plan(
     accepted_token_counts_cpu: list[int],
     num_draft_tokens: int,
     request_token_ids_for_replay,
-) -> Optional[DVRAcceptedSuffixReplayPlan]:
+) -> Optional[DVRSuffixReplayPlan]:
     """Build the live-state repair replay shape for partially accepted chains."""
 
     if accepted_tokens is None or accepted_tokens.numel() == 0:
@@ -445,7 +434,7 @@ def build_accepted_suffix_replay_plan(
     if not input_ids:
         return None
 
-    return DVRAcceptedSuffixReplayPlan(
+    return DVRSuffixReplayPlan(
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
         tail_lens_cpu=tail_lens_cpu,
@@ -453,9 +442,9 @@ def build_accepted_suffix_replay_plan(
         final_seq_lens_cpu=final_seq_lens_cpu,
         input_ids=input_ids,
         out_cache_locs=out_cache_locs,
-        accepted_cache_locs=accepted_cache_locs,
-        accepted_rows=torch.cat(accepted_rows) if accepted_rows else None,
-        accepted_offsets=torch.cat(accepted_offsets) if accepted_offsets else None,
+        append_cache_locs=accepted_cache_locs,
+        append_rows=torch.cat(accepted_rows) if accepted_rows else None,
+        append_offsets=torch.cat(accepted_offsets) if accepted_offsets else None,
     )
 
 
@@ -730,9 +719,11 @@ def suffix_draft_replay_batch_context(
 
         # Draft KV rows must be visible at absolute positions
         # base_seq_len..base_seq_len+draft during the oracle forward.
+        assert replay_plan.append_rows is not None
+        assert replay_plan.append_offsets is not None
         replay_batch.req_to_token_pool.write(
-            (replay_plan.draft_rows, replay_plan.draft_offsets),
-            replay_plan.draft_cache_locs.to(torch.int32),
+            (replay_plan.append_rows, replay_plan.append_offsets),
+            replay_plan.append_cache_locs.to(torch.int32),
         )
         yield replay_batch, replay_plan
 
