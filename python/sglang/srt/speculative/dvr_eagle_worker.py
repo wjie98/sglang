@@ -197,70 +197,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
             error_prefix="DVR EAGLE",
         )
 
-    def _advance_eagle_replay_prefix(
-        self,
-        *,
-        batch: ScheduleBatch,
-        verify_input: DVREagleVerifyInput,
-        accept_lens: torch.Tensor,
-    ) -> None:
-        """Track the logical EAGLE prefix used by deterministic replay.
-
-        EAGLE returns target predictions to the client, while the next verify
-        prefix is advanced by the accepted draft/input tokens whose KV and
-        recurrent states were computed by target verify.  The scheduler may
-        start the next forward before those tokens are reflected in
-        ``Req.output_ids``.  DVR-EAGLE therefore keeps its own prefix token
-        stream and uses it only for verifier replay reconstruction.
-        """
-
-        if batch.forward_mode.is_idle() or batch.reqs is None:
-            return
-
-        self.dvr_verifier_replay_prefix.prune_to_batch(batch)
-
-        bs = len(batch.seq_lens)
-        draft_token_num = verify_input.draft_token_num
-        seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if batch.seq_lens_cpu is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
-        accept_lens_cpu = accept_lens.detach().cpu().tolist()
-        # EAGLE v2 emits the accepted draft-token prefix. Target's bonus token
-        # seeds the next draft round, where it becomes a draft token before it
-        # can be committed.  Tracking predict/accept_index here would shift the
-        # replay prefix by one target prediction.
-        draft_tokens_cpu = (
-            verify_input.draft_token.reshape(bs, draft_token_num)
-            .detach()
-            .cpu()
-            .tolist()
-        )
-
-        for req, seq_len, accepted_len, draft_tokens in zip(
-            batch.reqs,
-            seq_lens_cpu,
-            accept_lens_cpu,
-            draft_tokens_cpu,
-            strict=True,
-        ):
-            prefix_output_len = max(0, int(seq_len) - len(req.origin_input_ids))
-            self.dvr_verifier_replay_prefix.align_req_to_output_len(
-                req,
-                prefix_output_len,
-                error_prefix="DVR EAGLE replay prefix",
-            )
-
-            accepted_token_ids = [
-                int(token_id) for token_id in draft_tokens[: int(accepted_len)]
-            ]
-            self.dvr_verifier_replay_prefix.append_output_tokens(
-                req,
-                accepted_token_ids,
-                initialize_from_req_output=False,
-            )
-
     def _prepare_dvr_boundary_for_verify(self, batch: ScheduleBatch) -> None:
         if batch.forward_mode.is_idle():
             return
@@ -548,10 +484,12 @@ class DecodeVerifyRollbackEagleWorkerV2(
         # the next deterministic tail. It copies accepted draft tokens to CPU,
         # so non-GDN no-oracle EAGLE paths still keep it off the hot path.
         if batch.return_logprob or used_suffix_oracle or not can_run_cuda_graph:
-            self._advance_eagle_replay_prefix(
+            self.dvr_verifier_replay_prefix.advance_eagle_verifier_stream_from_draft_rows(
                 batch=batch,
-                verify_input=verify_input,
+                draft_token=verify_input.draft_token,
+                draft_token_num=verify_input.draft_token_num,
                 accept_lens=accept_lens,
+                error_prefix="DVR EAGLE replay prefix",
             )
 
         if not batch.forward_mode.is_idle():

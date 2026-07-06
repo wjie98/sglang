@@ -462,6 +462,60 @@ class DVRReplayPrefixTracker:
             stream[:] = prefix_ids[prompt_len:]
             stream.extend(compact_output_token_ids)
 
+    def advance_eagle_verifier_stream_from_draft_rows(
+        self,
+        *,
+        batch: Any,
+        draft_token: Any,
+        draft_token_num: int,
+        accept_lens: Any,
+        error_prefix: str,
+    ) -> None:
+        """Append accepted EAGLE/MTP draft rows to the verifier stream.
+
+        DVR-EAGLE has two token streams: client output uses target predictions,
+        while the next deterministic verifier prefix uses the accepted draft
+        tokens whose target KV/GDN state was just verified.  Keeping this update
+        here prevents the worker verify loop from duplicating replay-prefix
+        ownership details.
+        """
+
+        if batch.forward_mode.is_idle() or batch.reqs is None:
+            return
+
+        self.prune_to_batch(batch)
+
+        bs = len(batch.seq_lens)
+        seq_lens_cpu = (
+            batch.seq_lens_cpu.tolist()
+            if batch.seq_lens_cpu is not None
+            else batch.seq_lens.detach().cpu().tolist()
+        )
+        accept_lens_cpu = accept_lens.detach().cpu().tolist()
+        draft_tokens_cpu = (
+            draft_token.reshape(bs, draft_token_num).detach().cpu().tolist()
+        )
+
+        for req, seq_len, accepted_len, draft_tokens in zip(
+            batch.reqs,
+            seq_lens_cpu,
+            accept_lens_cpu,
+            draft_tokens_cpu,
+            strict=True,
+        ):
+            prefix_output_len = max(0, int(seq_len) - len(req.origin_input_ids))
+            self.align_req_to_output_len(
+                req,
+                prefix_output_len,
+                error_prefix=error_prefix,
+            )
+
+            self.append_output_tokens(
+                req,
+                [int(token_id) for token_id in draft_tokens[: int(accepted_len)]],
+                initialize_from_req_output=False,
+            )
+
     def align_req_to_output_len(
         self,
         req: Any,
