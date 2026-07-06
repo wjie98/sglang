@@ -19,8 +19,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
+    DVRSpecResultAux,
     compact_output_token_rows,
-    dvr_spec_aux_from_pending_mamba_checkpoints,
 )
 from sglang.srt.speculative.dvr_logprob_repair import (
     defer_and_score_dvr_final_logprob_repairs,
@@ -529,7 +529,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
-            spec_aux=dvr_spec_aux_from_pending_mamba_checkpoints(
+            spec_aux=DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
                 pending_track_indices,
                 pending_track_seqlens,
                 final_logprob_repairs=final_logprob_repairs,

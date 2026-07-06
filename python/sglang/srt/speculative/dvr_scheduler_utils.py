@@ -150,38 +150,6 @@ def is_dvr_spec_v2_finished_by_published_seq_len(
     return seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
 
 
-def dvr_spec_aux_from_pending_mamba_checkpoints(
-    track_indices: Optional[list[Optional[int]]],
-    seqlens: Optional[list[Optional[int]]],
-    *,
-    final_logprob_repairs: Optional[
-        list[Optional[DVRFinalLogprobRepair]]
-    ] = None,
-) -> Optional[DVRSpecResultAux]:
-    """Build DVR scheduler aux data from verify-produced mamba checkpoints.
-
-    Workers should not depend on the aux object's internal fields; the scheduler
-    side owns how these pending checkpoints are represented and committed.
-    """
-
-    return DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
-        track_indices,
-        seqlens,
-        final_logprob_repairs=final_logprob_repairs,
-    )
-
-
-def apply_dvr_spec_result_aux_after_materialize(batch: Any, result: Any) -> None:
-    """Apply DVR worker aux data after scheduler materializes accepted tokens.
-
-    The scheduler should not know which exact DVR side channel is present in
-    ``GenerationBatchResult.spec_aux``. Keep the decode-output boundary here so
-    future DVR aux fields do not add more branches to batch result processing.
-    """
-
-    apply_dvr_final_logprob_repairs_from_result(batch, result)
-
-
 def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
     """Apply DVR exact final logprob repairs after Spec-v2 output materializes."""
 
@@ -541,14 +509,6 @@ class DVRReplayPrefixTracker:
         stream.extend(int(token_id) for token_id in real_output_ids)
 
 
-def pending_mamba_checkpoint_for_result(result: Any, i: int) -> DVRMambaCheckpoint:
-    aux = getattr(result, "spec_aux", None)
-    checkpoints = getattr(aux, "pending_mamba_checkpoints", None)
-    if checkpoints is None or i >= len(checkpoints) or checkpoints[i] is None:
-        return DVRMambaCheckpoint()
-    return checkpoints[i]
-
-
 def commit_pending_mamba_checkpoint_from_result(
     *,
     req: Any,
@@ -557,7 +517,15 @@ def commit_pending_mamba_checkpoint_from_result(
     req_index: int,
     tree_cache: Any,
 ) -> None:
-    checkpoint = pending_mamba_checkpoint_for_result(result, req_index)
+    aux = getattr(result, "spec_aux", None)
+    checkpoints = getattr(aux, "pending_mamba_checkpoints", None)
+    checkpoint = (
+        checkpoints[req_index]
+        if checkpoints is not None
+        and req_index < len(checkpoints)
+        and checkpoints[req_index] is not None
+        else DVRMambaCheckpoint()
+    )
     if not _pending_mamba_checkpoint_is_committable(
         checkpoint=checkpoint,
         req=req,
