@@ -124,22 +124,35 @@ class DVRLinearStateLifecycle:
         accepted_steps: torch.Tensor,
         accepted_token_counts_cpu,
         ctx: Optional[DVRLinearStateContext] = None,
+        seq_lens_cpu: Optional[List[int]] = None,
         live_state_already_replayed: Optional[torch.Tensor] = None,
         use_fast_self_draft_commit: bool = False,
+        publish_boundary_checkpoint: bool = True,
+        return_pending_boundary: bool = False,
     ):
+        pending_track_indices = [None] * len(batch.reqs)
+        pending_track_seqlens = [None] * len(batch.reqs)
         ctx = ctx or self.state_context(batch, require_boundary=True)
         if ctx is None:
-            return
+            return (
+                (pending_track_indices, pending_track_seqlens)
+                if return_pending_boundary
+                else None
+            )
         assert ctx.boundary_indices is not None
         if accepted_token_counts.numel() == 0:
-            return
+            return (
+                (pending_track_indices, pending_track_seqlens)
+                if return_pending_boundary
+                else None
+            )
 
-        if use_fast_self_draft_commit:
+        if use_fast_self_draft_commit and seq_lens_cpu is None:
             # Self-DVR follows the original v5 lifecycle: verify has already
             # appended accepted tokens to Req, so recover the pre-verify tail
-            # from request metadata.  The generic EAGLE path below uses
-            # ScheduleBatch lengths because EAGLE suffix replay needs the
-            # immutable pre-verify prefix.
+            # from request metadata. Spec-v2 overlap passes seq_lens_cpu
+            # explicitly because Req materialization is delayed there, even
+            # though it still uses the fast self-draft adapter commit path.
             verified_tail_lens_cpu = [
                 req.seqlen - accepted_token_num - 1 - self.boundary_seqlen[req.rid]
                 for req, accepted_token_num in zip(
@@ -147,11 +160,7 @@ class DVRLinearStateLifecycle:
                 )
             ]
         else:
-            seq_lens_cpu = (
-                batch.seq_lens_cpu.tolist()
-                if batch.seq_lens_cpu is not None
-                else batch.seq_lens.detach().cpu().tolist()
-            )
+            seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
             # Use the immutable pre-verify logical lengths from ScheduleBatch.
             # Request metadata can already reflect accepted tokens in some spec
             # paths, which is exactly the off-by-one/full-prefix replay dependency
@@ -191,21 +200,39 @@ class DVRLinearStateLifecycle:
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
 
-        for req, verified_tail_len, accepted_token_num in zip(
-            batch.reqs, verified_tail_lens_cpu, accepted_token_counts_cpu, strict=True
+        for i, (req, verified_tail_len, accepted_token_num) in enumerate(
+            zip(
+                batch.reqs,
+                verified_tail_lens_cpu,
+                accepted_token_counts_cpu,
+                strict=True,
+            )
         ):
             if verified_tail_len + accepted_token_num >= FLA_CHUNK_SIZE:
                 new_boundary_seqlen = self.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
                 self.boundary_seqlen[req.rid] = new_boundary_seqlen
-                ctx.state_adapter.set_request_boundary_checkpoint(
-                    batch=batch,
-                    req=req,
-                    track_idx=self.boundary_track_idx[req.rid],
-                    boundary_seqlen=new_boundary_seqlen,
-                )
+                track_idx = self.boundary_track_idx[req.rid]
+                if publish_boundary_checkpoint:
+                    ctx.state_adapter.set_request_boundary_checkpoint(
+                        batch=batch,
+                        req=req,
+                        track_idx=track_idx,
+                        boundary_seqlen=new_boundary_seqlen,
+                    )
+                if return_pending_boundary:
+                    # Overlap materializes accepted tokens after the worker
+                    # returns. Keep the checkpoint pending until scheduler output
+                    # processing has committed those tokens to Req.output_ids.
+                    pending_track_indices[i] = track_idx
+                    pending_track_seqlens[i] = new_boundary_seqlen
         self.boundary_backup = None
         self.live_backup = None
         self.suffix_replay_boundary_track_mask = None
+        return (
+            (pending_track_indices, pending_track_seqlens)
+            if return_pending_boundary
+            else None
+        )
 
     def has_dvr_state(self, batch: ScheduleBatch) -> bool:
         state_adapter = self.state_adapter()
