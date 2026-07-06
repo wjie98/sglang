@@ -712,6 +712,87 @@ def build_private_extend_batch(
     return replay_batch
 
 
+@contextmanager
+def suffix_draft_replay_batch_context(
+    *,
+    batch,
+    linear_state,
+    linear_state_ctx,
+    base_seq_lens_cpu: list[int],
+    draft_tokens: torch.Tensor,
+    draft_cache_locs: torch.Tensor,
+    request_token_ids_for_replay,
+    full_prefix_replay: bool = False,
+    restore_boundary_state: bool = False,
+    use_mamba_cow_from_boundary: bool = False,
+):
+    """Prepare a suffix+draft replay batch and protect live DVR state.
+
+    Callers still own the actual forward path: self-DVR uses the normal target
+    worker batch entrypoint, while DVR-EAGLE may need a prebuilt ForwardBatch to
+    attach M-RoPE positions and to return hidden states for the next MTP step.
+    """
+
+    if batch.forward_mode.is_idle() or linear_state_ctx is None:
+        yield None
+        return
+
+    live_indices = linear_state_ctx.live_indices
+    boundary_indices = linear_state_ctx.boundary_indices
+    if boundary_indices is None:
+        yield None
+        return
+
+    boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
+    if full_prefix_replay:
+        boundary_lens = [0 for _ in boundary_lens]
+    replay_plan = build_suffix_draft_replay_plan(
+        batch=batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        draft_tokens=draft_tokens,
+        draft_cache_locs=draft_cache_locs,
+        request_token_ids_for_replay=request_token_ids_for_replay,
+    )
+    if replay_plan is None:
+        yield None
+        return
+
+    # Suffix replay is an oracle for verifier rows.  Checkpoint publication is
+    # handled by the normal DVR commit path, not by this temporary EXTEND.
+    linear_state.set_suffix_replay_boundary_track_mask(None)
+    replay_spec = build_suffix_target_replay_spec(
+        replay_plan,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        mamba_cow_src_indices=(
+            boundary_indices
+            if use_mamba_cow_from_boundary and not full_prefix_replay
+            else None
+        ),
+        mamba_cow_dst_indices=(
+            live_indices if use_mamba_cow_from_boundary and not full_prefix_replay else None
+        ),
+        mamba_clear_indices=live_indices if full_prefix_replay else None,
+    )
+    replay_batch = build_target_extend_replay_batch(batch, replay_spec)
+
+    with linear_state_replay_context(
+        linear_state_ctx,
+        clear_state_input_window=full_prefix_replay,
+        restore_live_state=True,
+    ):
+        if restore_boundary_state and not full_prefix_replay:
+            linear_state.restore_boundary_state_for_suffix_replay(linear_state_ctx)
+
+        # Draft KV rows must be visible at absolute positions
+        # base_seq_len..base_seq_len+draft during the oracle forward.
+        replay_batch.req_to_token_pool.write(
+            (replay_plan.draft_rows, replay_plan.draft_offsets),
+            replay_plan.draft_cache_locs.to(torch.int32),
+        )
+        yield replay_batch, replay_plan
+
+
 def draft_row_logits_from_replay_hidden_states(
     *,
     target_worker,

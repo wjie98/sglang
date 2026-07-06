@@ -27,11 +27,8 @@ from sglang.srt.speculative.dvr_logprob_repair import (
 )
 from sglang.srt.speculative.dvr_target_replay import (
     build_suffix_draft_mrope_positions,
-    build_suffix_draft_replay_plan,
-    build_suffix_target_replay_spec,
-    build_target_extend_replay_batch,
     draft_row_logits_from_replay_hidden_states,
-    linear_state_replay_context,
+    suffix_draft_replay_batch_context,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_linear_state_worker import (
@@ -304,14 +301,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         otherwise KL can remain correct while the next draft chain drifts.
         """
 
-        if batch.forward_mode.is_idle() or linear_state_ctx is None:
-            return None
         if self.topk != 1 or self.linear_state.boundary_backup is None:
-            return None
-
-        live_indices = linear_state_ctx.live_indices
-        boundary_indices = linear_state_ctx.boundary_indices
-        if boundary_indices is None:
             return None
 
         base_seq_lens_cpu = (
@@ -319,57 +309,20 @@ class DecodeVerifyRollbackEagleWorkerV2(
             if batch.seq_lens_cpu is not None
             else batch.seq_lens.detach().cpu().tolist()
         )
-        boundary_lens = self.linear_state.boundary_lens_for_replay(
-            batch, base_seq_lens_cpu
-        )
-        if full_prefix_replay:
-            boundary_lens = [0 for _ in boundary_lens]
-        replay_plan = build_suffix_draft_replay_plan(
+        with suffix_draft_replay_batch_context(
             batch=batch,
+            linear_state=self.linear_state,
+            linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
-            boundary_lens=boundary_lens,
             draft_tokens=verify_input.draft_token,
             draft_cache_locs=batch.out_cache_loc,
             request_token_ids_for_replay=self._request_token_ids_for_replay,
-        )
-        if replay_plan is None:
-            return None
-
-        # The replay output replaces verifier logits/hidden states; checkpoint
-        # ownership stays with DVR's commit path rather than this temporary
-        # EXTEND forward.
-        self.linear_state.set_suffix_replay_boundary_track_mask(None)
-
-        replay_spec = build_suffix_target_replay_spec(
-            replay_plan,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            # Suffix replay starts from DVR-managed recurrent state. Do not
-            # re-apply cached-prefix deferred Mamba COW/clear ops that were
-            # already consumed by the real prefill/verify forward.
-            mamba_clear_indices=live_indices if full_prefix_replay else None,
-        )
-
-        replay_batch = build_target_extend_replay_batch(batch, replay_spec)
-
-        with linear_state_replay_context(
-            linear_state_ctx,
-            clear_state_input_window=full_prefix_replay,
-            restore_live_state=True,
-        ):
-            if not full_prefix_replay:
-                self.linear_state.restore_boundary_state_for_suffix_replay(
-                    linear_state_ctx
-                )
-
-            # The suffix EXTEND must see draft KV at absolute positions
-            # base_seq_len..base_seq_len+draft.  These are the same slots the
-            # real verify path owns, so publishing them in req_to_token_pool is
-            # intentional.  The replay itself now runs on a private batch.
-            replay_batch.req_to_token_pool.write(
-                (replay_plan.draft_rows, replay_plan.draft_offsets),
-                replay_plan.draft_cache_locs.to(torch.int32),
-            )
-
+            full_prefix_replay=full_prefix_replay,
+            restore_boundary_state=True,
+        ) as replay:
+            if replay is None:
+                return None
+            replay_batch, replay_plan = replay
             forward_batch = ForwardBatch.init_new(
                 replay_batch, self.target_worker.model_runner
             )
