@@ -34,8 +34,10 @@ class SpecAlgorithmPolicy:
 
     SGLang's scheduler, model runner, CUDA graph runner, and cache builder need
     a few cross-cutting algorithm traits.  Keep those traits here so generic
-    subsystems do not grow DVR-specific branches and new algorithms can be
-    integrated by adding a policy instead of editing every call site.
+    subsystems do not grow DVR-specific branches.  Custom algorithms still plug
+    in through the existing ``is_*()`` and ``supports_spec_v2()`` methods; this
+    policy keeps DVR-only derived rules internal instead of adding more public
+    enum-like hooks.
     """
 
     algorithm: Any
@@ -72,13 +74,11 @@ class SpecAlgorithmPolicy:
         return self.name == "DFLASH" or _custom_bool(self.algorithm, "is_dflash")
 
     def supports_spec_v2(self) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(self.algorithm, "supports_spec_v2", None)
-            return bool(method()) if method is not None else False
         return (
             (self.is_eagle() and not self.is_frozen_kv_mtp())
             or self.is_standalone()
             or self.is_dvr()
+            or _custom_bool(self.algorithm, "supports_spec_v2")
         )
 
     def uses_spec_v2(self, enable_overlap: bool) -> bool:
@@ -89,13 +89,6 @@ class SpecAlgorithmPolicy:
         synchronous v2 path, not a separate EAGLE-v1 implementation.
         """
 
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(self.algorithm, "uses_spec_v2", None)
-            return (
-                bool(method(enable_overlap))
-                if method is not None
-                else self.supports_spec_v2()
-            )
         if self.is_dvr_eagle():
             return True
         if self.is_dvr_self_draft():
@@ -103,10 +96,6 @@ class SpecAlgorithmPolicy:
         return self.supports_spec_v2()
 
     def prepare_cuda_graph_verify_input(self, verify_input: Any) -> Any:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(self.algorithm, "prepare_cuda_graph_verify_input", None)
-            return method(verify_input) if method is not None else verify_input
-
         if self.is_dvr_eagle():
             from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
 
@@ -123,14 +112,6 @@ class SpecAlgorithmPolicy:
         *,
         null_for_standalone: bool = False,
     ) -> Any:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(self.algorithm, "target_verify_capture_hidden_mode", None)
-            return (
-                method(default_mode, null_for_standalone=null_for_standalone)
-                if method is not None
-                else default_mode
-            )
-
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
         if self.is_dvr_self_draft():
@@ -140,19 +121,9 @@ class SpecAlgorithmPolicy:
         return default_mode
 
     def uses_eagle_style_target_verify_input(self) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(
-                self.algorithm, "uses_eagle_style_target_verify_input", None
-            )
-            return bool(method()) if method is not None else False
         return self.is_eagle() or self.is_standalone() or self.is_dvr()
 
     def target_verify_graph_bs_uses_token_count(self) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(
-                self.algorithm, "target_verify_graph_bs_uses_token_count", None
-            )
-            return bool(method()) if method is not None else False
         return (
             self.is_eagle()
             or self.is_standalone()
@@ -170,21 +141,6 @@ class SpecAlgorithmPolicy:
         default_capture_hidden_mode: Any,
         null_for_standalone: bool = False,
     ) -> Optional[Any]:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(
-                self.algorithm, "create_target_verify_cuda_graph_input", None
-            )
-            if method is not None:
-                return method(
-                    custom_mask=custom_mask,
-                    spec_steps=spec_steps,
-                    topk=topk,
-                    draft_token_num=draft_token_num,
-                    default_capture_hidden_mode=default_capture_hidden_mode,
-                    null_for_standalone=null_for_standalone,
-                )
-            return None
-
         if not self.uses_eagle_style_target_verify_input():
             return None
 
@@ -211,9 +167,6 @@ class SpecAlgorithmPolicy:
         return self.prepare_cuda_graph_verify_input(spec_info)
 
     def uses_draft_decode_custom_all_reduce(self) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(self.algorithm, "uses_draft_decode_custom_all_reduce", None)
-            return bool(method()) if method is not None else False
         return self.is_dvr()
 
     def uses_draft_extend_selected_logits(
@@ -224,18 +177,6 @@ class SpecAlgorithmPolicy:
         is_v2: bool,
         requires_gathered_buffer: bool,
     ) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(self.algorithm, "uses_draft_extend_selected_logits", None)
-            if method is not None:
-                return bool(
-                    method(
-                        topk=topk,
-                        model=model,
-                        is_v2=is_v2,
-                        requires_gathered_buffer=requires_gathered_buffer,
-                    )
-                )
-
         return (
             self.is_eagle()
             and is_v2
@@ -245,25 +186,11 @@ class SpecAlgorithmPolicy:
         )
 
     def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(
-                self.algorithm, "needs_mamba_radix_snapshot_for_spec_v2", None
-            )
-            return bool(method()) if method is not None else False
         return self.is_dvr()
 
     def requires_seq_lens_cpu_before_filter(
         self, *, batch: Any, enable_overlap: bool
     ) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(
-                self.algorithm, "requires_seq_lens_cpu_before_filter", None
-            )
-            return (
-                bool(method(batch=batch, enable_overlap=enable_overlap))
-                if method is not None
-                else False
-            )
         if not self.is_dvr():
             return False
 
@@ -277,11 +204,6 @@ class SpecAlgorithmPolicy:
         )
 
     def is_finished_by_published_seq_len(self, batch: Any, req_index: int) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(self.algorithm, "is_finished_by_published_seq_len", None)
-            return (
-                bool(method(batch, req_index)) if method is not None else False
-            )
         if not self.is_dvr():
             return False
 
@@ -292,11 +214,6 @@ class SpecAlgorithmPolicy:
         return is_dvr_spec_v2_finished_by_published_seq_len(batch, req_index)
 
     def linear_speculative_state_extension_factory(self, model_runner: Any):
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(
-                self.algorithm, "linear_speculative_state_extension_factory", None
-            )
-            return method(model_runner) if method is not None else None
         if not self.is_dvr():
             return None
         if model_runner.hybrid_gdn_config is None:
@@ -309,9 +226,6 @@ class SpecAlgorithmPolicy:
         return create_dvr_gdn_speculative_state_extension
 
     def uses_target_kv_pool_for_draft(self) -> bool:
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(self.algorithm, "uses_target_kv_pool_for_draft", None)
-            return bool(method()) if method is not None else False
         return self.is_dvr_self_draft()
 
     def proposed_draft_tokens_per_verify(
@@ -328,18 +242,6 @@ class SpecAlgorithmPolicy:
         rows.  Keep this in the algorithm policy so tokenizer-side metrics do
         not need to understand each spec worker's layout.
         """
-
-        if not _is_builtin_algorithm(self.algorithm):
-            method = getattr(
-                self.algorithm, "proposed_draft_tokens_per_verify", None
-            )
-            if method is not None:
-                return int(
-                    method(
-                        speculative_num_steps=speculative_num_steps,
-                        speculative_num_draft_tokens=speculative_num_draft_tokens,
-                    )
-                )
 
         if self.is_eagle() or self.is_dvr() or self.is_standalone():
             return max(0, int(speculative_num_steps))
