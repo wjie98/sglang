@@ -214,11 +214,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         if self.topk != 1 or self.linear_state.boundary_backup is None:
             return None
 
-        base_seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if batch.seq_lens_cpu is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
+        base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
         with suffix_draft_replay_batch_context(
             batch=batch,
             linear_state=self.linear_state,
@@ -482,11 +478,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             # DVR-EAGLE may rewrite previously collected output logprobs with a
             # final full-prefix oracle. Mark requests here so the generic
             # streamer only sees a request-level defer policy.
-            base_seq_lens_cpu = (
-                batch.seq_lens_cpu.tolist()
-                if batch.seq_lens_cpu is not None
-                else batch.seq_lens.detach().cpu().tolist()
-            )
+            base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
             self.dvr_client_output_replay_prefix.advance_output_stream_from_compact_rows(
                 batch=batch,
                 compact_output_token_ids_per_req=compact_output_token_ids_per_req,
