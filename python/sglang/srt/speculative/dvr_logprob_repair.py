@@ -102,33 +102,13 @@ def score_dvr_final_logprob_repairs(
     if not replay_tasks:
         return None
 
-    return _score_final_logprob_repair_tasks(
-        batch=batch,
-        target_worker=target_worker,
-        linear_state_ctx=linear_state_ctx,
-        replay_tasks=replay_tasks,
-    )
-
-
-def _score_final_logprob_repair_tasks(
-    *,
-    batch: ScheduleBatch,
-    target_worker: Any,
-    linear_state_ctx: Any,
-    replay_tasks: list[_DVRFinalLogprobReplayTask],
-) -> list[Optional[DVRFinalLogprobRepair]]:
-    """Score final repairs with the public single-request oracle.
-
-    The fixed 0.8B KL guard catches batched GDN final replay drifting from the
-    per-request max_new_tokens=0 oracle on short prompts.  Keep this split only
-    for final non-streaming logprob repair; generation, verify, and state commit
-    continue using the normal batched paths.
-    """
-
     repairs: list[Optional[DVRFinalLogprobRepair]] = [
         None for _ in range(len(batch.reqs))
     ]
     for task in replay_tasks:
+        # The fixed KL guards catch batched final replay drifting from the
+        # per-request max_new_tokens=0 oracle on short prompts.  Keep final
+        # repair request-by-request; generation and verify stay batched.
         input_token_logprobs = _run_final_logprob_replay(
             batch=batch,
             target_worker=target_worker,
@@ -328,12 +308,19 @@ def _final_replay_ids_for_req(
     prompt_len = len(req.origin_input_ids)
     materialized_seq_len = prompt_len + len(req.output_ids)
     stable_seq_len = min(replay_seq_len, max(base_seq_len, materialized_seq_len))
-    base_ids = _materialized_or_replay_prefix_ids(
-        req=req,
-        replay_prefix=replay_prefix,
-        seq_len=stable_seq_len,
-        error_prefix=error_prefix,
-    )
+    output_len = stable_seq_len - prompt_len
+    # DVR-EAGLE's replay tracker stores the verifier prefix, which can differ
+    # from already-materialized client output by one bonus token.  The final
+    # response repair must match Req.output_ids exactly, so prefer that stable
+    # materialized prefix when it covers the requested length.
+    if output_len > 0 and len(req.output_ids) >= output_len:
+        base_ids = list(req.origin_input_ids) + list(req.output_ids[:output_len])
+    else:
+        base_ids = replay_prefix.request_output_prefix_token_ids(
+            req,
+            stable_seq_len,
+            error_prefix=error_prefix,
+        )[:stable_seq_len]
 
     current_needed = replay_seq_len - stable_seq_len
     if current_needed == 0:
@@ -351,30 +338,6 @@ def _final_replay_ids_for_req(
         error_prefix=error_prefix,
     )
     return token_ids[:replay_seq_len]
-
-
-def _materialized_or_replay_prefix_ids(
-    *,
-    req: Any,
-    replay_prefix: DVRReplayPrefixTracker,
-    seq_len: int,
-    error_prefix: str,
-) -> list[int]:
-    prompt_len = len(req.origin_input_ids)
-    output_len = seq_len - prompt_len
-    # DVR-EAGLE's replay tracker stores the verifier prefix, which can differ
-    # from already-materialized client output by one bonus token.  The final
-    # response repair must match Req.output_ids exactly, so prefer that stable
-    # materialized prefix when it covers the requested length.
-    if output_len > 0 and len(req.output_ids) >= output_len:
-        return list(req.origin_input_ids) + list(req.output_ids[:output_len])
-
-    token_ids = replay_prefix.request_output_prefix_token_ids(
-        req,
-        seq_len,
-        error_prefix=error_prefix,
-    )
-    return token_ids[:seq_len]
 
 
 def _first_token_finish_pos(req: Any, token_ids: list[int]) -> Optional[int]:
