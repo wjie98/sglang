@@ -15,26 +15,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 
 
 @dataclass
-class DVRTargetReplaySpec:
-    input_ids: list[int]
-    out_cache_locs: list[torch.Tensor]
-    prefix_lens: list[int]
-    extend_lens: list[int]
-    final_seq_lens: list[int]
-    extend_logprob_start_lens: list[int]
-    extend_input_logprob_token_ids: Optional[list[int]] = None
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
-    return_logprob: bool = False
-    mamba_track_indices: Optional[torch.Tensor] = None
-    mamba_track_mask: Optional[torch.Tensor] = None
-    mamba_track_seqlens: Optional[torch.Tensor] = None
-    mamba_cow_src_indices: Optional[torch.Tensor] = None
-    mamba_cow_dst_indices: Optional[torch.Tensor] = None
-    mamba_clear_indices: Optional[torch.Tensor] = None
-    multimodal_inputs: Optional[list[Any]] = None
-
-
-@dataclass
 class DVRPrivateExtendBatchSpec:
     """Inputs for a DVR-owned EXTEND batch detached from scheduler mutation.
 
@@ -336,7 +316,8 @@ def build_suffix_draft_mrope_positions(
     return torch.cat(mrope_chunks, dim=1)
 
 
-def build_suffix_target_replay_spec(
+def build_suffix_target_replay_batch(
+    batch,
     replay_plan: DVRSuffixDraftReplayPlan | DVRAcceptedSuffixReplayPlan,
     *,
     capture_hidden_mode: CaptureHiddenMode,
@@ -344,21 +325,29 @@ def build_suffix_target_replay_spec(
     mamba_cow_src_indices: Optional[torch.Tensor] = None,
     mamba_cow_dst_indices: Optional[torch.Tensor] = None,
     mamba_clear_indices: Optional[torch.Tensor] = None,
-) -> DVRTargetReplaySpec:
-    """Map a suffix replay plan to the private target EXTEND batch spec."""
+) -> ScheduleBatch:
+    """Create the private target EXTEND batch for a suffix replay oracle."""
 
-    return DVRTargetReplaySpec(
-        input_ids=replay_plan.input_ids,
-        out_cache_locs=replay_plan.out_cache_locs,
-        prefix_lens=[int(x) for x in replay_plan.boundary_lens],
-        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-        final_seq_lens=replay_plan.final_seq_lens_cpu,
-        extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-        capture_hidden_mode=capture_hidden_mode,
-        return_logprob=return_logprob,
-        mamba_cow_src_indices=mamba_cow_src_indices,
-        mamba_cow_dst_indices=mamba_cow_dst_indices,
-        mamba_clear_indices=mamba_clear_indices,
+    return build_private_extend_batch(
+        batch,
+        DVRPrivateExtendBatchSpec(
+            reqs=batch.reqs,
+            input_ids=replay_plan.input_ids,
+            out_cache_locs=replay_plan.out_cache_locs,
+            prefix_lens=[int(x) for x in replay_plan.boundary_lens],
+            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+            final_seq_lens=replay_plan.final_seq_lens_cpu,
+            return_logprob=return_logprob,
+            extend_logprob_start_lens=[
+                int(x) for x in replay_plan.extend_lens_cpu
+            ],
+            multimodal_inputs=[req.multimodal_inputs for req in batch.reqs],
+            capture_hidden_mode=capture_hidden_mode,
+            is_prefill_only=batch.is_prefill_only,
+            mamba_cow_src_indices=mamba_cow_src_indices,
+            mamba_cow_dst_indices=mamba_cow_dst_indices,
+            mamba_clear_indices=mamba_clear_indices,
+        ),
     )
 
 
@@ -554,51 +543,6 @@ def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleB
     )
 
 
-def build_target_extend_replay_batch(
-    batch,
-    spec: DVRTargetReplaySpec,
-    *,
-    reqs: Optional[list[Any]] = None,
-) -> ScheduleBatch:
-    """Create a narrow EXTEND batch for DVR target replay oracles.
-
-    Suffix replay only needs request slots, cache pools, sequence lengths, and
-    the explicit GDN/Mamba state ops carried by ``spec``.  Building a private
-    batch keeps the live scheduler batch out of the oracle forward path.
-    """
-
-    replay_reqs = batch.reqs if reqs is None else reqs
-    return build_private_extend_batch(
-        batch,
-        DVRPrivateExtendBatchSpec(
-            reqs=replay_reqs,
-            input_ids=spec.input_ids,
-            out_cache_locs=spec.out_cache_locs,
-            prefix_lens=[int(x) for x in spec.prefix_lens],
-            extend_lens=[int(x) for x in spec.extend_lens],
-            final_seq_lens=spec.final_seq_lens,
-            return_logprob=spec.return_logprob,
-            extend_logprob_start_lens=[
-                int(x) for x in spec.extend_logprob_start_lens
-            ],
-            extend_input_logprob_token_ids=spec.extend_input_logprob_token_ids,
-            multimodal_inputs=(
-                [req.multimodal_inputs for req in replay_reqs]
-                if spec.multimodal_inputs is None
-                else spec.multimodal_inputs
-            ),
-            capture_hidden_mode=spec.capture_hidden_mode,
-            is_prefill_only=batch.is_prefill_only,
-            mamba_track_indices=spec.mamba_track_indices,
-            mamba_track_mask=spec.mamba_track_mask,
-            mamba_track_seqlens=spec.mamba_track_seqlens,
-            mamba_cow_src_indices=spec.mamba_cow_src_indices,
-            mamba_cow_dst_indices=spec.mamba_cow_dst_indices,
-            mamba_clear_indices=spec.mamba_clear_indices,
-        ),
-    )
-
-
 def build_private_extend_batch(
     batch,
     spec: DVRPrivateExtendBatchSpec,
@@ -761,7 +705,8 @@ def suffix_draft_replay_batch_context(
     # Suffix replay is an oracle for verifier rows.  Checkpoint publication is
     # handled by the normal DVR commit path, not by this temporary EXTEND.
     linear_state.set_suffix_replay_boundary_track_mask(None)
-    replay_spec = build_suffix_target_replay_spec(
+    replay_batch = build_suffix_target_replay_batch(
+        batch,
         replay_plan,
         capture_hidden_mode=CaptureHiddenMode.FULL,
         mamba_cow_src_indices=(
@@ -774,7 +719,6 @@ def suffix_draft_replay_batch_context(
         ),
         mamba_clear_indices=live_indices if full_prefix_replay else None,
     )
-    replay_batch = build_target_extend_replay_batch(batch, replay_spec)
 
     with linear_state_replay_context(
         linear_state_ctx,

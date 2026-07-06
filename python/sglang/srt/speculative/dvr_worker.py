@@ -37,8 +37,7 @@ from sglang.srt.speculative.dvr_logprob_repair import (
 from sglang.srt.speculative.dvr_scheduler_utils import DVRReplayPrefixTracker
 from sglang.srt.speculative.dvr_target_replay import (
     build_accepted_suffix_replay_plan,
-    build_suffix_target_replay_spec,
-    build_target_extend_replay_batch,
+    build_suffix_target_replay_batch,
     draft_row_logits_from_replay_hidden_states,
     linear_state_replay_context,
     suffix_draft_replay_batch_context,
@@ -935,14 +934,13 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         # Accepted-suffix replay is a commit repair, not a checkpoint publisher.
         # It intentionally leaves the live recurrent slot updated by the replay.
         self.linear_state.set_suffix_replay_boundary_track_mask(None)
-        replay_spec = build_suffix_target_replay_spec(
+        replay_batch = build_suffix_target_replay_batch(
+            batch,
             replay_plan,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             mamba_cow_src_indices=boundary_indices,
             mamba_cow_dst_indices=live_indices,
         )
-
-        replay_batch = build_target_extend_replay_batch(batch, replay_spec)
 
         with linear_state_replay_context(
             linear_state_ctx, restore_live_state=False
