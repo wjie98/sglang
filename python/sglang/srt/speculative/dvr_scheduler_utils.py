@@ -337,7 +337,7 @@ class DVRReplayPrefixTracker:
             include_full_untruncated_fill_ids=True,
         )
 
-    def append_output_tokens(
+    def _append_output_tokens(
         self,
         req: Any,
         token_ids,
@@ -360,29 +360,11 @@ class DVRReplayPrefixTracker:
 
         self.prune_to_batch(batch)
         for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
-            self.append_output_tokens(
+            self._append_output_tokens(
                 req,
                 token_ids,
                 initialize_from_req_output=initialize_from_req_output,
             )
-
-    def seed_from_target_extend(
-        self,
-        *,
-        batch: Any,
-        next_token_ids: Any,
-    ) -> None:
-        """Record target EXTEND's first client-visible output token."""
-
-        if batch.reqs is None or next_token_ids is None:
-            return
-
-        next_token_ids_cpu = next_token_ids.detach().cpu().tolist()
-        self.append_batch_output_tokens(
-            batch,
-            [[token_id] for token_id in next_token_ids_cpu],
-            initialize_from_req_output=True,
-        )
 
     def advance_output_stream_from_compact_rows(
         self,
@@ -472,19 +454,19 @@ class DVRReplayPrefixTracker:
             strict=True,
         ):
             prefix_output_len = max(0, int(seq_len) - len(req.origin_input_ids))
-            self.align_req_to_output_len(
+            self._align_req_to_output_len(
                 req,
                 prefix_output_len,
                 error_prefix=error_prefix,
             )
 
-            self.append_output_tokens(
+            self._append_output_tokens(
                 req,
                 [int(token_id) for token_id in draft_tokens[: int(accepted_len)]],
                 initialize_from_req_output=False,
             )
 
-    def align_req_to_output_len(
+    def _align_req_to_output_len(
         self,
         req: Any,
         output_len: int,

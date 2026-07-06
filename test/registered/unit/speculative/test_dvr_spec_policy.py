@@ -511,14 +511,14 @@ def test_dvr_eagle_replay_prefix_splits_verifier_and_output_streams():
             error_prefix="DVR EAGLE verifier replay prefix",
         )
 
-    verifier_prefix.append_output_tokens(
-        req,
-        [900, 901],
+    verifier_prefix.append_batch_output_tokens(
+        batch,
+        [[900, 901]],
         initialize_from_req_output=False,
     )
-    output_prefix.append_output_tokens(
-        req,
-        [749, 750],
+    output_prefix.append_batch_output_tokens(
+        batch,
+        [[749, 750]],
         initialize_from_req_output=True,
     )
     req.output_ids = [748]

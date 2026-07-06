@@ -255,10 +255,15 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 # prefill/extend step.  In overlap it can be consumed by the
                 # first verify before Req.output_ids is materialized, so the
                 # DVR-EAGLE final-logprob stream must learn it here.
-                self.dvr_client_output_replay_prefix.seed_from_target_extend(
-                    batch=batch,
-                    next_token_ids=batch_output.next_token_ids,
-                )
+                if batch_output.next_token_ids is not None:
+                    next_token_ids_cpu = (
+                        batch_output.next_token_ids.detach().cpu().tolist()
+                    )
+                    self.dvr_client_output_replay_prefix.append_batch_output_tokens(
+                        batch,
+                        [[token_id] for token_id in next_token_ids_cpu],
+                        initialize_from_req_output=True,
+                    )
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
