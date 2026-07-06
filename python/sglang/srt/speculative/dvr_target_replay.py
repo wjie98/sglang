@@ -266,7 +266,7 @@ def build_suffix_draft_mrope_positions(
             )
             if tail_positions.shape[1] > 0:
                 chunk_parts.append(tail_positions)
-        filled_tail = sum(part.shape[1] for part in chunk_parts) if chunk_parts else 0
+        filled_tail = sum(part.shape[1] for part in chunk_parts)
         if filled_tail < int(tail_len):
             fallback_tail = (
                 torch.arange(
@@ -316,9 +316,7 @@ def build_suffix_target_replay_batch(
             extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
             final_seq_lens=replay_plan.final_seq_lens_cpu,
             return_logprob=return_logprob,
-            extend_logprob_start_lens=[
-                int(x) for x in replay_plan.extend_lens_cpu
-            ],
+            extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
             multimodal_inputs=[req.multimodal_inputs for req in batch.reqs],
             capture_hidden_mode=capture_hidden_mode,
             is_prefill_only=batch.is_prefill_only,
@@ -346,15 +344,13 @@ def build_accepted_suffix_replay_plan(
         return None
 
     total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
-    if accepted_tokens.numel() != total_accepted:
-        return None
-    if accepted_cache_locs.numel() != total_accepted:
+    if (
+        accepted_tokens.numel() != total_accepted
+        or accepted_cache_locs.numel() != total_accepted
+    ):
         return None
 
-    needs_exact_replay = any(
-        int(accepted) < num_draft_tokens for accepted in accepted_token_counts_cpu
-    )
-    if not needs_exact_replay:
+    if all(int(accepted) >= num_draft_tokens for accepted in accepted_token_counts_cpu):
         return None
 
     accepted_tokens_cpu = accepted_tokens.detach().cpu().tolist()
