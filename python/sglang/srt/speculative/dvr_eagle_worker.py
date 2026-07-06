@@ -98,11 +98,20 @@ class DecodeVerifyRollbackEagleWorkerV2(
         self.dvr_client_output_replay_prefix.clear()
 
     @contextmanager
-    def _target_verify_graph_runner_context(self, disable_cuda_graph: bool = False):
-        target_runner = self.target_worker.model_runner
+    def _target_verify_context(
+        self, *, disable_cuda_graph: bool = False, prepare: bool = False
+    ):
         runner = None if disable_cuda_graph else self.cuda_graph_runner_for_target_verify
-        if runner is None and self.plan_stream is None and not disable_cuda_graph:
-            yield
+        use_plan_stream = prepare and self.plan_stream is not None and runner is None
+        stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
+
+        target_runner = self.target_worker.model_runner
+        patch_graph_runner = (
+            runner is not None or self.plan_stream is not None or disable_cuda_graph
+        )
+        if not patch_graph_runner:
+            with stream_ctx:
+                yield use_plan_stream
             return
 
         saved_graph_runner = target_runner.graph_runner
@@ -111,27 +120,14 @@ class DecodeVerifyRollbackEagleWorkerV2(
         # windows.  Prefer the DVR-EAGLE graph when captured; if capture is
         # disabled, keep the old eager fallback by installing None only inside
         # this scoped target-verify window.
-        target_runner.graph_runner = runner
-        try:
-            yield
-        finally:
-            target_runner.graph_runner = saved_graph_runner
-
-    @contextmanager
-    def _target_verify_prepare_context(self, disable_cuda_graph: bool = False):
-        use_plan_stream = (
-            self.plan_stream is not None
-            and (self.cuda_graph_runner_for_target_verify is None or disable_cuda_graph)
-        )
-        # The dedicated DVR-EAGLE target-verify graph replays GDN state-input
-        # and commit-buffer side effects.  Preparing its graph buffers on the
-        # overlap plan stream can race with the graph replay on CUDA even after
-        # a stream wait, so keep this graph's replay_prepare on the compute
-        # stream.  If the dedicated graph is unavailable, preserve the previous
-        # plan-stream eager fallback.
-        stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
-        with stream_ctx, self._target_verify_graph_runner_context(disable_cuda_graph):
-            yield use_plan_stream
+        # During prepare, the dedicated DVR-EAGLE graph must be prepared on the
+        # compute stream; only the eager fallback keeps the old plan-stream path.
+        with stream_ctx:
+            target_runner.graph_runner = runner
+            try:
+                yield use_plan_stream
+            finally:
+                target_runner.graph_runner = saved_graph_runner
 
     def _target_verify_graph_runner_bs(self, can_run_cuda_graph: bool):
         if not can_run_cuda_graph:
@@ -335,8 +331,9 @@ class DecodeVerifyRollbackEagleWorkerV2(
         bs = len(batch.seq_lens)
 
         disable_verify_graph = dvr_has_graph_unsafe_short_prompt(batch)
-        with self._target_verify_prepare_context(
-            disable_cuda_graph=disable_verify_graph
+        with self._target_verify_context(
+            disable_cuda_graph=disable_verify_graph,
+            prepare=True,
         ) as prepared_on_plan_stream:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
@@ -380,7 +377,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
             seq_lens_cpu=base_seq_lens_cpu,
         )
 
-        with self._target_verify_graph_runner_context(
+        with self._target_verify_context(
             disable_cuda_graph=disable_verify_graph
         ):
             forward_batch_output = self.target_worker.forward_batch_generation(
