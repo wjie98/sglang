@@ -228,26 +228,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
 
         return draft_input.bonus_tokens
 
-    def _use_dummy_draft_hidden_states(self, draft_input: EagleDraftInput):
-        """Normalize DVR draft input hidden states to the zero-width placeholder."""
-
-        if (
-            draft_input.hidden_states is not None
-            and draft_input.hidden_states.shape[-1] == 0
-        ):
-            return
-        if draft_input.hidden_states is not None:
-            num_tokens = draft_input.hidden_states.shape[0]
-            device = draft_input.hidden_states.device
-        elif self._draft_anchor_tokens(draft_input) is not None:
-            anchor_tokens = self._draft_anchor_tokens(draft_input)
-            num_tokens = anchor_tokens.shape[0]
-            device = anchor_tokens.device
-        else:
-            num_tokens = 0
-            device = self.device
-        draft_input.hidden_states = self._dummy_hidden_states(num_tokens, device=device)
-
     def __getattr__(self, name):
         return getattr(self.target_worker, name)
 

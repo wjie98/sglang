@@ -573,43 +573,6 @@ class DVRLinearStateLifecycle:
         self.suffix_replay_boundary_track_mask = None if mask is None else mask.detach()
 
     @staticmethod
-    def suffix_replay_boundary_track_info(
-        boundary_lens, extend_lens_cpu, *, device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the extra-buffer tracking request for suffix EXTEND replay.
-
-        DVR only needs the next chunk-boundary checkpoint.  When the replayed
-        suffix extends past that boundary, the aligned boundary is not the final
-        EXTEND position; pass ``boundary + chunk + 1`` so the hybrid backend
-        retrieves the checkpoint from its chunk-intermediate ``h`` buffer rather
-        than from the final recurrent state.
-        """
-
-        track_mask = []
-        track_seqlens = []
-        for boundary, extend_len in zip(boundary_lens, extend_lens_cpu, strict=True):
-            boundary = int(boundary)
-            extend_len = int(extend_len)
-            should_track = extend_len >= FLA_CHUNK_SIZE
-            track_mask.append(should_track)
-            if not should_track:
-                track_seqlens.append(boundary)
-            elif extend_len == FLA_CHUNK_SIZE:
-                track_seqlens.append(boundary + FLA_CHUNK_SIZE)
-            else:
-                # Magic but intentional: the hybrid backend treats aligned
-                # track lengths as "copy final recurrent state".  A suffix
-                # replay longer than one chunk has a final state past the next
-                # DVR boundary, so make the requested length unaligned to force
-                # the backend to copy that boundary from its intermediate h.
-                track_seqlens.append(boundary + FLA_CHUNK_SIZE + 1)
-
-        return (
-            torch.tensor(track_mask, dtype=torch.bool, device=device),
-            torch.tensor(track_seqlens, dtype=torch.long, device=device),
-        )
-
-    @staticmethod
     def _select_recurrent_backup(
         backup: DVRRecurrentStateBackup, indices: torch.Tensor
     ) -> DVRRecurrentStateBackup:
