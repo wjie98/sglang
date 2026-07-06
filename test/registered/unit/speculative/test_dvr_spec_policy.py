@@ -21,7 +21,7 @@ from sglang.srt.speculative.draft_decode_context import draft_decode_performance
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_logprob_repair import (
     _final_output_len_if_repair_needed,
-    _should_reuse_live_cache_locs_after_alloc_failure,
+    _try_live_cache_locs_for_final_replay,
 )
 from sglang.srt.arg_groups.speculative_hook import (
     speculative_uses_draft_decode_custom_all_reduce,
@@ -615,15 +615,19 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
     )
 
 
-def test_dvr_final_logprob_replay_reuses_live_slots_only_after_allocator_oom():
-    allocator_oom = RuntimeError(
-        "Prefill out of memory. Try to lower your batch size.\n"
-        "Try to allocate 725 tokens."
+def test_dvr_final_logprob_replay_reuses_only_complete_live_mapping():
+    req = SimpleNamespace(req_pool_idx=0)
+    batch = SimpleNamespace(
+        reqs=[req],
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.tensor([[3, 4, 5, 6]], dtype=torch.int32)
+        ),
     )
-    assert not _should_reuse_live_cache_locs_after_alloc_failure(
-        RuntimeError("CUDA out of memory")
-    )
-    assert _should_reuse_live_cache_locs_after_alloc_failure(allocator_oom)
+
+    assert _try_live_cache_locs_for_final_replay(batch, 3).tolist() == [3, 4, 5]
+
+    batch.req_to_token_pool.req_to_token[0, 1] = 0
+    assert _try_live_cache_locs_for_final_replay(batch, 3) is None
 
 
 def test_dvr_eagle_compacts_accepted_output_rows():

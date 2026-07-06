@@ -494,17 +494,10 @@ def _temporary_final_replay_cache_mapping(
     extend_len: int,
 ):
     allocated_cache_locs = None
-    try:
+    temp_cache_locs = _try_live_cache_locs_for_final_replay(batch, extend_len)
+    if temp_cache_locs is None:
         temp_cache_locs = _alloc_final_replay_cache_locs(batch, extend_len)
         allocated_cache_locs = temp_cache_locs
-    except RuntimeError as exc:
-        if not _should_reuse_live_cache_locs_after_alloc_failure(exc):
-            raise
-        # This replay is a final-response scoring oracle and every row belongs
-        # to a request that will finish in this verify step.  Reuse the live KV
-        # slots instead of requiring a second full-prefix copy; this keeps exact
-        # logprob repair viable under tight 80B token budgets.
-        temp_cache_locs = _live_cache_locs_for_final_replay(batch, extend_len)
     write_rows, write_offsets = _final_replay_req_to_token_indices(batch, extend_len)
     saved_locs = batch.req_to_token_pool.req_to_token[
         write_rows, write_offsets
@@ -523,28 +516,20 @@ def _temporary_final_replay_cache_mapping(
             batch.token_to_kv_pool_allocator.free(allocated_cache_locs)
 
 
-def _should_reuse_live_cache_locs_after_alloc_failure(exc: RuntimeError) -> bool:
-    """Return whether final scoring may fall back to live request KV slots."""
-
-    message = str(exc).lower()
-    return "out of memory" in message and "try to allocate" in message
-
-
-def _live_cache_locs_for_final_replay(
+def _try_live_cache_locs_for_final_replay(
     batch: ScheduleBatch,
     extend_len: int,
-) -> torch.Tensor:
-    """Return the existing per-request KV slots for final full-prefix replay."""
+) -> Optional[torch.Tensor]:
+    """Return existing final-response KV slots when the full prefix is mapped."""
 
     req = batch.reqs[0]
     cache_locs = batch.req_to_token_pool.req_to_token[
         req.req_pool_idx, : int(extend_len)
     ].to(torch.long)
+    if cache_locs.numel() != int(extend_len):
+        return None
     if torch.any(cache_locs <= 0):
-        raise RuntimeError(
-            "DVR final logprob repair cannot reuse live KV slots because the "
-            "request mapping does not cover the full replay prefix."
-        )
+        return None
     return cache_locs
 
 
