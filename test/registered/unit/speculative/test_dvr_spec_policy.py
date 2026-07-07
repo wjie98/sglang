@@ -497,7 +497,6 @@ def test_dvr_eagle_replay_prefix_splits_verifier_and_output_streams():
     output_prefix.append_batch_output_tokens(
         batch,
         [[748]],
-        initialize_from_req_output=True,
     )
     assert output_prefix.request_output_prefix_token_ids(
         req,
@@ -511,15 +510,13 @@ def test_dvr_eagle_replay_prefix_splits_verifier_and_output_streams():
             error_prefix="DVR EAGLE verifier replay prefix",
         )
 
-    verifier_prefix.append_batch_output_tokens(
+    verifier_prefix.append_batch_verifier_tokens(
         batch,
         [[900, 901]],
-        initialize_from_req_output=False,
     )
     output_prefix.append_batch_output_tokens(
         batch,
         [[749, 750]],
-        initialize_from_req_output=True,
     )
     req.output_ids = [748]
 
@@ -553,7 +550,6 @@ def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
     prefix.append_batch_output_tokens(
         batch,
         [[202, 203]],
-        initialize_from_req_output=True,
     )
 
     assert prefix.request_output_prefix_token_ids(

@@ -247,7 +247,6 @@ class DecodeVerifyRollbackEagleWorkerV2(
                     self.dvr_client_output_replay_prefix.append_batch_output_tokens(
                         batch,
                         [[token_id] for token_id in next_token_ids_cpu],
-                        initialize_from_req_output=True,
                     )
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)

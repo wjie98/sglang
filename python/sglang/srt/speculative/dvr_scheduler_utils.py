@@ -194,48 +194,57 @@ def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None
 
 
 class DVRReplayPrefixTracker:
-    """Per-worker replay prefix stream for spec-v2 overlap DVR.
+    """Per-worker replay prefix stream for DVR overlap paths.
 
     Spec-v2 can start the next DVR replay before the scheduler has materialized
-    the just-verified tokens into ``Req.output_ids``.  Self-DVR and DVR-EAGLE
-    advance that logical prefix from different token sources, but both need the
-    same request-id keyed stream and fallback reconstruction rules.
+    the just-verified tokens into ``Req.output_ids``.  Each tracker instance
+    owns exactly one logical stream: either verifier tokens or client-visible
+    output tokens.  Public methods name that stream explicitly so callers do not
+    pass semantic booleans at DVR worker call sites.
     """
 
     def __init__(self) -> None:
-        self._output_ids_by_rid: dict[Any, list[int]] = {}
+        self._tokens_by_rid: dict[Any, list[int]] = {}
 
     def clear(self) -> None:
-        self._output_ids_by_rid.clear()
+        self._tokens_by_rid.clear()
 
     def prune_to_batch(self, batch: Any) -> None:
         if batch.reqs is None:
-            self._output_ids_by_rid.clear()
+            self._tokens_by_rid.clear()
             return
 
         active_rids = {req.rid for req in batch.reqs}
-        for rid in list(self._output_ids_by_rid):
+        for rid in list(self._tokens_by_rid):
             if rid not in active_rids:
-                self._output_ids_by_rid.pop(rid, None)
+                self._tokens_by_rid.pop(rid, None)
 
-    def stream_for_req(
+    def _stream_for_req(
         self,
         req: Any,
         *,
-        initialize_from_req_output: bool,
+        seed_from_req_output: bool,
     ) -> list[int]:
-        initial_output_ids = list(req.output_ids) if initialize_from_req_output else []
-        stream = self._output_ids_by_rid.setdefault(req.rid, initial_output_ids)
-        if initialize_from_req_output and len(stream) < len(req.output_ids):
+        initial_output_ids = list(req.output_ids) if seed_from_req_output else []
+        stream = self._tokens_by_rid.setdefault(req.rid, initial_output_ids)
+        if seed_from_req_output and len(stream) < len(req.output_ids):
             stream[:] = list(req.output_ids)
         return stream
+
+    def observed_output_len(self, req: Any) -> int:
+        """Return the best known client-visible output length for final repair."""
+
+        return max(
+            len(req.output_ids),
+            len(self._stream_for_req(req, seed_from_req_output=True)),
+        )
 
     def _prefix_token_ids(
         self,
         req: Any,
         seq_len: int,
         *,
-        initialize_from_req_output: bool,
+        seed_from_req_output: bool,
         include_full_untruncated_fill_ids: bool = False,
         error_prefix: Optional[str] = None,
     ) -> Optional[list[int]]:
@@ -246,9 +255,7 @@ class DVRReplayPrefixTracker:
         if output_len <= 0:
             return origin_input_ids[:seq_len]
 
-        stream = self.stream_for_req(
-            req, initialize_from_req_output=initialize_from_req_output
-        )
+        stream = self._stream_for_req(req, seed_from_req_output=seed_from_req_output)
         if len(stream) >= output_len:
             return origin_input_ids + stream[:output_len]
 
@@ -295,7 +302,7 @@ class DVRReplayPrefixTracker:
         return self._prefix_token_ids(
             req,
             seq_len,
-            initialize_from_req_output=False,
+            seed_from_req_output=False,
             include_full_untruncated_fill_ids=True,
             error_prefix=error_prefix,
         )
@@ -318,7 +325,7 @@ class DVRReplayPrefixTracker:
         return self._prefix_token_ids(
             req,
             seq_len,
-            initialize_from_req_output=True,
+            seed_from_req_output=True,
             include_full_untruncated_fill_ids=True,
             error_prefix=error_prefix,
         )
@@ -333,38 +340,41 @@ class DVRReplayPrefixTracker:
         return self._prefix_token_ids(
             req,
             seq_len,
-            initialize_from_req_output=True,
+            seed_from_req_output=True,
             include_full_untruncated_fill_ids=True,
         )
 
-    def _append_output_tokens(
+    def _append_tokens(
         self,
         req: Any,
         token_ids,
         *,
-        initialize_from_req_output: bool,
+        seed_from_req_output: bool,
     ) -> None:
-        stream = self.stream_for_req(
-            req, initialize_from_req_output=initialize_from_req_output
-        )
+        stream = self._stream_for_req(req, seed_from_req_output=seed_from_req_output)
         stream.extend(int(token_id) for token_id in token_ids)
 
     def append_batch_output_tokens(
         self,
         batch: Any,
         tokens_per_req,
-        *,
-        initialize_from_req_output: bool,
     ) -> None:
-        """Advance all active replay streams from committed output-token rows."""
+        """Advance the client-visible output stream for all active requests."""
 
         self.prune_to_batch(batch)
         for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
-            self._append_output_tokens(
-                req,
-                token_ids,
-                initialize_from_req_output=initialize_from_req_output,
-            )
+            self._append_tokens(req, token_ids, seed_from_req_output=True)
+
+    def append_batch_verifier_tokens(
+        self,
+        batch: Any,
+        tokens_per_req,
+    ) -> None:
+        """Advance the verifier-prefix stream for all active requests."""
+
+        self.prune_to_batch(batch)
+        for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
+            self._append_tokens(req, token_ids, seed_from_req_output=False)
 
     def advance_output_stream_from_compact_rows(
         self,
@@ -393,10 +403,7 @@ class DVRReplayPrefixTracker:
             strict=True,
         ):
             prompt_len = len(req.origin_input_ids)
-            stream = self.stream_for_req(
-                req,
-                initialize_from_req_output=True,
-            )
+            stream = self._stream_for_req(req, seed_from_req_output=True)
             # In spec-v2 overlap, model-side seq_len can lag the
             # client-visible output stream by one result. Do not truncate a
             # prefix already learned from Req.output_ids/tracker state.
@@ -460,10 +467,10 @@ class DVRReplayPrefixTracker:
                 error_prefix=error_prefix,
             )
 
-            self._append_output_tokens(
+            self._append_tokens(
                 req,
                 [int(token_id) for token_id in draft_tokens[: int(accepted_len)]],
-                initialize_from_req_output=False,
+                seed_from_req_output=False,
             )
 
     def _align_req_to_output_len(
@@ -473,7 +480,7 @@ class DVRReplayPrefixTracker:
         *,
         error_prefix: str,
     ) -> None:
-        stream = self.stream_for_req(req, initialize_from_req_output=False)
+        stream = self._stream_for_req(req, seed_from_req_output=False)
         if len(stream) > output_len:
             del stream[output_len:]
             return

@@ -87,8 +87,7 @@ def score_dvr_final_logprob_repairs(
     for req_i, (req, seq_len, accept_len) in enumerate(
         zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
     ):
-        stream = replay_prefix.stream_for_req(req, initialize_from_req_output=True)
-        observed_output_len = max(len(req.output_ids), len(stream))
+        observed_output_len = replay_prefix.observed_output_len(req)
         final_output_len = _final_output_len_if_repair_needed(
             req=req,
             req_i=req_i,

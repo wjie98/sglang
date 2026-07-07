@@ -66,7 +66,7 @@ class DecodeVerifyRollbackWorkerV2(
         self.speculative_num_steps = self.num_draft_steps
         self.speculative_num_draft_tokens = self.num_draft_tokens
         self.draft_runner = self.model_runner
-        self.dvr_replay_prefix = DVRReplayPrefixTracker()
+        self.dvr_output_replay_prefix = DVRReplayPrefixTracker()
 
     @property
     def draft_worker(self):
@@ -79,7 +79,7 @@ class DecodeVerifyRollbackWorkerV2(
 
     def clear_cache_pool(self):
         super().clear_cache_pool()
-        self.dvr_replay_prefix.clear()
+        self.dvr_output_replay_prefix.clear()
 
     def _draft_cache_locs_from_req_to_token(
         self, batch: ScheduleBatch
@@ -88,7 +88,7 @@ class DecodeVerifyRollbackWorkerV2(
         return self.req_to_token_pool.req_to_token[rows, offsets].reshape(-1)
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
-        return self.dvr_replay_prefix.request_output_prefix_token_ids(
+        return self.dvr_output_replay_prefix.request_output_prefix_token_ids(
             req,
             boundary_seqlen,
             error_prefix="DVR spec-v2",
@@ -98,10 +98,9 @@ class DecodeVerifyRollbackWorkerV2(
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
-        self.dvr_replay_prefix.append_batch_output_tokens(
+        self.dvr_output_replay_prefix.append_batch_output_tokens(
             batch,
             tokens_per_req,
-            initialize_from_req_output=True,
         )
 
     def forward_batch_generation(
@@ -267,7 +266,7 @@ class DecodeVerifyRollbackWorkerV2(
                 final_logprob_repairs = score_dvr_final_logprob_repairs(
                     batch=batch,
                     target_worker=self.target_worker,
-                    replay_prefix=self.dvr_replay_prefix,
+                    replay_prefix=self.dvr_output_replay_prefix,
                     linear_state_ctx=linear_state_ctx,
                     base_seq_lens_cpu=base_seq_lens_cpu,
                     accept_lens_cpu=accept_lens_cpu,
