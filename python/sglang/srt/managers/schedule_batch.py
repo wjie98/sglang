@@ -1063,13 +1063,24 @@ class Req(ReqDllmMixin):
         self,
         num_correct_drafts: int,
         num_proposed_drafts: Optional[int] = None,
+        proposed_per_verify: Optional[int] = None,
     ):
         """Record one speculative verify step.
 
-        `num_proposed_drafts` is optional for legacy paths; when it is provided
-        it should count only drafts that could affect the visible output.
+        Proposal counts are optional for legacy paths.  Newer paths should pass
+        either an already-budgeted count or the full verify-window proposal
+        count so the final partial window does not lower acceptance metrics.
         """
+        if num_proposed_drafts is None and proposed_per_verify is not None:
+            num_proposed_drafts = self.useful_spec_proposed_drafts(
+                proposed_per_verify
+            )
         num_correct_drafts = max(0, int(num_correct_drafts))
+        if num_proposed_drafts is not None:
+            num_correct_drafts = min(
+                num_correct_drafts,
+                max(0, int(num_proposed_drafts)),
+            )
         self.spec_verify_ct += 1
         self.spec_num_correct_drafts += num_correct_drafts
         if num_proposed_drafts is not None:

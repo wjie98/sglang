@@ -424,9 +424,7 @@ class DFlashVerifyInput(SpecInput):
             new_bonus_tokens_list.append(new_bonus_token)
             num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
             req.record_spec_verify_metrics(
-                num_correct_drafts=min(
-                    num_correct_drafts_per_req_cpu[-1], num_proposed_drafts
-                ),
+                num_correct_drafts=num_correct_drafts_per_req_cpu[-1],
                 num_proposed_drafts=num_proposed_drafts,
             )
 

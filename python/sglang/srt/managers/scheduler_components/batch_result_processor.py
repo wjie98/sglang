@@ -590,10 +590,9 @@ class SchedulerBatchResultProcessor:
             req.kv_committed_len += accept_lens[i] - 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-            num_proposed_drafts = req.useful_spec_proposed_drafts(proposed_per_verify)
             req.record_spec_verify_metrics(
-                num_correct_drafts=min(num_correct_drafts, num_proposed_drafts),
-                num_proposed_drafts=num_proposed_drafts,
+                num_correct_drafts=num_correct_drafts,
+                proposed_per_verify=proposed_per_verify,
             )
 
         return predict_tokens
