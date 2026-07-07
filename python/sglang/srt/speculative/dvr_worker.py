@@ -724,40 +724,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
     # to EAGLE's postprocess contract so scheduler/radix-cache ownership remains
     # compatible with normal speculative decoding.
 
-    def _accepted_token_counts_and_steps(
-        self,
-        verify_output: EagleVerifyOutput,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
-        accepted_token_counts_cpu = [
-            x + 1 for x in verify_output.num_correct_drafts_per_req_cpu
-        ]
-        accepted_token_counts = torch.tensor(
-            accepted_token_counts_cpu,
-            dtype=torch.long,
-            device=device,
-        )
-        if accepted_token_counts.numel() == 0:
-            return accepted_token_counts, accepted_token_counts, accepted_token_counts_cpu
-
-        # DVR enforces topk=1 chain verify, so the accepted draft step is just
-        # the last accepted token's offset in each fixed verify window.
-        accepted_steps = accepted_token_counts - 1
-        return accepted_token_counts, accepted_steps, accepted_token_counts_cpu
-
-    def _select_accepted_verify_outputs(
-        self,
-        logits_output: LogitsProcessorOutput,
-        verify_output: EagleVerifyOutput,
-    ):
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            verify_output.accept_indices
-        ]
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[
-                verify_output.accept_indices
-            ]
-
     def _next_self_draft_input_from_bonus_tokens(
         self, bonus_tokens: torch.Tensor
     ) -> EagleDraftInput:
@@ -1103,7 +1069,13 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             vocab_mask=None,
         )
 
-        self._select_accepted_verify_outputs(logits_output, verify_output)
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            verify_output.accept_indices
+        ]
+        if logits_output.hidden_states is not None:
+            logits_output.hidden_states = logits_output.hidden_states[
+                verify_output.accept_indices
+            ]
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
             accept_lens_cpu = [
@@ -1123,13 +1095,17 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 ),
             )
         if linear_state_ctx is not None:
-            (
-                accepted_token_counts,
-                accepted_steps,
+            accepted_token_counts_cpu = [
+                x + 1 for x in verify_output.num_correct_drafts_per_req_cpu
+            ]
+            accepted_token_counts = torch.tensor(
                 accepted_token_counts_cpu,
-            ) = self._accepted_token_counts_and_steps(
-                verify_output, linear_state_ctx.live_indices.device
+                dtype=torch.long,
+                device=linear_state_ctx.live_indices.device,
             )
+            # DVR enforces topk=1 chain verify, so the accepted draft step is
+            # the last accepted token's offset in each fixed verify window.
+            accepted_steps = accepted_token_counts - 1
             is_self_dvr = isinstance(spec_info, DVRSelfDraftVerifyInput)
             # return_logprob must not change the self-draft state lifecycle.
             # Exact logprobs are repaired separately; using accepted-suffix
