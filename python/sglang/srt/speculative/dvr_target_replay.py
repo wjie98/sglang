@@ -359,7 +359,6 @@ def build_suffix_target_replay_batch(
             final_seq_lens=replay_plan.final_seq_lens_cpu,
             return_logprob=return_logprob,
             extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-            multimodal_inputs=[req.multimodal_inputs for req in batch.reqs],
             capture_hidden_mode=capture_hidden_mode,
             is_prefill_only=batch.is_prefill_only,
             mamba_cow_src_indices=mamba_cow_src_indices,
@@ -534,7 +533,6 @@ def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleB
             extend_lens=plan.extend_lens,
             final_seq_lens=plan.final_seq_lens,
             extend_logprob_start_lens=plan.prefix_lens,
-            multimodal_inputs=[req.multimodal_inputs for req in plan.reqs],
             is_extend_in_batch=False,
             all_extend_in_batch=False,
             is_prefill_only=True,
@@ -581,6 +579,11 @@ def build_private_extend_batch(
         if spec.extend_logprob_start_lens is None
         else spec.extend_logprob_start_lens
     )
+    multimodal_inputs = (
+        [req.multimodal_inputs for req in spec.reqs]
+        if spec.multimodal_inputs is None
+        else spec.multimodal_inputs
+    )
 
     replay_batch = ScheduleBatch(
         reqs=spec.reqs,
@@ -622,7 +625,7 @@ def build_private_extend_batch(
                 device=device,
             )
         ),
-        multimodal_inputs=spec.multimodal_inputs,
+        multimodal_inputs=multimodal_inputs,
         encoder_cached=None,
         encoder_lens=None,
         encoder_lens_cpu=None,
