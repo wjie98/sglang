@@ -98,58 +98,6 @@ def compact_output_token_rows(
     ]
 
 
-def should_resolve_dvr_spec_v2_seq_lens_before_filter(
-    *,
-    batch: Any,
-    enable_overlap: bool,
-) -> bool:
-    """Return whether overlap must publish seq_lens before filtering.
-
-    This is a DVR-only ownership rule: target verify mutates GDN state, so a row
-    that already reached the generation cap must not enter another draft/verify
-    round while result processing is still pending.
-    """
-
-    return (
-        enable_overlap
-        and batch.is_spec_v2
-        and get_spec_algorithm_policy(batch.spec_algorithm).is_dvr()
-    )
-
-
-def is_dvr_spec_v2_finished_by_published_seq_len(
-    batch: Any,
-    req_index: int,
-) -> bool:
-    """Return True for DVR overlap rows finished before Req is materialized."""
-
-    if not (
-        batch.is_spec_v2
-        and get_spec_algorithm_policy(batch.spec_algorithm).is_dvr()
-    ):
-        return False
-
-    req = batch.reqs[req_index]
-    max_new_tokens = req.sampling_params.max_new_tokens
-    if max_new_tokens is None:
-        return False
-    max_new_tokens = int(max_new_tokens)
-    if max_new_tokens <= 0:
-        return False
-
-    if batch.seq_lens_cpu is not None:
-        seq_len = int(batch.seq_lens_cpu[req_index].item())
-    elif batch.seq_lens is not None:
-        seq_len = int(batch.seq_lens[req_index].item())
-    else:
-        return False
-
-    # Decode seq_lens includes KV-visible generated tokens; the newest sampled
-    # bonus token is materialized into Req.output_ids one result-processing step
-    # later, hence the final visible token corresponds to max_new_tokens - 1.
-    return seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
-
-
 def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
     """Apply DVR exact final logprob repairs after Spec-v2 output materializes."""
 

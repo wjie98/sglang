@@ -100,6 +100,48 @@ def test_dvr_mamba_radix_snapshot_policy():
     assert not _policy(SpeculativeAlgorithm.NONE).needs_mamba_radix_snapshot_for_spec_v2()
 
 
+def test_dvr_published_seq_len_filter_policy():
+    dvr_policy = _policy(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK)
+    eagle_policy = _policy(SpeculativeAlgorithm.EAGLE)
+    req = SimpleNamespace(
+        origin_input_ids=[1, 2, 3],
+        sampling_params=SimpleNamespace(max_new_tokens=4),
+    )
+    batch = SimpleNamespace(
+        is_spec_v2=True,
+        seq_lens_cpu=torch.tensor([6]),
+        seq_lens=None,
+        reqs=[req],
+    )
+
+    assert dvr_policy.requires_seq_lens_cpu_before_filter(
+        batch=batch,
+        enable_overlap=True,
+    )
+    assert not dvr_policy.requires_seq_lens_cpu_before_filter(
+        batch=batch,
+        enable_overlap=False,
+    )
+    assert not eagle_policy.requires_seq_lens_cpu_before_filter(
+        batch=batch,
+        enable_overlap=True,
+    )
+
+    assert dvr_policy.is_finished_by_published_seq_len(
+        batch=batch,
+        req_index=0,
+    )
+    batch.seq_lens_cpu = torch.tensor([5])
+    assert not dvr_policy.is_finished_by_published_seq_len(
+        batch=batch,
+        req_index=0,
+    )
+    assert not eagle_policy.is_finished_by_published_seq_len(
+        batch=batch,
+        req_index=0,
+    )
+
+
 def test_mamba_radix_request_policy_helpers():
     req = SimpleNamespace()
 

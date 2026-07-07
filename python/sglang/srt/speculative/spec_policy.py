@@ -184,6 +184,53 @@ class SpecAlgorithmPolicy:
     def needs_mamba_radix_snapshot_for_spec_v2(self) -> bool:
         return self.is_dvr()
 
+    def requires_seq_lens_cpu_before_filter(
+        self,
+        *,
+        batch: Any,
+        enable_overlap: bool,
+    ) -> bool:
+        """Return whether filter_batch must publish seq_lens first.
+
+        DVR overlap can finish a row before accepted tokens are materialized
+        into Req.output_ids.  Keep this scheduling rule on the spec policy so
+        ScheduleBatch does not import DVR internals.
+        """
+
+        return enable_overlap and batch.is_spec_v2 and self.is_dvr()
+
+    def is_finished_by_published_seq_len(
+        self,
+        *,
+        batch: Any,
+        req_index: int,
+    ) -> bool:
+        """Return whether a row is logically finished from published seq_len."""
+
+        if not (batch.is_spec_v2 and self.is_dvr()):
+            return False
+
+        req = batch.reqs[req_index]
+        max_new_tokens = req.sampling_params.max_new_tokens
+        if max_new_tokens is None:
+            return False
+        max_new_tokens = int(max_new_tokens)
+        if max_new_tokens <= 0:
+            return False
+
+        if batch.seq_lens_cpu is not None:
+            seq_len = int(batch.seq_lens_cpu[req_index].item())
+        elif batch.seq_lens is not None:
+            seq_len = int(batch.seq_lens[req_index].item())
+        else:
+            return False
+
+        # Decode seq_lens includes KV-visible generated tokens; the newest
+        # sampled bonus token is materialized into Req.output_ids one
+        # result-processing step later, hence the final visible token
+        # corresponds to max_new_tokens - 1.
+        return seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
+
     def linear_speculative_state_extension_factory(self, model_runner: Any):
         if not self.is_dvr():
             return None

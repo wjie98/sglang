@@ -2540,11 +2540,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         before Req.output_ids is materialized.
         """
 
-        from sglang.srt.speculative.dvr_scheduler_utils import (
-            should_resolve_dvr_spec_v2_seq_lens_before_filter,
-        )
-
-        return should_resolve_dvr_spec_v2_seq_lens_before_filter(
+        return get_spec_algorithm_policy(
+            self.spec_algorithm
+        ).requires_seq_lens_cpu_before_filter(
             batch=self,
             enable_overlap=enable_overlap,
         )
@@ -2693,9 +2691,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
 
-            from sglang.srt.speculative.dvr_scheduler_utils import (
-                is_dvr_spec_v2_finished_by_published_seq_len,
-            )
+            spec_policy = get_spec_algorithm_policy(self.spec_algorithm)
 
             keep_indices = []
             for i in range(len(self.reqs)):
@@ -2703,7 +2699,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     continue
                 if self.reqs[i].finished():
                     continue
-                if is_dvr_spec_v2_finished_by_published_seq_len(self, i):
+                if spec_policy.is_finished_by_published_seq_len(
+                    batch=self,
+                    req_index=i,
+                ):
                     continue
                 keep_indices.append(i)
 
