@@ -313,7 +313,7 @@ class DVRGatedStateAdapter:
             conv[:, indices] = 0
         state_cache.temporal[:, indices] = 0
 
-    def _backup_recurrent_state(
+    def backup_recurrent_state(
         self, *, state_cache, indices: torch.Tensor
     ) -> DVRRecurrentStateBackup:
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
@@ -323,7 +323,7 @@ class DVRGatedStateAdapter:
             indices=indices.clone(),
         )
 
-    def _restore_recurrent_state(
+    def restore_recurrent_state(
         self,
         *,
         state_cache,
@@ -338,24 +338,6 @@ class DVRGatedStateAdapter:
             state_cache.temporal.dtype, copy=False
         )
 
-    def backup_recurrent_state(
-        self, *, state_cache, indices: torch.Tensor
-    ) -> DVRRecurrentStateBackup:
-        return self._backup_recurrent_state(state_cache=state_cache, indices=indices)
-
-    def restore_recurrent_state(
-        self,
-        *,
-        state_cache,
-        backup: DVRRecurrentStateBackup,
-        indices: Optional[torch.Tensor] = None,
-    ):
-        self._restore_recurrent_state(
-            state_cache=state_cache,
-            backup=backup,
-            indices=indices,
-        )
-
     def backup_verify_recurrent_states(
         self,
         *,
@@ -364,10 +346,10 @@ class DVRGatedStateAdapter:
         live_indices: torch.Tensor,
     ) -> Tuple[DVRRecurrentStateBackup, DVRRecurrentStateBackup]:
         return (
-            self._backup_recurrent_state(
+            self.backup_recurrent_state(
                 state_cache=state_cache, indices=boundary_indices
             ),
-            self._backup_recurrent_state(state_cache=state_cache, indices=live_indices),
+            self.backup_recurrent_state(state_cache=state_cache, indices=live_indices),
         )
 
     def prepare_recurrent_state_for_verify(
@@ -388,7 +370,7 @@ class DVRGatedStateAdapter:
         # Draft decode mutates the live recurrent slot. DVR target verify needs
         # the chunk-boundary SSM state for chunkwise scan, but the draft-start
         # conv state for producing the draft suffix inputs.
-        self._restore_recurrent_state(
+        self.restore_recurrent_state(
             state_cache=state_cache,
             backup=boundary_backup,
             indices=boundary_indices,
@@ -400,36 +382,16 @@ class DVRGatedStateAdapter:
             for conv, saved_conv in zip(state_cache.conv, live_backup.conv, strict=True):
                 conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)
 
-    def make_forward_context(
-        self,
-        *,
-        layer,
-        forward_batch,
-        state_cache,
-        cache_indices: torch.Tensor,
-        query_start_loc: Optional[torch.Tensor],
-        conv_states: torch.Tensor,
-        ssm_states: torch.Tensor,
-        seq_len: int,
-    ) -> DVRGatedForwardContext:
-        return DVRGatedForwardContext(
-            layer=layer,
-            forward_batch=forward_batch,
-            state_cache=state_cache,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            conv_states=conv_states,
-            ssm_states=ssm_states,
-            seq_len=seq_len,
-            is_target_verify=forward_batch.forward_mode.is_target_verify(),
-        )
-
-    def cache_extend_tail_from_state_inputs(
+    def cache_gdn_extend_tail(
         self,
         *,
         forward_batch,
         state_cache,
-        state_inputs: DVRStateInputs,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
     ):
         if self.is_draft_worker:
             # DVR state-input windows are target-model prefill oracles.  EAGLE
@@ -445,41 +407,22 @@ class DVRGatedStateAdapter:
         ):
             return
 
-        input_tensors = state_inputs.tensors()
-        assert input_tensors
-        state_input_indices = forward_batch.req_pool_indices.to(
-            device=input_tensors[0].device, dtype=torch.long
+        state_inputs = DVRGDNStateInputs.from_extend_forward(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
         )
-        state_input_indices = state_input_indices + 1
+        state_input_indices = forward_batch.req_pool_indices.to(
+            device=state_inputs.q.device, dtype=torch.long
+        )
         state_inputs.write_extend_tail(
             state_window,
-            indices=state_input_indices,
+            indices=state_input_indices + 1,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             chunk_size=self.chunk_size,
-        )
-
-    def cache_gdn_extend_tail(
-        self,
-        *,
-        forward_batch,
-        state_cache,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-    ):
-        self.cache_extend_tail_from_state_inputs(
-            forward_batch=forward_batch,
-            state_cache=state_cache,
-            state_inputs=DVRGDNStateInputs.from_extend_forward(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-            ),
         )
 
     def forward_gdn_target_verify(
@@ -496,7 +439,7 @@ class DVRGatedStateAdapter:
     ) -> torch.Tensor:
         """Run GDN target verify using DVR's prefill-equivalent state replay."""
 
-        context = self.make_forward_context(
+        context = DVRGatedForwardContext(
             layer=layer,
             forward_batch=forward_batch,
             state_cache=state_cache,
@@ -505,6 +448,7 @@ class DVRGatedStateAdapter:
             conv_states=state_cache.conv[0],
             ssm_states=state_cache.temporal,
             seq_len=mixed_qkv.shape[0],
+            is_target_verify=forward_batch.forward_mode.is_target_verify(),
         )
         mixed_qkv = self.process_target_verify_conv(
             context=context,
