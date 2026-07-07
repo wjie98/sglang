@@ -215,14 +215,6 @@ def _final_replay_ids_for_req(
     verify tail tokens should be present.
     """
 
-    if replay_seq_len <= base_seq_len:
-        token_ids = replay_prefix.request_output_prefix_token_ids(
-            req,
-            replay_seq_len,
-            error_prefix=error_prefix,
-        )
-        return token_ids[:replay_seq_len]
-
     token_ids = replay_prefix.try_request_output_prefix_token_ids(
         req,
         replay_seq_len,
