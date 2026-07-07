@@ -174,7 +174,7 @@ class SpecAlgorithmPolicy:
         requires_gathered_buffer: bool,
     ) -> bool:
         return (
-            self.is_eagle()
+            self.is_dvr_eagle()
             and is_v2
             and topk == 1
             and not requires_gathered_buffer
