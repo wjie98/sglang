@@ -601,6 +601,12 @@ class DVRGatedStateAdapter:
         )
         tail_lens_after = tail_lens_before + accepted_token_counts
         crosses_chunk_boundary = tail_lens_after >= self.chunk_size
+        no_commit_step = torch.full_like(tail_lens_before, -1)
+        req_indices = torch.arange(
+            live_indices.shape[0],
+            dtype=torch.long,
+            device=live_indices.device,
+        )
         if use_fast_self_draft_commit:
             # Self-DVR uses the target model as its own draft model, so the
             # target-verify intermediate state is already the v5 hot-path state
@@ -617,7 +623,6 @@ class DVRGatedStateAdapter:
             boundary_state_step = (
                 0 if state_cache.intermediate_ssm.shape[2] == 1 else self.chunk_size - 1
             )
-            no_commit_step = torch.full_like(tail_lens_before, -1)
             commit_step = torch.where(
                 crosses_chunk_boundary,
                 torch.full_like(tail_lens_before, boundary_state_step),
@@ -656,11 +661,7 @@ class DVRGatedStateAdapter:
                 state_input_indices=state_input_indices,
                 live_indices=live_indices,
                 boundary_indices=boundary_indices,
-                req_indices=torch.arange(
-                    live_indices.shape[0],
-                    dtype=torch.long,
-                    device=live_indices.device,
-                ),
+                req_indices=req_indices,
                 token_count=tail_lens_after,
             )
 
@@ -697,7 +698,6 @@ class DVRGatedStateAdapter:
                 accepted_steps[live_conv_req_indices],
             )
 
-        no_commit_step = torch.full_like(tail_lens_before, -1)
         crossing_req_indices = torch.nonzero(boundary_needs_rebuild).flatten()
         if crossing_req_indices.numel() > 0:
             # Build the chunk checkpoint from DVR's prefill-equivalent
@@ -747,11 +747,6 @@ class DVRGatedStateAdapter:
         state_window.zero_after_lens(
             indices=state_input_indices,
             keep_lens=tail_lens_after,
-        )
-        req_indices = torch.arange(
-            live_indices.shape[0],
-            dtype=torch.long,
-            device=live_indices.device,
         )
         draft_token_num = state_cache.intermediate_conv_window[0].shape[2]
         partial_accept = accepted_token_counts < draft_token_num
