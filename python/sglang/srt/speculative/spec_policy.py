@@ -15,12 +15,8 @@ def _algo_name(algorithm: Any) -> str:
     return str(getattr(algorithm, "name", algorithm) or "NONE").upper()
 
 
-def _is_builtin_algorithm(algorithm: Any) -> bool:
-    return isinstance(algorithm, Enum)
-
-
 def _custom_bool(algorithm: Any, method_name: str, default: bool = False) -> bool:
-    if _is_builtin_algorithm(algorithm):
+    if isinstance(algorithm, Enum):
         return default
     method = getattr(algorithm, method_name, None)
     if method is None:

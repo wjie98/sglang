@@ -140,9 +140,6 @@ class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
         return dvr_chain_uniform_samples(candidates, batch)
 
 
-DVRVerifyInput = DVRSelfDraftVerifyInput
-
-
 class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
     """DVR speculative worker using the target model as a self draft model.
 
