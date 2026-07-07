@@ -285,19 +285,14 @@ class DecodeVerifyRollbackWorkerV2(
                 if not is_self_dvr and torch.any(
                     accept_lens < self.num_draft_tokens
                 ).item():
-                    max_accept = accept_index.shape[1]
-                    valid_accept = torch.arange(
-                        max_accept, dtype=torch.long, device=self.device
-                    ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
-                    compact_predict_indices = self._spec_v2_compact_output_indices(
-                        accept_index=accept_index,
-                        max_accept=max_accept,
-                        device=self.device,
+                    accepted_ids, accepted_cache_locs = (
+                        self._compact_spec_v2_accepted_tokens_and_cache_locs(
+                            batch=batch,
+                            predict=predict,
+                            accept_index=accept_index,
+                            accept_lens=accept_lens,
+                        )
                     )
-                    accepted_ids = predict[compact_predict_indices[valid_accept]]
-                    accepted_cache_locs = batch.out_cache_loc[
-                        accept_index.clamp_min(0).long()[valid_accept]
-                    ]
                     if accepted_ids.numel() > 0:
                         live_state_already_replayed = (
                             self._replay_accepted_suffix_for_partial_verify(
@@ -574,6 +569,37 @@ class DecodeVerifyRollbackWorkerV2(
             ) = get_token_ids_logprobs(
                 gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
             )
+
+    def _compact_spec_v2_accepted_tokens_and_cache_locs(
+        self,
+        *,
+        batch: ScheduleBatch,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return accepted tokens/cache slots in scheduler output order.
+
+        DVR's partial-verify suffix replay must replay the same compact token
+        stream that result processing will materialize. Tree ``accept_index``
+        names KV slots, while ``predict`` is emitted as fixed per-request
+        windows; keep that mapping in one place so replay and logprob code do
+        not drift.
+        """
+
+        max_accept = accept_index.shape[1]
+        valid_accept = torch.arange(
+            max_accept, dtype=torch.long, device=self.device
+        ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
+        compact_predict_indices = self._spec_v2_compact_output_indices(
+            accept_index=accept_index,
+            max_accept=max_accept,
+            device=self.device,
+        )
+        return (
+            predict[compact_predict_indices[valid_accept]],
+            batch.out_cache_loc[accept_index.clamp_min(0).long()[valid_accept]],
+        )
 
     def _spec_v2_compact_output_indices(
         self,
