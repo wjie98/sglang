@@ -973,33 +973,38 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 compact_tokens.append([int(x) for x in token_ids[start:end]])
         return compact_tokens
 
-    def _repair_final_logprobs_for_spec_v1(
+    def _score_final_logprob_repairs(
         self,
         *,
         batch: ScheduleBatch,
+        replay_prefix: DVRReplayPrefixTracker,
         linear_state_ctx,
         base_seq_lens_cpu: list[int],
         accept_lens_cpu: list[int],
         compact_output_token_ids_per_req: list[list[int]],
-    ) -> None:
-        """Repair final non-streaming DVR output logprobs with a prefill oracle."""
-
-        if linear_state_ctx is None or not any(
-            req.return_logprob and not req.stream and req.finished()
-            for req in batch.reqs
-        ):
-            return
-
-        repairs = score_dvr_final_logprob_repairs(
+        error_prefix: str,
+        allow_preclaimed_final_token: bool = False,
+    ):
+        if not batch.return_logprob:
+            return None
+        defer_dvr_non_streaming_logprob_output_until_finish(
+            batch,
+            base_seq_lens_cpu=base_seq_lens_cpu,
+        )
+        return score_dvr_final_logprob_repairs(
             batch=batch,
             target_worker=self.target_worker,
-            replay_prefix=DVRReplayPrefixTracker(),
+            replay_prefix=replay_prefix,
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
             accept_lens_cpu=accept_lens_cpu,
             compact_output_token_ids_per_req=compact_output_token_ids_per_req,
-            error_prefix="DVR spec-v1 final logprob",
+            error_prefix=error_prefix,
+            allow_preclaimed_final_token=allow_preclaimed_final_token,
         )
+
+    @staticmethod
+    def _apply_spec_v1_final_logprob_repairs(batch: ScheduleBatch, repairs) -> None:
         if repairs is None:
             return
 
@@ -1019,6 +1024,34 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
             req.logprob.output_token_logprobs_idx[:] = repair.output_ids
             allow_req_non_streaming_logprob_output(req)
+
+    def _repair_final_logprobs_for_spec_v1(
+        self,
+        *,
+        batch: ScheduleBatch,
+        linear_state_ctx,
+        base_seq_lens_cpu: list[int],
+        accept_lens_cpu: list[int],
+        compact_output_token_ids_per_req: list[list[int]],
+    ) -> None:
+        """Repair final non-streaming DVR output logprobs with a prefill oracle."""
+
+        if linear_state_ctx is None or not any(
+            req.return_logprob and not req.stream and req.finished()
+            for req in batch.reqs
+        ):
+            return
+
+        repairs = self._score_final_logprob_repairs(
+            batch=batch,
+            replay_prefix=DVRReplayPrefixTracker(),
+            linear_state_ctx=linear_state_ctx,
+            base_seq_lens_cpu=base_seq_lens_cpu,
+            accept_lens_cpu=accept_lens_cpu,
+            compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+            error_prefix="DVR spec-v1 final logprob",
+        )
+        self._apply_spec_v1_final_logprob_repairs(batch, repairs)
 
     def verify(
         self,

@@ -20,10 +20,6 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
     DVRSpecResultAux,
 )
-from sglang.srt.speculative.dvr_logprob_repair import (
-    defer_dvr_non_streaming_logprob_output_until_finish,
-    score_dvr_final_logprob_repairs,
-)
 from sglang.srt.speculative.dvr_linear_state_worker import DVRSpecV2LinearStateMixin
 from sglang.srt.speculative.dvr_utils import (
     chain_speculative_sampling,
@@ -259,13 +255,8 @@ class DecodeVerifyRollbackWorkerV2(
                 compact_output_token_ids_per_req,
             )
             if batch.return_logprob:
-                defer_dvr_non_streaming_logprob_output_until_finish(
-                    batch,
-                    base_seq_lens_cpu=base_seq_lens_cpu,
-                )
-                final_logprob_repairs = score_dvr_final_logprob_repairs(
+                final_logprob_repairs = self._score_final_logprob_repairs(
                     batch=batch,
-                    target_worker=self.target_worker,
                     replay_prefix=self.dvr_output_replay_prefix,
                     linear_state_ctx=linear_state_ctx,
                     base_seq_lens_cpu=base_seq_lens_cpu,
