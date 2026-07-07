@@ -32,7 +32,7 @@ from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_linear_state_worker import DVRLinearStateReplayMixin
 from sglang.srt.speculative.dvr_logprob_repair import (
     defer_dvr_non_streaming_logprob_output_until_finish,
-    score_dvr_final_logprob_repairs,
+    score_deferred_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_scheduler_utils import DVRReplayPrefixTracker
 from sglang.srt.speculative.dvr_target_replay import (
@@ -936,36 +936,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 compact_tokens.append([int(x) for x in token_ids[start:end]])
         return compact_tokens
 
-    def _score_final_logprob_repairs(
-        self,
-        *,
-        batch: ScheduleBatch,
-        replay_prefix: DVRReplayPrefixTracker,
-        linear_state_ctx,
-        base_seq_lens_cpu: list[int],
-        accept_lens_cpu: list[int],
-        compact_output_token_ids_per_req: list[list[int]],
-        error_prefix: str,
-        allow_preclaimed_final_token: bool = False,
-    ):
-        if not batch.return_logprob:
-            return None
-        defer_dvr_non_streaming_logprob_output_until_finish(
-            batch,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-        )
-        return score_dvr_final_logprob_repairs(
-            batch=batch,
-            target_worker=self.target_worker,
-            replay_prefix=replay_prefix,
-            linear_state_ctx=linear_state_ctx,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            accept_lens_cpu=accept_lens_cpu,
-            compact_output_token_ids_per_req=compact_output_token_ids_per_req,
-            error_prefix=error_prefix,
-            allow_preclaimed_final_token=allow_preclaimed_final_token,
-        )
-
     @staticmethod
     def _apply_spec_v1_final_logprob_repairs(batch: ScheduleBatch, repairs) -> None:
         if repairs is None:
@@ -1005,8 +975,9 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
         ):
             return
 
-        repairs = self._score_final_logprob_repairs(
+        repairs = score_deferred_dvr_final_logprob_repairs(
             batch=batch,
+            target_worker=self.target_worker,
             replay_prefix=DVRReplayPrefixTracker(),
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,

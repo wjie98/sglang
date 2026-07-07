@@ -22,8 +22,7 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     compact_output_token_rows,
 )
 from sglang.srt.speculative.dvr_logprob_repair import (
-    defer_dvr_non_streaming_logprob_output_until_finish,
-    score_dvr_final_logprob_repairs,
+    score_deferred_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_target_replay import (
     run_suffix_draft_replay_oracle,
@@ -466,11 +465,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 compact_output_token_ids_per_req=compact_output_token_ids_per_req,
                 error_prefix="DVR EAGLE final logprob output replay prefix",
             )
-            defer_dvr_non_streaming_logprob_output_until_finish(
-                batch,
-                base_seq_lens_cpu=base_seq_lens_cpu,
-            )
-            final_logprob_repairs = score_dvr_final_logprob_repairs(
+            final_logprob_repairs = score_deferred_dvr_final_logprob_repairs(
                 batch=batch,
                 target_worker=self.target_worker,
                 replay_prefix=self.dvr_client_output_replay_prefix,

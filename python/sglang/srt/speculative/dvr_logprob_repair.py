@@ -54,6 +54,39 @@ def defer_dvr_non_streaming_logprob_output_until_finish(
             defer_req_non_streaming_logprob_output(req)
 
 
+def score_deferred_dvr_final_logprob_repairs(
+    *,
+    batch: ScheduleBatch,
+    target_worker: Any,
+    replay_prefix: DVRReplayPrefixTracker,
+    linear_state_ctx: Any,
+    base_seq_lens_cpu: list[int],
+    accept_lens_cpu: list[int],
+    compact_output_token_ids_per_req: Optional[list[list[int]]] = None,
+    error_prefix: str,
+    allow_preclaimed_final_token: bool = False,
+) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
+    """Defer non-streaming output and score exact final DVR logprob repairs."""
+
+    if not batch.return_logprob:
+        return None
+    defer_dvr_non_streaming_logprob_output_until_finish(
+        batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+    )
+    return score_dvr_final_logprob_repairs(
+        batch=batch,
+        target_worker=target_worker,
+        replay_prefix=replay_prefix,
+        linear_state_ctx=linear_state_ctx,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        accept_lens_cpu=accept_lens_cpu,
+        compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+        error_prefix=error_prefix,
+        allow_preclaimed_final_token=allow_preclaimed_final_token,
+    )
+
+
 def score_dvr_final_logprob_repairs(
     *,
     batch: ScheduleBatch,
