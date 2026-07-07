@@ -28,10 +28,12 @@ from sglang.srt.arg_groups.speculative_hook import (
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
+    DVRMambaCheckpoint,
     DVRReplayPrefixTracker,
     DVRSpecResultAux,
     apply_dvr_final_logprob_repairs_from_result,
     compact_output_token_rows,
+    commit_pending_mamba_checkpoint_from_result,
 )
 from sglang.srt.speculative.output_policy import (
     allow_req_non_streaming_logprob_output,
@@ -185,6 +187,67 @@ def test_mamba_radix_unfinished_insert_plan_prefers_snapshot():
     )
     assert plan.cache_len == 96
     assert plan.snapshot_indices is None
+
+
+def test_dvr_pending_mamba_checkpoint_commit_guards():
+    class Pool:
+        @staticmethod
+        def get_mamba_ping_pong_other_idx(track_idx):
+            return 1 - track_idx
+
+    req = SimpleNamespace(
+        rid="r0",
+        origin_input_ids=[1] * 64,
+        output_ids=[2] * 64,
+        mamba_last_track_seqlen=64,
+        mamba_next_track_idx=0,
+        mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
+    )
+    batch = SimpleNamespace(req_to_token_pool=Pool())
+    tree_cache = SimpleNamespace(page_size=64)
+
+    result = SimpleNamespace(
+        spec_aux=DVRSpecResultAux(
+            pending_mamba_checkpoints=[
+                DVRMambaCheckpoint(track_idx=0, seqlen=128),
+            ],
+        )
+    )
+    commit_pending_mamba_checkpoint_from_result(
+        req=req,
+        batch=batch,
+        result=result,
+        req_index=0,
+        tree_cache=tree_cache,
+    )
+    assert req.mamba_last_track_seqlen == 128
+    assert req.mamba_next_track_idx == 1
+
+    result.spec_aux.pending_mamba_checkpoints = [
+        DVRMambaCheckpoint(track_idx=1, seqlen=128)
+    ]
+    commit_pending_mamba_checkpoint_from_result(
+        req=req,
+        batch=batch,
+        result=result,
+        req_index=0,
+        tree_cache=tree_cache,
+    )
+    assert req.mamba_last_track_seqlen == 128
+    assert req.mamba_next_track_idx == 1
+
+    result.spec_aux.pending_mamba_checkpoints = [
+        DVRMambaCheckpoint(track_idx=2, seqlen=192)
+    ]
+    commit_pending_mamba_checkpoint_from_result(
+        req=req,
+        batch=batch,
+        result=result,
+        req_index=0,
+        tree_cache=tree_cache,
+    )
+    assert req.mamba_last_track_seqlen == 128
+    assert req.mamba_next_track_idx == 1
 
 
 def test_dvr_linear_state_extension_policy():

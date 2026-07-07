@@ -485,12 +485,42 @@ def _pending_mamba_checkpoint_is_committable(
     if not checkpoint.valid:
         return False
 
+    if checkpoint.seqlen <= 0:
+        return False
+
+    last_track_seqlen = getattr(req, "mamba_last_track_seqlen", None)
+    if last_track_seqlen is not None and checkpoint.seqlen <= last_track_seqlen:
+        return False
+
     materialized_len = len(req.origin_input_ids) + len(req.output_ids)
     if checkpoint.seqlen > materialized_len:
         return False
 
+    if not _pending_mamba_checkpoint_track_idx_is_valid(
+        checkpoint=checkpoint,
+        req=req,
+    ):
+        return False
+
     page_size = getattr(tree_cache, "page_size", 1)
     return page_size == 1 or checkpoint.seqlen % page_size == 0
+
+
+def _pending_mamba_checkpoint_track_idx_is_valid(
+    *,
+    checkpoint: DVRMambaCheckpoint,
+    req: Any,
+) -> bool:
+    buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+    if buffer is None:
+        return False
+    if checkpoint.track_idx < 0 or checkpoint.track_idx >= buffer.numel():
+        return False
+
+    # A pending DVR boundary names the request-local ping-pong slot that holds
+    # the just-verified GDN state.  A freed lazy slot is marked as -1 and must
+    # never become the scheduler-owned checkpoint for future radix inserts.
+    return buffer[checkpoint.track_idx].item() != -1
 
 
 def maybe_handle_dvr_mamba_checkpoint_after_decode(
