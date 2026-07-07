@@ -229,7 +229,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
 
     def clear_cache_pool(self):
         self.linear_state.clear_cache_state()
-        return None
 
     # Public worker entrypoints. The shape follows EAGLE: normal extend produces
     # the first verified token, then decode-verify-rollback handles generation.

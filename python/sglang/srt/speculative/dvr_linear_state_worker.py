@@ -68,19 +68,6 @@ class DVRLinearStateReplayMixin:
                         device=ctx.live_indices.device, dtype=torch.long
                     ),
                 )
-            zero_source_live_indices = [
-                task.live_idx
-                for task in tasks
-                if task.source_state_indices is None and task.source_seqlen == 0
-            ]
-            if zero_source_live_indices:
-                ctx.state_adapter.zero_recurrent_state(
-                    state_cache=ctx.state_cache,
-                    indices=torch.stack(zero_source_live_indices).to(
-                        device=ctx.live_indices.device, dtype=torch.long
-                    ),
-                )
-
             replay_plan = build_boundary_replay_plan(
                 batch=batch,
                 tasks=tasks,

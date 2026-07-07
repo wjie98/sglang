@@ -74,7 +74,7 @@ class DecodeVerifyRollbackWorkerV2(
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
-        return None
+        pass
 
     def clear_cache_pool(self):
         super().clear_cache_pool()
