@@ -101,11 +101,6 @@ def get_unfinished_insert_plan(
     return MambaRadixUnfinishedInsertPlan(cache_len=cache_len)
 
 
-def get_req_mamba_radix_cache_policy(req: Any) -> MambaRadixCachePolicy:
-    policy = _get_req_mamba_radix_cache_policy(req)
-    return policy if policy is not None else MambaRadixCachePolicy()
-
-
 def clear_req_mamba_radix_insert_snapshot(req: Any) -> None:
     policy = _get_req_mamba_radix_cache_policy(req)
     if policy is not None:
