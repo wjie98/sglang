@@ -3,32 +3,22 @@ from __future__ import annotations
 from typing import Any
 
 
-def _ensure_req_output_policy_fields(req: Any) -> None:
-    if not hasattr(req, "spec_defer_non_streaming_logprob_output"):
-        req.spec_defer_non_streaming_logprob_output = False
-    if not hasattr(req, "spec_final_logprob_repair_claimed"):
-        req.spec_final_logprob_repair_claimed = False
-
-
 def defer_req_non_streaming_logprob_output(req: Any) -> None:
     """Defer a non-streaming logprob chunk until final response repair."""
 
-    _ensure_req_output_policy_fields(req)
     req.spec_defer_non_streaming_logprob_output = True
 
 
 def allow_req_non_streaming_logprob_output(req: Any) -> None:
     """Allow a previously deferred non-streaming logprob response to emit."""
 
-    _ensure_req_output_policy_fields(req)
     req.spec_defer_non_streaming_logprob_output = False
 
 
 def try_claim_req_final_logprob_repair(req: Any) -> bool:
     """Claim the request's final logprob repair exactly once."""
 
-    _ensure_req_output_policy_fields(req)
-    if req.spec_final_logprob_repair_claimed:
+    if getattr(req, "spec_final_logprob_repair_claimed", False):
         return False
 
     req.spec_final_logprob_repair_claimed = True
