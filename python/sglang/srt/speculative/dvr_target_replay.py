@@ -85,6 +85,64 @@ class DVRBoundaryReplayPlan:
     boundary_indices: torch.Tensor
 
 
+def _suffix_replay_lengths(
+    *,
+    base_seq_lens_cpu: list[int],
+    boundary_lens: list[int],
+    append_token_counts_cpu: list[int],
+) -> tuple[list[int], list[int], list[int]]:
+    tail_lens_cpu = [
+        int(seq_len) - int(boundary)
+        for seq_len, boundary in zip(base_seq_lens_cpu, boundary_lens, strict=True)
+    ]
+    extend_lens_cpu = [
+        int(tail) + int(append_count)
+        for tail, append_count in zip(
+            tail_lens_cpu, append_token_counts_cpu, strict=True
+        )
+    ]
+    final_seq_lens_cpu = [
+        int(boundary) + int(extend_len)
+        for boundary, extend_len in zip(boundary_lens, extend_lens_cpu, strict=True)
+    ]
+    return tail_lens_cpu, extend_lens_cpu, final_seq_lens_cpu
+
+
+def _suffix_replay_inputs(
+    *,
+    batch,
+    base_seq_lens_cpu: list[int],
+    boundary_lens: list[int],
+    tail_lens_cpu: list[int],
+    append_tokens_cpu_by_req: list[list[int]],
+    append_cache_locs_by_req: list[torch.Tensor],
+    request_token_ids_for_replay,
+) -> tuple[list[int], list[torch.Tensor]]:
+    input_ids = []
+    out_cache_locs = []
+    for req, seq_len, boundary, tail_len, append_tokens, append_cache_locs in zip(
+        batch.reqs,
+        base_seq_lens_cpu,
+        boundary_lens,
+        tail_lens_cpu,
+        append_tokens_cpu_by_req,
+        append_cache_locs_by_req,
+        strict=True,
+    ):
+        token_ids = request_token_ids_for_replay(req, int(seq_len))
+        input_ids.extend(token_ids[int(boundary) : int(seq_len)])
+        input_ids.extend(append_tokens)
+        if int(tail_len) > 0:
+            out_cache_locs.append(
+                batch.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, int(boundary) : int(seq_len)
+                ].to(torch.long)
+            )
+        if len(append_tokens) > 0:
+            out_cache_locs.append(append_cache_locs.to(torch.long))
+    return input_ids, out_cache_locs
+
+
 @contextmanager
 def linear_state_replay_context(
     linear_state_ctx,
@@ -170,37 +228,20 @@ def build_suffix_draft_replay_plan(
     draft_tokens = draft_tokens.reshape(bs, draft_token_num)
     draft_cache_locs = draft_cache_locs.reshape(bs, draft_token_num)
     draft_tokens_cpu = draft_tokens.detach().cpu().tolist()
-    tail_lens_cpu = [
-        int(seq_len) - int(boundary)
-        for seq_len, boundary in zip(base_seq_lens_cpu, boundary_lens, strict=True)
-    ]
-    extend_lens_cpu = [tail + draft_token_num for tail in tail_lens_cpu]
-    final_seq_lens_cpu = [
-        int(boundary) + int(extend_len)
-        for boundary, extend_len in zip(boundary_lens, extend_lens_cpu, strict=True)
-    ]
-
-    input_ids = []
-    out_cache_locs = []
-    for req_i, (req, seq_len, boundary, tail_len) in enumerate(
-        zip(
-            batch.reqs,
-            base_seq_lens_cpu,
-            boundary_lens,
-            tail_lens_cpu,
-            strict=True,
-        )
-    ):
-        token_ids = request_token_ids_for_replay(req, int(seq_len))
-        input_ids.extend(token_ids[int(boundary) : int(seq_len)])
-        input_ids.extend(draft_tokens_cpu[req_i])
-        if int(tail_len) > 0:
-            out_cache_locs.append(
-                batch.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, int(boundary) : int(seq_len)
-                ].to(torch.long)
-            )
-        out_cache_locs.append(draft_cache_locs[req_i].to(torch.long))
+    tail_lens_cpu, extend_lens_cpu, final_seq_lens_cpu = _suffix_replay_lengths(
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        append_token_counts_cpu=[draft_token_num] * bs,
+    )
+    input_ids, out_cache_locs = _suffix_replay_inputs(
+        batch=batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        tail_lens_cpu=tail_lens_cpu,
+        append_tokens_cpu_by_req=draft_tokens_cpu,
+        append_cache_locs_by_req=[draft_cache_locs[i] for i in range(bs)],
+        request_token_ids_for_replay=request_token_ids_for_replay,
+    )
 
     if not input_ids:
         return None
@@ -354,51 +395,31 @@ def build_accepted_suffix_replay_plan(
     if all(int(accepted) >= num_draft_tokens for accepted in accepted_token_counts_cpu):
         return None
 
-    accepted_tokens_cpu = accepted_tokens.detach().cpu().tolist()
     accepted_cache_locs = accepted_cache_locs.to(torch.long)
-    tail_lens_cpu = [
-        int(seq_len) - int(boundary)
-        for seq_len, boundary in zip(base_seq_lens_cpu, boundary_lens, strict=True)
-    ]
-    extend_lens_cpu = [
-        int(tail) + int(accepted)
-        for tail, accepted in zip(
-            tail_lens_cpu, accepted_token_counts_cpu, strict=True
-        )
-    ]
-    final_seq_lens_cpu = [
-        int(boundary) + int(extend_len)
-        for boundary, extend_len in zip(boundary_lens, extend_lens_cpu, strict=True)
-    ]
+    tail_lens_cpu, extend_lens_cpu, final_seq_lens_cpu = _suffix_replay_lengths(
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        append_token_counts_cpu=accepted_token_counts_cpu,
+    )
 
-    input_ids = []
-    out_cache_locs = []
+    accepted_tokens_cpu = accepted_tokens.detach().cpu().tolist()
+    accepted_tokens_by_req = []
+    accepted_cache_locs_by_req = []
     accepted_rows = []
     accepted_offsets = []
     token_offset = 0
-    for req_i, (req, seq_len, boundary, tail_len, accepted_count) in enumerate(
+    for req_i, (seq_len, accepted_count) in enumerate(
         zip(
-            batch.reqs,
             base_seq_lens_cpu,
-            boundary_lens,
-            tail_lens_cpu,
             accepted_token_counts_cpu,
             strict=True,
         )
     ):
         accepted_count = int(accepted_count)
-        token_ids = request_token_ids_for_replay(req, int(seq_len))
-        input_ids.extend(token_ids[int(boundary) : int(seq_len)])
-        input_ids.extend(
+        accepted_tokens_by_req.append(
             accepted_tokens_cpu[token_offset : token_offset + accepted_count]
         )
-        if int(tail_len) > 0:
-            out_cache_locs.append(
-                batch.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, int(boundary) : int(seq_len)
-                ].to(torch.long)
-            )
-        out_cache_locs.append(
+        accepted_cache_locs_by_req.append(
             accepted_cache_locs[token_offset : token_offset + accepted_count]
         )
         if accepted_count > 0:
@@ -416,6 +437,16 @@ def build_accepted_suffix_replay_plan(
                 )
             )
         token_offset += accepted_count
+
+    input_ids, out_cache_locs = _suffix_replay_inputs(
+        batch=batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        tail_lens_cpu=tail_lens_cpu,
+        append_tokens_cpu_by_req=accepted_tokens_by_req,
+        append_cache_locs_by_req=accepted_cache_locs_by_req,
+        request_token_ids_for_replay=request_token_ids_for_replay,
+    )
 
     if not input_ids:
         return None
