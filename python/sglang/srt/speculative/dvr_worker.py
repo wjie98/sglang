@@ -1038,6 +1038,10 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             self.page_size,
             vocab_mask=None,
         )
+        accept_lens_cpu = [
+            int(num_correct) + 1
+            for num_correct in verify_output.num_correct_drafts_per_req_cpu
+        ]
 
         logits_output.next_token_logits = logits_output.next_token_logits[
             verify_output.accept_indices
@@ -1048,10 +1052,6 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             ]
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
-            accept_lens_cpu = [
-                int(num_correct) + 1
-                for num_correct in verify_output.num_correct_drafts_per_req_cpu
-            ]
             self._repair_final_logprobs_for_spec_v1(
                 batch=batch,
                 linear_state_ctx=linear_state_ctx,
@@ -1065,11 +1065,8 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                 ),
             )
         if linear_state_ctx is not None:
-            accepted_token_counts_cpu = [
-                x + 1 for x in verify_output.num_correct_drafts_per_req_cpu
-            ]
             accepted_token_counts = torch.tensor(
-                accepted_token_counts_cpu,
+                accept_lens_cpu,
                 dtype=torch.long,
                 device=linear_state_ctx.live_indices.device,
             )
@@ -1089,14 +1086,14 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
                         spec_info=spec_info,
                         verify_output=verify_output,
                         linear_state_ctx=linear_state_ctx,
-                        accepted_token_counts_cpu=accepted_token_counts_cpu,
+                        accepted_token_counts_cpu=accept_lens_cpu,
                     )
                 )
             self.linear_state.commit_after_verify(
                 batch=batch,
                 accepted_token_counts=accepted_token_counts,
                 accepted_steps=accepted_steps,
-                accepted_token_counts_cpu=accepted_token_counts_cpu,
+                accepted_token_counts_cpu=accept_lens_cpu,
                 ctx=linear_state_ctx,
                 live_state_already_replayed=live_state_already_replayed,
                 use_fast_self_draft_commit=is_self_dvr,

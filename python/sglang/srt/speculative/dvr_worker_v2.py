@@ -242,8 +242,11 @@ class DecodeVerifyRollbackWorkerV2(
         )
         new_seq_lens = scheduler_seq_lens + accept_lens
         final_logprob_repairs = None
+        has_verify_tokens = (
+            not batch.forward_mode.is_idle() and accept_lens.numel() > 0
+        )
 
-        if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
+        if has_verify_tokens:
             base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
             accept_lens_cpu = accept_lens.detach().cpu().tolist()
             compact_output_token_ids_per_req = (
@@ -275,10 +278,7 @@ class DecodeVerifyRollbackWorkerV2(
         if linear_state_ctx is not None:
             is_self_dvr = isinstance(spec_info, DVRSelfDraftVerifyInput)
             live_state_already_replayed = None
-            if (
-                not batch.forward_mode.is_idle()
-                and accept_lens.numel() > 0
-            ):
+            if has_verify_tokens:
                 # return_logprob is an output-scoring concern.  Keep self-DVR
                 # on the same fast state commit path as no-logprob so enabling
                 # logprobs does not change the next draft state or acceptance.
@@ -318,7 +318,7 @@ class DecodeVerifyRollbackWorkerV2(
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
-        if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
+        if has_verify_tokens:
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)
                 * self.num_draft_tokens
@@ -329,7 +329,7 @@ class DecodeVerifyRollbackWorkerV2(
         else:
             verified_id = torch.empty((0,), dtype=torch.int32, device=self.device)
 
-        if batch.return_logprob and not batch.forward_mode.is_idle():
+        if batch.return_logprob and has_verify_tokens:
             self._compute_spec_v2_logprobs(
                 batch, logits_output, predict, accept_index
             )
