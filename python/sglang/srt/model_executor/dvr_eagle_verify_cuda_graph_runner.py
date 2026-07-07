@@ -47,7 +47,7 @@ class DVREagleTargetVerifyCudaGraphRunner:
         self.dvr_eagle_worker = dvr_eagle_worker
         model_runner = dvr_eagle_worker.target_worker.model_runner
         with dvr_eagle_target_verify_cuda_graph_context(model_runner):
-            self.runner = _DVREagleTargetVerifyCudaGraphRunner(model_runner)
+            self.runner = CudaGraphRunner(model_runner)
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         with dvr_eagle_target_verify_cuda_graph_context(
@@ -71,14 +71,3 @@ class DVREagleTargetVerifyCudaGraphRunner:
 
     def __getattr__(self, name):
         return getattr(self.runner, name)
-
-
-class _DVREagleTargetVerifyCudaGraphRunner(CudaGraphRunner):
-    def get_spec_info(self, num_tokens: int):
-        spec_info = super().get_spec_info(num_tokens)
-        if spec_info is None:
-            return None
-
-        from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
-
-        return DVREagleVerifyInput.from_eagle_verify_input(spec_info)
