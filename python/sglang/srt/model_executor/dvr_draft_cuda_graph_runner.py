@@ -239,7 +239,8 @@ def _assert_draft_decode_performance_state(model_runner, extra_attn_backends):
 def _dvr_draft_decode_context(
     model_runner,
     *,
-    capture_mode: str | None = None,
+    graph_capture: bool = False,
+    self_draft_graph_capture: bool = False,
     disable_model_runner_graph: bool = False,
     disable_batch_invariant_ops: bool = False,
     clear_kernel_config_caches: bool = False,
@@ -253,7 +254,6 @@ def _dvr_draft_decode_context(
 
     patched_attrs = []
     global_server_args = get_global_server_args()
-    graph_capture = capture_mode is not None
 
     def patch_attr(obj, attr_name, value):
         if obj is None or not hasattr(obj, attr_name):
@@ -261,42 +261,39 @@ def _dvr_draft_decode_context(
         patched_attrs.append((obj, attr_name, getattr(obj, attr_name)))
         setattr(obj, attr_name, value)
 
-    env_override = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False)
-    env_override.__enter__()
+    with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False):
+        try:
+            if clear_kernel_config_caches:
+                _clear_determinism_sensitive_kernel_caches()
 
-    try:
-        if clear_kernel_config_caches:
-            _clear_determinism_sensitive_kernel_caches()
-
-        _patch_draft_determinism_flags(
-            model_runner,
-            global_server_args,
-            patch_attr,
-            disable_model_runner_graph=disable_model_runner_graph,
-        )
-        _patch_draft_decode_backend_tree(
-            model_runner, extra_attn_backends, patch_attr
-        )
-
-        if graph_capture:
-            _patch_graph_capture_extras(
+            _patch_draft_determinism_flags(
                 model_runner,
+                global_server_args,
                 patch_attr,
-                self_draft_graph=(capture_mode == "self"),
+                disable_model_runner_graph=disable_model_runner_graph,
+            )
+            _patch_draft_decode_backend_tree(
+                model_runner, extra_attn_backends, patch_attr
             )
 
-        _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr)
+            if graph_capture:
+                _patch_graph_capture_extras(
+                    model_runner,
+                    patch_attr,
+                    self_draft_graph=self_draft_graph_capture,
+                )
 
-        _assert_draft_decode_performance_state(model_runner, extra_attn_backends)
+            _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr)
 
-        with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
-            yield
-    finally:
-        for obj, attr_name, original_value in reversed(patched_attrs):
-            setattr(obj, attr_name, original_value)
-        if clear_kernel_config_caches:
-            _clear_determinism_sensitive_kernel_caches()
-        env_override.__exit__(None, None, None)
+            _assert_draft_decode_performance_state(model_runner, extra_attn_backends)
+
+            with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
+                yield
+        finally:
+            for obj, attr_name, original_value in reversed(patched_attrs):
+                setattr(obj, attr_name, original_value)
+            if clear_kernel_config_caches:
+                _clear_determinism_sensitive_kernel_caches()
 
 
 def dvr_self_draft_graph_capture_context(model_runner):
@@ -304,7 +301,8 @@ def dvr_self_draft_graph_capture_context(model_runner):
 
     return _dvr_draft_decode_context(
         model_runner,
-        capture_mode="self",
+        graph_capture=True,
+        self_draft_graph_capture=True,
         disable_batch_invariant_ops=True,
         clear_kernel_config_caches=True,
     )
@@ -338,7 +336,7 @@ def dvr_eagle_draft_decode_context(
 
     return _dvr_draft_decode_context(
         model_runner,
-        capture_mode="eagle" if graph_capture else None,
+        graph_capture=graph_capture,
         disable_batch_invariant_ops=True,
         clear_kernel_config_caches=clear_kernel_config_caches,
         extra_attn_backends=attn_backends,
