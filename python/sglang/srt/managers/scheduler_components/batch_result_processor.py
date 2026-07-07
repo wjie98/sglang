@@ -26,10 +26,10 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.dvr_scheduler_utils import (
-    apply_dvr_final_logprob_repairs_from_result,
-    cache_unfinished_prefill_req_with_dvr_mamba_snapshot,
-    maybe_handle_dvr_mamba_checkpoint_after_decode,
+from sglang.srt.speculative.scheduler_hooks import (
+    apply_spec_final_logprob_repairs_from_result,
+    cache_unfinished_prefill_req_with_spec_state,
+    maybe_handle_spec_mamba_checkpoint_after_decode,
 )
 from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -241,11 +241,10 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
-                        # DVR spec-v2 overlap prefill may materialize a
-                        # generated-prefix checkpoint. Use a DVR helper so the
-                        # normal cache path stays readable and only that case
-                        # attaches the matching mamba snapshot.
-                        cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
+                        # Spec workers may attach state snapshots to unfinished
+                        # prefix-cache inserts; keep those rules outside the
+                        # generic prefill result loop.
+                        cache_unfinished_prefill_req_with_spec_state(
                             req=req,
                             batch=batch,
                             req_index=i,
@@ -711,9 +710,9 @@ class SchedulerBatchResultProcessor:
                     req=req, next_token_id=next_token_id, batch=batch
                 )
 
-        # DVR workers can return aux data whose ownership starts only after the
-        # scheduler materializes accepted tokens into Req.
-        apply_dvr_final_logprob_repairs_from_result(batch, result)
+        # Some spec workers return aux data whose ownership starts only after
+        # the scheduler materializes accepted tokens into Req.
+        apply_spec_final_logprob_repairs_from_result(batch, result)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -902,7 +901,7 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        if maybe_handle_dvr_mamba_checkpoint_after_decode(
+        if maybe_handle_spec_mamba_checkpoint_after_decode(
             req=req,
             batch=batch,
             result=result,
