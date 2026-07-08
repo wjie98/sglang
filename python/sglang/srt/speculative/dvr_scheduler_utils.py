@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.mamba_radix_cache_policy import (
     mark_req_skip_mamba_radix_finished_insert,
     set_req_mamba_radix_insert_snapshot,
 )
-from sglang.srt.speculative.output_policy import (
+from sglang.srt.speculative.dvr_output_policy import (
     allow_req_non_streaming_logprob_output,
 )
 from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy

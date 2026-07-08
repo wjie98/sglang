@@ -21,7 +21,7 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRSpecResultAux,
     compact_output_token_rows,
 )
-from sglang.srt.speculative.draft_decode_context import (
+from sglang.srt.speculative.dvr_draft_decode_context import (
     draft_decode_performance_context,
 )
 from sglang.srt.speculative.dvr_logprob_repair import (

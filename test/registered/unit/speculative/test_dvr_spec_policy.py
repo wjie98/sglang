@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.mamba_radix_cache_policy import (
     set_req_mamba_radix_insert_snapshot,
     should_insert_finished_req,
 )
-from sglang.srt.speculative.draft_decode_context import draft_decode_performance_context
+from sglang.srt.speculative.dvr_draft_decode_context import draft_decode_performance_context
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_logprob_repair import (
     _final_output_len_if_repair_needed,
@@ -35,7 +35,7 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     compact_output_token_rows,
     commit_pending_mamba_checkpoint_from_result,
 )
-from sglang.srt.speculative.output_policy import (
+from sglang.srt.speculative.dvr_output_policy import (
     allow_req_non_streaming_logprob_output,
     defer_req_non_streaming_logprob_output,
     should_hold_non_streaming_logprob_output,

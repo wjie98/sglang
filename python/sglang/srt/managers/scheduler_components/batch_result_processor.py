@@ -26,7 +26,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.scheduler_hooks import (
+from sglang.srt.speculative.dvr_scheduler_hooks import (
     apply_spec_final_logprob_repairs_from_result,
     cache_unfinished_prefill_req_with_spec_state,
     maybe_handle_spec_mamba_checkpoint_after_decode,

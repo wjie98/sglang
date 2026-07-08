@@ -45,7 +45,7 @@ from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
-from sglang.srt.mem_cache.linear_state_extension import (
+from sglang.srt.mem_cache.dvr_linear_state_extension import (
     LinearSpeculativeStateExtensionConfig,
     LinearSpeculativeStateExtensionFactory,
 )

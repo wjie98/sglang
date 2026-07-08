@@ -56,7 +56,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.output_policy import (
+from sglang.srt.speculative.dvr_output_policy import (
     allow_req_non_streaming_logprob_output,
 )
 from sglang.srt.speculative.spec_utils import select_top_k_tokens

@@ -21,7 +21,7 @@ from sglang.srt.speculative.dvr_target_replay import (
     build_private_extend_batch,
     linear_state_replay_context,
 )
-from sglang.srt.speculative.output_policy import (
+from sglang.srt.speculative.dvr_output_policy import (
     defer_req_non_streaming_logprob_output,
     try_claim_req_final_logprob_repair,
 )

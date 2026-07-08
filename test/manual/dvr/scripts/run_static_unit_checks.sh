@@ -10,6 +10,7 @@ mapfile -t DVR_PY_FILES < <(
     python/sglang/srt/speculative \
     python/sglang/srt/model_executor \
     python/sglang/srt/layers/attention/linear \
+    python/sglang/srt/mem_cache \
     -maxdepth 1 -name 'dvr_*.py' -print | sort
 )
 DVR_PY_FILES+=(python/sglang/srt/speculative/eagle_info_v2.py)

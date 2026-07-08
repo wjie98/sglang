@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputWindow
 from sglang.srt.layers.attention.linear.dvr_state_adapter import (
     DVRGatedStateAdapter,
 )
-from sglang.srt.mem_cache.linear_state_extension import (
+from sglang.srt.mem_cache.dvr_linear_state_extension import (
     LinearSpeculativeStateExtensionConfig,
 )
 
