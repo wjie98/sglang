@@ -45,6 +45,7 @@ class GenerationBatchResult:
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
+    num_proposed_drafts_per_req_cpu: Optional[List[int]] = None
 
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor

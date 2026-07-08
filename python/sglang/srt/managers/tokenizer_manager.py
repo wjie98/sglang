@@ -2287,16 +2287,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
-            # Total number of proposed draft tokens per request.
-            speculative_algorithm = SpeculativeAlgorithm.from_string(
-                self.server_args.speculative_algorithm
-            )
-            proposed_per_verify = get_spec_algorithm_policy(
-                speculative_algorithm
-            ).proposed_draft_tokens_per_verify(
-                speculative_num_steps=self.server_args.speculative_num_steps,
-                speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-            )
             if (
                 hasattr(recv_obj, "spec_num_proposed_drafts")
                 and len(recv_obj.spec_num_proposed_drafts) > i
@@ -2304,6 +2294,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 num_proposed_drafts = recv_obj.spec_num_proposed_drafts[i]
             else:
+                proposed_per_verify = max(
+                    0, int(self.server_args.speculative_num_draft_tokens) - 1
+                )
                 num_proposed_drafts = recv_obj.spec_verify_ct[i] * proposed_per_verify
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 

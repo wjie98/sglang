@@ -345,6 +345,10 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
+            num_proposed_drafts_per_req_cpu=[
+                req.useful_spec_proposed_drafts(self.num_draft_steps)
+                for req in batch.reqs
+            ],
             spec_aux=DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
                 pending_track_indices,
                 pending_track_seqlens,

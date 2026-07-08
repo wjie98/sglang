@@ -51,22 +51,6 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     return sum(req.seqlen for req in batch.reqs)
 
 
-def _spec_draft_proposals_per_round(
-    spec_algorithm,
-    *,
-    num_steps: int,
-    num_draft_tokens: int,
-) -> int:
-    """Return the draft-token denominator used for scheduler spec metrics."""
-
-    from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
-
-    return get_spec_algorithm_policy(spec_algorithm).proposed_draft_tokens_per_verify(
-        speculative_num_steps=num_steps,
-        speculative_num_draft_tokens=num_draft_tokens,
-    )
-
-
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -729,10 +713,10 @@ class SchedulerMetricsReporter:
             spec_snapshot = self._active_spec_config_snapshot()
             spec_num_steps = spec_snapshot["num_steps"]
             spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
-            draft_per_round = _spec_draft_proposals_per_round(
-                self.scheduler.spec_algorithm,
-                num_steps=spec_num_steps,
-                num_draft_tokens=spec_num_draft_tokens,
+            draft_per_round = (
+                spec_num_draft_tokens - 1
+                if spec_num_draft_tokens
+                else spec_num_steps or 0
             )
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (

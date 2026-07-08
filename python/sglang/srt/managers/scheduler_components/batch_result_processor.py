@@ -31,7 +31,6 @@ from sglang.srt.speculative.dvr_scheduler_hooks import (
     cache_unfinished_prefill_req_with_spec_state,
     maybe_handle_spec_mamba_checkpoint_after_decode,
 )
-from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -564,12 +563,8 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
-        proposed_per_verify = get_spec_algorithm_policy(
-            batch.spec_algorithm
-        ).proposed_draft_tokens_per_verify(
-            speculative_num_steps=self.server_args.speculative_num_steps,
-            speculative_num_draft_tokens=stride,
-        )
+        proposed_drafts_per_req = result.num_proposed_drafts_per_req_cpu
+        default_proposed_per_verify = max(0, int(stride) - 1)
 
         for i, req in enumerate(batch.reqs):
             predict_tokens.append(
@@ -591,7 +586,11 @@ class SchedulerBatchResultProcessor:
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
             req.record_spec_verify_metrics(
                 num_correct_drafts=num_correct_drafts,
-                proposed_per_verify=proposed_per_verify,
+                num_proposed_drafts=(
+                    proposed_drafts_per_req[i]
+                    if proposed_drafts_per_req is not None
+                    else req.useful_spec_proposed_drafts(default_proposed_per_verify)
+                ),
             )
 
         return predict_tokens

@@ -555,6 +555,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            num_proposed_drafts_per_req_cpu=[
+                req.useful_spec_proposed_drafts(self.speculative_num_steps)
+                for req in batch.reqs
+            ],
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,

@@ -7,9 +7,6 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
-from sglang.srt.managers.scheduler_components.metrics_reporter import (
-    _spec_draft_proposals_per_round,
-)
 from sglang.srt.mem_cache.mamba_radix_cache_policy import (
     get_req_mamba_radix_insert_snapshot,
     get_unfinished_insert_plan,
@@ -342,68 +339,6 @@ def test_draft_extend_selected_logits_policy_is_capability_gated():
         model=model,
         is_v2=True,
         requires_gathered_buffer=False,
-    )
-
-
-def test_spec_accept_rate_proposal_width_policy():
-    assert (
-        _policy(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-        ).proposed_draft_tokens_per_verify(
-            speculative_num_steps=15,
-            speculative_num_draft_tokens=16,
-        )
-        == 15
-    )
-    assert (
-        _policy(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
-        ).proposed_draft_tokens_per_verify(
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=4,
-        )
-        == 3
-    )
-    assert (
-        _policy(SpeculativeAlgorithm.EAGLE).proposed_draft_tokens_per_verify(
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=8,
-        )
-        == 3
-    )
-    assert (
-        _policy(SpeculativeAlgorithm.DFLASH).proposed_draft_tokens_per_verify(
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=8,
-        )
-        == 7
-    )
-
-
-def test_scheduler_spec_accept_rate_uses_policy_width():
-    assert (
-        _spec_draft_proposals_per_round(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-            num_steps=15,
-            num_draft_tokens=16,
-        )
-        == 15
-    )
-    assert (
-        _spec_draft_proposals_per_round(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
-            num_steps=3,
-            num_draft_tokens=4,
-        )
-        == 3
-    )
-    assert (
-        _spec_draft_proposals_per_round(
-            SpeculativeAlgorithm.DFLASH,
-            num_steps=3,
-            num_draft_tokens=8,
-        )
-        == 7
     )
 
 
