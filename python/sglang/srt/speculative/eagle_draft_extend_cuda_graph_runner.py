@@ -261,10 +261,10 @@ class EAGLEDraftExtendCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
+            spec_policy = get_spec_algorithm_policy(self.model_runner.spec_algorithm)
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
+                if spec_policy.is_eagle() or spec_policy.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -488,9 +488,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         num_tokens = forward_batch.input_ids.shape[0]
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            spec_policy = get_spec_algorithm_policy(self.model_runner.spec_algorithm)
             max_batch_size = (
                 max_num_tokens // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
+                if spec_policy.is_eagle()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)

@@ -100,7 +100,6 @@ class SpeculativeAlgorithm(Enum):
         return self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
             SpeculativeAlgorithm.FROZEN_KV_MTP,
         )
 

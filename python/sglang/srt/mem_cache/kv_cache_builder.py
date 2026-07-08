@@ -214,7 +214,7 @@ def build_kv_cache(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         page_size=page_size,
-        is_eagle=spec_algorithm.is_eagle(),
+        is_eagle=get_spec_algorithm_policy(spec_algorithm).is_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
         ),

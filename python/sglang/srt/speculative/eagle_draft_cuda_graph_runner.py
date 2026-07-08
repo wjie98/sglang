@@ -31,6 +31,7 @@ from sglang.srt.speculative.draft_decode_context import (
     draft_decode_performance_context,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -213,10 +214,10 @@ class EAGLEDraftCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
+            spec_policy = get_spec_algorithm_policy(self.model_runner.spec_algorithm)
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
+                if spec_policy.is_eagle() or spec_policy.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -419,10 +420,10 @@ class EAGLEDraftCudaGraphRunner:
         # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            spec_policy = get_spec_algorithm_policy(self.model_runner.spec_algorithm)
             max_batch_size = (
                 max_num_tokens // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
+                if spec_policy.is_eagle() or spec_policy.is_standalone()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
