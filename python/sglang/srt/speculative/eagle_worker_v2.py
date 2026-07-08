@@ -42,9 +42,6 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
-from sglang.srt.speculative.draft_decode_context import (
-    draft_decode_performance_context,
-)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -66,7 +63,6 @@ from sglang.srt.speculative.eagle_utils import (
     per_step_draft_out_cache_loc,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     generate_token_bitmask,
@@ -90,7 +86,6 @@ from sglang.srt.utils.common import (
     is_npu,
     log_info_on_rank0,
     next_power_of_2,
-    require_gathered_buffer,
 )
 
 _is_npu = is_npu()
@@ -207,8 +202,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        spec_policy = get_spec_algorithm_policy(self.speculative_algorithm)
-        self._uses_dvr_draft_decode_context = spec_policy.is_dvr_eagle()
+        self._draft_extend_selected_logits = False
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -228,26 +222,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-        self._draft_extend_selected_logits = spec_policy.uses_draft_extend_selected_logits(
-            topk=self.topk,
-            model=self.draft_runner.model,
-            is_v2=True,
-            requires_gathered_buffer=require_gathered_buffer(
-                self.draft_runner.server_args
-            ),
-        )
 
     def _draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
-        if not self._uses_dvr_draft_decode_context:
-            return empty_context()
-        return draft_decode_performance_context(
-            self.draft_runner,
-            clear_kernel_config_caches=clear_kernel_config_caches,
-            attn_backends=(
-                getattr(self, "draft_attn_backend", None),
-                getattr(self, "draft_extend_attn_backend", None),
-            ),
-        )
+        return empty_context()
 
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
@@ -846,6 +823,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    draft_worker_cls = EagleDraftWorker
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -879,7 +858,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        self._draft_worker = EagleDraftWorker(
+        self._draft_worker = self.draft_worker_cls(
             server_args,
             gpu_id,
             tp_rank,

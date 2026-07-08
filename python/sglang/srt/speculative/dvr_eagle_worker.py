@@ -21,6 +21,9 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRSpecResultAux,
     compact_output_token_rows,
 )
+from sglang.srt.speculative.draft_decode_context import (
+    draft_decode_performance_context,
+)
 from sglang.srt.speculative.dvr_logprob_repair import (
     score_deferred_dvr_final_logprob_repairs,
 )
@@ -40,16 +43,50 @@ from sglang.srt.speculative.dvr_utils import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2, EagleDraftWorker
+from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     record_stream_each,
     record_stream_for_v2_verify,
 )
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_npu, require_gathered_buffer
 
 _is_npu = is_npu()
+
+
+class DVREagleDraftWorker(EagleDraftWorker):
+    """EAGLE draft worker with DVR's provisional decode policy.
+
+    Standard EAGLE keeps the normal deterministic/runtime settings.  DVR-EAGLE
+    verifies every draft with the target model, so its draft decode path should
+    use the same performance-first context as self-DVR without making the
+    upstream EagleDraftWorker depend on DVR internals.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._draft_extend_selected_logits = get_spec_algorithm_policy(
+            self.speculative_algorithm
+        ).uses_draft_extend_selected_logits(
+            topk=self.topk,
+            model=self.draft_runner.model,
+            is_v2=True,
+            requires_gathered_buffer=require_gathered_buffer(
+                self.draft_runner.server_args
+            ),
+        )
+
+    def _draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
+        return draft_decode_performance_context(
+            self.draft_runner,
+            clear_kernel_config_caches=clear_kernel_config_caches,
+            attn_backends=(
+                getattr(self, "draft_attn_backend", None),
+                getattr(self, "draft_extend_attn_backend", None),
+            ),
+        )
 
 
 class DecodeVerifyRollbackEagleWorkerV2(
@@ -62,6 +99,8 @@ class DecodeVerifyRollbackEagleWorkerV2(
     verify forward, so this path remains isolated from the self-decode draft
     worker.
     """
+
+    draft_worker_cls = DVREagleDraftWorker
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
