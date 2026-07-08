@@ -7,9 +7,9 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
-from sglang.srt.mem_cache.mamba_radix_cache_policy import (
+from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
     get_req_mamba_radix_insert_snapshot,
-    get_unfinished_insert_plan,
+    get_unfinished_insert_state,
     mark_req_skip_mamba_radix_finished_insert,
     set_req_mamba_radix_insert_snapshot,
     should_insert_finished_req,
@@ -160,30 +160,30 @@ def test_mamba_radix_request_policy_helpers():
 def test_mamba_radix_unfinished_insert_plan_prefers_snapshot():
     req = SimpleNamespace(mamba_last_track_seqlen=32)
 
-    plan = get_unfinished_insert_plan(
+    cache_len, snapshot_indices = get_unfinished_insert_state(
         req,
         enable_mamba_extra_buffer=True,
         token_count=96,
     )
-    assert plan.cache_len == 32
-    assert plan.snapshot_indices is None
+    assert cache_len == 32
+    assert snapshot_indices is None
 
     set_req_mamba_radix_insert_snapshot(req, indices="snapshot_idx", seqlen=64)
-    plan = get_unfinished_insert_plan(
+    cache_len, snapshot_indices = get_unfinished_insert_state(
         req,
         enable_mamba_extra_buffer=True,
         token_count=96,
     )
-    assert plan.cache_len == 64
-    assert plan.snapshot_indices == "snapshot_idx"
+    assert cache_len == 64
+    assert snapshot_indices == "snapshot_idx"
 
-    plan = get_unfinished_insert_plan(
+    cache_len, snapshot_indices = get_unfinished_insert_state(
         req,
         enable_mamba_extra_buffer=False,
         token_count=96,
     )
-    assert plan.cache_len == 96
-    assert plan.snapshot_indices is None
+    assert cache_len == 96
+    assert snapshot_indices is None
 
 
 def test_dvr_pending_mamba_checkpoint_commit_guards():

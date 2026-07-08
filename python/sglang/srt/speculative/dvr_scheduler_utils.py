@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
-from sglang.srt.mem_cache.mamba_radix_cache_policy import (
+from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
     clear_req_mamba_radix_insert_snapshot,
     mark_req_skip_mamba_radix_finished_insert,
     set_req_mamba_radix_insert_snapshot,

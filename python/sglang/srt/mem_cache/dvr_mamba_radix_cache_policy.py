@@ -1,19 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 
 @dataclass
-class MambaRadixInsertSnapshot:
+class DVRMambaRadixInsertSnapshot:
     indices: Any
     seqlen: int
-
-
-@dataclass(frozen=True)
-class MambaRadixUnfinishedInsertPlan:
-    cache_len: Optional[int]
-    snapshot_indices: Optional[Any] = None
 
 
 def mark_req_skip_mamba_radix_finished_insert(req: Any) -> None:
@@ -32,25 +26,25 @@ def should_insert_finished_req(req: Any, *, default_is_insert: bool) -> bool:
 def set_req_mamba_radix_insert_snapshot(
     req: Any, *, indices: Any, seqlen: int
 ) -> None:
-    req.mamba_radix_insert_snapshot = MambaRadixInsertSnapshot(
+    req.mamba_radix_insert_snapshot = DVRMambaRadixInsertSnapshot(
         indices=indices, seqlen=seqlen
     )
 
 
 def get_req_mamba_radix_insert_snapshot(
     req: Any,
-) -> Optional[MambaRadixInsertSnapshot]:
+) -> Optional[DVRMambaRadixInsertSnapshot]:
     """Return a worker-provided checkpoint snapshot for unfinished insert."""
 
     return getattr(req, "mamba_radix_insert_snapshot", None)
 
 
-def get_unfinished_insert_plan(
+def get_unfinished_insert_state(
     req: Any,
     *,
     enable_mamba_extra_buffer: bool,
     token_count: int,
-) -> MambaRadixUnfinishedInsertPlan:
+) -> Tuple[Optional[int], Optional[Any]]:
     """Resolve the checkpoint source for unfinished-request cache insertion.
 
     Normal decoding donates the request's current mamba ping-pong slot. Spec-v2
@@ -65,15 +59,12 @@ def get_unfinished_insert_plan(
         and snapshot.indices is not None
         and snapshot.seqlen is not None
     ):
-        return MambaRadixUnfinishedInsertPlan(
-            cache_len=snapshot.seqlen,
-            snapshot_indices=snapshot.indices,
-        )
+        return snapshot.seqlen, snapshot.indices
 
     cache_len = (
         req.mamba_last_track_seqlen if enable_mamba_extra_buffer else token_count
     )
-    return MambaRadixUnfinishedInsertPlan(cache_len=cache_len)
+    return cache_len, None
 
 
 def clear_req_mamba_radix_insert_snapshot(req: Any) -> None:

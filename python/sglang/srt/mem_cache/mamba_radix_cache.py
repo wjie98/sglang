@@ -49,9 +49,9 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.mem_cache.mamba_radix_cache_policy import (
+from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
     clear_req_mamba_radix_insert_snapshot,
-    get_unfinished_insert_plan,
+    get_unfinished_insert_state,
     should_insert_finished_req,
 )
 
@@ -655,13 +655,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
-        insert_plan = get_unfinished_insert_plan(
+        cache_len, insert_mamba_indices = get_unfinished_insert_state(
             req,
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             token_count=len(token_ids),
         )
-        cache_len = insert_plan.cache_len
-        insert_mamba_indices = insert_plan.snapshot_indices
         try:
             if self.disable or cache_len is None:
                 return _skip_cache_unfinished_req(req)
