@@ -25,6 +25,8 @@ run_one_mode() {
   local server_log="${RESULT_ROOT}/logs/${label}_server.log"
   local kl_log="${RESULT_ROOT}/results/${label}_return_logprob_true.log"
   local no_logprob_log="${RESULT_ROOT}/results/${label}_return_logprob_false.log"
+  local prefix_cache_kl_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_true.log"
+  local prefix_cache_no_logprob_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_false.log"
 
   echo "==> Starting ${label} DVR-EAGLE server on ${BASE_URL}"
   setsid env \
@@ -70,6 +72,7 @@ run_one_mode() {
     --seed 2032 \
     2>&1 | tee "${kl_log}"
   grep -q '"kl_failed": 0' "${kl_log}"
+  grep -q '"accept_failed": 0' "${kl_log}"
 
   echo "==> Running ${label} no-return-logprob smoke"
   conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
@@ -82,6 +85,34 @@ run_one_mode() {
     --ignore-eos \
     --seed 2032 \
     2>&1 | tee "${no_logprob_log}"
+  grep -q '"accept_failed": 0' "${no_logprob_log}"
+
+  echo "==> Running ${label} prefix-cache safety boundary returned-logprob KL smoke"
+  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+    --base-url "${BASE_URL}" \
+    --prompt-token-lengths 65 \
+    --max-new 65 \
+    --cache-mode warm-all \
+    --check-kl \
+    --min-accept-rate 0.99 \
+    --ignore-eos \
+    --seed 3032 \
+    2>&1 | tee "${prefix_cache_kl_log}"
+  grep -q '"kl_failed": 0' "${prefix_cache_kl_log}"
+  grep -q '"accept_failed": 0' "${prefix_cache_kl_log}"
+
+  echo "==> Running ${label} prefix-cache safety boundary no-return-logprob smoke"
+  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+    --base-url "${BASE_URL}" \
+    --prompt-token-lengths 65 \
+    --max-new 65 \
+    --cache-mode warm-all \
+    --no-return-logprob \
+    --min-accept-rate 0.99 \
+    --ignore-eos \
+    --seed 3032 \
+    2>&1 | tee "${prefix_cache_no_logprob_log}"
+  grep -q '"accept_failed": 0' "${prefix_cache_no_logprob_log}"
 
   stop_process_group "${SERVER_PID}"
   SERVER_PID=""

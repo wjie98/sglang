@@ -108,6 +108,17 @@ def handle_dvr_speculative_decoding(server_args):
         raise ValueError(
             "DVR EAGLE requires setting --speculative-draft-model-path."
         )
+    if is_dvr_eagle_enabled(server_args) and not server_args.disable_radix_cache:
+        # DVR-EAGLE/MTP owns an independent draft KV pool.  The regular radix
+        # tree only tracks target KV slots, so a target prefix hit can leave
+        # the MTP draft prefix KV unavailable or stale and sharply reduce the
+        # accept rate.  Keep correctness/acceptance stable until draft-prefix
+        # KV ownership is represented in the cache.
+        logger.warning(
+            "Radix cache is disabled for DVR EAGLE because independent MTP "
+            "draft KV prefixes are not tracked by the target radix cache."
+        )
+        server_args.disable_radix_cache = True
 
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = 16
