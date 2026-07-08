@@ -296,33 +296,3 @@ class SpecInput(ABC):
             x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
-
-    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
-        """Optionally adjust graph-resident replay buffers before replay.
-
-        This is a narrow CUDA-graph extension point: spec algorithms may copy
-        already-owned replay tensors into graph buffers, but request ownership
-        and accept/rollback state must remain in the spec worker/scheduler.
-        """
-
-        return None
-
-    def cuda_graph_metadata_context(
-        self,
-        *,
-        model_runner,
-        attn_backend,
-        forward_mode,
-        fallback_custom_mask=None,
-    ):
-        """Scoped metadata patching for algorithms with graph-only invariants.
-
-        The context only covers attention metadata construction during capture
-        or replay_prepare. It must restore every temporary mutation before the
-        actual graph replay so non-spec and target-verify paths keep their
-        normal backend state.
-        """
-
-        from contextlib import nullcontext
-
-        return nullcontext()

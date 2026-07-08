@@ -70,6 +70,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import share_input_buffers_in
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.speculative.spec_cuda_graph import (
+    prepare_spec_cuda_graph_replay_buffers,
+    spec_cuda_graph_metadata_context,
+)
 from sglang.srt.speculative.spec_policy import (
     create_target_verify_cuda_graph_input_for_runner,
     get_spec_algorithm_policy,
@@ -1002,15 +1006,12 @@ class CudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            metadata_context = (
-                empty_context()
-                if forward_batch.spec_info is None
-                else forward_batch.spec_info.cuda_graph_metadata_context(
-                    model_runner=self.model_runner,
-                    attn_backend=attn_backend,
-                    forward_mode=forward_batch.forward_mode,
-                    fallback_custom_mask=self.buffers.custom_mask,
-                )
+            metadata_context = spec_cuda_graph_metadata_context(
+                forward_batch.spec_info,
+                model_runner=self.model_runner,
+                attn_backend=attn_backend,
+                forward_mode=forward_batch.forward_mode,
+                fallback_custom_mask=self.buffers.custom_mask,
             )
             with metadata_context:
                 attn_backend.init_forward_metadata_out_graph(
@@ -1147,10 +1148,9 @@ class CudaGraphRunner:
             padded_num_tokens=bs * self.num_tokens_per_bs,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        if forward_batch.spec_info is not None:
-            forward_batch.spec_info.prepare_cuda_graph_replay_buffers(
-                self, raw_num_token
-            )
+        prepare_spec_cuda_graph_replay_buffers(
+            forward_batch.spec_info, self, raw_num_token
+        )
         if (
             self.model_runner.spec_algorithm.is_dflash()
             and self.model_runner.is_draft_worker
@@ -1183,15 +1183,12 @@ class CudaGraphRunner:
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        metadata_context = (
-            empty_context()
-            if forward_batch.spec_info is None
-            else forward_batch.spec_info.cuda_graph_metadata_context(
-                model_runner=self.model_runner,
-                attn_backend=attn_backend,
-                forward_mode=self.capture_forward_mode,
-                fallback_custom_mask=buffers.custom_mask,
-            )
+        metadata_context = spec_cuda_graph_metadata_context(
+            forward_batch.spec_info,
+            model_runner=self.model_runner,
+            attn_backend=attn_backend,
+            forward_mode=self.capture_forward_mode,
+            fallback_custom_mask=buffers.custom_mask,
         )
         with metadata_context:
             attn_backend.init_forward_metadata_out_graph(fb_view)
