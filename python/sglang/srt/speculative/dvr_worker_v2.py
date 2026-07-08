@@ -23,7 +23,6 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
 from sglang.srt.speculative.dvr_logprob_repair import (
     score_deferred_dvr_final_logprob_repairs,
 )
-from sglang.srt.speculative.dvr_linear_state_worker import DVRSpecV2LinearStateMixin
 from sglang.srt.speculative.dvr_utils import (
     chain_speculative_sampling,
     dvr_chain_uniform_samples,
@@ -50,9 +49,7 @@ if is_cuda():
     )
 
 
-class DecodeVerifyRollbackWorkerV2(
-    DVRSpecV2LinearStateMixin, DecodeVerifyRollbackWorker
-):
+class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
     """Overlap-scheduler DVR worker.
 
     DVR has no standalone draft model.  The scheduler still expects a spec-v2
@@ -168,12 +165,16 @@ class DecodeVerifyRollbackWorkerV2(
                 self.num_draft_tokens,
             )
 
-        seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
+        seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         replay_tasks = self.linear_state.prepare_for_draft(
             batch, seq_lens_cpu=seq_lens_cpu
         )
         if replay_tasks:
-            self._replay_linear_state_boundaries(batch, replay_tasks)
+            self.linear_state.replay_boundary_tasks(
+                batch,
+                replay_tasks,
+                request_token_ids_for_replay=self._request_token_ids_for_replay,
+            )
             self.linear_state.restore_tail_lens_after_replay(
                 batch, replay_tasks, seq_lens_cpu=seq_lens_cpu
             )
@@ -214,7 +215,7 @@ class DecodeVerifyRollbackWorkerV2(
         scheduler_seq_lens = batch.seq_lens
         linear_state_ctx = self.linear_state.restore_for_verify(
             batch,
-            seq_lens_cpu=self._batch_seq_lens_cpu_list(batch),
+            seq_lens_cpu=self.linear_state.batch_seq_lens_cpu(batch),
         )
         batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
         batch_result = self._forward_target_verify_for_dvr(batch)
@@ -247,7 +248,7 @@ class DecodeVerifyRollbackWorkerV2(
         )
 
         if has_verify_tokens:
-            base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
+            base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
             accept_lens_cpu = accept_lens.detach().cpu().tolist()
             compact_output_token_ids_per_req = (
                 self._compact_flat_tokens_by_accept_lens(
@@ -305,7 +306,7 @@ class DecodeVerifyRollbackWorkerV2(
                             )
                         )
             pending_track_indices, pending_track_seqlens = (
-                self._commit_linear_state_after_verify_v2(
+                self.linear_state.commit_after_verify_v2(
                     batch=batch,
                     accepted_token_counts=accept_lens.to(torch.long),
                     accepted_steps=(accept_lens - 1).to(torch.long),

@@ -32,10 +32,6 @@ from sglang.srt.speculative.dvr_target_replay import (
     suffix_draft_replay_batch_context,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
-from sglang.srt.speculative.dvr_linear_state_worker import (
-    DVRLinearStateReplayMixin,
-    DVRSpecV2LinearStateMixin,
-)
 from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
 from sglang.srt.speculative.dvr_utils import (
     dvr_has_graph_unsafe_short_prompt,
@@ -89,9 +85,7 @@ class DVREagleDraftWorker(EagleDraftWorker):
         )
 
 
-class DecodeVerifyRollbackEagleWorkerV2(
-    DVRLinearStateReplayMixin, DVRSpecV2LinearStateMixin, EAGLEWorkerV2
-):
+class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     """EAGLE draft with DVR target verify/rollback semantics.
 
     The draft model and draft-extend phases stay on the standard EAGLE v2
@@ -206,12 +200,16 @@ class DecodeVerifyRollbackEagleWorkerV2(
         # state. DVR only checkpoints/restores target recurrent state for the
         # verifier. Use batch logical lengths explicitly because overlap can run
         # the next forward before Req.output_ids has been materialized.
-        seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
+        seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         replay_tasks = self.linear_state.prepare_for_draft(
             batch, seq_lens_cpu=seq_lens_cpu
         )
         if replay_tasks:
-            self._replay_linear_state_boundaries(batch, replay_tasks)
+            self.linear_state.replay_boundary_tasks(
+                batch,
+                replay_tasks,
+                request_token_ids_for_replay=self._request_token_ids_for_replay,
+            )
             self.linear_state.restore_tail_lens_after_replay(
                 batch, replay_tasks, seq_lens_cpu=seq_lens_cpu
             )
@@ -240,7 +238,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         if self.topk != 1 or self.linear_state.boundary_backup is None:
             return None
 
-        base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
+        base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         with suffix_draft_replay_batch_context(
             batch=batch,
             linear_state=self.linear_state,
@@ -399,7 +397,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
                 verify_input.retrieve_next_token.shape
             ).cpu()
 
-        base_seq_lens_cpu = self._batch_seq_lens_cpu_list(batch)
+        base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         linear_state_ctx = self.linear_state.restore_for_verify(
             batch,
             seq_lens_cpu=base_seq_lens_cpu,
@@ -520,7 +518,7 @@ class DecodeVerifyRollbackEagleWorkerV2(
         pending_track_seqlens = None
         if linear_state_ctx is not None:
             pending_track_indices, pending_track_seqlens = (
-                self._commit_linear_state_after_verify_v2(
+                self.linear_state.commit_after_verify_v2(
                     batch=batch,
                     accepted_token_counts=accept_lens.to(torch.long),
                     accepted_steps=(accept_lens - 1).to(torch.long),

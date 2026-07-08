@@ -29,7 +29,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
-from sglang.srt.speculative.dvr_linear_state_worker import DVRLinearStateReplayMixin
 from sglang.srt.speculative.dvr_logprob_repair import (
     defer_dvr_non_streaming_logprob_output_until_finish,
     score_deferred_dvr_final_logprob_repairs,
@@ -143,7 +142,7 @@ class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
         return dvr_chain_uniform_samples(candidates, batch)
 
 
-class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
+class DecodeVerifyRollbackWorker:
     """DVR speculative worker using the target model as a self draft model.
 
     The control flow mirrors EAGLE: self-decode draft, target verify, then
@@ -559,7 +558,11 @@ class DecodeVerifyRollbackWorker(DVRLinearStateReplayMixin):
             batch, use_request_seqlen=True
         )
         if replay_tasks:
-            self._replay_linear_state_boundaries(batch, replay_tasks)
+            self.linear_state.replay_boundary_tasks(
+                batch,
+                replay_tasks,
+                request_token_ids_for_replay=self._request_token_ids_for_replay,
+            )
             self.linear_state.restore_tail_lens_after_replay(
                 batch, replay_tasks, use_request_seqlen=True
             )
