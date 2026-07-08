@@ -27,9 +27,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.speculative.dvr_draft_decode_context import (
-    draft_decode_performance_context,
-)
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils import (
@@ -195,11 +192,9 @@ class EAGLEDraftCudaGraphRunner:
         self.buffers.share_buffers()
 
         # Capture
-        draft_decode_ctx = draft_decode_performance_context(
-            model_runner,
+        draft_decode_ctx = self.eagle_worker._draft_decode_context(
             graph_capture=True,
             clear_kernel_config_caches=True,
-            attn_backends=(self.draft_attn_backend,),
         )
         try:
             with model_capture_mode(), draft_decode_ctx:
@@ -262,10 +257,7 @@ class EAGLEDraftCudaGraphRunner:
             else contextlib.nullcontext()
         )
         with ctx:
-            draft_decode_ctx = draft_decode_performance_context(
-                self.model_runner,
-                attn_backends=(self.draft_attn_backend,),
-            )
+            draft_decode_ctx = self.eagle_worker._draft_decode_context()
             with draft_decode_ctx:
                 self.graphs[self.bs].replay()
 

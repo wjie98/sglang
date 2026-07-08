@@ -74,9 +74,15 @@ class DVREagleDraftWorker(EagleDraftWorker):
             ),
         )
 
-    def _draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
+    def _draft_decode_context(
+        self,
+        *,
+        graph_capture: bool = False,
+        clear_kernel_config_caches: bool = False,
+    ):
         return draft_decode_performance_context(
             self.draft_runner,
+            graph_capture=graph_capture,
             clear_kernel_config_caches=clear_kernel_config_caches,
             attn_backends=(
                 getattr(self, "draft_attn_backend", None),

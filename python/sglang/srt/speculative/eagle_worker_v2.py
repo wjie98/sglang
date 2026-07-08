@@ -223,7 +223,12 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
-    def _draft_decode_context(self, *, clear_kernel_config_caches: bool = False):
+    def _draft_decode_context(
+        self,
+        *,
+        graph_capture: bool = False,
+        clear_kernel_config_caches: bool = False,
+    ):
         return empty_context()
 
     def _rebuild_topk1_chain_buffers(self) -> None:
