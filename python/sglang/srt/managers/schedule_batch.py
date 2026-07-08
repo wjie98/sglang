@@ -778,8 +778,8 @@ class Req(ReqDllmMixin):
         self.mamba_lazy_is_insert: bool = True
         # Request-local mamba radix insertion policy. Speculative workers may
         # attach a checkpoint snapshot that radix cache consumes later.
-        self.mamba_radix_skip_finished_insert: bool = False
-        self.mamba_radix_insert_snapshot: Any = None
+        self.dvr_mamba_radix_skip_finished_insert: bool = False
+        self.dvr_mamba_radix_insert_snapshot: Any = None
         # Check finish
         self.tokenizer = None
         self.finished_reason: Optional[BaseFinishReason] = None
@@ -871,8 +871,8 @@ class Req(ReqDllmMixin):
         # True means the input logprob has been already sent to detokenizer.
         self.input_logprob_sent: bool = False
         # Request-local output policy for speculative exact-logprob repair.
-        self.spec_defer_non_streaming_logprob_output: bool = False
-        self.spec_final_logprob_repair_claimed: bool = False
+        self.dvr_defer_non_streaming_logprob_output: bool = False
+        self.dvr_final_logprob_repair_claimed: bool = False
         # Temporary holder to store input_token_logprobs.
         self.input_token_logprobs: Optional[List[Tuple[int]]] = None
         self.temp_input_top_logprobs_val: Optional[List[torch.Tensor]] = None
