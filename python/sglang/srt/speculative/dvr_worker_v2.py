@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
-    DVRSpecResultAux,
+    build_dvr_spec_result_aux,
 )
 from sglang.srt.speculative.dvr_logprob_repair import (
     score_deferred_dvr_final_logprob_repairs,
@@ -349,9 +349,9 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 req.useful_spec_proposed_drafts(self.num_draft_steps)
                 for req in batch.reqs
             ],
-            spec_aux=DVRSpecResultAux.from_pending_mamba_checkpoint_lists(
-                pending_track_indices,
-                pending_track_seqlens,
+            spec_aux=build_dvr_spec_result_aux(
+                track_indices=pending_track_indices,
+                seqlens=pending_track_seqlens,
                 final_logprob_repairs=final_logprob_repairs,
             ),
             routed_experts_output=batch_result.routed_experts_output,

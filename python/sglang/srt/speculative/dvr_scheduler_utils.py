@@ -48,35 +48,33 @@ class DVRSpecResultAux:
         list[Optional[DVRFinalLogprobRepair]]
     ] = None
 
-    @classmethod
-    def from_pending_mamba_checkpoint_lists(
-        cls,
-        track_indices: Optional[list[Optional[int]]],
-        seqlens: Optional[list[Optional[int]]],
-        final_logprob_repairs: Optional[
-            list[Optional[DVRFinalLogprobRepair]]
-        ] = None,
-    ) -> Optional["DVRSpecResultAux"]:
-        if track_indices is None and seqlens is None and final_logprob_repairs is None:
-            return None
 
-        if track_indices is None:
-            track_indices = [None] * (len(seqlens) if seqlens is not None else 0)
-        if seqlens is None:
-            seqlens = [None] * len(track_indices)
+def build_dvr_spec_result_aux(
+    *,
+    track_indices: Optional[list[Optional[int]]],
+    seqlens: Optional[list[Optional[int]]],
+    final_logprob_repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = None,
+) -> Optional[DVRSpecResultAux]:
+    if track_indices is None and seqlens is None and final_logprob_repairs is None:
+        return None
 
-        checkpoints = [
-            (
-                DVRMambaCheckpoint(track_idx=track_idx, seqlen=seqlen)
-                if track_idx is not None and seqlen is not None
-                else None
-            )
-            for track_idx, seqlen in zip(track_indices, seqlens, strict=True)
-        ]
-        return cls(
-            pending_mamba_checkpoints=checkpoints or None,
-            final_logprob_repairs=final_logprob_repairs,
+    if track_indices is None:
+        track_indices = [None] * (len(seqlens) if seqlens is not None else 0)
+    if seqlens is None:
+        seqlens = [None] * len(track_indices)
+
+    checkpoints = [
+        (
+            DVRMambaCheckpoint(track_idx=track_idx, seqlen=seqlen)
+            if track_idx is not None and seqlen is not None
+            else None
         )
+        for track_idx, seqlen in zip(track_indices, seqlens, strict=True)
+    ]
+    return DVRSpecResultAux(
+        pending_mamba_checkpoints=checkpoints or None,
+        final_logprob_repairs=final_logprob_repairs,
+    )
 
 
 def compact_output_token_rows(
