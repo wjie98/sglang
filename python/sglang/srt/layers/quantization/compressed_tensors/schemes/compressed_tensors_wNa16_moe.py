@@ -130,7 +130,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         # In the case where we have actorder/g_idx,
         # we do not partition the w2 scales
-        load_full_w2 = (self.actorder != "static") and self.group_size != -1
+        load_full_w2 = (
+            self.actorder is not None
+            and self.actorder != "static"
+            and self.group_size != -1
+        )
 
         if load_full_w2:
             w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
@@ -257,16 +261,18 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         # Force record: these are the target GPTQ shapes for rollback.
         layer._original_shapes["w13_weight_packed"] = tuple(w13_weight.shape)
+        layer._original_shapes["w2_weight_packed"] = tuple(w2_weight.shape)
+
+        # Also record the shapes of the scales.
+        layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
         layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
+
         if not self.sym:
             layer._original_shapes["w13_weight_zero_point"] = w13_qzeros.shape
-
-        layer._original_shapes["w2_weight_packed"] = tuple(w2_weight.shape)
-        layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
-        if not self.sym:
             layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
         if getattr(layer, "is_marlin_converted", False):
             return
@@ -391,6 +397,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
     def restore_weights_before_loading(self, layer: torch.nn.Module):
         """Forcibly resize parameters back to their original shapes (e.g., GPTQ format) before loading weights."""
+
         if not hasattr(layer, "_original_shapes"):
             return
 
@@ -422,6 +429,8 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             w13_g_idx=getattr(layer, "w13_weight_g_idx", None),
             w2_g_idx=getattr(layer, "w2_weight_g_idx", None),
             is_k_full=self.is_k_full,
+            w13_qzeros=layer.w13_weight_zero_point if not self.sym else None,
+            w2_qzeros=layer.w2_weight_zero_point if not self.sym else None,
         )
 
     def apply_weights(
@@ -473,6 +482,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            clamp_limit=self.moe_runner_config.swiglu_limit,
             workspace=layer.workspace,
         )
         return StandardCombineInput(hidden_states=output)
@@ -535,8 +545,8 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."

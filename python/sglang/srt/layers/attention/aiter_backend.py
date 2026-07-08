@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
+
 """
 end to end attention solution with aiter kernels
 """
@@ -24,7 +26,6 @@ from sglang.srt.layers.attention.utils import (
     get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -69,6 +70,7 @@ from sglang.srt.layers.attention.utils import (
     pad_sequence_with_mask,
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
@@ -153,11 +155,11 @@ class AiterAttnBackend(AttentionBackend):
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = topk
         self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.head_dim = model_runner.model_config.head_dim
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
+            get_parallel().attn_tp_size
         )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
@@ -1116,88 +1118,6 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
                 )
-        elif forward_batch.forward_mode.is_draft_extend():
-            # EAGLE V1: DRAFT_EXTEND mode - uses spec_info.num_accept_tokens
-            if self.use_mla:
-                kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                    spec_info.generate_attn_arg_prefill(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.seq_lens_sum,
-                        self.req_to_token,
-                    )
-                )
-
-                if _use_mla_ps_kernel:
-                    max_seqlen_qo = max(forward_batch.extend_seq_lens_cpu)
-                    (
-                        work_metadata,
-                        work_indptr,
-                        work_info_set,
-                        reduce_indptr,
-                        reduce_final_map,
-                        reduce_partial_map,
-                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
-
-                    num_kv_splits = self.max_split_per_batch
-
-                    self.make_mla_meta_data(
-                        qo_indptr,
-                        kv_indptr,
-                        self.kv_last_page_len[:bs],
-                        work_metadata,
-                        work_info_set,
-                        work_indptr,
-                        reduce_indptr,
-                        reduce_final_map,
-                        reduce_partial_map,
-                        max_seqlen_qo,
-                        fast_mode=fast_mode,
-                        max_split_per_batch=num_kv_splits,
-                        intra_batch_mode=intra_batch_mode,
-                    )
-
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    # self.mla_indices_updater_prefill.kv_last_page_len,
-                    self.kv_last_page_len[:bs],
-                    max(forward_batch.extend_seq_lens_cpu),
-                    forward_batch.seq_lens_cpu.max().item(),
-                    work_metadata=work_metadata,
-                    work_info_set=work_info_set,
-                    work_indptr=work_indptr,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    num_kv_splits=num_kv_splits,
-                    run_graph=False,
-                )
-            else:
-                # Non-MLA draft_extend: use triton extend kernel with causal masking
-                kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                    spec_info.generate_attn_arg_prefill(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.seq_lens_sum,
-                        self.req_to_token,
-                    )
-                )
-                kv_indices = kv_indices.to(torch.int64)
-                draft_max_extend_len = torch.max(spec_info.num_accept_tokens).item()
-
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    None,
-                    draft_max_extend_len,
-                    None,
-                    custom_mask=custom_mask,
-                    mask_indptr=None,
-                    max_extend_len=draft_max_extend_len,
-                )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
@@ -1940,72 +1860,6 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
             )
-        elif forward_mode.is_draft_extend():
-            # EAGLE V1: Uses spec_info.num_accept_tokens
-            num_tokens_per_bs = self.speculative_num_steps + 1
-            seq_lens = seq_lens[:bs]
-            extend_lens = spec_info.num_accept_tokens[:bs]
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-
-            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-            max_q_len = num_tokens_per_bs
-
-            if self.use_mla and _use_mla_ps_kernel:
-                num_kv_splits = self.max_split_per_batch
-
-                self.make_mla_meta_data(
-                    qo_indptr,
-                    kv_indptr,
-                    kv_last_page_len,
-                    self.work_metadata,
-                    self.work_info_set,
-                    self.work_indptr,
-                    self.reduce_indptr,
-                    self.reduce_final_map,
-                    self.reduce_partial_map,
-                    max_q_len,
-                    fast_mode=fast_mode,
-                    max_split_per_batch=num_kv_splits,
-                    intra_batch_mode=intra_batch_mode,
-                )
-
-                work_metadata = self.work_metadata
-                work_info_set = self.work_info_set
-                work_indptr = self.work_indptr
-
-                reduce_indptr = self.reduce_indptr
-                reduce_final_map = self.reduce_final_map
-                reduce_partial_map = self.reduce_partial_map
-
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                max_kv_len,
-                work_metadata=work_metadata,
-                work_info_set=work_info_set,
-                work_indptr=work_indptr,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                num_kv_splits=num_kv_splits,
-            )
-
         else:
             raise ValueError("Invalid forward mode")
 
@@ -2051,20 +1905,14 @@ class AiterAttnBackend(AttentionBackend):
                 # launch_reshape_and_cache_flash; always route through
                 # set_kv_buffer which dispatches to the SHUFFLE 5D writer.
                 if self.kv_cache_is_vectorized_5d:
-                    if self.use_sliding_window_kv_pool:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            cache_loc,
-                            k,
-                            v,
-                            k_descale,
-                            v_descale,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, k_descale, v_descale
-                        )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        k_descale,
+                        v_descale,
+                    )
                 # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
                 # both unified attention and sliding window kv pool are active.
                 # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
@@ -2101,20 +1949,14 @@ class AiterAttnBackend(AttentionBackend):
                 elif self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
-                    if self.use_sliding_window_kv_pool:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer,
-                            cache_loc,
-                            k,
-                            v,
-                            k_descale,
-                            v_descale,
-                            swa_loc=self.forward_metadata.swa_out_cache_loc,
-                        )
-                    else:
-                        self.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, k_descale, v_descale
-                        )
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        k,
+                        v,
+                        k_descale,
+                        v_descale,
+                    )
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -2134,7 +1976,6 @@ class AiterAttnBackend(AttentionBackend):
             if (
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
@@ -2283,10 +2124,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
                 return o
-            elif (
-                forward_batch.forward_mode.is_draft_extend()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
+            elif forward_batch.forward_mode.is_draft_extend_v2():
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
                 work_info_set = self.forward_metadata.work_info_set
@@ -2358,10 +2196,7 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            ):
+            if forward_batch.forward_mode.is_target_verify():
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -2488,6 +2323,11 @@ class AiterAttnBackend(AttentionBackend):
                 page_table = self.forward_metadata.swa_page_table
 
             extra_kwargs = {}
+            attn_out = getattr(forward_batch, "_attn_output", None)
+            if attn_out is not None and q.dtype != fp8_dtype:
+                extra_kwargs["out"] = attn_out.view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -2540,20 +2380,17 @@ class AiterAttnBackend(AttentionBackend):
         if save_kv_cache:
             # SHUFFLE 5D pool path — see forward_extend for rationale.
             if self.kv_cache_is_vectorized_5d:
-                if self.use_sliding_window_kv_pool:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(
                         forward_batch.out_cache_loc,
-                        k,
-                        v,
-                        k_descale,
-                        v_descale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                else:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer, forward_batch.out_cache_loc, k, v, k_descale, v_descale
-                    )
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
+                    k,
+                    v,
+                    k_descale,
+                    v_descale,
+                )
             # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
             # both unified attention and sliding window kv pool are active.
             # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
@@ -2595,17 +2432,15 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     forward_batch.out_cache_loc,
                 )
-            elif self.use_sliding_window_kv_pool:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    forward_batch.out_cache_loc,
-                    k,
-                    v,
-                    swa_loc=self.forward_metadata.swa_out_cache_loc,
-                )
             else:
                 self.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        self.forward_metadata.swa_out_cache_loc,
+                    ),
+                    k,
+                    v,
                 )
 
         if self.use_mla:
@@ -2736,10 +2571,10 @@ class AiterIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_attention_tp_size()
+            get_parallel().attn_tp_size
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
@@ -2952,7 +2787,7 @@ class AiterMultiStepDraftBackend:
             )
         self.max_context_len = self.attn_backends[0].max_context_len
         self.num_head = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices

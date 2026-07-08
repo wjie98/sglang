@@ -29,7 +29,6 @@ from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
-from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 
 if TYPE_CHECKING:
 
@@ -46,7 +45,7 @@ if TYPE_CHECKING:
 
 def get_draft_kv_pool(
     *,
-    draft_worker: "BaseTpWorker",
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
 ):
@@ -55,30 +54,18 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
-    if get_spec_algorithm_policy(spec_algorithm).uses_target_kv_pool_for_draft():
-        # DVR self-draft reuses the target model runner and target KV pool. There
-        # is no independent draft KV pool to register for disaggregation/HiCache.
-        return None, None
-
-    # V2 (EAGLE family) nests the runner under `.draft_worker`; DFLASH /
-    # FROZEN_KV_MTP expose `.model_runner` directly.
-    if spec_algorithm.supports_spec_v2():
-        if server_args.enable_multi_layer_eagle:
-            draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-        else:
-            draft_runner = draft_worker.draft_worker.draft_runner
-        return draft_runner.token_to_kv_pool, draft_runner.model_config
-
-    return (
-        draft_worker.model_runner.token_to_kv_pool,
-        draft_worker.model_config,
-    )
+    # V2 workers nest the draft runner under `.draft_worker`.
+    if server_args.enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool, draft_runner.model_config
 
 
 def maybe_register_hicache_draft(
     *,
-    tree_cache: "BasePrefixCache",
-    draft_worker: "BaseTpWorker",
+    tree_cache: BasePrefixCache,
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
     enable_hierarchical_cache: bool,
@@ -102,8 +89,8 @@ def maybe_register_hicache_draft(
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.memory_pool_host import (
-        MHATokenToKVPoolHost,
         MLATokenToKVPoolHost,
+        get_mha_host_pool_cls,
     )
 
     pool = draft_kv_pool
@@ -120,7 +107,7 @@ def maybe_register_hicache_draft(
         layout=server_args.hicache_mem_layout,
     )
     if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
     else:
@@ -135,21 +122,21 @@ def maybe_register_hicache_draft(
 
 def build_kv_cache(
     *,
-    server_args: "ServerArgs",
-    model_config: "ModelConfig",
-    tp_worker: "BaseTpWorker",
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    tp_worker: BaseTpWorker,
     page_size: int,
-    spec_algorithm: "SpeculativeAlgorithm",
-    attn_tp_cpu_group: "ProcessGroup",
-    tp_cpu_group: "ProcessGroup",
-    attn_cp_cpu_group: "ProcessGroup",
+    spec_algorithm: SpeculativeAlgorithm,
+    attn_tp_cpu_group: ProcessGroup,
+    tp_cpu_group: ProcessGroup,
+    attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: "ParallelState",
-    tp_group: "GroupCoordinator",
-    pp_group: "GroupCoordinator",
+    ps: ParallelState,
+    tp_group: GroupCoordinator,
+    pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
-) -> "KVCacheBuildResult":
+) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
@@ -214,7 +201,7 @@ def build_kv_cache(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         page_size=page_size,
-        is_eagle=get_spec_algorithm_policy(spec_algorithm).is_eagle(),
+        is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
         ),

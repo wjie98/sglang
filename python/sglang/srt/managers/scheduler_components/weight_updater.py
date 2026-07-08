@@ -86,9 +86,7 @@ class SchedulerWeightUpdaterManager:
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
-    disaggregation_mode: Any
-    get_disagg_decode_prealloc_queue: Callable
-    get_disagg_prefill_bootstrap_queue: Callable
+    scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
@@ -296,17 +294,22 @@ class SchedulerWeightUpdaterManager:
             self.offload_tags.add(tag)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            scheduler = self.scheduler
+            if scheduler is not None:
+                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+                    for queue_name in (
+                        "disagg_decode_transfer_queue",
+                        "disagg_decode_prealloc_queue",
+                    ):
+                        queue = getattr(scheduler, queue_name, None)
+                        if queue is not None:
+                            queue.release_memory_occupation()
+                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+                    if queue is not None:
+                        queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                queue = self.get_disagg_decode_prealloc_queue()
-                if queue is not None:
-                    queue.release_memory_occupation()
-            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                queue = self.get_disagg_prefill_bootstrap_queue()
-                if queue is not None:
-                    queue.release_memory_occupation()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
@@ -345,15 +348,20 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                queue = self.get_disagg_decode_prealloc_queue()
-                if queue is not None:
-                    queue.resume_memory_occupation()
-            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                queue = self.get_disagg_prefill_bootstrap_queue()
-                if queue is not None:
-                    queue.resume_memory_occupation()
+            scheduler = self.scheduler
+            if scheduler is not None:
+                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+                    for queue_name in (
+                        "disagg_decode_transfer_queue",
+                        "disagg_decode_prealloc_queue",
+                    ):
+                        queue = getattr(scheduler, queue_name, None)
+                        if queue is not None:
+                            queue.resume_memory_occupation()
+                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+                    if queue is not None:
+                        queue.resume_memory_occupation()
 
         return ResumeMemoryOccupationReqOutput()
 
