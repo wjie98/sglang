@@ -83,7 +83,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
-    draft_probs: Optional[torch.Tensor] = None
     grammar: BaseGrammarObject = None
 
     # Shape info for padding

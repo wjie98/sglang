@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from typing import List, Optional, Tuple
 
 import torch
@@ -122,6 +122,7 @@ class DVREagleVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
         return dvr_chain_uniform_samples(candidates, batch)
 
 
+@dataclass
 class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
     """DVR verify input with classic chain speculative sampling.
 
@@ -130,6 +131,8 @@ class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
     the generated distribution and acceptance rate aligned with the reference
     branch.
     """
+
+    draft_probs: Optional[torch.Tensor] = None
 
     def _sampling_fn_and_draft_probs(self, target_probs: torch.Tensor, batch):
         if self.draft_probs is None:
