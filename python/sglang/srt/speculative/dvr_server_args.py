@@ -183,7 +183,7 @@ def handle_dvr_speculative_decoding(server_args):
         server_args.disable_overlap_schedule = True
         logger.warning(
             "Overlap scheduler is disabled for DVR. Set "
-            "SGLANG_ENABLE_SPEC_V2=True to use the experimental DVR spec v2 path."
+            "SGLANG_ENABLE_SPEC_V2=True to use DVR spec v2 overlap scheduling."
         )
     server_args.enable_mixed_chunk = False
     logger.warning("Mixed chunked prefill is disabled for DVR.")

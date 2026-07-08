@@ -199,6 +199,7 @@ class SpecAlgorithmPolicy:
     def uses_target_kv_pool_for_draft(self) -> bool:
         return self.is_dvr_self_draft()
 
+
 def get_spec_algorithm_policy(algorithm: Any) -> SpecAlgorithmPolicy:
     return SpecAlgorithmPolicy(algorithm)
 
