@@ -2539,21 +2539,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.enable_overlap
         )
 
-    def requires_seq_lens_cpu_before_filter(self, *, enable_overlap: bool) -> bool:
-        """Return whether filter_batch needs published CPU seq_lens first.
-
-        Scheduler owns when seq_lens are resolved; speculative algorithms own
-        the rule for whether a delayed result can make a row logically finished
-        before Req.output_ids is materialized.
-        """
-
-        return get_spec_algorithm_policy(
-            self.spec_algorithm
-        ).requires_seq_lens_cpu_before_filter(
-            batch=self,
-            enable_overlap=enable_overlap,
-        )
-
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
 
@@ -2698,20 +2683,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             elif chunked_req_to_exclude is None:
                 chunked_req_to_exclude = []
 
-            spec_policy = get_spec_algorithm_policy(self.spec_algorithm)
-
-            keep_indices = []
-            for i in range(len(self.reqs)):
-                if self.reqs[i] in chunked_req_to_exclude:
-                    continue
-                if self.reqs[i].finished():
-                    continue
-                if spec_policy.is_finished_by_published_seq_len(
-                    batch=self,
-                    req_index=i,
-                ):
-                    continue
-                keep_indices.append(i)
+            keep_indices = [
+                i
+                for i in range(len(self.reqs))
+                if not self.reqs[i].finished()
+                and self.reqs[i] not in chunked_req_to_exclude
+            ]
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests

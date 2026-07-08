@@ -32,6 +32,9 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     compact_output_token_rows,
     commit_pending_mamba_checkpoint_from_result,
 )
+from sglang.srt.speculative.dvr_scheduler_hooks import (
+    maybe_filter_running_batch_with_spec_state,
+)
 from sglang.srt.speculative.dvr_output_policy import (
     allow_req_non_streaming_logprob_output,
     defer_req_non_streaming_logprob_output,
@@ -99,11 +102,10 @@ def test_dvr_mamba_radix_snapshot_policy():
     assert not _policy(SpeculativeAlgorithm.NONE).needs_mamba_radix_snapshot_for_spec_v2()
 
 
-def test_dvr_published_seq_len_filter_policy():
-    dvr_policy = _policy(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK)
-    eagle_policy = _policy(SpeculativeAlgorithm.EAGLE)
+def test_dvr_published_seq_len_filter_hook():
     req = SimpleNamespace(
         origin_input_ids=[1, 2, 3],
+        finished=lambda: False,
         sampling_params=SimpleNamespace(max_new_tokens=4),
     )
     batch = SimpleNamespace(
@@ -111,33 +113,41 @@ def test_dvr_published_seq_len_filter_policy():
         seq_lens_cpu=torch.tensor([6]),
         seq_lens=None,
         reqs=[req],
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+        filter_batch=lambda keep_indices, v1_spec_info_filtered: setattr(
+            batch, "filtered_keep_indices", keep_indices
+        ),
+    )
+    future_map = SimpleNamespace(
+        resolve_seq_lens_cpu=lambda resolved_batch: setattr(
+            resolved_batch, "seq_lens_resolved", True
+        )
     )
 
-    assert dvr_policy.requires_seq_lens_cpu_before_filter(
+    assert maybe_filter_running_batch_with_spec_state(
         batch=batch,
+        future_map=future_map,
         enable_overlap=True,
+        v1_spec_info_filtered=True,
     )
-    assert not dvr_policy.requires_seq_lens_cpu_before_filter(
-        batch=batch,
-        enable_overlap=False,
-    )
-    assert not eagle_policy.requires_seq_lens_cpu_before_filter(
-        batch=batch,
-        enable_overlap=True,
-    )
+    assert batch.seq_lens_resolved
+    assert batch.filtered_keep_indices == []
 
-    assert dvr_policy.is_finished_by_published_seq_len(
-        batch=batch,
-        req_index=0,
-    )
     batch.seq_lens_cpu = torch.tensor([5])
-    assert not dvr_policy.is_finished_by_published_seq_len(
+    assert maybe_filter_running_batch_with_spec_state(
         batch=batch,
-        req_index=0,
+        future_map=future_map,
+        enable_overlap=True,
+        v1_spec_info_filtered=True,
     )
-    assert not eagle_policy.is_finished_by_published_seq_len(
+    assert batch.filtered_keep_indices == [0]
+
+    batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+    assert not maybe_filter_running_batch_with_spec_state(
         batch=batch,
-        req_index=0,
+        future_map=future_map,
+        enable_overlap=True,
+        v1_spec_info_filtered=True,
     )
 
 
