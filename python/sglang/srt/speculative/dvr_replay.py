@@ -640,43 +640,6 @@ def dvr_suffix_replay_context(
         yield replay_batch, replay_plan
 
 
-def _draft_row_logits_from_replay_hidden_states(
-    *,
-    target_worker,
-    forward_batch,
-    hidden_states: torch.Tensor,
-    hidden_gather_indices: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return logits/hidden states for replayed draft-token rows only."""
-
-    draft_hidden_states = _gather_replay_hidden_states(
-        hidden_states=hidden_states,
-        hidden_gather_indices=hidden_gather_indices,
-    )
-    logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
-    logits_metadata.next_token_logits_buffer = None
-    draft_logits = target_worker.model_runner.model.logits_processor._get_logits(
-        draft_hidden_states,
-        target_worker.model_runner.model.lm_head,
-        logits_metadata,
-    )
-    return draft_logits, draft_hidden_states
-
-
-def _gather_replay_hidden_states(
-    *,
-    hidden_states: torch.Tensor,
-    hidden_gather_indices: torch.Tensor,
-) -> torch.Tensor:
-    if hidden_states is None:
-        raise RuntimeError("DVR target replay did not return hidden states.")
-    gather_indices = hidden_gather_indices.to(
-        device=hidden_states.device,
-        dtype=torch.long,
-    )
-    return hidden_states[gather_indices]
-
-
 def replay_dvr_accepted_suffix_for_live_state(
     *,
     batch: ScheduleBatch,
@@ -800,12 +763,23 @@ def run_dvr_suffix_replay_oracle(
         forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
 
     assert replay_plan.hidden_gather_indices is not None
-    return _draft_row_logits_from_replay_hidden_states(
-        target_worker=target_worker,
-        forward_batch=forward_batch,
-        hidden_states=oracle_output.logits_output.hidden_states,
-        hidden_gather_indices=replay_plan.hidden_gather_indices,
+    hidden_states = oracle_output.logits_output.hidden_states
+    if hidden_states is None:
+        raise RuntimeError("DVR target replay did not return hidden states.")
+    draft_hidden_states = hidden_states[
+        replay_plan.hidden_gather_indices.to(
+            device=hidden_states.device,
+            dtype=torch.long,
+        )
+    ]
+    logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+    logits_metadata.next_token_logits_buffer = None
+    draft_logits = target_worker.model_runner.model.logits_processor._get_logits(
+        draft_hidden_states,
+        target_worker.model_runner.model.lm_head,
+        logits_metadata,
     )
+    return draft_logits, draft_hidden_states
 
 
 def score_dvr_verify_outputs(
