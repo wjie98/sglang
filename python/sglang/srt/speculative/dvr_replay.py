@@ -572,75 +572,75 @@ def _build_private_extend_batch(
         else spec.multimodal_inputs
     )
 
-    replay_batch = ScheduleBatch(
+    replay_batch = ScheduleBatch.init_new(
         reqs=spec.reqs,
         req_to_token_pool=batch.req_to_token_pool,
         token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
         tree_cache=batch.tree_cache,
         model_config=batch.model_config,
         enable_overlap=batch.enable_overlap,
-        device=batch.device,
-        forward_mode=ForwardMode.EXTEND,
-        input_ids=torch.tensor(spec.input_ids, dtype=torch.int64, device=device),
-        req_pool_indices=req_pool_indices,
-        req_pool_indices_cpu=req_pool_indices.cpu(),
-        seq_lens=final_seq_lens,
-        out_cache_loc=out_cache_loc,
-        seq_lens_cpu=final_seq_lens.cpu(),
-        seq_lens_sum=sum(spec.final_seq_lens),
-        return_logprob=spec.return_logprob,
-        top_logprobs_nums=spec.top_logprobs_nums,
-        token_ids_logprobs=spec.token_ids_logprobs,
-        global_num_tokens=global_num_tokens,
-        global_num_tokens_for_logprob=global_num_tokens_for_logprob,
-        is_extend_in_batch=spec.is_extend_in_batch,
-        all_extend_in_batch=spec.all_extend_in_batch,
-        can_run_dp_cuda_graph=False,
-        can_run_dp_breakable_cuda_graph=False,
-        tbo_split_seq_index=None,
-        global_forward_mode=None,
-        extend_num_tokens=len(spec.input_ids),
-        extend_lens=spec.extend_lens,
-        prefix_lens=spec.prefix_lens,
-        extend_logprob_start_lens=extend_logprob_start_lens,
-        extend_input_logprob_token_ids=(
-            None
-            if spec.extend_input_logprob_token_ids is None
-            else torch.tensor(
-                spec.extend_input_logprob_token_ids,
-                dtype=torch.int64,
-                device=device,
-            )
-        ),
-        multimodal_inputs=multimodal_inputs,
-        encoder_cached=None,
-        encoder_lens=None,
-        encoder_lens_cpu=None,
-        encoder_out_cache_loc=None,
-        sampling_info=None,
-        orig_seq_lens=final_seq_lens.to(dtype=torch.int32),
-        input_embeds=None,
-        ne_token_table=None,
         spec_algorithm=batch.spec_algorithm,
-        spec_info=None,
-        capture_hidden_mode=spec.capture_hidden_mode,
-        hicache_consumer_index=-1,
-        is_prefill_only=(
-            batch.is_prefill_only
-            if spec.is_prefill_only is None
-            else spec.is_prefill_only
-        ),
         dllm_config=batch.dllm_config,
-        has_grammar=False,
-        return_hidden_states=False,
-        return_hidden_states_before_norm=False,
-        mamba_track_indices=spec.mamba_track_indices,
-        mamba_track_mask=spec.mamba_track_mask,
-        mamba_track_seqlens=spec.mamba_track_seqlens,
-        mamba_cow_src_indices=spec.mamba_cow_src_indices,
-        mamba_cow_dst_indices=spec.mamba_cow_dst_indices,
-        mamba_clear_indices=spec.mamba_clear_indices,
     )
+    replay_batch.forward_mode = ForwardMode.EXTEND
+    replay_batch.input_ids = torch.tensor(
+        spec.input_ids, dtype=torch.int64, device=device
+    )
+    replay_batch.req_pool_indices = req_pool_indices
+    replay_batch.req_pool_indices_cpu = req_pool_indices.cpu()
+    replay_batch.seq_lens = final_seq_lens
+    replay_batch.seq_lens_cpu = final_seq_lens.cpu()
+    replay_batch.seq_lens_sum = sum(spec.final_seq_lens)
+    replay_batch.out_cache_loc = out_cache_loc
+    replay_batch.orig_seq_lens = final_seq_lens.to(dtype=torch.int32)
+    replay_batch.extend_num_tokens = len(spec.input_ids)
+    replay_batch.extend_lens = spec.extend_lens
+    replay_batch.prefix_lens = spec.prefix_lens
+    replay_batch.extend_logprob_start_lens = extend_logprob_start_lens
+    replay_batch.extend_input_logprob_token_ids = (
+        None
+        if spec.extend_input_logprob_token_ids is None
+        else torch.tensor(
+            spec.extend_input_logprob_token_ids,
+            dtype=torch.int64,
+            device=device,
+        )
+    )
+    replay_batch.multimodal_inputs = multimodal_inputs
+    replay_batch.return_logprob = spec.return_logprob
+    replay_batch.top_logprobs_nums = spec.top_logprobs_nums
+    replay_batch.token_ids_logprobs = spec.token_ids_logprobs
+    replay_batch.global_num_tokens = global_num_tokens
+    replay_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+    replay_batch.is_extend_in_batch = spec.is_extend_in_batch
+    replay_batch.all_extend_in_batch = spec.all_extend_in_batch
+    replay_batch.can_run_dp_cuda_graph = False
+    replay_batch.can_run_dp_breakable_cuda_graph = False
+    replay_batch.tbo_split_seq_index = None
+    replay_batch.global_forward_mode = None
+    replay_batch.encoder_cached = None
+    replay_batch.encoder_lens = None
+    replay_batch.encoder_lens_cpu = None
+    replay_batch.encoder_out_cache_loc = None
+    replay_batch.sampling_info = None
+    replay_batch.input_embeds = None
+    replay_batch.ne_token_table = None
+    replay_batch.spec_info = None
+    replay_batch.capture_hidden_mode = spec.capture_hidden_mode
+    replay_batch.hicache_consumer_index = -1
+    replay_batch.is_prefill_only = (
+        batch.is_prefill_only if spec.is_prefill_only is None else spec.is_prefill_only
+    )
+    replay_batch.has_grammar = False
+    replay_batch.return_hidden_states = False
+    replay_batch.return_hidden_states_before_norm = False
+    replay_batch.mamba_track_indices = spec.mamba_track_indices
+    replay_batch.mamba_track_mask = spec.mamba_track_mask
+    replay_batch.mamba_track_seqlens = spec.mamba_track_seqlens
+    replay_batch.mamba_cow_src_indices = spec.mamba_cow_src_indices
+    replay_batch.mamba_cow_dst_indices = spec.mamba_cow_dst_indices
+    replay_batch.mamba_clear_indices = spec.mamba_clear_indices
+
     if spec.with_sampling_info:
         from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
