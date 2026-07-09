@@ -495,9 +495,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             replay_prefix=(
                 self.dvr_output_prefix if not batch.forward_mode.is_idle() else None
             ),
-            target_worker=(
-                self.target_worker if not batch.forward_mode.is_idle() else None
-            ),
             output_tokens=predict if not batch.forward_mode.is_idle() else None,
             token_logprobs=logits_output.next_token_logprobs,
             tokens_per_req=(
@@ -505,7 +502,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             ),
             base_seq_lens_cpu=base_seq_lens_cpu,
             error_prefix="DVR EAGLE",
-            draft_kv_state=draft_result.kv_state,
             predict=predict if partial_suffix_replay_kwargs is not None else None,
             accept_index=(
                 accept_index if partial_suffix_replay_kwargs is not None else None

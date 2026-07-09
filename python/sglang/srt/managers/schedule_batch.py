@@ -1215,7 +1215,18 @@ class Req(ReqDllmMixin):
                 # extra-buffer tracking, but target radix nodes do not own the
                 # separate MTP draft KV prefix.  Reusing a target prefix would
                 # skip draft prefill for those tokens and lower acceptance.
+                #
+                # match_prefix may already have installed a deferred mamba COW
+                # on Req before we force the prefix miss.  Cancel that Req-side
+                # effect as well; otherwise a no-prefix prefill would still
+                # start from the cached recurrent state and drift from the
+                # full-prefill GDN oracle.
+                had_mamba_cow = self.mamba_cow_src_index is not None
                 match_result = zero_match_result(tree_cache, match_result)
+                if had_mamba_cow:
+                    self.mamba_cow_src_index = None
+                    if self.mamba_pool_idx is not None and self.already_computed == 0:
+                        self.mamba_needs_clear = True
             (
                 self.prefix_indices,
                 self.last_node,

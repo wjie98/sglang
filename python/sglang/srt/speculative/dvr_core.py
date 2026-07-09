@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-)
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
     DVRDeferredOutput,
@@ -23,8 +17,6 @@ from sglang.srt.speculative.dvr_info import (
     try_claim_dvr_final_logprob_repair,
 )
 from sglang.srt.speculative.dvr_replay import (
-    _linear_state_replay_context,
-    build_dvr_private_extend_batch,
     replay_dvr_accepted_suffix_for_live_state,
 )
 
@@ -84,16 +76,13 @@ class DVRVerifyResult:
 def score_dvr_verify_outputs(
     *,
     batch: Any,
-    target_worker: Any,
     replay_prefix: DVRPendingOutputPrefix,
-    linear_state_ctx: Any,
     output_tokens: torch.Tensor,
     accept_lens: torch.Tensor,
     token_logprobs: Optional[torch.Tensor],
     tokens_per_req: int,
     base_seq_lens_cpu: list[int],
     error_prefix: str,
-    force_final_logprob_replay: bool = False,
 ) -> tuple[list[int], Optional[list[Optional[DVRFinalLogprobRepair]]]]:
     """Record accepted DVR tokens and carry exact final non-streaming logprobs."""
 
@@ -154,168 +143,13 @@ def score_dvr_verify_outputs(
 
         if not try_claim_dvr_final_logprob_repair(req):
             continue
-        repairs[req_i] = _build_final_logprob_repair(
-            batch=batch,
-            target_worker=target_worker,
-            linear_state_ctx=linear_state_ctx,
-            replay_prefix=replay_prefix,
-            req_i=req_i,
+        repairs[req_i] = replay_prefix.final_logprob_repair(
             req=req,
-            final_output_len=final_output_len,
+            output_len=final_output_len,
             error_prefix=f"{error_prefix} final logprob",
-            force_final_logprob_replay=force_final_logprob_replay,
         )
         has_repair = True
     return accept_lens_cpu, repairs if has_repair else None
-
-
-def _build_final_logprob_repair(
-    *,
-    batch: Any,
-    target_worker: Any,
-    linear_state_ctx: Any,
-    replay_prefix: DVRPendingOutputPrefix,
-    req_i: int,
-    req: Any,
-    final_output_len: int,
-    error_prefix: str,
-    force_final_logprob_replay: bool,
-) -> DVRFinalLogprobRepair:
-    if not (force_final_logprob_replay and linear_state_ctx is not None):
-        return replay_prefix.final_logprob_repair(
-            req,
-            final_output_len,
-            error_prefix=error_prefix,
-        )
-
-    # EAGLE/MTP uses compact suffix replay to pair verify logits with hidden
-    # states for the next draft.  Final non-streaming logprobs are stricter:
-    # return the same rows as a full target EXTEND over prompt + output.
-    prompt_len = len(req.origin_input_ids)
-    replay_seq_len = prompt_len + final_output_len
-    replay_ids = replay_prefix.request_output_prefix_token_ids(
-        req,
-        replay_seq_len,
-        error_prefix=error_prefix,
-    )
-    extend_len = len(replay_ids)
-    replay_batch = build_dvr_private_extend_batch(
-        batch,
-        reqs=[req],
-        input_ids=replay_ids,
-        out_cache_locs=None,
-        prefix_lens=[0],
-        extend_lens=[extend_len],
-        final_seq_lens=[extend_len],
-        return_logprob=True,
-        top_logprobs_nums=[0],
-        token_ids_logprobs=[None],
-        extend_logprob_start_lens=[0],
-        extend_input_logprob_token_ids=replay_ids[1:] + [0],
-        multimodal_inputs=[None],
-        is_prefill_only=True,
-        with_sampling_info=True,
-    )
-    replay_linear_state_ctx = _subset_linear_state_ctx(linear_state_ctx, [req_i])
-    with _temporary_final_replay_cache_mapping(
-        replay_batch,
-        extend_len,
-    ) as temp_cache_locs:
-        device = replay_batch.seq_lens.device
-        replay_batch.out_cache_loc = temp_cache_locs.to(
-            device=device, dtype=torch.long
-        )
-        replay_batch.mamba_clear_indices = replay_linear_state_ctx.live_indices
-
-        with (
-            envs.SGLANG_EAGER_INPUT_NO_COPY.override(True),
-            _linear_state_replay_context(
-                replay_linear_state_ctx,
-                clear_state_input_window=True,
-                restore_live_state=True,
-            ),
-        ):
-            replay_linear_state_ctx.state_adapter.zero_recurrent_state(
-                state_cache=replay_linear_state_ctx.state_cache,
-                indices=replay_linear_state_ctx.live_indices,
-            )
-            score_output = target_worker.forward_batch_generation(
-                batch=replay_batch,
-            )
-            input_token_logprobs = score_output.logits_output.input_token_logprobs
-            if input_token_logprobs is not None:
-                input_token_logprobs = input_token_logprobs.detach().cpu()
-        if input_token_logprobs is None:
-            raise RuntimeError("DVR final logprob replay did not return logprobs.")
-
-    output_logprob_start = prompt_len - 1
-    final_output_ids = replay_ids[prompt_len : prompt_len + final_output_len]
-    output_logprob_end = output_logprob_start + len(final_output_ids)
-    return DVRFinalLogprobRepair(
-        output_ids=final_output_ids,
-        output_logprobs=input_token_logprobs[
-            output_logprob_start:output_logprob_end
-        ]
-        .detach()
-        .cpu()
-        .tolist(),
-    )
-
-
-def _subset_linear_state_ctx(linear_state_ctx: Any, req_indices: list[int]) -> Any:
-    index = torch.tensor(
-        req_indices, dtype=torch.long, device=linear_state_ctx.live_indices.device
-    )
-    boundary_indices = getattr(linear_state_ctx, "boundary_indices", None)
-    if boundary_indices is not None:
-        boundary_indices = boundary_indices[index]
-    return replace(
-        linear_state_ctx,
-        state_input_indices=linear_state_ctx.state_input_indices[index],
-        live_indices=linear_state_ctx.live_indices[index],
-        boundary_indices=boundary_indices,
-    )
-
-
-@contextmanager
-def _temporary_final_replay_cache_mapping(
-    batch: Any,
-    extend_len: int,
-):
-    device = batch.seq_lens.device
-    page_size = getattr(batch.tree_cache, "page_size", 1)
-    if page_size == 1:
-        temp_cache_locs = alloc_token_slots(batch.tree_cache, extend_len)
-    else:
-        prefix_lens_cpu = torch.zeros(1, dtype=torch.int64)
-        seq_lens_cpu = torch.tensor([extend_len], dtype=torch.int64)
-        temp_cache_locs = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_cpu.to(device=device, non_blocking=True),
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=seq_lens_cpu.to(device=device, non_blocking=True),
-            seq_lens_cpu=seq_lens_cpu,
-            last_loc=torch.full((1,), -1, dtype=torch.long, device=device),
-            extend_num_tokens=extend_len,
-        )
-    write_offsets = torch.arange(int(extend_len), dtype=torch.long, device=device)
-    write_rows = torch.full(
-        (int(extend_len),),
-        int(batch.reqs[0].req_pool_idx),
-        dtype=torch.long,
-        device=device,
-    )
-    saved_locs = batch.req_to_token_pool.req_to_token[
-        write_rows, write_offsets
-    ].clone()
-    try:
-        batch.req_to_token_pool.write(
-            (write_rows, write_offsets), temp_cache_locs.to(torch.int32)
-        )
-        yield temp_cache_locs
-    finally:
-        batch.req_to_token_pool.write((write_rows, write_offsets), saved_locs)
-        batch.token_to_kv_pool_allocator.free(temp_cache_locs)
 
 
 def _final_output_len_if_repair_needed(
@@ -392,13 +226,11 @@ def finish_dvr_verify(
     accept_lens_cpu: Optional[list[int]],
     num_draft_tokens: int,
     replay_prefix: Optional[DVRPendingOutputPrefix] = None,
-    target_worker: Optional[Any] = None,
     output_tokens: Optional[torch.Tensor] = None,
     token_logprobs: Optional[torch.Tensor] = None,
     tokens_per_req: Optional[int] = None,
     base_seq_lens_cpu: Optional[list[int]] = None,
     error_prefix: str = "DVR",
-    draft_kv_state: Optional[DVRDraftKVState] = None,
     predict: Optional[torch.Tensor] = None,
     accept_index: Optional[torch.Tensor] = None,
     partial_suffix_replay_kwargs: Optional[dict[str, Any]] = None,
@@ -414,32 +246,20 @@ def finish_dvr_verify(
     final_logprob_repairs = None
     if (
         replay_prefix is not None
-        and target_worker is not None
         and output_tokens is not None
         and tokens_per_req is not None
         and base_seq_lens_cpu is not None
         and not batch.forward_mode.is_idle()
     ):
-        # External draft models seed the next draft from suffix-oracle hidden
-        # states, but exact final non-streaming logprobs must still match a full
-        # target EXTEND when prefix-cache/GDN chunk boundaries are involved.
-        force_final_logprob_replay = (
-            draft_kv_state is not None
-            and draft_kv_state.needs_accepted_suffix_repair
-            and linear_state_ctx is not None
-        )
         accept_lens_cpu, final_logprob_repairs = score_dvr_verify_outputs(
             batch=batch,
-            target_worker=target_worker,
             replay_prefix=replay_prefix,
-            linear_state_ctx=linear_state_ctx,
             output_tokens=output_tokens,
             accept_lens=accept_lens,
             token_logprobs=token_logprobs,
             tokens_per_req=tokens_per_req,
             base_seq_lens_cpu=base_seq_lens_cpu,
             error_prefix=error_prefix,
-            force_final_logprob_replay=force_final_logprob_replay,
         )
     elif accept_lens_cpu is None:
         accept_lens_cpu = accept_lens.detach().cpu().tolist()

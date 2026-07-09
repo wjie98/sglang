@@ -1101,13 +1101,11 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
             accept_lens_cpu=None,
             num_draft_tokens=self.num_draft_tokens,
             replay_prefix=self.dvr_output_replay_prefix if has_verify_tokens else None,
-            target_worker=self.target_worker if has_verify_tokens else None,
             output_tokens=predict if has_verify_tokens else None,
             token_logprobs=logits_output.next_token_logprobs,
             tokens_per_req=self.num_draft_tokens if has_verify_tokens else None,
             base_seq_lens_cpu=base_seq_lens_cpu,
             error_prefix="DVR spec-v2",
-            draft_kv_state=draft_result.kv_state,
             predict=predict if partial_suffix_replay_kwargs is not None else None,
             accept_index=(
                 accept_index if partial_suffix_replay_kwargs is not None else None
