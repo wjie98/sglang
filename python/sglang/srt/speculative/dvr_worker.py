@@ -504,47 +504,6 @@ class DecodeVerifyRollbackWorker:
     # Self-draft path. DVR uses the target model's decode path as a draft model,
     # but keeps EAGLE-compatible tree/retrieve metadata for verification.
 
-    def _dvr_draft_rows_and_offsets(
-        self, batch: ScheduleBatch, num_tokens: Optional[int] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return req_to_token rows/columns for the self-draft verify window."""
-
-        num_tokens = self.num_draft_tokens if num_tokens is None else num_tokens
-        offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
-            num_tokens, dtype=torch.long, device=batch.seq_lens.device
-        ).unsqueeze(0)
-        rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
-        return rows, offsets
-
-    def _draft_cache_locs_from_req_to_token(
-        self, batch: ScheduleBatch
-    ) -> torch.Tensor:
-        # ScheduleBatch.prepare_for_decode already reserved the speculative
-        # decode window and wrote it into req_to_token. Self-DVR draft and verify
-        # share that window; allocating a second one leaks KV ownership.
-        rows, offsets = self._dvr_draft_rows_and_offsets(batch)
-        return batch.req_to_token_pool.req_to_token[rows, offsets].reshape(-1)
-
-    def _finish_dvr_draft_preprocess_decode(
-        self, batch: ScheduleBatch, spec_info: EagleDraftInput
-    ) -> None:
-        """Apply decode metadata common to DVR self-draft v1 and v2."""
-
-        batch.return_hidden_states = False
-        batch.mamba_track_indices = None
-        batch.mamba_track_mask = None
-        batch.mamba_track_seqlens = None
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
-
-    def _draft_preprocess_idle(self, batch: ScheduleBatch):
-        batch.spec_info = EagleDraftInput.create_idle_input(
-            device=self.device,
-            hidden_size=0,
-            dtype=self.model_config.dtype,
-            topk=self.topk,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
-
     @staticmethod
     def _request_token_ids_for_replay(req, boundary_seqlen: int):
         token_ids = list(req.origin_input_ids) + list(req.output_ids)
@@ -1061,12 +1020,31 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 self._draft_anchor_tokens(spec_info).to(torch.int64)
             )
 
-        batch.out_cache_loc = self._draft_cache_locs_from_req_to_token(batch)
-        self._finish_dvr_draft_preprocess_decode(batch, spec_info)
+        # ScheduleBatch.prepare_for_decode already reserved the speculative
+        # decode window and wrote it into req_to_token. Self-DVR draft and verify
+        # share that window; allocating a second one leaks KV ownership.
+        offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
+            self.num_draft_tokens, dtype=torch.long, device=batch.seq_lens.device
+        ).unsqueeze(0)
+        rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
+        batch.out_cache_loc = batch.req_to_token_pool.req_to_token[
+            rows, offsets
+        ].reshape(-1)
+        batch.return_hidden_states = False
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
+        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
     def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
-            self._draft_preprocess_idle(batch)
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=0,
+                dtype=self.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.num_draft_steps,
