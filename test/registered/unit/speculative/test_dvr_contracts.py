@@ -184,7 +184,7 @@ def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
         )
 
 
-def test_dvr_output_policy_defer_non_streaming_logprob():
+def test_dvr_request_flags_defer_non_streaming_logprob():
     req = SimpleNamespace(
         return_logprob=True,
         stream=False,
@@ -203,7 +203,7 @@ def test_dvr_output_policy_defer_non_streaming_logprob():
     )
 
 
-def test_dvr_output_policy_does_not_defer_streaming_or_non_logprob_output():
+def test_dvr_request_flags_do_not_defer_streaming_or_non_logprob_output():
     streaming_req = SimpleNamespace(
         return_logprob=True,
         stream=True,
@@ -231,7 +231,7 @@ def test_dvr_output_policy_does_not_defer_streaming_or_non_logprob_output():
     )
 
 
-def test_dvr_output_policy_final_logprob_repair_claim_is_once_only():
+def test_dvr_request_flags_final_logprob_repair_claim_is_once_only():
     req = SimpleNamespace(
         return_logprob=True,
         stream=False,
