@@ -836,8 +836,12 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_kv_indices = kv_indices_buf
 
         if not self.skip_prefill:
+            # Target-verify masks cover each draft row over the prefix plus the
+            # draft-token tail: num_draft_tokens * (seq_len + num_draft_tokens).
+            # Allocate the same upper bound used by _update_target_verify_buffers
+            # so graph replay remains valid at context-length boundaries.
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                (max_num_tokens * (self.max_context_len + self.num_draft_tokens)),
                 dtype=torch.uint8,
                 device=self.device,
             )

@@ -287,6 +287,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
         self.dvr_state_adapter = DVRGatedStateAdapter.for_gdn(
             self.kernel_dispatcher,
+            model_runner=model_runner,
             is_draft_worker=self.is_draft_worker,
         )
         self.verify_intermediate_state_indices = torch.arange(
@@ -402,10 +403,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.dvr_state_adapter.get_layer_state_cache(
+            req_to_token_pool=self.req_to_token_pool,
+            state_cache=mamba_cache_params,
+            layer_id=layer.layer_id,
+        )
         if self.dvr_state_adapter.is_dvr_target_verify(
             state_cache=mamba_cache_params, is_target_verify=is_target_verify
         ):
-            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             # DVR target verify replays GDN state with prefill-equivalent inputs.
             return self.dvr_state_adapter.forward_gdn_target_verify(
                 layer=layer,

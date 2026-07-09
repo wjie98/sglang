@@ -2,21 +2,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, fields
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
+from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-    get_last_loc,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -26,6 +21,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     dvr_self_draft_eager_context,
+    dvr_self_draft_graph_skip_reason,
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
@@ -33,11 +29,12 @@ from sglang.srt.speculative.dvr_logprob_repair import (
     defer_dvr_non_streaming_logprob_output_until_finish,
     score_deferred_dvr_final_logprob_repairs,
 )
-from sglang.srt.speculative.dvr_scheduler_utils import DVRReplayPrefixTracker
+from sglang.srt.speculative.dvr_scheduler_utils import (
+    DVRReplayPrefixTracker,
+    apply_dvr_final_logprob_repairs,
+)
 from sglang.srt.speculative.dvr_target_replay import (
-    build_accepted_suffix_replay_plan,
-    build_suffix_target_replay_batch,
-    linear_state_replay_context,
+    replay_accepted_suffix_for_live_state,
     run_suffix_draft_replay_oracle,
     suffix_draft_replay_batch_context,
 )
@@ -47,19 +44,18 @@ from sglang.srt.speculative.dvr_utils import (
     dvr_has_graph_unsafe_short_prompt,
 )
 from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
-    EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
     organize_draft_results,
-)
-from sglang.srt.speculative.dvr_output_policy import (
-    allow_req_non_streaming_logprob_output,
+    eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import select_top_k_tokens
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.async_probe import maybe_detect_nan
 
@@ -67,6 +63,102 @@ if is_cuda():
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
 logger = logging.getLogger(__name__)
+
+
+def _add_output_logprobs_for_dvr_spec_v1(
+    batch: ScheduleBatch,
+    verify_output: Any,
+    logits_output: LogitsProcessorOutput,
+) -> None:
+    """Populate request logprob buffers for DVR's spec-v1 worker.
+
+    Upstream removed the old generic spec-v1 logprob helper when spec decoding
+    moved to v2.  DVR keeps a v1 compatibility worker, so keep this narrow copy
+    inside DVR instead of reintroducing a generic API that upstream no longer
+    uses.
+    """
+
+    accept_indices = verify_output.accept_indices
+    assert len(accept_indices) == len(logits_output.next_token_logits)
+
+    temperatures = batch.sampling_info.temperatures
+    num_draft_tokens = batch.spec_info.draft_token_num
+    temperatures = temperatures[accept_indices // num_draft_tokens]
+    if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+        logprobs = torch.nn.functional.log_softmax(
+            logits_output.next_token_logits, dim=-1
+        )
+    else:
+        logprobs = torch.nn.functional.log_softmax(
+            logits_output.next_token_logits / temperatures, dim=-1
+        )
+
+    num_tokens_per_req = [
+        accept + 1 for accept in verify_output.num_correct_drafts_per_req_cpu
+    ]
+    top_logprobs_nums = batch.top_logprobs_nums or [0] * len(batch.reqs)
+    token_ids_logprobs = batch.token_ids_logprobs or [None] * len(batch.reqs)
+    top_logprobs_nums_expanded = [
+        num
+        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req)
+        for _ in range(num_tokens)
+    ]
+    token_ids_logprobs_expanded = [
+        token_ids
+        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req)
+        for _ in range(num_tokens)
+    ]
+
+    should_top_logprobs = any(x > 0 for x in top_logprobs_nums)
+    should_token_ids_logprobs = any(x is not None for x in token_ids_logprobs)
+    if should_top_logprobs:
+        (
+            logits_output.next_token_top_logprobs_val,
+            logits_output.next_token_top_logprobs_idx,
+        ) = get_top_logprobs(logprobs, top_logprobs_nums_expanded)
+
+    if should_token_ids_logprobs:
+        (
+            logits_output.next_token_token_ids_logprobs_val,
+            logits_output.next_token_token_ids_logprobs_idx,
+        ) = get_token_ids_logprobs(logprobs, token_ids_logprobs_expanded)
+
+    batch_next_token_ids = verify_output.accept_tokens
+    logits_output.next_token_logprobs = logprobs[
+        torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
+        batch_next_token_ids,
+    ]
+
+    pt = 0
+    next_token_logprobs = logits_output.next_token_logprobs.tolist()
+    accept_tokens_list = batch_next_token_ids.tolist()
+    token_top_logprobs_val = logits_output.next_token_top_logprobs_val
+    token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
+    token_ids_logprobs_val = logits_output.next_token_token_ids_logprobs_val
+    token_ids_logprobs_idx = logits_output.next_token_token_ids_logprobs_idx
+    for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
+        for _ in range(num_tokens):
+            if req.return_logprob:
+                req.logprob.output_token_logprobs_val.append(next_token_logprobs[pt])
+                req.logprob.output_token_logprobs_idx.append(accept_tokens_list[pt])
+                if req.logprob.top_logprobs_num > 0:
+                    req.logprob.output_top_logprobs_val.append(
+                        token_top_logprobs_val[pt]
+                    )
+                    req.logprob.output_top_logprobs_idx.append(
+                        token_top_logprobs_idx[pt]
+                    )
+                if (
+                    req.logprob.token_ids_logprob is not None
+                    and should_token_ids_logprobs
+                ):
+                    req.logprob.output_token_ids_logprobs_val.append(
+                        token_ids_logprobs_val[pt]
+                    )
+                    req.logprob.output_token_ids_logprobs_idx.append(
+                        token_ids_logprobs_idx[pt]
+                    )
+            pt += 1
 
 
 class DVRTargetVerifyMixin:
@@ -142,6 +234,16 @@ class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
         return dvr_chain_uniform_samples(candidates, batch)
 
 
+@dataclass
+class DVRVerifyOutput:
+    """Compatibility view for DVR spec-v1 post-verify bookkeeping."""
+
+    accept_tokens: torch.Tensor
+    accept_indices: torch.Tensor
+    num_correct_drafts_per_req_cpu: List[int]
+    draft_extend_input: EagleDraftExtendInput
+
+
 class DecodeVerifyRollbackWorker:
     """DVR speculative worker using the target model as a self draft model.
 
@@ -182,7 +284,11 @@ class DecodeVerifyRollbackWorker:
         self.device = server_args.device
         self.page_size = server_args.page_size
         self.topk = 1
-        self.max_batch_size = target_worker.max_running_requests
+        self.max_batch_size = (
+            getattr(target_worker, "max_running_requests", None)
+            or getattr(target_worker.model_runner, "max_running_requests", None)
+            or server_args.max_running_requests
+        )
         self.num_draft_steps = server_args.speculative_num_steps
         self.num_draft_tokens = server_args.speculative_num_draft_tokens
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -194,11 +300,6 @@ class DecodeVerifyRollbackWorker:
             model_runner=self.model_runner,
         )
         self.cuda_graph_runner_for_draft_decode = None
-        if (
-            not server_args.disable_cuda_graph
-            and not server_args.disable_draft_cuda_graph
-        ):
-            self.cuda_graph_runner_for_draft_decode = DVRDraftDecodeCudaGraphRunner(self)
         self._logged_dvr_draft_graph_skip_reasons = set()
 
         logger.info(
@@ -229,8 +330,41 @@ class DecodeVerifyRollbackWorker:
     def __getattr__(self, name):
         return getattr(self.target_worker, name)
 
+    def init_attention_backends(self):
+        # Target worker owns the model and attention backend. Scheduler already
+        # initializes it before calling this self-draft worker hook.
+        pass
+
+    def init_cuda_graphs(self):
+        # Capture the dedicated self-draft decode graph after target attention
+        # backends exist. This matches upstream's separated init order.
+        if (
+            self.cuda_graph_runner_for_draft_decode is None
+            and not self.server_args.disable_cuda_graph
+            and not self.server_args.disable_draft_cuda_graph
+        ):
+            self.cuda_graph_runner_for_draft_decode = DVRDraftDecodeCudaGraphRunner(self)
+
     def clear_cache_pool(self):
         self.linear_state.clear_cache_state()
+
+    def alloc_memory_pool(
+        self,
+        *,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        # Self-DVR uses the target model and its pools.  Keep this hook explicit
+        # so Scheduler's draft-worker initialization does not fall through
+        # __getattr__ and allocate/profile the target pools a second time.
+        del memory_pool_config
+        if req_to_token_pool is None or token_to_kv_pool_allocator is None:
+            req_to_token_pool, token_to_kv_pool_allocator = (
+                self.target_worker.get_memory_pool()
+            )
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
     # Public worker entrypoints. The shape follows EAGLE: normal extend produces
     # the first verified token, then decode-verify-rollback handles generation.
@@ -243,18 +377,31 @@ class DecodeVerifyRollbackWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
+                next_draft_input=batch.spec_info,
                 num_correct_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
         spec_info = self.draft(batch)
         logits_output, verify_output, can_run_cuda_graph = self.verify(batch, spec_info)
+        accept_lens = torch.tensor(
+            [x + 1 for x in verify_output.num_correct_drafts_per_req_cpu],
+            dtype=batch.seq_lens.dtype,
+            device=batch.seq_lens.device,
+        )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=verify_output.accept_tokens,
             num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
             num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
+            next_draft_input=batch.spec_info,
+            new_seq_lens=batch.seq_lens + accept_lens,
+            speculative_num_draft_tokens=self.num_draft_tokens,
+            num_proposed_drafts_per_req_cpu=[
+                req.useful_spec_proposed_drafts(self.num_draft_steps)
+                for req in batch.reqs
+            ],
         )
 
     def forward_target_extend(
@@ -291,33 +438,6 @@ class DecodeVerifyRollbackWorker:
     # Self-draft path. DVR uses the target model's decode path as a draft model,
     # but keeps EAGLE-compatible tree/retrieve metadata for verification.
 
-    def _alloc_draft_cache_locs(self, batch: ScheduleBatch) -> torch.Tensor:
-        num_seqs = batch.batch_size()
-        if self.page_size == 1:
-            return alloc_token_slots(
-                batch.tree_cache,
-                num_seqs * self.num_draft_tokens * self.topk,
-            )
-
-        prefix_lens = batch.seq_lens
-        prefix_lens_cpu = batch.seq_lens_cpu
-        end_lens = prefix_lens + self.num_draft_tokens
-        end_lens_cpu = prefix_lens_cpu + self.num_draft_tokens
-        last_loc = get_last_loc(
-            batch.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
-            prefix_lens,
-        )
-        return alloc_paged_token_slots_extend(
-            batch.tree_cache,
-            prefix_lens,
-            prefix_lens_cpu,
-            end_lens,
-            end_lens_cpu,
-            last_loc,
-            num_seqs * self.num_draft_tokens * self.topk,
-        )
-
     def _dvr_draft_rows_and_offsets(
         self, batch: ScheduleBatch, num_tokens: Optional[int] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -329,6 +449,15 @@ class DecodeVerifyRollbackWorker:
         ).unsqueeze(0)
         rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
         return rows, offsets
+
+    def _draft_cache_locs_from_req_to_token(
+        self, batch: ScheduleBatch
+    ) -> torch.Tensor:
+        # ScheduleBatch.prepare_for_decode already reserved the speculative
+        # decode window and wrote it into req_to_token. Self-DVR draft and verify
+        # share that window; allocating a second one leaks KV ownership.
+        rows, offsets = self._dvr_draft_rows_and_offsets(batch)
+        return batch.req_to_token_pool.req_to_token[rows, offsets].reshape(-1)
 
     def _finish_dvr_draft_preprocess_decode(
         self, batch: ScheduleBatch, spec_info: EagleDraftInput
@@ -343,46 +472,21 @@ class DecodeVerifyRollbackWorker:
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
         batch.maybe_evict_swa()
-        for req in batch.reqs:
-            req.decode_batch_idx += 1
 
-        num_seqs = batch.batch_size()
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
 
-        if batch.sampling_info.penalizer_orchestrator.is_required:
+        penalizer_orchestrator = batch.sampling_info.penalizer_orchestrator
+        if penalizer_orchestrator is not None and penalizer_orchestrator.is_required:
             # Keep draft sampling close to normal autoregressive decode by
             # accounting for the anchor token before sampling following tokens.
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            penalizer_orchestrator.cumulate_output_tokens(
                 self._draft_anchor_tokens(spec_info).to(torch.int64)
             )
 
-        # Self-draft decodes directly into the slots that target verify will
-        # read. Do not allocate a second verify window, or KV ownership and
-        # radix-cache rollback stop matching the normal speculative layout.
-        out_cache_loc = self._alloc_draft_cache_locs(batch)
-        self._assign_dvr_draft_cache_locs(batch, out_cache_loc)
-
-        batch.out_cache_loc = out_cache_loc
+        batch.out_cache_loc = self._draft_cache_locs_from_req_to_token(batch)
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
         self._finish_dvr_draft_preprocess_decode(batch, spec_info)
-
-    def _assign_dvr_draft_cache_locs(
-        self, batch: ScheduleBatch, out_cache_loc: torch.Tensor
-    ):
-        """Publish DVR self-draft KV slots into req_to_token for topk=1.
-
-        The old generic EAGLE helper had a simple branch for ``topk == 1``:
-        copy the freshly allocated draft slots into each request's token table
-        starting at the current decode length. DVR only supports chain mode
-        with topk=1, so keeping this local avoids reviving the broader tree
-        kernel and keeps ownership identical to the original DVR path.
-        """
-
-        rows, cols = self._dvr_draft_rows_and_offsets(batch)
-        batch.req_to_token_pool.req_to_token[rows, cols] = out_cache_loc.reshape(
-            batch.batch_size(), self.num_draft_tokens
-        ).to(torch.int32)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
@@ -409,15 +513,6 @@ class DecodeVerifyRollbackWorker:
             f"boundary_seqlen={boundary_seqlen}."
         )
 
-    def _prepare_dvr_draft_forward_batch(
-        self, batch: ScheduleBatch, forward_batch: ForwardBatch
-    ) -> None:
-        skip_reason = None
-        if dvr_has_graph_unsafe_short_prompt(batch):
-            skip_reason = "one-token prompt GDN state-input graph boundary"
-        forward_batch.dvr_draft_cuda_graph_skip_reason = skip_reason
-        forward_batch.dvr_disable_draft_cuda_graph = skip_reason is not None
-
     def _log_dvr_draft_graph_skip_once(self, reason: str) -> None:
         if reason in self._logged_dvr_draft_graph_skip_reasons:
             return
@@ -439,14 +534,14 @@ class DecodeVerifyRollbackWorker:
             # The same page-padded one-token prompt edge can crash TARGET_VERIFY
             # graph replay on GDN models. Keep the fallback local to DVR; normal
             # prompts and all non-DVR target paths still use the captured graph.
-            saved_graph_runner = self.model_runner.graph_runner
-            self.model_runner.graph_runner = None
+            saved_graph_runner = self.model_runner.decode_cuda_graph_runner
+            self.model_runner.decode_cuda_graph_runner = None
         try:
             return self.target_worker.forward_batch_generation(batch, is_verify=True)
         finally:
             batch.return_logprob = need_return_logprob
             if disable_verify_graph:
-                self.model_runner.graph_runner = saved_graph_runner
+                self.model_runner.decode_cuda_graph_runner = saved_graph_runner
 
     def _build_self_draft_verify_input(
         self,
@@ -522,7 +617,20 @@ class DecodeVerifyRollbackWorker:
             batch.return_logprob = False
         try:
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
-            self._prepare_dvr_draft_forward_batch(batch, forward_batch)
+            if forward_batch.seq_lens_cpu is None:
+                forward_batch.seq_lens_cpu = seq_lens_cpu
+            if forward_batch.seq_lens_cpu is None:
+                forward_batch.seq_lens_cpu = forward_batch.seq_lens.detach().cpu()
+            elif not torch.is_tensor(forward_batch.seq_lens_cpu):
+                forward_batch.seq_lens_cpu = torch.tensor(
+                    forward_batch.seq_lens_cpu, dtype=torch.int64, device="cpu"
+                )
+            if forward_batch.seq_lens_sum is None:
+                forward_batch.seq_lens_sum = (
+                    seq_lens_sum
+                    if seq_lens_sum is not None
+                    else int(forward_batch.seq_lens_cpu.sum().item())
+                )
             parent_list, top_scores_index, draft_tokens, draft_probs = (
                 self.draft_forward(forward_batch)
             )
@@ -540,9 +648,7 @@ class DecodeVerifyRollbackWorker:
             seq_lens_sum=(
                 forward_batch.seq_lens_sum if seq_lens_sum is None else seq_lens_sum
             ),
-            seq_lens_cpu=(
-                forward_batch.seq_lens_cpu if seq_lens_cpu is None else seq_lens_cpu
-            ),
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
     def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -668,9 +774,7 @@ class DecodeVerifyRollbackWorker:
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def _draft_decode_forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        graph_skip_reason = getattr(
-            forward_batch, "dvr_draft_cuda_graph_skip_reason", None
-        )
+        graph_skip_reason = dvr_self_draft_graph_skip_reason(forward_batch)
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_decode is not None
             and self.cuda_graph_runner_for_draft_decode.can_run(forward_batch)
@@ -679,9 +783,6 @@ class DecodeVerifyRollbackWorker:
             return self.cuda_graph_runner_for_draft_decode.replay(forward_batch)
 
         min_seq_len = _min_seq_len_cpu(forward_batch)
-        if graph_skip_reason is None and min_seq_len <= 2:
-            graph_skip_reason = "seq_len<=2 initial GDN state-input graph boundary"
-
         if (
             getattr(self.model_runner, "hybrid_gdn_config", None) is not None
             and graph_skip_reason is None
@@ -748,9 +849,7 @@ class DecodeVerifyRollbackWorker:
             num_tokens_for_logprob_per_req=1,
         )
 
-    def _prepare_next_draft_after_verify(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
-    ):
+    def _prepare_next_draft_after_verify(self, batch: ScheduleBatch, verify_output: Any):
         draft_extend_input = verify_output.draft_extend_input
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
@@ -778,6 +877,34 @@ class DecodeVerifyRollbackWorker:
         accept_end = torch.cumsum(num_accept_tokens, dim=0) - 1
         bonus_tokens = draft_extend_input.input_ids[accept_end]
         batch.spec_info = self._next_self_draft_input_from_bonus_tokens(bonus_tokens)
+
+    def _sample_and_build_verify_output(
+        self,
+        *,
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+        logits_output: LogitsProcessorOutput,
+    ) -> DVRVerifyOutput:
+        predict, accept_lens, accept_index = eagle_sample(
+            spec_info, batch, logits_output, vocab_mask=None
+        )
+        accept_lens_cpu = [int(x) for x in accept_lens.tolist()]
+        accept_mask = torch.arange(
+            accept_index.shape[1], dtype=torch.long, device=accept_index.device
+        ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
+        accept_indices = accept_index[accept_mask].to(torch.long)
+        accept_tokens = predict[accept_indices].to(torch.long)
+        return DVRVerifyOutput(
+            accept_tokens=accept_tokens,
+            accept_indices=accept_indices,
+            num_correct_drafts_per_req_cpu=[
+                max(num_accept - 1, 0) for num_accept in accept_lens_cpu
+            ],
+            draft_extend_input=EagleDraftExtendInput(
+                input_ids=accept_tokens,
+                num_accept_tokens_cpu=accept_lens_cpu,
+            ),
+        )
 
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
@@ -828,7 +955,7 @@ class DecodeVerifyRollbackWorker:
         spec_info: EagleVerifyInput,
         linear_state_ctx,
         accepted_token_counts_cpu: List[int],
-        verify_output: Optional[EagleVerifyOutput] = None,
+        verify_output: Optional[Any] = None,
         accepted_ids: Optional[torch.Tensor] = None,
         accepted_cache_locs: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
@@ -851,62 +978,19 @@ class DecodeVerifyRollbackWorker:
             accepted_cache_locs = batch.out_cache_loc
         if accepted_ids is None or accepted_ids.numel() == 0:
             return None
-        total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
-        if (
-            accepted_ids.numel() != total_accepted
-            or accepted_cache_locs.numel() != total_accepted
-        ):
-            return None
-
-        live_indices = linear_state_ctx.live_indices
-        boundary_indices = linear_state_ctx.boundary_indices
-        assert boundary_indices is not None
-
         base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
-        boundary_lens = self.linear_state.boundary_lens_for_replay(
-            batch, base_seq_lens_cpu
-        )
-        replay_plan = build_accepted_suffix_replay_plan(
+        return replay_accepted_suffix_for_live_state(
             batch=batch,
+            target_worker=self.target_worker,
+            linear_state=self.linear_state,
+            linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
-            boundary_lens=boundary_lens,
-            accepted_tokens=accepted_ids,
-            accepted_cache_locs=accepted_cache_locs,
             accepted_token_counts_cpu=accepted_token_counts_cpu,
+            accepted_ids=accepted_ids,
+            accepted_cache_locs=accepted_cache_locs,
             num_draft_tokens=self.num_draft_tokens,
             request_token_ids_for_replay=self._request_token_ids_for_replay,
         )
-        if replay_plan is None:
-            return None
-
-        # Accepted-suffix replay is a commit repair, not a checkpoint publisher.
-        # It intentionally leaves the live recurrent slot updated by the replay.
-        self.linear_state.set_suffix_replay_boundary_track_mask(None)
-        replay_batch = build_suffix_target_replay_batch(
-            batch,
-            replay_plan,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            mamba_cow_src_indices=boundary_indices,
-            mamba_cow_dst_indices=live_indices,
-        )
-
-        with linear_state_replay_context(
-            linear_state_ctx, restore_live_state=False
-        ):
-            if replay_plan.append_rows is not None:
-                assert replay_plan.append_offsets is not None
-                replay_batch.req_to_token_pool.write(
-                    (replay_plan.append_rows, replay_plan.append_offsets),
-                    replay_plan.append_cache_locs.to(
-                        device=replay_batch.seq_lens.device, dtype=torch.int32
-                    ),
-                )
-            self.target_worker.forward_batch_generation(
-                batch=replay_batch, is_verify=True
-            )
-            return torch.ones(
-                len(batch.reqs), dtype=torch.bool, device=live_indices.device
-            )
 
     @staticmethod
     def _seq_lens_cpu_list_for_verify(
@@ -941,28 +1025,6 @@ class DecodeVerifyRollbackWorker:
                 compact_tokens.append([int(x) for x in token_ids[start:end]])
         return compact_tokens
 
-    @staticmethod
-    def _apply_spec_v1_final_logprob_repairs(batch: ScheduleBatch, repairs) -> None:
-        if repairs is None:
-            return
-
-        for req_i, req in enumerate(batch.reqs):
-            if req_i >= len(repairs):
-                break
-            repair = repairs[req_i]
-            if repair is None or not req.return_logprob:
-                continue
-            output_len = len(repair.output_ids)
-            if list(req.output_ids[:output_len]) != repair.output_ids:
-                raise RuntimeError(
-                    "DVR spec-v1 final logprob repair no longer matches "
-                    f"materialized output ids: rid={req.rid}, "
-                    f"repair_len={output_len}, req_output_len={len(req.output_ids)}."
-                )
-            req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
-            req.logprob.output_token_logprobs_idx[:] = repair.output_ids
-            allow_req_non_streaming_logprob_output(req)
-
     def _repair_final_logprobs_for_spec_v1(
         self,
         *,
@@ -990,13 +1052,13 @@ class DecodeVerifyRollbackWorker:
             compact_output_token_ids_per_req=compact_output_token_ids_per_req,
             error_prefix="DVR spec-v1 final logprob",
         )
-        self._apply_spec_v1_final_logprob_repairs(batch, repairs)
+        apply_dvr_final_logprob_repairs(batch, repairs)
 
     def verify(
         self,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
-    ) -> Tuple[LogitsProcessorOutput, EagleVerifyOutput, bool]:
+    ) -> Tuple[LogitsProcessorOutput, Any, bool]:
         # DVR reuses the cache locations populated by self-decode draft. This
         # matches the reference branch and avoids reallocating a second verify
         # window over the same tokens.
@@ -1037,12 +1099,10 @@ class DecodeVerifyRollbackWorker:
                 device=logits_output.next_token_logits.device,
             )
         )
-        verify_output: EagleVerifyOutput = spec_info.verify(
-            batch,
-            logits_output,
-            self.token_to_kv_pool_allocator,
-            self.page_size,
-            vocab_mask=None,
+        verify_output = self._sample_and_build_verify_output(
+            batch=batch,
+            spec_info=spec_info,
+            logits_output=logits_output,
         )
         accept_lens_cpu = [
             int(num_correct) + 1
@@ -1057,7 +1117,9 @@ class DecodeVerifyRollbackWorker:
                 verify_output.accept_indices
             ]
         if batch.return_logprob:
-            add_output_logprobs_for_spec_v1(batch, verify_output, logits_output)
+            _add_output_logprobs_for_dvr_spec_v1(
+                batch, verify_output, logits_output
+            )
             self._repair_final_logprobs_for_spec_v1(
                 batch=batch,
                 linear_state_ctx=linear_state_ctx,

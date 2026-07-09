@@ -4,8 +4,8 @@ from contextlib import contextmanager
 
 from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dvr_utils import iter_dvr_attention_backends
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -143,6 +143,19 @@ def _min_seq_len_cpu(forward_batch: ForwardBatch) -> int:
     return int(forward_batch.seq_lens.min().item())
 
 
+def dvr_self_draft_graph_skip_reason(forward_batch: ForwardBatch) -> str | None:
+    """Return the local reason a self-draft decode step cannot use its graph."""
+
+    # The first self-draft decode after a one-token prompt reaches the graph as
+    # seq_len=2 (prompt token + anchor token). On GDN models that graph replay
+    # can hit an illegal access in the packed decode state-input window; eager
+    # decode handles the same boundary and the next draft step can return to the
+    # graph.
+    if _min_seq_len_cpu(forward_batch) <= 2:
+        return "seq_len<=2 initial GDN state-input graph boundary"
+    return None
+
+
 def _patch_draft_determinism_flags(
     model_runner,
     global_server_args,
@@ -153,6 +166,7 @@ def _patch_draft_determinism_flags(
     patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
     patch_attr(global_server_args, "enable_deterministic_inference", False)
     if disable_model_runner_graph:
+        patch_attr(model_runner, "decode_cuda_graph_runner", None)
         patch_attr(model_runner, "graph_runner", None)
 
 
@@ -192,8 +206,8 @@ def _patch_graph_capture_extras(
 def _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr):
     # Provisional draft tokens must not update mamba prefix-cache tracking
     # slots. DVR commits verified recurrent state after target verify.
-    patch_attr(model_runner.server_args, "mamba_scheduler_strategy", "no_buffer")
-    patch_attr(global_server_args, "mamba_scheduler_strategy", "no_buffer")
+    patch_attr(model_runner.server_args, "mamba_radix_cache_strategy", "no_buffer")
+    patch_attr(global_server_args, "mamba_radix_cache_strategy", "no_buffer")
 
 
 def _assert_draft_decode_performance_state(model_runner, extra_attn_backends):
@@ -355,24 +369,17 @@ class DVRDraftDecodeCudaGraphRunner:
         self.dvr_worker = dvr_worker
         model_runner = dvr_worker.model_runner
         with dvr_self_draft_graph_capture_context(model_runner):
-            self.runner = CudaGraphRunner(model_runner)
+            self.runner = DecodeCudaGraphRunner(model_runner)
 
     @property
     def capture_bs(self):
         return self.runner.capture_bs
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
-        if getattr(forward_batch, "dvr_disable_draft_cuda_graph", False):
+        if dvr_self_draft_graph_skip_reason(forward_batch) is not None:
             return False
-        # The first self-draft decode after a one-token prompt reaches the graph
-        # as seq_len=2 (prompt token + anchor token).  On GDN models that graph
-        # replay can hit an illegal access in the packed decode state-input
-        # window; eager decode handles the same boundary and the next step can
-        # return to the graph.
-        if _min_seq_len_cpu(forward_batch) <= 2:
-            return False
-        return self.runner.can_run(forward_batch)
+        return self.runner.can_run_graph(forward_batch)
 
     def replay(self, forward_batch: ForwardBatch):
         with dvr_self_draft_graph_replay_context(self.dvr_worker.model_runner):
-            return self.runner.replay(forward_batch)
+            return self.runner.execute(forward_batch)

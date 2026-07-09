@@ -7,14 +7,10 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.layers.attention.linear.dvr_gdn_state import (
     DVRGDNStateInputCache,
     DVRGDNStateInputs,
-    create_dvr_gdn_speculative_state_extension,
 )
 from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputWindow
 from sglang.srt.layers.attention.linear.dvr_state_adapter import (
     DVRGatedStateAdapter,
-)
-from sglang.srt.mem_cache.dvr_linear_state_extension import (
-    LinearSpeculativeStateExtensionConfig,
 )
 
 
@@ -95,7 +91,7 @@ def test_gdn_state_input_cache_uses_generic_linear_state_field():
     assert window.capacity == FLA_CHUNK_SIZE + 16
 
 
-def test_dvr_gdn_speculative_state_extension_factory():
+def test_dvr_gdn_adapter_lazily_adds_state_input_cache_view():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
         intermediate_size=32 * 128,
@@ -105,22 +101,43 @@ def test_dvr_gdn_speculative_state_extension_factory():
         state_size=128,
         conv_kernel=4,
     )
-    extension = create_dvr_gdn_speculative_state_extension(
-        LinearSpeculativeStateExtensionConfig(
-            num_layers=1,
-            spec_state_size=2,
-            num_draft_tokens=4,
-            state_shape=state_shape,
-            conv_dtype=torch.float32,
-            ssm_dtype=torch.float32,
-            device="cpu",
-        )
+    all_layers_state_cache = SimpleNamespace(
+        intermediate_ssm=torch.zeros(1, 3, 4, 16, 128, 128),
+    )
+    req_to_token_pool = SimpleNamespace(
+        mamba_pool=SimpleNamespace(mamba_cache=all_layers_state_cache),
+        mamba_map={7: 0},
+        get_mamba_indices=lambda req_pool_indices: req_pool_indices,
+        get_speculative_mamba2_params_all_layers=lambda: all_layers_state_cache,
+    )
+    batch = SimpleNamespace(
+        batch_size=lambda: 1,
+        req_to_token_pool=req_to_token_pool,
+        reqs=[SimpleNamespace(mamba_ping_pong_track_buffer=torch.tensor([0]))],
+    )
+    adapter = DVRGatedStateAdapter(
+        ops=None,
+        enabled=True,
+        state_shape=state_shape,
+        conv_dtype=torch.float32,
+        device="cpu",
     )
 
-    assert extension.intermediate_ssm_tokens == 1
-    assert extension.intermediate_conv_tokens == 4
-    assert extension.state_input_cache is not None
-    assert extension.state_input_cache.state_inputs().q.shape[1] == 4
+    layer_state_cache = SimpleNamespace(
+        intermediate_ssm=all_layers_state_cache.intermediate_ssm[0],
+    )
+    wrapped = adapter.get_layer_state_cache(
+        req_to_token_pool=batch.req_to_token_pool,
+        state_cache=layer_state_cache,
+        layer_id=7,
+    )
+
+    assert wrapped.base is layer_state_cache
+    assert req_to_token_pool._dvr_linear_state_input_cache is not None
+    window = DVRStateInputWindow.from_cache(wrapped)
+    assert window.enabled
+    assert window.capacity == FLA_CHUNK_SIZE + 4
+    assert window.tensors()[0].shape == (4, FLA_CHUNK_SIZE + 4, 8, 128)
 
 
 def test_gdn_extend_tail_cache_skips_draft_workers():

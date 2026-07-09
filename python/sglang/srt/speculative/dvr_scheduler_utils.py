@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
@@ -9,10 +9,9 @@ from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
     mark_req_skip_mamba_radix_finished_insert,
     set_req_mamba_radix_insert_snapshot,
 )
-from sglang.srt.speculative.dvr_output_policy import (
+from sglang.srt.managers.scheduler_components.output_policy import (
     allow_req_non_streaming_logprob_output,
 )
-from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 
 
 @dataclass
@@ -103,6 +102,15 @@ def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None
     repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = getattr(
         aux, "final_logprob_repairs", None
     )
+    apply_dvr_final_logprob_repairs(batch, repairs)
+
+
+def apply_dvr_final_logprob_repairs(
+    batch: Any,
+    repairs: Optional[list[Optional[DVRFinalLogprobRepair]]],
+) -> None:
+    """Apply exact final DVR output logprobs after output tokens materialize."""
+
     if repairs is None:
         return
 
@@ -531,11 +539,11 @@ def maybe_handle_dvr_mamba_checkpoint_after_decode(
 ) -> bool:
     """Handle DVR's decode-time mamba checkpoint commit if applicable."""
 
-    if not get_spec_algorithm_policy(batch.spec_algorithm).is_dvr():
+    if not batch.spec_algorithm.is_dvr():
         return False
 
     mark_req_skip_mamba_radix_finished_insert(req)
-    if batch.is_spec_v2:
+    if _is_dvr_spec_v2(batch):
         commit_pending_mamba_checkpoint_from_result(
             req=req,
             batch=batch,
@@ -554,7 +562,7 @@ def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
     tree_cache: Any,
     enable_hisparse: bool,
     hisparse_coordinator: Any,
-) -> None:
+) -> bool:
     """Cache unfinished prefill reqs while preserving DVR mamba checkpoints.
 
     Normal prefill caching only inserts requests that are not already in the
@@ -564,12 +572,7 @@ def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
     """
 
     should_cache_unfinished = not batch.decoding_reqs or req not in batch.decoding_reqs
-    is_dvr_spec_v2 = (
-        batch.is_spec_v2
-        and get_spec_algorithm_policy(
-            batch.spec_algorithm
-        ).needs_mamba_radix_snapshot_for_spec_v2()
-    )
+    is_dvr_spec_v2 = _is_dvr_spec_v2(batch)
     if is_dvr_spec_v2 and not should_cache_unfinished:
         scheduled_extend_len = (
             batch.extend_lens[req_index]
@@ -579,7 +582,7 @@ def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
         should_cache_unfinished = scheduled_extend_len > 1
 
     if not should_cache_unfinished:
-        return
+        return False
 
     if is_dvr_spec_v2:
         _set_req_radix_insert_snapshot_from_batch(
@@ -590,6 +593,7 @@ def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
     maybe_cache_unfinished_req(req, tree_cache)
     if enable_hisparse:
         hisparse_coordinator.admit_request_into_staging(req)
+    return True
 
 
 def _set_req_radix_insert_snapshot_from_batch(
@@ -611,4 +615,195 @@ def _set_req_radix_insert_snapshot_from_batch(
         req,
         indices=batch.mamba_track_indices[req_index].reshape(1),
         seqlen=int(batch.mamba_track_cache_seqlens[req_index].item()),
+    )
+
+
+def _is_dvr_spec_v2(batch: Any) -> bool:
+    spec_algorithm = batch.spec_algorithm
+    if not spec_algorithm.is_dvr():
+        return False
+    return spec_algorithm.is_dvr_eagle() or getattr(batch, "enable_overlap", False)
+
+
+def maybe_filter_running_batch_with_spec_state(
+    *,
+    batch: Any,
+    future_map: Any,
+    enable_overlap: bool,
+) -> bool:
+    """Filter running batch with DVR's spec-v2 logical-finish state if needed."""
+
+    spec_algorithm = batch.spec_algorithm
+    if not enable_overlap or not spec_algorithm.is_dvr():
+        return False
+    if spec_algorithm.is_dvr_self_draft() and not batch.enable_overlap:
+        return False
+
+    future_map.resolve_seq_lens_cpu(batch)
+    keep_indices = [
+        i
+        for i, req in enumerate(batch.reqs)
+        if not req.finished()
+        and not _dvr_is_finished_by_published_seq_len(batch=batch, req_index=i)
+    ]
+    batch.filter_batch(keep_indices=keep_indices)
+    return True
+
+
+def _dvr_is_finished_by_published_seq_len(*, batch: Any, req_index: int) -> bool:
+    req = batch.reqs[req_index]
+    max_new_tokens = req.sampling_params.max_new_tokens
+    if max_new_tokens is None:
+        return False
+    max_new_tokens = int(max_new_tokens)
+    if max_new_tokens <= 0:
+        return False
+
+    if batch.seq_lens_cpu is not None:
+        seq_len = int(batch.seq_lens_cpu[req_index].item())
+    elif batch.seq_lens is not None:
+        seq_len = int(batch.seq_lens[req_index].item())
+    else:
+        return False
+
+    # Decode seq_lens includes KV-visible generated tokens; the newest sampled
+    # bonus token is materialized into Req.output_ids one result-processing step
+    # later, hence the final visible token corresponds to max_new_tokens - 1.
+    return seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
+
+
+def apply_spec_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
+    """Apply DVR final-response logprob repairs, if any."""
+
+    if batch.spec_algorithm.is_dvr():
+        apply_dvr_final_logprob_repairs_from_result(batch, result)
+
+
+def _is_dvr_spec_v1_result(batch: Any, result: Any) -> bool:
+    """Return whether result uses DVR self-draft's legacy spec-v1 shape."""
+
+    return (
+        batch.spec_algorithm.is_dvr_self_draft()
+        and getattr(result, "accept_lens", None) is None
+        and getattr(result, "num_correct_drafts_per_req_cpu", None) is not None
+    )
+
+
+def maybe_resolve_dvr_spec_v1_decode_tokens_from_result(
+    *,
+    batch: Any,
+    result: Any,
+    model_worker: Any,
+    accept_grammar_tokens: Callable[[Any, Any], Any],
+) -> Optional[list[list[int]]]:
+    """Resolve DVR spec-v1 flat accepted tokens into per-request token runs."""
+
+    if not _is_dvr_spec_v1_result(batch, result):
+        return None
+
+    assert result.next_token_ids.is_cpu
+    flat_tokens = result.next_token_ids.tolist()
+    accept_lens = [x + 1 for x in result.num_correct_drafts_per_req_cpu]
+    if len(accept_lens) != len(batch.reqs):
+        raise RuntimeError(
+            "DVR spec-v1 result length mismatch: "
+            f"{len(accept_lens)=}, {len(batch.reqs)=}."
+        )
+    if sum(accept_lens) != len(flat_tokens):
+        raise RuntimeError(
+            "DVR spec-v1 accepted-token length mismatch: "
+            f"{sum(accept_lens)=}, {len(flat_tokens)=}."
+        )
+
+    result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
+    on_verify_complete_cpu = getattr(model_worker, "on_verify_complete_cpu", None)
+    if callable(on_verify_complete_cpu):
+        on_verify_complete_cpu(
+            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+        )
+
+    default_proposed_per_verify = max(
+        0, int(getattr(result, "speculative_num_draft_tokens", 1) or 1) - 1
+    )
+    proposed_drafts_per_req = getattr(result, "num_proposed_drafts_per_req_cpu", None)
+
+    predict_tokens = []
+    offset = 0
+    for i, (req, accept_len) in enumerate(zip(batch.reqs, accept_lens, strict=True)):
+        accept_tokens = flat_tokens[offset : offset + accept_len]
+        offset += accept_len
+
+        if req.is_retracted:
+            pass
+        elif req.finished():
+            # Spec prepare_for_decode pre-claims one bonus slot.
+            req.kv_committed_len -= 1
+        else:
+            if req.grammar is not None:
+                accept_tokens = accept_grammar_tokens(req, accept_tokens)
+
+            num_accept_tokens = len(accept_tokens)
+            # Spec prepare_for_decode already committed the bonus slot.
+            req.kv_committed_len += num_accept_tokens - 1
+            req.record_spec_verify_metrics(
+                num_correct_drafts=result.num_correct_drafts_per_req_cpu[i],
+                num_proposed_drafts=(
+                    proposed_drafts_per_req[i]
+                    if proposed_drafts_per_req is not None
+                    else req.useful_spec_proposed_drafts(default_proposed_per_verify)
+                ),
+            )
+
+        predict_tokens.append(accept_tokens)
+
+    return predict_tokens
+
+
+def should_skip_dvr_spec_v1_decode_logprob_append(*, batch: Any, result: Any) -> bool:
+    """DVR spec-v1 computes request logprobs inside the worker compatibility path."""
+
+    return _is_dvr_spec_v1_result(batch, result)
+
+
+def maybe_cache_unfinished_prefill_req_with_spec_state(
+    *,
+    req: Any,
+    batch: Any,
+    req_index: int,
+    tree_cache: Any,
+    enable_hisparse: bool,
+    hisparse_coordinator: Any,
+) -> bool:
+    """Cache unfinished prefill reqs while preserving DVR mamba checkpoints."""
+
+    if not batch.spec_algorithm.is_dvr():
+        return False
+    return cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
+        req=req,
+        batch=batch,
+        req_index=req_index,
+        tree_cache=tree_cache,
+        enable_hisparse=enable_hisparse,
+        hisparse_coordinator=hisparse_coordinator,
+    )
+
+
+def maybe_handle_spec_mamba_checkpoint_after_decode(
+    *,
+    req: Any,
+    batch: Any,
+    result: Any,
+    req_index: int,
+    tree_cache: Any,
+) -> bool:
+    """Handle DVR's decode-time mamba checkpoint commit if applicable."""
+
+    if not batch.spec_algorithm.is_dvr():
+        return False
+    return maybe_handle_dvr_mamba_checkpoint_after_decode(
+        req=req,
+        batch=batch,
+        result=result,
+        req_index=req_index,
+        tree_cache=tree_cache,
     )

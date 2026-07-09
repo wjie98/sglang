@@ -77,12 +77,6 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         super().clear_cache_pool()
         self.dvr_output_replay_prefix.clear()
 
-    def _draft_cache_locs_from_req_to_token(
-        self, batch: ScheduleBatch
-    ) -> torch.Tensor:
-        rows, offsets = self._dvr_draft_rows_and_offsets(batch)
-        return self.req_to_token_pool.req_to_token[rows, offsets].reshape(-1)
-
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
         return self.dvr_output_replay_prefix.request_output_prefix_token_ids(
             req,
@@ -192,7 +186,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             batch,
             spec_info,
             seq_lens_sum=batch.seq_lens_sum,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
             suppress_return_logprob=True,
         )
 

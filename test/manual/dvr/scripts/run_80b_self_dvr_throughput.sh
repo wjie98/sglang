@@ -66,10 +66,13 @@ run_one_mode() {
   local spec_v2="$2"
   shift 2
   local server_log="${RESULT_ROOT}/logs/80b_self_${label}_server.log"
+  local overlap_args=()
+  if [[ "${spec_v2}" == "0" ]]; then
+    overlap_args=(--disable-overlap-schedule)
+  fi
 
   echo "==> Starting 80B self-DVR ${label} server on ${BASE_URL}"
   setsid env \
-    SGLANG_ENABLE_SPEC_V2="${spec_v2}" \
     SGLANG_RETURN_ORIGINAL_LOGPROB=True \
     PYTHONPATH="${PYTHONPATH}" \
     conda run --no-capture-output -n "${CONDA_ENV}" python -m sglang.launch_server \
@@ -92,6 +95,7 @@ run_one_mode() {
       --speculative-num-steps 15 \
       --cuda-graph-bs 1 2 3 4 \
       --cuda-graph-max-bs 4 \
+      "${overlap_args[@]}" \
       "$@" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &
@@ -139,8 +143,8 @@ require_file "${LONGBENCH_CUSTOM_DATASET}"
 
 # Fixed reproduced口径:
 # - v1: compatibility scheduler, overlap disabled.
-# - v2: SGLANG_ENABLE_SPEC_V2=1, overlap enabled.
+# - v2: spec-v2 worker with overlap enabled.
 # - max_mamba_cache_size must stay 16; omitting it lowers effective concurrency.
-run_one_mode "v1" "0" --disable-overlap-schedule
+run_one_mode "v1" "0"
 run_one_mode "v2" "1"
 summarize_results

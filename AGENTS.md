@@ -31,6 +31,10 @@ variables near the top of each file.  When reporting a run, include the script
 path, commit, key override variables, result directory, and whether the server
 log confirms the expected CUDA graph and effective concurrency.
 
+Do not use the removed `SGLANG_ENABLE_SPEC_V2` environment variable.  The fixed
+scripts select the self-DVR v1 compatibility worker with
+`--disable-overlap-schedule`; omitting that flag uses the spec-v2 overlap worker.
+
 Do not silently change benchmark knobs such as request count, output length,
 max concurrency, `--max-mamba-cache-size`, overlap mode, backend, or returned
 logprob handling.  If a new experiment needs different knobs, create a separate

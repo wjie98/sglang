@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
@@ -14,14 +13,10 @@ from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
     set_req_mamba_radix_insert_snapshot,
     should_insert_finished_req,
 )
-from sglang.srt.speculative.dvr_draft_decode_context import draft_decode_performance_context
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_logprob_repair import (
     _final_output_len_if_repair_needed,
     _try_live_cache_locs_for_final_replay,
-)
-from sglang.srt.arg_groups.speculative_hook import (
-    speculative_uses_draft_decode_custom_all_reduce,
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
@@ -31,75 +26,29 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     apply_dvr_final_logprob_repairs_from_result,
     compact_output_token_rows,
     commit_pending_mamba_checkpoint_from_result,
-)
-from sglang.srt.speculative.dvr_scheduler_hooks import (
     maybe_filter_running_batch_with_spec_state,
 )
-from sglang.srt.speculative.dvr_output_policy import (
+from sglang.srt.managers.scheduler_components.output_policy import (
     allow_req_non_streaming_logprob_output,
     defer_req_non_streaming_logprob_output,
     should_hold_non_streaming_logprob_output,
     try_claim_req_final_logprob_repair,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 
 
-def _policy(algorithm):
-    return get_spec_algorithm_policy(algorithm)
-
-
-def test_dvr_spec_v2_policy():
+def test_dvr_spec_algorithm_contracts():
     self_draft = SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
     eagle_draft = SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
 
-    assert _policy(self_draft).uses_spec_v2(enable_overlap=True)
-    assert not _policy(self_draft).uses_spec_v2(enable_overlap=False)
-    # DVR-EAGLE is implemented on EAGLE's v2 schema only. Disabling overlap
-    # selects synchronous v2, not a separate EAGLE-v1 worker.
-    assert _policy(eagle_draft).uses_spec_v2(enable_overlap=True)
-    assert _policy(eagle_draft).uses_spec_v2(enable_overlap=False)
-
-
-def test_dvr_target_verify_capture_hidden_policy():
-    self_draft = SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-    eagle_draft = SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
-    standalone = SpeculativeAlgorithm.STANDALONE
-
-    assert (
-        _policy(self_draft).target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
-        == CaptureHiddenMode.NULL
-    )
-    assert (
-        _policy(eagle_draft).target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
-        == CaptureHiddenMode.FULL
-    )
-    assert (
-        _policy(standalone).target_verify_capture_hidden_mode(CaptureHiddenMode.FULL)
-        == CaptureHiddenMode.FULL
-    )
-    assert (
-        _policy(standalone).target_verify_capture_hidden_mode(
-            CaptureHiddenMode.FULL,
-            null_for_standalone=True,
-        )
-        == CaptureHiddenMode.NULL
-    )
-
-
-def test_dvr_mamba_radix_snapshot_policy():
-    assert (
-        _policy(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-        ).needs_mamba_radix_snapshot_for_spec_v2()
-    )
-    assert (
-        _policy(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
-        ).needs_mamba_radix_snapshot_for_spec_v2()
-    )
-    assert not _policy(SpeculativeAlgorithm.EAGLE).needs_mamba_radix_snapshot_for_spec_v2()
-    assert not _policy(SpeculativeAlgorithm.NONE).needs_mamba_radix_snapshot_for_spec_v2()
+    assert self_draft.is_dvr()
+    assert self_draft.is_dvr_self_draft()
+    assert not self_draft.is_dvr_eagle()
+    assert eagle_draft.is_dvr()
+    assert eagle_draft.is_dvr_eagle()
+    assert not eagle_draft.is_eagle()
+    assert self_draft.supports_spec_v2()
+    assert eagle_draft.supports_spec_v2()
 
 
 def test_dvr_published_seq_len_filter_hook():
@@ -109,12 +58,12 @@ def test_dvr_published_seq_len_filter_hook():
         sampling_params=SimpleNamespace(max_new_tokens=4),
     )
     batch = SimpleNamespace(
-        is_spec_v2=True,
+        enable_overlap=True,
         seq_lens_cpu=torch.tensor([6]),
         seq_lens=None,
         reqs=[req],
         spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-        filter_batch=lambda keep_indices, v1_spec_info_filtered: setattr(
+        filter_batch=lambda keep_indices: setattr(
             batch, "filtered_keep_indices", keep_indices
         ),
     )
@@ -128,7 +77,6 @@ def test_dvr_published_seq_len_filter_hook():
         batch=batch,
         future_map=future_map,
         enable_overlap=True,
-        v1_spec_info_filtered=True,
     )
     assert batch.seq_lens_resolved
     assert batch.filtered_keep_indices == []
@@ -138,7 +86,6 @@ def test_dvr_published_seq_len_filter_hook():
         batch=batch,
         future_map=future_map,
         enable_overlap=True,
-        v1_spec_info_filtered=True,
     )
     assert batch.filtered_keep_indices == [0]
 
@@ -147,7 +94,6 @@ def test_dvr_published_seq_len_filter_hook():
         batch=batch,
         future_map=future_map,
         enable_overlap=True,
-        v1_spec_info_filtered=True,
     )
 
 
@@ -257,120 +203,19 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_next_track_idx == 1
 
 
-def test_dvr_linear_state_extension_policy():
-    runner_without_gdn = SimpleNamespace(hybrid_gdn_config=None)
-    runner_with_gdn = SimpleNamespace(hybrid_gdn_config=object())
-
-    assert (
-        _policy(SpeculativeAlgorithm.EAGLE).linear_speculative_state_extension_factory(
-            runner_with_gdn
-        )
-        is None
-    )
-    assert (
-        _policy(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-        ).linear_speculative_state_extension_factory(
-            runner_without_gdn
-        )
-        is None
-    )
-    assert (
-        _policy(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-        ).linear_speculative_state_extension_factory(
-            runner_with_gdn
-        )
-        is not None
-    )
-
-
-def test_dvr_self_draft_reuses_target_kv_pool():
-    assert _policy(
-        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-    ).uses_target_kv_pool_for_draft()
-    assert (
-        not _policy(
-            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
-        ).uses_target_kv_pool_for_draft()
-    )
-    assert not _policy(SpeculativeAlgorithm.EAGLE).uses_target_kv_pool_for_draft()
-
-
-def test_dvr_draft_decode_custom_all_reduce_policy_hook():
-    assert speculative_uses_draft_decode_custom_all_reduce("DECODE_VERIFY_ROLLBACK")
-    assert speculative_uses_draft_decode_custom_all_reduce(
-        "DECODE_VERIFY_ROLLBACK_EAGLE"
-    )
-    assert not speculative_uses_draft_decode_custom_all_reduce("EAGLE")
-    assert not speculative_uses_draft_decode_custom_all_reduce(None)
-
-
-def test_draft_extend_selected_logits_policy_is_capability_gated():
-    model = SimpleNamespace(supports_draft_extend_selected_logits=True)
-    model_without_capability = SimpleNamespace()
-
-    dvr_eagle = _policy(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE)
-    assert dvr_eagle.uses_draft_extend_selected_logits(
-        topk=1,
-        model=model,
-        is_v2=True,
-        requires_gathered_buffer=False,
-    )
-    assert not dvr_eagle.uses_draft_extend_selected_logits(
-        topk=2,
-        model=model,
-        is_v2=True,
-        requires_gathered_buffer=False,
-    )
-    assert not dvr_eagle.uses_draft_extend_selected_logits(
-        topk=1,
-        model=model_without_capability,
-        is_v2=True,
-        requires_gathered_buffer=False,
-    )
-    assert not dvr_eagle.uses_draft_extend_selected_logits(
-        topk=1,
-        model=model,
-        is_v2=True,
-        requires_gathered_buffer=True,
-    )
-
-    # Keep the selected-logits optimization scoped to DVR-EAGLE so ordinary
-    # EAGLE/MTP behavior stays exactly on the upstream draft-extend path.
-    assert not _policy(SpeculativeAlgorithm.EAGLE).uses_draft_extend_selected_logits(
-        topk=1,
-        model=model,
-        is_v2=True,
-        requires_gathered_buffer=False,
-    )
-    assert not _policy(SpeculativeAlgorithm.NONE).uses_draft_extend_selected_logits(
-        topk=1,
-        model=model,
-        is_v2=True,
-        requires_gathered_buffer=False,
-    )
-
-
-def test_draft_decode_context_is_noop_for_regular_eagle():
-    runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.EAGLE)
-    with draft_decode_performance_context(runner) as ctx:
-        assert ctx is None
-
-
 def test_dvr_self_draft_graph_runner_only_skips_known_short_boundary():
     graph_runner = object.__new__(DVRDraftDecodeCudaGraphRunner)
-    graph_runner.runner = SimpleNamespace(can_run=lambda forward_batch: True)
+    graph_runner.runner = SimpleNamespace(can_run_graph=lambda forward_batch: True)
 
     assert not graph_runner.can_run(
+        SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
+    )
+    assert graph_runner.can_run(
         SimpleNamespace(
             dvr_disable_draft_cuda_graph=True,
             seq_lens_cpu=torch.tensor([4]),
             batch_size=1,
         )
-    )
-    assert not graph_runner.can_run(
-        SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
     )
     assert graph_runner.can_run(
         SimpleNamespace(seq_lens_cpu=torch.tensor([3]), batch_size=1)

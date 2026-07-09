@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/common.sh"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/data/hwj/Qwen3.5-0.8B}"
 PORT="${PORT:-30124}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.50}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/0p8b-self-dvr-kl}"
 SERVER_PID=""
@@ -23,10 +24,13 @@ run_one_mode() {
   local spec_v2="$2"
   local server_log="${RESULT_ROOT}/logs/${label}_server.log"
   local client_log="${RESULT_ROOT}/results/${label}_kl.log"
+  local overlap_args=()
+  if [[ "${spec_v2}" == "0" ]]; then
+    overlap_args=(--disable-overlap-schedule)
+  fi
 
   echo "==> Starting ${label} server on ${BASE_URL}"
   setsid env \
-    SGLANG_ENABLE_SPEC_V2="${spec_v2}" \
     SGLANG_RETURN_ORIGINAL_LOGPROB=True \
     PYTHONPATH="${PYTHONPATH}" \
     conda run --no-capture-output -n "${CONDA_ENV}" python -m sglang.launch_server \
@@ -36,7 +40,7 @@ run_one_mode() {
       --speculative-algorithm DECODE_VERIFY_ROLLBACK \
       --speculative-num-draft-tokens 16 \
       --page-size 1 \
-      --mem-fraction-static 0.45 \
+      --mem-fraction-static "${MEM_FRACTION_STATIC}" \
       --attention-backend triton \
       --linear-attn-backend triton \
       --sampling-backend pytorch \
@@ -44,6 +48,7 @@ run_one_mode() {
       --cuda-graph-bs 1 2 4 \
       --cuda-graph-max-bs 4 \
       --max-running-requests 8 \
+      "${overlap_args[@]}" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &
   SERVER_PID="$!"

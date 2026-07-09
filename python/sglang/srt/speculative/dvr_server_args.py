@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
@@ -49,6 +48,15 @@ def handle_dvr_defaults(server_args):
     if not _is_dvr_gated_linear_state_model(server_args):
         return
 
+    if server_args.disable_radix_cache:
+        logger.warning(
+            "DVR for gated linear-state models requires radix-cache "
+            "infrastructure for mamba extra_buffer state tracking. Keeping "
+            "radix cache enabled; use explicit cache flushes for no-prefix-cache "
+            "tests."
+        )
+        server_args.disable_radix_cache = False
+
     if server_args.page_size != FLA_CHUNK_SIZE:
         logger.warning(
             "DVR for gated linear-state models requires page_size to match "
@@ -59,12 +67,12 @@ def handle_dvr_defaults(server_args):
         )
         server_args.page_size = FLA_CHUNK_SIZE
 
-    if server_args.mamba_scheduler_strategy != "extra_buffer":
+    if server_args.mamba_radix_cache_strategy != "extra_buffer":
         logger.warning(
             "DVR for gated linear-state models requires mamba extra_buffer "
-            "state tracking. Setting --mamba-scheduler-strategy extra_buffer."
+            "state tracking. Setting --mamba-radix-cache-strategy extra_buffer."
         )
-        server_args.mamba_scheduler_strategy = "extra_buffer"
+        server_args.mamba_radix_cache_strategy = "extra_buffer"
 
     if server_args.mamba_track_interval != FLA_CHUNK_SIZE:
         logger.warning(
@@ -108,7 +116,11 @@ def handle_dvr_speculative_decoding(server_args):
         raise ValueError(
             "DVR EAGLE requires setting --speculative-draft-model-path."
         )
-    if is_dvr_eagle_enabled(server_args) and not server_args.disable_radix_cache:
+    if (
+        is_dvr_eagle_enabled(server_args)
+        and not server_args.disable_radix_cache
+        and not _is_dvr_gated_linear_state_model_safe(server_args)
+    ):
         # DVR-EAGLE/MTP owns an independent draft KV pool.  The regular radix
         # tree only tracks target KV slots, so a target prefix hit can leave
         # the MTP draft prefix KV unavailable or stale and sharply reduce the
@@ -165,25 +177,17 @@ def handle_dvr_speculative_decoding(server_args):
     _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
 
     if is_dvr_eagle_enabled(server_args):
-        if not envs.SGLANG_ENABLE_SPEC_V2.get():
-            server_args.disable_overlap_schedule = True
-            logger.warning(
-                "Non-overlap synchronous spec v2 is used for DVR EAGLE. Set "
-                "SGLANG_ENABLE_SPEC_V2=True to use overlap scheduling."
-            )
+        if server_args.disable_overlap_schedule:
+            logger.warning("Synchronous spec v2 is used for DVR EAGLE.")
         else:
-            server_args.disable_overlap_schedule = False
             logger.warning("Overlap spec v2 is enabled for DVR EAGLE.")
-    elif envs.SGLANG_ENABLE_SPEC_V2.get():
-        server_args.disable_overlap_schedule = False
-        logger.warning(
-            "Spec v2 is enabled for DVR and overlap schedule is turned on."
-        )
+    elif not server_args.disable_overlap_schedule:
+        logger.warning("Spec v2 is enabled for DVR and overlap schedule is on.")
     else:
-        server_args.disable_overlap_schedule = True
         logger.warning(
-            "Overlap scheduler is disabled for DVR. Set "
-            "SGLANG_ENABLE_SPEC_V2=True to use DVR spec v2 overlap scheduling."
+            "Overlap scheduler is disabled for DVR, so self-draft uses the "
+            "spec-v1 worker. Omit --disable-overlap-schedule to use DVR "
+            "spec-v2 overlap scheduling."
         )
     server_args.enable_mixed_chunk = False
     logger.warning("Mixed chunked prefill is disabled for DVR.")

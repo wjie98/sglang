@@ -13,6 +13,7 @@ from sglang.srt.speculative.dvr_target_replay import (
     build_boundary_replay_batch,
     build_boundary_replay_plan,
 )
+from sglang.srt.speculative.dvr_server_args import is_dvr_eagle_enabled
 
 
 @dataclass
@@ -48,6 +49,11 @@ class DVRLinearStateLifecycle:
         self.boundary_seqlen = {}
         self.boundary_track_idx = {}
         self.boundary_backup = None
+        # Identifies the worker-local target boundary snapshot.  Separate
+        # EAGLE/MTP draft phases can mutate shared linear-state slots before
+        # the next target verify, so DVR-EAGLE preserves this snapshot when the
+        # request and chunk boundary are unchanged.
+        self.boundary_backup_keys = None
         self.live_backup = None
         self.suffix_replay_boundary_track_mask = None
         self.validate_args()
@@ -56,6 +62,7 @@ class DVRLinearStateLifecycle:
         self.boundary_seqlen.clear()
         self.boundary_track_idx.clear()
         self.boundary_backup = None
+        self.boundary_backup_keys = None
         self.live_backup = None
         self.suffix_replay_boundary_track_mask = None
 
@@ -170,7 +177,10 @@ class DVRLinearStateLifecycle:
             )
 
     def finish_prepare_for_draft(self, batch: ScheduleBatch):
-        self.backup_boundary_state(batch)
+        self.refresh_boundary_backup(batch)
+
+    def finish_prepare_for_separate_draft(self, batch: ScheduleBatch):
+        self.ensure_boundary_backup(batch)
 
     def restore_for_verify(
         self,
@@ -306,6 +316,7 @@ class DVRLinearStateLifecycle:
                     pending_track_indices[i] = track_idx
                     pending_track_seqlens[i] = new_boundary_seqlen
         self.boundary_backup = None
+        self.boundary_backup_keys = None
         self.live_backup = None
         self.suffix_replay_boundary_track_mask = None
         return (
@@ -441,9 +452,11 @@ class DVRLinearStateLifecycle:
         )
 
     def state_adapter(self):
-        linear_backend = getattr(
-            self.model_runner.attn_backend, "linear_attn_backend", None
-        )
+        # Scheduler constructs the DVR worker before attention backends are
+        # initialized. Treat a missing backend as "not ready" and resolve the
+        # adapter lazily when verify/draft state is actually used.
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        linear_backend = getattr(attn_backend, "linear_attn_backend", None)
         if linear_backend is None:
             return None
         return getattr(linear_backend, "dvr_state_adapter", None)
@@ -523,8 +536,11 @@ class DVRLinearStateLifecycle:
                 batch, req, boundary_track_idx, state_adapter, boundary_seqlen
             )
             return dst, None
-        if self.materialize_radix_boundary_for_req(
-            batch, req, boundary_seqlen, dst, state_adapter
+        if (
+            not is_dvr_eagle_enabled(self.server_args)
+            and self.materialize_radix_boundary_for_req(
+                batch, req, boundary_seqlen, dst, state_adapter
+            )
         ):
             self.set_boundary_checkpoint(
                 batch, req, boundary_track_idx, state_adapter, boundary_seqlen
@@ -643,13 +659,30 @@ class DVRLinearStateLifecycle:
             tail_lens=torch.tensor(tail_lens, device=ctx.live_indices.device),
         )
 
-    def backup_boundary_state(self, batch: ScheduleBatch):
+    def refresh_boundary_backup(self, batch: ScheduleBatch):
+        self._backup_boundary_state(batch, preserve_existing=False)
+
+    def ensure_boundary_backup(self, batch: ScheduleBatch):
+        self._backup_boundary_state(batch, preserve_existing=True)
+
+    def _backup_boundary_state(self, batch: ScheduleBatch, *, preserve_existing: bool):
         ctx = self.state_context(batch, require_boundary=True)
         if ctx is None:
             self.boundary_backup = None
+            self.boundary_backup_keys = None
             self.live_backup = None
             return
         assert ctx.boundary_indices is not None
+        backup_keys = [
+            (req.rid, int(self.boundary_seqlen.get(req.rid, -1)))
+            for req in batch.reqs
+        ]
+        if (
+            preserve_existing
+            and self.boundary_backup is not None
+            and self.boundary_backup_keys == backup_keys
+        ):
+            return
         self.boundary_backup, self.live_backup = (
             ctx.state_adapter.backup_verify_recurrent_states(
                 state_cache=ctx.state_cache,
@@ -657,6 +690,7 @@ class DVRLinearStateLifecycle:
                 live_indices=ctx.live_indices,
             )
         )
+        self.boundary_backup_keys = backup_keys
 
     def boundary_lens_for_replay(self, batch: ScheduleBatch, seq_lens_cpu) -> List[int]:
         boundary_lens = []

@@ -107,7 +107,6 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -308,7 +307,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        if get_spec_algorithm_policy(speculative_algorithm).is_eagle():
+        if speculative_algorithm.is_eagle() or speculative_algorithm.is_dvr_eagle():
             # In the current eagle implementation, we store the draft tokens in the output token slots,
             # so we need to reserve the space for the draft tokens.
             self.num_reserved_tokens = max(

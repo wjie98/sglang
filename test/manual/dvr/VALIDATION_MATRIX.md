@@ -53,7 +53,6 @@ test/manual/dvr/scripts/run_0p8b_self_dvr_kl.sh
 Server:
 
 ```bash
-SGLANG_ENABLE_SPEC_V2=<0-or-1> \
 SGLANG_RETURN_ORIGINAL_LOGPROB=True \
 PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
   --model-path /mnt/data/hwj/Qwen3.5-0.8B \
@@ -71,6 +70,9 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.laun
   --max-running-requests 8 \
   --skip-server-warmup
 ```
+
+Add `--disable-overlap-schedule` for the self-DVR v1 compatibility worker.
+Omit it for the spec-v2 overlap worker.
 
 Client:
 
@@ -103,7 +105,6 @@ test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
 Self-DVR server:
 
 ```bash
-SGLANG_ENABLE_SPEC_V2=<0-or-1> \
 SGLANG_RETURN_ORIGINAL_LOGPROB=True \
 PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
   --model-path /mnt/data/hwj/Qwen3.5-35B-A3B \
@@ -125,10 +126,12 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.laun
   --skip-server-warmup
 ```
 
+Add `--disable-overlap-schedule` for the self-DVR v1 compatibility worker.
+Omit it for the spec-v2 overlap worker.
+
 DVR-EAGLE server:
 
 ```bash
-SGLANG_ENABLE_SPEC_V2=<0-or-1> \
 SGLANG_RETURN_ORIGINAL_LOGPROB=True \
 PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.launch_server \
   --model-path /mnt/data/hwj/Qwen3.5-35B-A3B \
@@ -184,9 +187,9 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
 ```
 
 The sync and overlap DVR-EAGLE modes are both spec-v2 semantics.  In this tree
-`SGLANG_ENABLE_SPEC_V2=0` selects synchronous v2 execution for DVR-EAGLE, and
-`SGLANG_ENABLE_SPEC_V2=1` selects overlap v2 execution.  DVR-EAGLE v1 is not a
-supported matrix entry.
+`--disable-overlap-schedule` selects synchronous v2 execution for DVR-EAGLE, and
+the default overlap scheduler selects overlap v2 execution.  DVR-EAGLE v1 is not
+a supported matrix entry.
 
 The `--seed 2032`, `prompt_len=65`, `max_new=65` entry is the fixed regression
 for seeded MTP boundary acceptance.  It crosses the GDN chunk boundary and must

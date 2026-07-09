@@ -2522,6 +2522,12 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
+        # DVR page-size and GDN state-tracking defaults must be resolved before
+        # model-specific mamba/radix validation runs below.
+        from sglang.srt.speculative.dvr_server_args import handle_dvr_defaults
+
+        handle_dvr_defaults(self)
+
         self._handle_cuda_graph_config()
 
         # Handle device-specific backends.
@@ -6097,10 +6103,25 @@ class ServerArgs:
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
-                    self.disable_custom_all_reduce = True
-                    logger.warning(
-                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                    from sglang.srt.speculative.dvr_server_args import is_dvr_enabled
+
+                    use_draft_decode_custom_all_reduce = (
+                        self.speculative_algorithm is not None
+                        and not self.disable_custom_all_reduce
+                        and is_dvr_enabled(self)
                     )
+                    self.disable_custom_all_reduce = True
+                    if use_draft_decode_custom_all_reduce:
+                        logger.warning(
+                            "NCCL_ALGO is set to 'allreduce:tree'. Custom all reduce "
+                            "is disabled for deterministic prefill and verify; the "
+                            "speculative draft decode CUDA graph may enable it "
+                            "temporarily."
+                        )
+                    else:
+                        logger.warning(
+                            "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                        )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:

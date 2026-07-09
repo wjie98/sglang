@@ -342,6 +342,9 @@ def build_suffix_target_replay_batch(
     *,
     capture_hidden_mode: CaptureHiddenMode,
     return_logprob: bool = False,
+    mamba_track_indices: Optional[torch.Tensor] = None,
+    mamba_track_mask: Optional[torch.Tensor] = None,
+    mamba_track_seqlens: Optional[torch.Tensor] = None,
     mamba_cow_src_indices: Optional[torch.Tensor] = None,
     mamba_cow_dst_indices: Optional[torch.Tensor] = None,
     mamba_clear_indices: Optional[torch.Tensor] = None,
@@ -361,6 +364,9 @@ def build_suffix_target_replay_batch(
             extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
             capture_hidden_mode=capture_hidden_mode,
             is_prefill_only=batch.is_prefill_only,
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=mamba_track_seqlens,
             mamba_cow_src_indices=mamba_cow_src_indices,
             mamba_cow_dst_indices=mamba_cow_dst_indices,
             mamba_clear_indices=mamba_clear_indices,
@@ -678,6 +684,7 @@ def suffix_draft_replay_batch_context(
     full_prefix_replay: bool = False,
     restore_boundary_state: bool = False,
     use_mamba_cow_from_boundary: bool = False,
+    track_replay_boundary_checkpoint: bool = False,
 ):
     """Prepare a suffix+draft replay batch and protect live DVR state.
 
@@ -711,13 +718,40 @@ def suffix_draft_replay_batch_context(
         yield None
         return
 
-    # Suffix replay is an oracle for verifier rows.  Checkpoint publication is
-    # handled by the normal DVR commit path, not by this temporary EXTEND.
-    linear_state.set_suffix_replay_boundary_track_mask(None)
+    # Suffix replay is an oracle for verifier rows.  When it crosses the next
+    # chunk boundary, let the normal EXTEND tracking path materialize that
+    # boundary checkpoint; DVR commit will decide after sampling whether the
+    # checkpoint is actually accepted.
+    boundary_track_mask = None
+    if track_replay_boundary_checkpoint and not full_prefix_replay:
+        append_count = int(replay_plan.append_cache_locs.shape[1])
+        chunk_size = int(linear_state.server_args.mamba_track_interval)
+        boundary_track_mask = torch.tensor(
+            [
+                int(tail_len) + append_count >= chunk_size
+                for tail_len in replay_plan.tail_lens_cpu
+            ],
+            dtype=torch.bool,
+            device=batch.seq_lens.device,
+        )
+        if not bool(boundary_track_mask.any().item()):
+            boundary_track_mask = None
+    linear_state.set_suffix_replay_boundary_track_mask(boundary_track_mask)
     replay_batch = build_suffix_target_replay_batch(
         batch,
         replay_plan,
         capture_hidden_mode=CaptureHiddenMode.FULL,
+        mamba_track_indices=boundary_indices if boundary_track_mask is not None else None,
+        mamba_track_mask=boundary_track_mask,
+        mamba_track_seqlens=(
+            torch.tensor(
+                replay_plan.final_seq_lens_cpu,
+                dtype=torch.int64,
+                device=batch.seq_lens.device,
+            )
+            if boundary_track_mask is not None
+            else None
+        ),
         mamba_cow_src_indices=(
             boundary_indices
             if use_mamba_cow_from_boundary and not full_prefix_replay
@@ -772,6 +806,77 @@ def draft_row_logits_from_replay_hidden_states(
         logits_metadata,
     )
     return draft_logits, draft_hidden_states
+
+
+def replay_accepted_suffix_for_live_state(
+    *,
+    batch: ScheduleBatch,
+    target_worker,
+    linear_state,
+    linear_state_ctx,
+    base_seq_lens_cpu: list[int],
+    accepted_token_counts_cpu: list[int],
+    accepted_ids: torch.Tensor,
+    accepted_cache_locs: torch.Tensor,
+    num_draft_tokens: int,
+    request_token_ids_for_replay,
+) -> Optional[torch.Tensor]:
+    """Refresh live recurrent state after a partial verify acceptance.
+
+    The TARGET_VERIFY hot path forwards every proposed draft token.  When a row
+    is rejected, however, the committed suffix is shorter and may include a
+    target-predicted token.  Replaying only "unclosed chunk tail + accepted
+    tokens" updates the live recurrent slot to the exact committed sequence
+    without replaying the full prefix.
+    """
+
+    if batch.forward_mode.is_idle() or linear_state_ctx is None:
+        return None
+    if accepted_ids is None or accepted_ids.numel() == 0:
+        return None
+
+    live_indices = linear_state_ctx.live_indices
+    boundary_indices = linear_state_ctx.boundary_indices
+    assert boundary_indices is not None
+
+    boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
+    replay_plan = build_accepted_suffix_replay_plan(
+        batch=batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        accepted_tokens=accepted_ids,
+        accepted_cache_locs=accepted_cache_locs,
+        accepted_token_counts_cpu=accepted_token_counts_cpu,
+        num_draft_tokens=num_draft_tokens,
+        request_token_ids_for_replay=request_token_ids_for_replay,
+    )
+    if replay_plan is None:
+        return None
+
+    # Commit repair, not checkpoint publication: leave the live recurrent slot
+    # updated by the replay so the normal commit path can copy it directly.
+    linear_state.set_suffix_replay_boundary_track_mask(None)
+    replay_batch = build_suffix_target_replay_batch(
+        batch,
+        replay_plan,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        mamba_cow_src_indices=boundary_indices,
+        mamba_cow_dst_indices=live_indices,
+    )
+    with linear_state_replay_context(linear_state_ctx, restore_live_state=False):
+        if replay_plan.append_rows is not None:
+            assert replay_plan.append_offsets is not None
+            replay_batch.req_to_token_pool.write(
+                (replay_plan.append_rows, replay_plan.append_offsets),
+                replay_plan.append_cache_locs.to(
+                    device=replay_batch.seq_lens.device,
+                    dtype=torch.int32,
+                ),
+            )
+        target_worker.forward_batch_generation(batch=replay_batch, is_verify=True)
+        return torch.ones(
+            len(batch.reqs), dtype=torch.bool, device=live_indices.device
+        )
 
 
 def run_suffix_draft_replay_oracle(

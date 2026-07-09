@@ -33,6 +33,8 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DECODE_VERIFY_ROLLBACK = auto()
+    DECODE_VERIFY_ROLLBACK_EAGLE = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -115,6 +117,23 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_dvr_self_draft(self) -> bool:
+        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+
+    def is_dvr_eagle(self) -> bool:
+        return self == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE
+
+    def is_dvr(self) -> bool:
+        return self.is_dvr_self_draft() or self.is_dvr_eagle()
+
+    def supports_spec_v2(self) -> bool:
+        return (
+            self.is_eagle()
+            or self.is_dflash()
+            or self.is_standalone()
+            or self.is_dvr()
+        )
+
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
@@ -157,7 +176,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def need_topk(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_dvr_eagle()
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         """Hook for per-algorithm server args mutation.
@@ -171,7 +190,13 @@ class SpeculativeAlgorithm(Enum):
             _handle_ngram,
         )
 
-        if self.is_dflash():
+        if self.is_dvr():
+            from sglang.srt.speculative.dvr_server_args import (
+                handle_dvr_speculative_decoding,
+            )
+
+            handle_dvr_speculative_decoding(server_args)
+        elif self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
@@ -197,6 +222,8 @@ class SpeculativeAlgorithm(Enum):
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
 
+        enable_overlap = not server_args.disable_overlap_schedule
+
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
@@ -212,6 +239,25 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return FrozenKVMTPWorkerV2
+
+        if self.is_dvr_eagle():
+            from sglang.srt.speculative.dvr_eagle_worker import (
+                DecodeVerifyRollbackEagleWorkerV2,
+            )
+
+            return DecodeVerifyRollbackEagleWorkerV2
+
+        if self.is_dvr_self_draft():
+            if enable_overlap:
+                from sglang.srt.speculative.dvr_worker_v2 import (
+                    DecodeVerifyRollbackWorkerV2,
+                )
+
+                return DecodeVerifyRollbackWorkerV2
+
+            from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
+
+            return DecodeVerifyRollbackWorker
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).

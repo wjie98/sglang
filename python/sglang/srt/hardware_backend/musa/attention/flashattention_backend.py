@@ -264,17 +264,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if self.use_sliding_window_kv_pool:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                elif not self.use_mla:
+                if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
@@ -675,17 +665,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if self.use_sliding_window_kv_pool:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        cache_loc,
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    )
-                elif not self.use_mla:
+                if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),

@@ -408,6 +408,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dvr()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -782,7 +783,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            metadata_hook = getattr(
+                forward_batch.spec_info, "cuda_graph_metadata_context", None
+            )
+            metadata_context = (
+                empty_context()
+                if metadata_hook is None
+                else metadata_hook(
+                    model_runner=self.model_runner,
+                    attn_backend=attn_backend,
+                    forward_mode=forward_batch.forward_mode,
+                    fallback_custom_mask=self.buffers.custom_mask,
+                )
+            )
+            with metadata_context:
+                attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
 
             def run_once():
                 # Must run inside the capture block: warmup mutations here are
@@ -914,6 +931,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dvr()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -929,6 +947,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        spec_replay_hook = getattr(
+            forward_batch.spec_info, "prepare_cuda_graph_replay_buffers", None
+        )
+        if spec_replay_hook is not None:
+            spec_replay_hook(self, raw_num_token)
         if (
             self.model_runner.spec_algorithm.is_dflash()
             and self.model_runner.is_draft_worker
@@ -960,7 +983,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
+        metadata_hook = getattr(
+            forward_batch.spec_info, "cuda_graph_metadata_context", None
+        )
+        metadata_context = (
+            empty_context()
+            if metadata_hook is None
+            else metadata_hook(
+                model_runner=self.model_runner,
+                attn_backend=attn_backend,
+                forward_mode=self.capture_forward_mode,
+                fallback_custom_mask=buffers.custom_mask,
+            )
+        )
+        with metadata_context:
+            attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Store fields
         self.raw_bs = raw_bs
@@ -1038,34 +1075,47 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_dvr()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
-            else:
 
-                capture_mode = (
-                    CaptureHiddenMode.NULL
-                    if self.model_runner.spec_algorithm.is_standalone()
-                    else CaptureHiddenMode.FULL
-                )
-                spec_info = EagleVerifyInput(
-                    draft_token=None,
-                    custom_mask=self.buffers.custom_mask,
-                    positions=None,
-                    retrieve_index=None,
-                    retrieve_next_token=None,
-                    retrieve_next_sibling=None,
-                    retrieve_cum_len=None,
-                    spec_steps=self.speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
-                    draft_token_num=self.speculative_num_draft_tokens,
-                    capture_hidden_mode=capture_mode,
-                    seq_lens_sum=None,
-                    seq_lens_cpu=None,
-                )
-                # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
+            capture_mode = CaptureHiddenMode.FULL
+            if (
+                self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_dvr_self_draft()
+            ):
+                capture_mode = CaptureHiddenMode.NULL
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=self.buffers.custom_mask,
+                positions=None,
+                retrieve_index=None,
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_cum_len=None,
+                spec_steps=self.speculative_num_steps,
+                topk=self.model_runner.server_args.speculative_eagle_topk,
+                draft_token_num=self.speculative_num_draft_tokens,
+                capture_hidden_mode=capture_mode,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+            if self.model_runner.spec_algorithm.is_dvr_eagle():
+                from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
+
+                spec_info = DVREagleVerifyInput.from_eagle_verify_input(spec_info)
+            elif self.model_runner.spec_algorithm.is_dvr_self_draft():
+                from sglang.srt.speculative.dvr_worker import DVRSelfDraftVerifyInput
+
+                spec_info = DVRSelfDraftVerifyInput.from_eagle_verify_input(spec_info)
+
+            # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states.
+            if self.model_runner.spec_algorithm.is_eagle() or (
+                self.model_runner.spec_algorithm.is_dvr_eagle()
+            ):
                 spec_info.hidden_states = torch.zeros(
                     (num_tokens, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,

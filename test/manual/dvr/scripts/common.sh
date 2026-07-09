@@ -10,6 +10,15 @@ CONDA_ENV="${CONDA_ENV:-dvr_dev}"
 export PYTHONPATH="${PYTHONPATH:-python}"
 export SGLANG_RETURN_ORIGINAL_LOGPROB="${SGLANG_RETURN_ORIGINAL_LOGPROB:-True}"
 
+if [[ -z "${CUDAHOSTCXX:-}" ]]; then
+  DVR_CONDA_CXX="$(
+    conda run --no-capture-output -n "${CONDA_ENV}" bash -lc \
+      'command -v x86_64-conda-linux-gnu-g++ || command -v g++'
+  )"
+  export CUDAHOSTCXX="${DVR_CONDA_CXX}"
+fi
+export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:--ccbin ${CUDAHOSTCXX}}"
+
 conda_python() {
   conda run --no-capture-output -n "${CONDA_ENV}" python "$@"
 }

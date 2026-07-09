@@ -31,9 +31,6 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
 logger = logging.getLogger(__name__)
 
 

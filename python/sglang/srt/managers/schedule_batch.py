@@ -109,6 +109,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.speculative.dvr_server_args import is_dvr_eagle_enabled
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
@@ -801,6 +802,8 @@ class Req(ReqDllmMixin):
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
+        self.dvr_mamba_radix_skip_finished_insert: bool = False
+        self.dvr_mamba_radix_insert_snapshot: Any = None
 
         # Check finish
         self.tokenizer = None
@@ -897,6 +900,8 @@ class Req(ReqDllmMixin):
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
         self.input_logprob_sent: bool = False
+        self.defer_non_streaming_logprob_output: bool = False
+        self.final_logprob_repair_claimed: bool = False
         # Temporary holder to store input_token_logprobs.
         self.input_token_logprobs: Optional[List[Tuple[int]]] = None
         self.temp_input_top_logprobs_val: Optional[List[torch.Tensor]] = None
@@ -960,6 +965,8 @@ class Req(ReqDllmMixin):
 
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
+        # Per-request count of draft proposals that could affect visible output.
+        self.spec_num_proposed_drafts = 0
 
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
@@ -1027,10 +1034,15 @@ class Req(ReqDllmMixin):
     @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
-        # NOTE: when spec is enabled, prefill_only optimizations are disabled
-
         spec_alg = get_global_server_args().speculative_algorithm
-        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+        # Most speculative algorithms keep prefill-only optimizations disabled
+        # so their draft-side state can stay warm.  DVR-EAGLE's draft KV is
+        # request-local and not represented in target radix cache nodes, so a
+        # max_new=0 cache-warm/scoring request should remain target prefill only.
+        return self.sampling_params.max_new_tokens == 0 and (
+            spec_alg is None
+            or is_dvr_eagle_enabled(get_global_server_args())
+        )
 
     @property
     def output_ids_through_stop(self) -> array[int]:
@@ -1085,6 +1097,31 @@ class Req(ReqDllmMixin):
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
         self.spec_correct_drafts_histogram[num_correct_drafts] += 1
+
+    def record_spec_verify_metrics(
+        self,
+        num_correct_drafts: int,
+        num_proposed_drafts: Optional[int] = None,
+        proposed_per_verify: Optional[int] = None,
+    ):
+        """Record one speculative verify step."""
+        if num_proposed_drafts is None and proposed_per_verify is not None:
+            num_proposed_drafts = self.useful_spec_proposed_drafts(
+                proposed_per_verify
+            )
+        num_correct_drafts = max(0, int(num_correct_drafts))
+        if num_proposed_drafts is not None:
+            num_correct_drafts = min(num_correct_drafts, max(0, int(num_proposed_drafts)))
+        self.spec_verify_ct += 1
+        self.spec_num_correct_drafts += num_correct_drafts
+        if num_proposed_drafts is not None:
+            self.spec_num_proposed_drafts += max(0, int(num_proposed_drafts))
+        self.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+    def useful_spec_proposed_drafts(self, proposed_per_verify: int) -> int:
+        """Return draft proposals that can still affect visible output."""
+        remaining_output = self.sampling_params.max_new_tokens - len(self.output_ids)
+        return min(max(0, int(proposed_per_verify)), max(0, remaining_output - 1))
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -1175,6 +1212,12 @@ class Req(ReqDllmMixin):
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
+                match_result = zero_match_result(tree_cache, match_result)
+            elif is_dvr_eagle_enabled(get_global_server_args()):
+                # DVR-EAGLE keeps radix-cache infrastructure enabled for GDN
+                # extra-buffer tracking, but target radix nodes do not own the
+                # separate MTP draft KV prefix.  Reusing a target prefix would
+                # skip draft prefill for those tokens and lower acceptance.
                 match_result = zero_match_result(tree_cache, match_result)
             (
                 self.prefix_indices,
@@ -1581,6 +1624,7 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
     track_index: int
     track_seqlen: int
+    track_cache_seqlen: int
 
 
 def set_mamba_track_indices_from_reqs(batch):
@@ -1758,6 +1802,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # Worker-side snapshot seqlens for spec-v2 unfinished prefill inserts.
+    mamba_track_cache_seqlens: torch.Tensor = None  # shape: [b], int64
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -2057,6 +2103,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        use_mamba_radix_snapshot = (
+            self.spec_algorithm.is_dvr_eagle()
+            or (self.spec_algorithm.is_dvr_self_draft() and self.enable_overlap)
+        )
+        mamba_track_cache_seqlens_cpu = [] if use_mamba_radix_snapshot else None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_input_len
@@ -2136,6 +2187,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
+                if mamba_track_cache_seqlens_cpu is not None:
+                    mamba_track_cache_seqlens_cpu.append(
+                        track_entry.track_cache_seqlen
+                    )
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -2237,6 +2292,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():
+            self.mamba_track_cache_seqlens = None
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2252,6 +2308,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
+            if mamba_track_cache_seqlens_cpu is not None:
+                self.mamba_track_cache_seqlens = torch.tensor(
+                    mamba_track_cache_seqlens_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
@@ -2286,6 +2348,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mask = req.extend_input_len >= mamba_cache_chunk_size
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
+        mamba_track_cache_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
             # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
@@ -2344,11 +2407,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+            mamba_track_cache_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
+            track_cache_seqlen=mamba_track_cache_seqlen,
         )
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
@@ -2664,6 +2729,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
+        self.mamba_track_cache_seqlens = None
         if get_global_server_args().enable_mamba_extra_buffer():
             mamba_track_interval = get_global_server_args().mamba_track_interval
 
@@ -2740,6 +2806,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_cache_seqlens = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -2797,6 +2864,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_cache_seqlens = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -2845,6 +2913,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_cache_seqlens=self.mamba_track_cache_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

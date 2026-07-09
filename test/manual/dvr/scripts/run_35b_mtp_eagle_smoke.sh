@@ -8,6 +8,10 @@ source "${SCRIPT_DIR}/common.sh"
 MODEL_PATH="${MODEL_PATH:-/mnt/data/hwj/Qwen3.5-35B-A3B}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-${MODEL_PATH}}"
 PORT="${PORT:-30135}"
+SPEC_DRAFT_TOKENS="${SPEC_DRAFT_TOKENS:-2}"
+SPEC_STEPS="${SPEC_STEPS:-1}"
+ACCEPT_TEMPERATURE="${ACCEPT_TEMPERATURE:-0.0}"
+ACCEPT_TOP_P="${ACCEPT_TOP_P:-1.0}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/35b-mtp-eagle-smoke}"
 SERVER_PID=""
@@ -27,10 +31,13 @@ run_one_mode() {
   local no_logprob_log="${RESULT_ROOT}/results/${label}_return_logprob_false.log"
   local prefix_cache_kl_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_true.log"
   local prefix_cache_no_logprob_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_false.log"
+  local overlap_args=()
+  if [[ "${spec_v2}" == "0" ]]; then
+    overlap_args=(--disable-overlap-schedule)
+  fi
 
   echo "==> Starting ${label} DVR-EAGLE server on ${BASE_URL}"
   setsid env \
-    SGLANG_ENABLE_SPEC_V2="${spec_v2}" \
     SGLANG_RETURN_ORIGINAL_LOGPROB=True \
     PYTHONPATH="${PYTHONPATH}" \
     conda run --no-capture-output -n "${CONDA_ENV}" python -m sglang.launch_server \
@@ -40,8 +47,8 @@ run_one_mode() {
       --tp-size 4 \
       --speculative-algorithm DECODE_VERIFY_ROLLBACK_EAGLE \
       --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
-      --speculative-num-draft-tokens 4 \
-      --speculative-num-steps 3 \
+      --speculative-num-draft-tokens "${SPEC_DRAFT_TOKENS}" \
+      --speculative-num-steps "${SPEC_STEPS}" \
       --speculative-eagle-topk 1 \
       --page-size 1 \
       --context-length 4096 \
@@ -54,6 +61,7 @@ run_one_mode() {
       --cuda-graph-bs 1 2 4 \
       --cuda-graph-max-bs 4 \
       --max-running-requests 4 \
+      "${overlap_args[@]}" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &
   SERVER_PID="$!"
@@ -61,6 +69,9 @@ run_one_mode() {
   wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
 
   echo "==> Running ${label} returned-logprob KL smoke"
+  # Acceptance is used here as a hidden/state consistency oracle.  Keep it
+  # greedy; stochastic sampling can legitimately reject a correct top-1 MTP
+  # draft when the target sample draws a different token.
   conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --prompt-token-lengths 63,64,65 \
@@ -68,6 +79,8 @@ run_one_mode() {
     --cache-mode flush-each \
     --check-kl \
     --min-accept-rate 0.99 \
+    --temperature "${ACCEPT_TEMPERATURE}" \
+    --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \
     --seed 2032 \
     2>&1 | tee "${kl_log}"
@@ -82,6 +95,8 @@ run_one_mode() {
     --cache-mode flush-each \
     --no-return-logprob \
     --min-accept-rate 0.99 \
+    --temperature "${ACCEPT_TEMPERATURE}" \
+    --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \
     --seed 2032 \
     2>&1 | tee "${no_logprob_log}"
@@ -95,6 +110,8 @@ run_one_mode() {
     --cache-mode warm-all \
     --check-kl \
     --min-accept-rate 0.99 \
+    --temperature "${ACCEPT_TEMPERATURE}" \
+    --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \
     --seed 3032 \
     2>&1 | tee "${prefix_cache_kl_log}"
@@ -109,6 +126,8 @@ run_one_mode() {
     --cache-mode warm-all \
     --no-return-logprob \
     --min-accept-rate 0.99 \
+    --temperature "${ACCEPT_TEMPERATURE}" \
+    --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \
     --seed 3032 \
     2>&1 | tee "${prefix_cache_no_logprob_log}"

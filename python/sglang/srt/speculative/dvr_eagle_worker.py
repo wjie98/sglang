@@ -10,24 +10,24 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
-from sglang.srt.model_executor.dvr_eagle_verify_cuda_graph_runner import (
-    DVREagleTargetVerifyCudaGraphRunner,
+from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+    dvr_eagle_draft_decode_context,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
 )
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
     build_dvr_spec_result_aux,
     compact_output_token_rows,
 )
-from sglang.srt.speculative.dvr_draft_decode_context import (
-    draft_decode_performance_context,
-)
 from sglang.srt.speculative.dvr_logprob_repair import (
     score_deferred_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_target_replay import (
+    replay_accepted_suffix_for_live_state,
     run_suffix_draft_replay_oracle,
     suffix_draft_replay_batch_context,
 )
@@ -40,8 +40,9 @@ from sglang.srt.speculative.dvr_utils import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2, EagleDraftWorker
-from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
+from sglang.srt.speculative.eagle_utils import eagle_prepare_for_verify, eagle_sample
 from sglang.srt.speculative.spec_utils import (
+    commit_mamba_states_after_verify,
     generate_token_bitmask,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -50,6 +51,72 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import is_npu, require_gathered_buffer
 
 _is_npu = is_npu()
+
+
+def _uses_draft_extend_selected_logits(*, topk, model, requires_gathered_buffer):
+    return (
+        topk == 1
+        and not requires_gathered_buffer
+        and getattr(model, "supports_draft_extend_selected_logits", False)
+    )
+
+
+@contextmanager
+def dvr_eagle_target_verify_cuda_graph_context(model_runner):
+    """Capture/replay DVR-EAGLE target verify with DVR target semantics."""
+
+    saved_flag = getattr(model_runner, "enable_dvr_target_verify_cuda_graph", None)
+    model_runner.enable_dvr_target_verify_cuda_graph = True
+    try:
+        yield
+    finally:
+        if saved_flag is None:
+            try:
+                delattr(model_runner, "enable_dvr_target_verify_cuda_graph")
+            except AttributeError:
+                pass
+        else:
+            model_runner.enable_dvr_target_verify_cuda_graph = saved_flag
+
+
+class DVREagleTargetVerifyCudaGraphRunner:
+    """CUDA graph runner for DVR-EAGLE target verify.
+
+    The target worker's default graph is captured with generic EAGLE verifier
+    metadata. DVR-EAGLE needs a target verify graph whose padded rows and GDN
+    state-input windows follow DVR verifier rules.
+    """
+
+    def __init__(self, dvr_eagle_worker):
+        self.dvr_eagle_worker = dvr_eagle_worker
+        model_runner = dvr_eagle_worker.target_worker.model_runner
+        with dvr_eagle_target_verify_cuda_graph_context(model_runner):
+            self.runner = DecodeCudaGraphRunner(model_runner)
+
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
+        with dvr_eagle_target_verify_cuda_graph_context(
+            self.dvr_eagle_worker.target_worker.model_runner
+        ):
+            return self.runner.can_run_graph(forward_batch)
+
+    def replay_prepare(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
+        with dvr_eagle_target_verify_cuda_graph_context(
+            self.dvr_eagle_worker.target_worker.model_runner
+        ):
+            return self.runner.load_batch(
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+
+    def replay(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
+        with dvr_eagle_target_verify_cuda_graph_context(
+            self.dvr_eagle_worker.target_worker.model_runner
+        ):
+            return self.runner.execute(
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+
+    def __getattr__(self, name):
+        return getattr(self.runner, name)
 
 
 class DVREagleDraftWorker(EagleDraftWorker):
@@ -63,12 +130,9 @@ class DVREagleDraftWorker(EagleDraftWorker):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._draft_extend_selected_logits = get_spec_algorithm_policy(
-            self.speculative_algorithm
-        ).uses_draft_extend_selected_logits(
+        self._draft_extend_selected_logits = _uses_draft_extend_selected_logits(
             topk=self.topk,
             model=self.draft_runner.model,
-            is_v2=True,
             requires_gathered_buffer=require_gathered_buffer(
                 self.draft_runner.server_args
             ),
@@ -80,7 +144,7 @@ class DVREagleDraftWorker(EagleDraftWorker):
         graph_capture: bool = False,
         clear_kernel_config_caches: bool = False,
     ):
-        return draft_decode_performance_context(
+        return dvr_eagle_draft_decode_context(
             self.draft_runner,
             graph_capture=graph_capture,
             clear_kernel_config_caches=clear_kernel_config_caches,
@@ -121,9 +185,17 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         self.dvr_verifier_replay_prefix = DVRReplayPrefixTracker()
         self.dvr_client_output_replay_prefix = DVRReplayPrefixTracker()
         self.cuda_graph_runner_for_target_verify = None
-        if not self.server_args.disable_cuda_graph and (
-            self.server_args.model_impl != "mindspore"
+
+    def init_cuda_graphs(self):
+        super().init_cuda_graphs()
+        if (
+            self.cuda_graph_runner_for_target_verify is None
+            and not self.server_args.disable_cuda_graph
+            and self.server_args.model_impl != "mindspore"
         ):
+            # Target ModelRunner fields such as ngram embedding buffers are
+            # initialized during the normal target graph setup.  Build the
+            # DVR-EAGLE target-verify graph here, not in __init__.
             self.cuda_graph_runner_for_target_verify = (
                 DVREagleTargetVerifyCudaGraphRunner(self)
             )
@@ -151,7 +223,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 yield use_plan_stream
             return
 
-        saved_graph_runner = target_runner.graph_runner
+        saved_graph_runner = target_runner.decode_cuda_graph_runner
         # Overlap target verify previously had to hide the generic EAGLE graph
         # because its padded metadata does not understand DVR GDN state-input
         # windows.  Prefer the DVR-EAGLE graph when captured; if capture is
@@ -160,18 +232,18 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         # During prepare, the dedicated DVR-EAGLE graph must be prepared on the
         # compute stream; only the eager fallback keeps the old plan-stream path.
         with stream_ctx:
-            target_runner.graph_runner = runner
+            target_runner.decode_cuda_graph_runner = runner
             try:
                 yield use_plan_stream
             finally:
-                target_runner.graph_runner = saved_graph_runner
+                target_runner.decode_cuda_graph_runner = saved_graph_runner
 
     def _target_verify_graph_runner_bs(self, can_run_cuda_graph: bool):
         if not can_run_cuda_graph:
             return None
         runner = (
             self.cuda_graph_runner_for_target_verify
-            or self.target_worker.model_runner.graph_runner
+            or self.target_worker.model_runner.decode_cuda_graph_runner
         )
         return None if runner is None else runner.bs
 
@@ -219,7 +291,12 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             self.linear_state.restore_tail_lens_after_replay(
                 batch, replay_tasks, seq_lens_cpu=seq_lens_cpu
             )
-        self.linear_state.finish_prepare_for_draft(batch)
+        # In overlap mode, the EAGLE/MTP draft worker can run before the next
+        # target verify and may share low-level linear-state slots with the
+        # target worker.  Keep the worker-local target boundary backup as the
+        # verifier authority instead of refreshing it from a slot the draft
+        # phase may have already mutated.
+        self.linear_state.finish_prepare_for_separate_draft(batch)
 
     def _target_suffix_extend_verify_output(
         self,
@@ -254,6 +331,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             draft_cache_locs=batch.out_cache_loc,
             request_token_ids_for_replay=self._request_token_ids_for_replay,
             restore_boundary_state=True,
+            track_replay_boundary_checkpoint=True,
         ) as replay:
             if replay is None:
                 return None
@@ -265,6 +343,52 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 use_forward_batch=True,
             )
             return draft_logits, draft_hidden_states
+
+    def _compact_accepted_tokens_and_cache_locs(
+        self,
+        *,
+        batch: ScheduleBatch,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_accept = accept_index.shape[1]
+        valid_accept = torch.arange(
+            max_accept, dtype=torch.long, device=self.device
+        ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
+        bs = accept_index.shape[0]
+        compact_predict_indices = (
+            torch.arange(bs, dtype=torch.long, device=self.device).unsqueeze(1)
+            * self.speculative_num_draft_tokens
+            + torch.arange(max_accept, dtype=torch.long, device=self.device).unsqueeze(0)
+        )
+        return (
+            predict[compact_predict_indices[valid_accept]],
+            batch.out_cache_loc[accept_index.clamp_min(0).long()[valid_accept]],
+        )
+
+    def _replay_accepted_suffix_for_partial_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        linear_state_ctx,
+        base_seq_lens_cpu: list[int],
+        accepted_token_counts_cpu: list[int],
+        accepted_ids: torch.Tensor,
+        accepted_cache_locs: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return replay_accepted_suffix_for_live_state(
+            batch=batch,
+            target_worker=self.target_worker,
+            linear_state=self.linear_state,
+            linear_state_ctx=linear_state_ctx,
+            base_seq_lens_cpu=base_seq_lens_cpu,
+            accepted_token_counts_cpu=accepted_token_counts_cpu,
+            accepted_ids=accepted_ids,
+            accepted_cache_locs=accepted_cache_locs,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            request_token_ids_for_replay=self._request_token_ids_for_replay,
+        )
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -367,12 +491,11 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             disable_cuda_graph=disable_verify_graph,
             prepare=True,
         ) as prepared_on_plan_stream:
-            verify_forward_batch, can_run_cuda_graph = (
-                verify_input.prepare_for_v2_verify(
-                    self.req_to_token_pool,
-                    batch,
-                    self.target_worker,
-                )
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                verify_input,
+                self.req_to_token_pool,
+                batch,
+                self.target_worker,
             )
 
         record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
@@ -464,8 +587,8 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         maybe_detect_inf(
             logits_output.next_token_logits, "dvr eagle verify: target model logits"
         )
-        predict, accept_lens, accept_index = verify_input.sample(
-            batch, logits_output, vocab_mask
+        predict, accept_lens, accept_index = eagle_sample(
+            verify_input, batch, logits_output, vocab_mask
         )
         new_seq_lens = batch.seq_lens + accept_lens
         # Replay-prefix tracking is needed whenever suffix replay may reconstruct
@@ -522,22 +645,48 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
 
         pending_track_indices = None
         pending_track_seqlens = None
+        live_state_already_replayed = None
         if linear_state_ctx is not None:
+            accept_lens_cpu = accept_lens.detach().cpu().tolist()
+            if torch.any(accept_lens < verify_input.draft_token_num).item():
+                accepted_ids, accepted_cache_locs = (
+                    self._compact_accepted_tokens_and_cache_locs(
+                        batch=batch,
+                        predict=predict,
+                        accept_index=accept_index,
+                        accept_lens=accept_lens,
+                    )
+                )
+                live_state_already_replayed = (
+                    self._replay_accepted_suffix_for_partial_verify(
+                        batch=batch,
+                        linear_state_ctx=linear_state_ctx,
+                        base_seq_lens_cpu=base_seq_lens_cpu,
+                        accepted_token_counts_cpu=accept_lens_cpu,
+                        accepted_ids=accepted_ids,
+                        accepted_cache_locs=accepted_cache_locs,
+                    )
+                )
             pending_track_indices, pending_track_seqlens = (
                 self.linear_state.commit_after_verify_v2(
                     batch=batch,
                     accepted_token_counts=accept_lens.to(torch.long),
                     accepted_steps=(accept_lens - 1).to(torch.long),
                     ctx=linear_state_ctx,
+                    live_state_already_replayed=live_state_already_replayed,
                 )
             )
-            self.linear_state.backup_boundary_state(batch)
-        elif (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-            or self.target_worker.model_runner.hybrid_lightning_config is not None
-        ):
-            self._mamba_verify_update(batch, accept_lens, accept_index, bs)
+            self.linear_state.refresh_boundary_backup(batch)
+        else:
+            # Non-DVR mambaish fallback mirrors upstream EAGLE v2.  GDN DVR
+            # commits through linear_state above to preserve rollback semantics.
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                self.speculative_num_draft_tokens,
+            )
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(

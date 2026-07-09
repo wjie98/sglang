@@ -26,6 +26,13 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.dvr_scheduler_utils import (
+    apply_spec_final_logprob_repairs_from_result,
+    maybe_cache_unfinished_prefill_req_with_spec_state,
+    maybe_handle_spec_mamba_checkpoint_after_decode,
+    maybe_resolve_dvr_spec_v1_decode_tokens_from_result,
+    should_skip_dvr_spec_v1_decode_logprob_append,
+)
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -238,10 +245,27 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
-                        if self.server_args.enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                    else:
+                        # DVR spec-v2 can attach a generated-prefix Mamba
+                        # checkpoint to a cache insert that upstream would not
+                        # normally see.  If it does not handle this request,
+                        # keep the original unfinished-prefill cache path.
+                        spec_cached = maybe_cache_unfinished_prefill_req_with_spec_state(
+                            req=req,
+                            batch=batch,
+                            req_index=i,
+                            tree_cache=self.tree_cache,
+                            enable_hisparse=self.server_args.enable_hisparse,
+                            hisparse_coordinator=self.hisparse_coordinator,
+                        )
+                        if not spec_cached and (
+                            not batch.decoding_reqs or req not in batch.decoding_reqs
+                        ):
+                            maybe_cache_unfinished_req(req, self.tree_cache)
+                            if self.server_args.enable_hisparse:
+                                self.hisparse_coordinator.admit_request_into_staging(
+                                    req
+                                )
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
@@ -554,6 +578,8 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+        proposed_drafts_per_req = result.num_proposed_drafts_per_req_cpu
+        default_proposed_per_verify = max(0, int(stride) - 1)
 
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -580,11 +606,17 @@ class SchedulerBatchResultProcessor:
                 else:
                     # EAGLE prepare_for_decode pre-claimed the bonus slot.
                     req.kv_committed_len += num_accept_tokens - 1
-                req.spec_verify_ct += 1
-
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-                req.spec_num_correct_drafts += num_correct_drafts
-                req.update_spec_correct_drafts_histogram(num_correct_drafts)
+                req.record_spec_verify_metrics(
+                    num_correct_drafts=num_correct_drafts,
+                    num_proposed_drafts=(
+                        proposed_drafts_per_req[i]
+                        if proposed_drafts_per_req is not None
+                        else req.useful_spec_proposed_drafts(
+                            default_proposed_per_verify
+                        )
+                    ),
+                )
 
             predict_tokens.append(accept_tokens)
 
@@ -652,6 +684,9 @@ class SchedulerBatchResultProcessor:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        skip_decode_logprob_append = should_skip_dvr_spec_v1_decode_logprob_append(
+            batch=batch, result=result
+        )
 
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
@@ -703,7 +738,7 @@ class SchedulerBatchResultProcessor:
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
-            if req.return_logprob:
+            if req.return_logprob and not skip_decode_logprob_append:
                 self._apply_decode_logprobs(
                     req=req,
                     i=i,
@@ -739,6 +774,9 @@ class SchedulerBatchResultProcessor:
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
+        # Some spec workers return aux data whose ownership starts only after
+        # the scheduler materializes accepted tokens into Req.
+        apply_spec_final_logprob_repairs_from_result(batch, result)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -761,7 +799,14 @@ class SchedulerBatchResultProcessor:
     ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
         next_token_logprobs = None
         if not batch.spec_algorithm.is_none():
-            next_token_ids = self._resolve_spec_v2_tokens(result, batch)
+            next_token_ids = maybe_resolve_dvr_spec_v1_decode_tokens_from_result(
+                batch=batch,
+                result=result,
+                model_worker=self.model_worker,
+                accept_grammar_tokens=self._accept_grammar_tokens,
+            )
+            if next_token_ids is None:
+                next_token_ids = self._resolve_spec_v2_tokens(result, batch)
         elif isinstance(next_token_ids, list):
             pass  # MLX path: already a list[int], skip torch round-trip
         else:
@@ -895,6 +940,15 @@ class SchedulerBatchResultProcessor:
         post-decode cleanup to free the temporary second slot.
         """
         if req.mamba_ping_pong_track_buffer is None:
+            return
+
+        if maybe_handle_spec_mamba_checkpoint_after_decode(
+            req=req,
+            batch=batch,
+            result=result,
+            req_index=i,
+            tree_cache=self.tree_cache,
+        ):
             return
 
         lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()

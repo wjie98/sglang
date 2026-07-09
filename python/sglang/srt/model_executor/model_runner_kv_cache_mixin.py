@@ -39,7 +39,6 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.speculative.spec_policy import get_spec_algorithm_policy
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -403,11 +402,6 @@ class ModelRunnerKVCacheMixin:
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
-                    linear_speculative_state_extension_factory=get_spec_algorithm_policy(
-                        self.spec_algorithm
-                    ).linear_speculative_state_extension_factory(
-                        self
-                    ),
                 )
             else:
                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req

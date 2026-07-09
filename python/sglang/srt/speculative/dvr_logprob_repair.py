@@ -8,6 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.output_policy import (
+    defer_req_non_streaming_logprob_output,
+    try_claim_req_final_logprob_repair,
+)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -20,10 +24,6 @@ from sglang.srt.speculative.dvr_target_replay import (
     DVRPrivateExtendBatchSpec,
     build_private_extend_batch,
     linear_state_replay_context,
-)
-from sglang.srt.speculative.dvr_output_policy import (
-    defer_req_non_streaming_logprob_output,
-    try_claim_req_final_logprob_repair,
 )
 
 
@@ -366,6 +366,13 @@ def _run_final_logprob_replay(
                 restore_live_state=True,
             ),
         ):
+            # Final logprob repair is a full-prefix scoring oracle.  Unlike
+            # suffix replay, it must start from an empty recurrent state; the
+            # context above only saves/restores the live slot.
+            replay_linear_state_ctx.state_adapter.zero_recurrent_state(
+                state_cache=replay_linear_state_ctx.state_cache,
+                indices=replay_linear_state_ctx.live_indices,
+            )
             # This is an external scoring oracle equivalent to
             # max_new_tokens=0, not a target-verify pass.  Keep is_verify=False
             # so TP worker runs the normal prefill-only logprob path.

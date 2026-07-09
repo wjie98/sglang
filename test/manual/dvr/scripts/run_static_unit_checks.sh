@@ -18,6 +18,6 @@ DVR_PY_FILES+=(python/sglang/srt/speculative/eagle_info_v2.py)
 git diff --check
 conda_python -m py_compile "${DVR_PY_FILES[@]}"
 conda_python -m pytest \
-  test/registered/unit/speculative/test_dvr_spec_policy.py \
+  test/registered/unit/speculative/test_dvr_contracts.py \
   test/registered/unit/server_args/test_dvr_server_args.py \
   test/registered/unit/layers/test_dvr_gdn_state_input_cache.py

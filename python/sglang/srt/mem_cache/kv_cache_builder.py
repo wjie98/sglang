@@ -53,6 +53,8 @@ def get_draft_kv_pool(
     draft worker, or (None, None) when no draft KV pool is available."""
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
+    if spec_algorithm.is_dvr_self_draft():
+        return None, None
 
     # V2 workers nest the draft runner under `.draft_worker`.
     if server_args.enable_multi_layer_eagle:
@@ -201,7 +203,7 @@ def build_kv_cache(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         page_size=page_size,
-        is_eagle=spec_algorithm.is_eagle(),
+        is_eagle=spec_algorithm.is_eagle() or spec_algorithm.is_dvr_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
         ),

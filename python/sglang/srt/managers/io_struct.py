@@ -100,6 +100,10 @@ class SpeculativeDecodingMetricsMixin:
     # (strict drafts-only count, excludes the bonus token).
     spec_num_correct_drafts: List[int]
 
+    # Proposed drafts: Number of useful proposed draft tokens during speculative
+    # decoding (strict drafts-only count, excludes the bonus token).
+    spec_num_proposed_drafts: List[int]
+
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
     # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
