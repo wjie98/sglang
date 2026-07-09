@@ -224,35 +224,6 @@ def _linear_state_replay_context(
         )
 
 
-def _build_suffix_draft_replay_plan(
-    *,
-    batch,
-    base_seq_lens_cpu: list[int],
-    boundary_lens: list[int],
-    draft_tokens: torch.Tensor,
-    draft_cache_locs: torch.Tensor,
-    request_token_ids_for_replay,
-) -> Optional[_DVRSuffixReplayPlan]:
-    """Build the common tail+draft replay shape for self-DVR and DVR-EAGLE."""
-
-    bs = len(batch.seq_lens)
-    draft_token_num = draft_tokens.numel() // max(bs, 1)
-    draft_tokens = draft_tokens.reshape(bs, draft_token_num)
-    draft_cache_locs = draft_cache_locs.reshape(bs, draft_token_num)
-    append_token_counts_cpu = [draft_token_num] * bs
-    return _build_suffix_replay_plan(
-        batch=batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        append_tokens_cpu_by_req=draft_tokens.detach().cpu().tolist(),
-        append_cache_locs_by_req=[draft_cache_locs[i] for i in range(bs)],
-        append_cache_locs=draft_cache_locs,
-        append_token_counts_cpu=append_token_counts_cpu,
-        request_token_ids_for_replay=request_token_ids_for_replay,
-        hidden_gather_append_count=draft_token_num,
-    )
-
-
 def _build_suffix_draft_mrope_positions(
     replay_batch: ScheduleBatch,
     replay_plan: _DVRSuffixReplayPlan,
@@ -343,65 +314,6 @@ def _build_suffix_target_replay_batch(
         mamba_cow_src_indices=mamba_cow_src_indices,
         mamba_cow_dst_indices=mamba_cow_dst_indices,
         mamba_clear_indices=mamba_clear_indices,
-    )
-
-
-def _build_accepted_suffix_replay_plan(
-    *,
-    batch,
-    base_seq_lens_cpu: list[int],
-    boundary_lens: list[int],
-    accepted_tokens: torch.Tensor,
-    accepted_cache_locs: torch.Tensor,
-    accepted_token_counts_cpu: list[int],
-    num_draft_tokens: int,
-    request_token_ids_for_replay,
-) -> Optional[_DVRSuffixReplayPlan]:
-    """Build the live-state repair replay shape for partially accepted chains."""
-
-    if accepted_tokens is None or accepted_tokens.numel() == 0:
-        return None
-
-    total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
-    if (
-        accepted_tokens.numel() != total_accepted
-        or accepted_cache_locs.numel() != total_accepted
-    ):
-        return None
-
-    if all(int(accepted) >= num_draft_tokens for accepted in accepted_token_counts_cpu):
-        return None
-
-    accepted_cache_locs = accepted_cache_locs.to(torch.long)
-    accepted_tokens_cpu = accepted_tokens.detach().cpu().tolist()
-    accepted_tokens_by_req = []
-    accepted_cache_locs_by_req = []
-    token_offset = 0
-    for req_i, (seq_len, accepted_count) in enumerate(
-        zip(
-            base_seq_lens_cpu,
-            accepted_token_counts_cpu,
-            strict=True,
-        )
-    ):
-        accepted_count = int(accepted_count)
-        accepted_tokens_by_req.append(
-            accepted_tokens_cpu[token_offset : token_offset + accepted_count]
-        )
-        accepted_cache_locs_by_req.append(
-            accepted_cache_locs[token_offset : token_offset + accepted_count]
-        )
-        token_offset += accepted_count
-
-    return _build_suffix_replay_plan(
-        batch=batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        append_tokens_cpu_by_req=accepted_tokens_by_req,
-        append_cache_locs_by_req=accepted_cache_locs_by_req,
-        append_cache_locs=accepted_cache_locs,
-        append_token_counts_cpu=accepted_token_counts_cpu,
-        request_token_ids_for_replay=request_token_ids_for_replay,
     )
 
 
@@ -642,13 +554,20 @@ def dvr_suffix_replay_context(
     boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
     if full_prefix_replay:
         boundary_lens = [0 for _ in boundary_lens]
-    replay_plan = _build_suffix_draft_replay_plan(
+    bs = len(batch.seq_lens)
+    draft_token_num = draft_tokens.numel() // max(bs, 1)
+    draft_tokens = draft_tokens.reshape(bs, draft_token_num)
+    draft_cache_locs = draft_cache_locs.reshape(bs, draft_token_num)
+    replay_plan = _build_suffix_replay_plan(
         batch=batch,
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
-        draft_tokens=draft_tokens,
-        draft_cache_locs=draft_cache_locs,
+        append_tokens_cpu_by_req=draft_tokens.detach().cpu().tolist(),
+        append_cache_locs_by_req=[draft_cache_locs[i] for i in range(bs)],
+        append_cache_locs=draft_cache_locs,
+        append_token_counts_cpu=[draft_token_num] * bs,
         request_token_ids_for_replay=request_token_ids_for_replay,
+        hidden_gather_append_count=draft_token_num,
     )
     if replay_plan is None:
         yield None
@@ -789,15 +708,38 @@ def replay_dvr_accepted_suffix_for_live_state(
     boundary_indices = linear_state_ctx.boundary_indices
     assert boundary_indices is not None
 
+    total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
+    if (
+        accepted_ids.numel() != total_accepted
+        or accepted_cache_locs.numel() != total_accepted
+    ):
+        return None
+    if all(int(accepted) >= num_draft_tokens for accepted in accepted_token_counts_cpu):
+        return None
+
     boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
-    replay_plan = _build_accepted_suffix_replay_plan(
+    accepted_cache_locs = accepted_cache_locs.to(torch.long)
+    accepted_tokens_cpu = accepted_ids.detach().cpu().tolist()
+    accepted_tokens_by_req = []
+    accepted_cache_locs_by_req = []
+    token_offset = 0
+    for accepted_count in accepted_token_counts_cpu:
+        accepted_count = int(accepted_count)
+        accepted_tokens_by_req.append(
+            accepted_tokens_cpu[token_offset : token_offset + accepted_count]
+        )
+        accepted_cache_locs_by_req.append(
+            accepted_cache_locs[token_offset : token_offset + accepted_count]
+        )
+        token_offset += accepted_count
+    replay_plan = _build_suffix_replay_plan(
         batch=batch,
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
-        accepted_tokens=accepted_ids,
-        accepted_cache_locs=accepted_cache_locs,
-        accepted_token_counts_cpu=accepted_token_counts_cpu,
-        num_draft_tokens=num_draft_tokens,
+        append_tokens_cpu_by_req=accepted_tokens_by_req,
+        append_cache_locs_by_req=accepted_cache_locs_by_req,
+        append_cache_locs=accepted_cache_locs,
+        append_token_counts_cpu=accepted_token_counts_cpu,
         request_token_ids_for_replay=request_token_ids_for_replay,
     )
     if replay_plan is None:
