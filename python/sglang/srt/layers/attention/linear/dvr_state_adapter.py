@@ -21,8 +21,6 @@ from sglang.srt.layers.attention.linear.dvr_state import (
     DVRStateInputs,
     DVRStateInputWindow,
     DVRStateOps,
-)
-from sglang.srt.layers.attention.linear.dvr_state_verify import (
     rebuild_dvr_live_state_grouped,
     run_dvr_chunkwise_verify,
     write_dvr_conv_windows,
