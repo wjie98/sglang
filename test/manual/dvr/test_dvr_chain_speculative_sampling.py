@@ -26,7 +26,7 @@ from typing import List
 
 import torch
 
-from sglang.srt.speculative.dvr_utils import chain_speculative_sampling
+from sglang.srt.speculative.dvr_worker import chain_speculative_sampling
 
 
 def reference_chain_speculative_sampling(

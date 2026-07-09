@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     dvr_eagle_draft_decode_context,
+    iter_dvr_attention_backends,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -32,10 +33,9 @@ from sglang.srt.speculative.dvr_target_replay import (
     suffix_draft_replay_batch_context,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
-from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
-from sglang.srt.speculative.dvr_utils import (
+from sglang.srt.speculative.dvr_worker import (
+    DVREagleVerifyInput,
     dvr_has_graph_unsafe_short_prompt,
-    iter_dvr_attention_backends,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens

@@ -7,8 +7,45 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.dvr_utils import iter_dvr_attention_backends
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+_ATTN_BACKEND_CHILD_ATTRS = (
+    "decode_backend",
+    "prefill_backend",
+    "full_attn_backend",
+    "linear_attn_backend",
+    "primary",
+)
+_ATTN_BACKEND_CHILD_LIST_ATTRS = (
+    "attn_backend_list",
+    "attn_backends",
+    "backends",
+    "children",
+)
+
+
+def iter_dvr_attention_backends(attn_backend):
+    """Yield every backend wrapper that may carry decode determinism state."""
+
+    if attn_backend is None:
+        return
+
+    seen = set()
+    stack = [attn_backend]
+    while stack:
+        backend = stack.pop()
+        if backend is None or id(backend) in seen:
+            continue
+        seen.add(id(backend))
+        yield backend
+
+        for attr_name in _ATTN_BACKEND_CHILD_ATTRS:
+            stack.append(getattr(backend, attr_name, None))
+
+        for attr_name in _ATTN_BACKEND_CHILD_LIST_ATTRS:
+            for child in getattr(backend, attr_name, None) or ():
+                stack.append(child)
 
 
 @contextmanager

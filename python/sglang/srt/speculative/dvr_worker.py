@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from typing import Any, List, Optional, Tuple
 
@@ -8,6 +9,7 @@ import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -38,11 +40,6 @@ from sglang.srt.speculative.dvr_target_replay import (
     run_suffix_draft_replay_oracle,
     suffix_draft_replay_batch_context,
 )
-from sglang.srt.speculative.dvr_utils import (
-    chain_speculative_sampling,
-    dvr_chain_uniform_samples,
-    dvr_has_graph_unsafe_short_prompt,
-)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -62,7 +59,319 @@ from sglang.srt.utils.async_probe import maybe_detect_nan
 if is_cuda():
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - non-CUDA builds use the torch fallback.
+    triton = None
+    tl = None
+
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _dvr_causal_verify_cuda_graph_metadata(
+    model_runner, attn_backend, forward_mode, spec_info, fallback_custom_mask=None
+):
+    """Build DVR target-verify graph metadata without selecting custom masks."""
+
+    old_custom_mask = getattr(spec_info, "custom_mask", None)
+    should_clear_custom_mask = (
+        (
+            model_runner.spec_algorithm.is_dvr_self_draft()
+            or getattr(model_runner, "enable_dvr_target_verify_cuda_graph", False)
+        )
+        and forward_mode.is_target_verify()
+        and spec_info is not None
+    )
+    if (
+        should_clear_custom_mask
+        and old_custom_mask is None
+        and fallback_custom_mask is not None
+    ):
+        # DVR target verify is a topk=1 chain, so the real attention mask is
+        # causal. Some graph metadata builders still read custom_mask.shape;
+        # provide the graph buffer only for that shape bookkeeping.
+        spec_info.custom_mask = fallback_custom_mask
+    try:
+        yield
+    finally:
+        if should_clear_custom_mask:
+            spec_info.custom_mask = old_custom_mask
+            backends = [attn_backend]
+            full_attn_backend = getattr(attn_backend, "full_attn_backend", None)
+            if full_attn_backend is not None:
+                backends.append(full_attn_backend)
+            for backend in backends:
+                metadata = getattr(backend, "forward_metadata", None)
+                if metadata is None:
+                    continue
+                if hasattr(metadata, "custom_mask"):
+                    metadata.custom_mask = None
+                if hasattr(metadata, "mask_indptr"):
+                    metadata.mask_indptr = None
+
+
+def dvr_has_graph_unsafe_short_prompt(batch) -> bool:
+    """Return whether DVR/GDN graph replay should skip the one-token edge."""
+
+    return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
+
+
+def dvr_chain_uniform_samples(
+    candidates: torch.Tensor,
+    batch,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return accept/reject uniforms for DVR chain sampling."""
+
+    sampling_seed = getattr(batch.sampling_info, "sampling_seed", None)
+    if sampling_seed is None:
+        return (
+            torch.rand_like(candidates, dtype=torch.float32),
+            torch.rand((candidates.shape[0],), dtype=torch.float32, device=batch.device),
+        )
+
+    bs, num_slots = candidates.shape
+    device = candidates.device
+    seed = sampling_seed.to(device=device).repeat_interleave(num_slots + 1)
+    slot_offsets = torch.arange(num_slots + 1, dtype=torch.int64, device=device)
+    positions = (
+        batch.seq_lens.to(device=device, dtype=torch.int64).unsqueeze(1) + slot_offsets
+    ).reshape(-1)
+    cols = torch.zeros((1,), dtype=torch.int32, device=device)
+    uniforms = (
+        murmur_hash32(seed, positions, cols)
+        .reshape(bs, num_slots + 1)
+        .to(torch.float32)
+        / 4294967296.0
+    )
+    return uniforms[:, :num_slots], uniforms[:, num_slots].contiguous()
+
+
+if triton is not None:
+
+    @triton.jit
+    def _chain_speculative_sampling_kernel(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        draft_probs,
+        stride_cand_b: tl.constexpr,
+        stride_cand_s: tl.constexpr,
+        stride_acc_b: tl.constexpr,
+        stride_acc_s: tl.constexpr,
+        stride_idx_b: tl.constexpr,
+        stride_idx_s: tl.constexpr,
+        stride_uni_b: tl.constexpr,
+        stride_uni_s: tl.constexpr,
+        stride_tp_b: tl.constexpr,
+        stride_tp_s: tl.constexpr,
+        stride_tp_v: tl.constexpr,
+        stride_dp_b: tl.constexpr,
+        stride_dp_s: tl.constexpr,
+        stride_dp_v: tl.constexpr,
+        NUM_SLOTS: tl.constexpr,
+        ACCEPT_COLS: tl.constexpr,
+        PREDICT_NUMEL: tl.constexpr,
+        TARGET_ROWS: tl.constexpr,
+        DRAFT_ROWS: tl.constexpr,
+        VOCAB_SIZE: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        bid = tl.program_id(0)
+        cand_base = candidates + bid * stride_cand_b
+        accept_base = accept_index + bid * stride_acc_b
+        index_base = retrive_index + bid * stride_idx_b
+        uniform_base = uniform_samples + bid * stride_uni_b
+
+        prob_row = 0
+        root_index = tl.load(index_base)
+        valid_last = (root_index >= 0) & (root_index < PREDICT_NUMEL)
+        if (ACCEPT_COLS > 0) and valid_last:
+            tl.store(accept_base, root_index)
+        last_index = root_index
+        num_accepted = 0
+        step = 1
+        continue_verifying = 1
+        while (step < NUM_SLOTS) and (continue_verifying == 1) and valid_last:
+            draft_token = tl.load(cand_base + step * stride_cand_s)
+            next_index = tl.load(index_base + step * stride_idx_s)
+            valid_token = (
+                (draft_token >= 0)
+                & (draft_token < VOCAB_SIZE)
+                & (prob_row < TARGET_ROWS)
+            )
+            if valid_token:
+                target_prob = tl.load(
+                    target_probs
+                    + bid * stride_tp_b
+                    + prob_row * stride_tp_s
+                    + draft_token * stride_tp_v
+                )
+                valid_draft_row = prob_row < DRAFT_ROWS
+                draft_prob = tl.load(
+                    draft_probs
+                    + bid * stride_dp_b
+                    + prob_row * stride_dp_s
+                    + draft_token * stride_dp_v,
+                    mask=valid_draft_row,
+                    other=0.0,
+                )
+                coin = tl.load(uniform_base + (step - 1) * stride_uni_s)
+                can_accept = (
+                    valid_draft_row
+                    & (next_index >= 0)
+                    & (next_index < PREDICT_NUMEL)
+                    & ((num_accepted + 1) < ACCEPT_COLS)
+                    & (coin * draft_prob < target_prob)
+                )
+            else:
+                can_accept = False
+
+            if can_accept:
+                tl.store(predicts + last_index, draft_token)
+                num_accepted += 1
+                prob_row = step
+                last_index = next_index
+                tl.store(accept_base + num_accepted * stride_acc_s, last_index)
+                step += 1
+            else:
+                continue_verifying = 0
+
+        tl.store(accept_token_num + bid, num_accepted)
+        all_accepted = continue_verifying
+
+        target_base = target_probs + bid * stride_tp_b + prob_row * stride_tp_s
+        draft_base = draft_probs + bid * stride_dp_b + prob_row * stride_dp_s
+
+        norm_sum = 0.0
+        if valid_last and (prob_row < TARGET_ROWS):
+            for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+                offsets = v_start + tl.arange(0, BLOCK_V)
+                mask = offsets < VOCAB_SIZE
+                target_val = tl.load(
+                    target_base + offsets * stride_tp_v, mask=mask, other=0.0
+                )
+                if all_accepted:
+                    residual_val = target_val
+                else:
+                    draft_val = tl.load(
+                        draft_base + offsets * stride_dp_v,
+                        mask=mask & (prob_row < DRAFT_ROWS),
+                        other=0.0,
+                    )
+                    residual_val = tl.maximum(target_val - draft_val, 0.0)
+                norm_sum += tl.sum(residual_val)
+
+            final_token = VOCAB_SIZE - 1
+            if norm_sum <= 0.0:
+                best_val = -float("inf")
+                for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+                    offsets = v_start + tl.arange(0, BLOCK_V)
+                    mask = offsets < VOCAB_SIZE
+                    target_val = tl.load(
+                        target_base + offsets * stride_tp_v,
+                        mask=mask,
+                        other=-float("inf"),
+                    )
+                    block_best = tl.max(target_val, axis=0)
+                    if block_best > best_val:
+                        best_val = block_best
+                        final_token = v_start + tl.argmax(target_val, axis=0)
+            else:
+                target_u = tl.load(uniform_samples_for_final_sampling + bid) * norm_sum
+                cdf = 0.0
+                found = 0
+                for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+                    if found == 0:
+                        offsets = v_start + tl.arange(0, BLOCK_V)
+                        mask = offsets < VOCAB_SIZE
+                        target_val = tl.load(
+                            target_base + offsets * stride_tp_v, mask=mask, other=0.0
+                        )
+                        if all_accepted:
+                            residual_val = target_val
+                        else:
+                            draft_val = tl.load(
+                                draft_base + offsets * stride_dp_v,
+                                mask=mask & (prob_row < DRAFT_ROWS),
+                                other=0.0,
+                            )
+                            residual_val = tl.maximum(target_val - draft_val, 0.0)
+                        block_cdf = cdf + tl.cumsum(residual_val, axis=0)
+                        matched = block_cdf > target_u
+                        if tl.max(matched, axis=0):
+                            final_token = v_start + tl.argmax(
+                                matched.to(tl.int32), axis=0
+                            )
+                            found = 1
+                        cdf += tl.sum(residual_val)
+
+            tl.store(predicts + last_index, final_token)
+
+
+def chain_speculative_sampling(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+    deterministic: bool,
+) -> None:
+    """Classic topk=1 chain speculative sampling for DVR self draft."""
+
+    del retrive_next_token, retrive_next_sibling
+    del threshold_single, threshold_acc, deterministic
+
+    if triton is None or not (candidates.is_cuda and target_probs.is_cuda):
+        raise RuntimeError("DVR chain speculative sampling requires Triton CUDA.")
+
+    batch_size, num_slots = candidates.shape
+    _chain_speculative_sampling_kernel[(batch_size,)](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        draft_probs,
+        candidates.stride(0),
+        candidates.stride(1),
+        accept_index.stride(0),
+        accept_index.stride(1),
+        retrive_index.stride(0),
+        retrive_index.stride(1),
+        uniform_samples.stride(0),
+        uniform_samples.stride(1),
+        target_probs.stride(0),
+        target_probs.stride(1),
+        target_probs.stride(2),
+        draft_probs.stride(0),
+        draft_probs.stride(1),
+        draft_probs.stride(2),
+        NUM_SLOTS=num_slots,
+        ACCEPT_COLS=accept_index.shape[1],
+        PREDICT_NUMEL=predicts.numel(),
+        TARGET_ROWS=target_probs.shape[1],
+        DRAFT_ROWS=draft_probs.shape[1],
+        VOCAB_SIZE=target_probs.shape[-1],
+        BLOCK_V=4096,
+    )
 
 
 def _add_output_logprobs_for_dvr_spec_v1(
@@ -190,11 +499,7 @@ class DVRTargetVerifyMixin:
         forward_mode,
         fallback_custom_mask=None,
     ):
-        from sglang.srt.speculative.dvr_utils import (
-            dvr_causal_verify_cuda_graph_metadata,
-        )
-
-        return dvr_causal_verify_cuda_graph_metadata(
+        return _dvr_causal_verify_cuda_graph_metadata(
             model_runner,
             attn_backend,
             forward_mode,

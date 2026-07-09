@@ -23,13 +23,11 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
 from sglang.srt.speculative.dvr_logprob_repair import (
     score_deferred_dvr_final_logprob_repairs,
 )
-from sglang.srt.speculative.dvr_utils import (
-    chain_speculative_sampling,
-    dvr_chain_uniform_samples,
-)
 from sglang.srt.speculative.dvr_worker import (
     DVRSelfDraftVerifyInput,
     DecodeVerifyRollbackWorker,
+    chain_speculative_sampling,
+    dvr_chain_uniform_samples,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
