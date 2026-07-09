@@ -35,7 +35,6 @@ from sglang.srt.speculative.dvr_info import (
 )
 from sglang.srt.speculative.dvr_linear_state import (
     DVRLinearStateLifecycle,
-    commit_dvr_verify_linear_state,
 )
 from sglang.srt.speculative.dvr_replay import (
     replay_dvr_accepted_suffix_for_live_state,
@@ -116,6 +115,69 @@ def dvr_chain_uniform_samples(
         / 4294967296.0
     )
     return uniforms[:, :num_slots], uniforms[:, num_slots].contiguous()
+
+
+def finalize_dvr_verify_linear_state(
+    *,
+    linear_state: DVRLinearStateLifecycle,
+    batch: ScheduleBatch,
+    linear_state_ctx: Any,
+    accept_lens: torch.Tensor,
+    accept_lens_cpu: Optional[list[int]],
+    num_draft_tokens: int,
+    seq_lens_cpu: Optional[list[int]] = None,
+    predict: Optional[torch.Tensor] = None,
+    accept_index: Optional[torch.Tensor] = None,
+    partial_suffix_replay_kwargs: Optional[dict[str, Any]] = None,
+    use_fast_self_draft_commit: bool = False,
+) -> tuple[list[int], Optional[list[Any]], Optional[list[Any]]]:
+    """Commit DVR target-verify state after sampling.
+
+    Self-DVR is the primary path; EAGLE/MTP reuses this tail and only supplies
+    suffix replay arguments because its accepted token stream can differ from
+    the full draft window.
+    """
+
+    if accept_lens_cpu is None:
+        accept_lens_cpu = accept_lens.detach().cpu().tolist()
+    if linear_state_ctx is None:
+        return accept_lens_cpu, None, None
+
+    live_state_already_replayed = None
+    if partial_suffix_replay_kwargs is not None and torch.any(
+        accept_lens < num_draft_tokens
+    ).item():
+        if predict is None or accept_index is None:
+            raise RuntimeError("DVR partial suffix replay requires sampled outputs.")
+        accepted_ids, accepted_cache_locs = compact_dvr_accepted_tokens_and_cache_locs(
+            batch=batch,
+            predict=predict,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            num_draft_tokens=num_draft_tokens,
+        )
+        if accepted_ids.numel() > 0:
+            live_state_already_replayed = replay_dvr_accepted_suffix_for_live_state(
+                batch=batch,
+                accepted_token_counts_cpu=accept_lens_cpu,
+                accepted_ids=accepted_ids,
+                accepted_cache_locs=accepted_cache_locs,
+                **partial_suffix_replay_kwargs,
+            )
+
+    pending_track_indices, pending_track_seqlens = linear_state.commit_after_verify(
+        batch=batch,
+        accepted_token_counts=accept_lens.to(torch.long),
+        accepted_steps=(accept_lens - 1).to(torch.long),
+        accepted_token_counts_cpu=accept_lens_cpu,
+        ctx=linear_state_ctx,
+        seq_lens_cpu=seq_lens_cpu or linear_state.batch_seq_lens_cpu(batch),
+        live_state_already_replayed=live_state_already_replayed,
+        use_fast_self_draft_commit=use_fast_self_draft_commit,
+        publish_boundary_checkpoint=False,
+        return_pending_boundary=True,
+    )
+    return accept_lens_cpu, pending_track_indices, pending_track_seqlens
 
 
 if triton is not None:
@@ -874,50 +936,6 @@ class _DVRSelfDraftCore:
             )
             return draft_logits
 
-    def _replay_accepted_suffix_for_partial_verify(
-        self,
-        *,
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-        linear_state_ctx,
-        accepted_token_counts_cpu: List[int],
-        verify_output: Optional[Any] = None,
-        accepted_ids: Optional[torch.Tensor] = None,
-        accepted_cache_locs: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        """Refresh live GDN state with the exact accepted-token suffix.
-
-        The hot TARGET_VERIFY path forwards the proposed draft tokens.  When a
-        row is rejected, however, SGLang commits the target-predicted token at
-        that row.  Replaying only "unclosed chunk tail + accepted tokens" keeps
-        DVR's live recurrent state aligned with the actual scheduler-owned
-        token sequence without replaying the full prefix.
-        """
-
-        if batch.forward_mode.is_idle() or linear_state_ctx is None:
-            return None
-
-        if accepted_ids is None:
-            assert verify_output is not None
-            accepted_ids = verify_output.draft_extend_input.input_ids
-        if accepted_cache_locs is None:
-            accepted_cache_locs = batch.out_cache_loc
-        if accepted_ids is None or accepted_ids.numel() == 0:
-            return None
-        base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
-        return replay_dvr_accepted_suffix_for_live_state(
-            batch=batch,
-            target_worker=self.target_worker,
-            linear_state=self.linear_state,
-            linear_state_ctx=linear_state_ctx,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            accepted_token_counts_cpu=accepted_token_counts_cpu,
-            accepted_ids=accepted_ids,
-            accepted_cache_locs=accepted_cache_locs,
-            num_draft_tokens=self.num_draft_tokens,
-            request_token_ids_for_replay=self._request_token_ids_for_replay,
-        )
-
     @staticmethod
     def _seq_lens_cpu_list_for_verify(
         batch: ScheduleBatch,
@@ -1077,7 +1095,7 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
             self.linear_state.restore_tail_lens_after_replay(
                 batch, replay_tasks, seq_lens_cpu=seq_lens_cpu
             )
-        self.linear_state.finish_prepare_for_draft(batch)
+        self.linear_state.backup_boundary_state(batch, preserve_existing=False)
         self._draft_preprocess_decode_for_self_dvr(batch)
 
         spec_info = batch.spec_info
@@ -1171,42 +1189,40 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
         pending_track_seqlens = None
         if linear_state_ctx is not None:
             is_self_dvr = bool(getattr(spec_info, "is_self_draft", False))
-            live_state_already_replayed = None
-            if has_verify_tokens:
-                # return_logprob is an output-scoring concern.  Keep self-DVR
-                # on the same fast state commit path as no-logprob so enabling
-                # logprobs does not change the next draft state or acceptance.
-                if not is_self_dvr and torch.any(
-                    accept_lens < self.num_draft_tokens
-                ).item():
-                    accepted_ids, accepted_cache_locs = (
-                        compact_dvr_accepted_tokens_and_cache_locs(
-                            batch=batch,
-                            predict=predict,
-                            accept_index=accept_index,
-                            accept_lens=accept_lens,
-                            num_draft_tokens=self.num_draft_tokens,
-                        )
-                    )
-                    if accepted_ids.numel() > 0:
-                        live_state_already_replayed = (
-                            self._replay_accepted_suffix_for_partial_verify(
-                                batch=batch,
-                                spec_info=spec_info,
-                                linear_state_ctx=linear_state_ctx,
-                                accepted_token_counts_cpu=accept_lens_cpu,
-                                accepted_ids=accepted_ids,
-                                accepted_cache_locs=accepted_cache_locs,
-                            )
-                        )
-            pending_track_indices, pending_track_seqlens = commit_dvr_verify_linear_state(
-                linear_state=self.linear_state,
-                batch=batch,
-                linear_state_ctx=linear_state_ctx,
-                accept_lens=accept_lens,
-                accept_lens_cpu=accept_lens_cpu,
-                live_state_already_replayed=live_state_already_replayed,
-                use_fast_self_draft_commit=is_self_dvr,
+            partial_suffix_replay_kwargs = None
+            # return_logprob is an output-scoring concern.  Keep self-DVR on the
+            # same fast state commit path as no-logprob; only non-self callers
+            # need an accepted-suffix replay before commit.
+            if has_verify_tokens and not is_self_dvr:
+                partial_suffix_replay_kwargs = dict(
+                    target_worker=self.target_worker,
+                    linear_state=self.linear_state,
+                    linear_state_ctx=linear_state_ctx,
+                    base_seq_lens_cpu=self._seq_lens_cpu_list_for_verify(
+                        batch, spec_info
+                    ),
+                    num_draft_tokens=self.num_draft_tokens,
+                    request_token_ids_for_replay=self._request_token_ids_for_replay,
+                )
+            accept_lens_cpu, pending_track_indices, pending_track_seqlens = (
+                finalize_dvr_verify_linear_state(
+                    linear_state=self.linear_state,
+                    batch=batch,
+                    linear_state_ctx=linear_state_ctx,
+                    accept_lens=accept_lens,
+                    accept_lens_cpu=accept_lens_cpu,
+                    num_draft_tokens=self.num_draft_tokens,
+                    predict=(
+                        predict if partial_suffix_replay_kwargs is not None else None
+                    ),
+                    accept_index=(
+                        accept_index
+                        if partial_suffix_replay_kwargs is not None
+                        else None
+                    ),
+                    partial_suffix_replay_kwargs=partial_suffix_replay_kwargs,
+                    use_fast_self_draft_commit=is_self_dvr,
+                )
             )
 
         if has_verify_tokens:

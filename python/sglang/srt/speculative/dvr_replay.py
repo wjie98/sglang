@@ -281,67 +281,7 @@ def _build_suffix_draft_mrope_positions(
     return torch.cat(mrope_chunks, dim=1)
 
 
-def build_boundary_replay_batch(
-    *,
-    batch,
-    tasks,
-    boundary_indices: torch.Tensor,
-    request_token_ids_for_replay,
-) -> Optional[ScheduleBatch]:
-    """Create the private batch for missing chunk-boundary checkpoints.
-
-    Boundary replay is a real checkpoint materialization step, not a temporary
-    verifier oracle.  It therefore runs on a narrow ScheduleBatch containing
-    only the requests whose radix prefix did not already provide the requested
-    chunk-aligned state.
-    """
-
-    reqs = [task.req for task in tasks]
-    input_ids = []
-    out_cache_locs = []
-    prefix_lens = []
-    extend_lens = []
-    final_seq_lens = []
-
-    for task in tasks:
-        token_ids = request_token_ids_for_replay(task.req, task.boundary_seqlen)
-        replay_token_ids = token_ids[task.source_seqlen : task.boundary_seqlen]
-        input_ids.extend(replay_token_ids)
-        out_cache_locs.append(
-            batch.req_to_token_pool.req_to_token[
-                task.req.req_pool_idx,
-                task.source_seqlen : task.boundary_seqlen,
-            ].to(torch.long)
-        )
-        prefix_lens.append(task.source_seqlen)
-        extend_lens.append(task.boundary_seqlen - task.source_seqlen)
-        final_seq_lens.append(task.boundary_seqlen)
-
-    if not input_ids:
-        return None
-
-    device = batch.device
-    return _build_private_extend_batch(
-        batch,
-        reqs=reqs,
-        input_ids=input_ids,
-        out_cache_locs=out_cache_locs,
-        prefix_lens=prefix_lens,
-        extend_lens=extend_lens,
-        final_seq_lens=final_seq_lens,
-        extend_logprob_start_lens=prefix_lens,
-        is_extend_in_batch=False,
-        all_extend_in_batch=False,
-        is_prefill_only=True,
-        mamba_track_indices=boundary_indices,
-        mamba_track_mask=torch.ones(len(reqs), dtype=torch.bool, device=device),
-        mamba_track_seqlens=torch.tensor(
-            final_seq_lens, dtype=torch.int64, device=device
-        ),
-    )
-
-
-def _build_private_extend_batch(
+def build_dvr_private_extend_batch(
     batch,
     *,
     reqs: list[Any],
@@ -559,7 +499,7 @@ def dvr_suffix_replay_context(
         if not bool(boundary_track_mask.any().item()):
             boundary_track_mask = None
     linear_state.set_suffix_replay_boundary_track_mask(boundary_track_mask)
-    replay_batch = _build_private_extend_batch(
+    replay_batch = build_dvr_private_extend_batch(
         batch,
         reqs=batch.reqs,
         input_ids=replay_plan.input_ids,
@@ -682,7 +622,7 @@ def replay_dvr_accepted_suffix_for_live_state(
     # Commit repair, not checkpoint publication: leave the live recurrent slot
     # updated by the replay so the normal commit path can copy it directly.
     linear_state.set_suffix_replay_boundary_track_mask(None)
-    replay_batch = _build_private_extend_batch(
+    replay_batch = build_dvr_private_extend_batch(
         batch,
         reqs=batch.reqs,
         input_ids=replay_plan.input_ids,
@@ -860,22 +800,12 @@ def _build_final_logprob_repair(
     error_prefix: str,
     force_final_logprob_replay: bool,
 ) -> DVRFinalLogprobRepair:
-    if not force_final_logprob_replay or linear_state_ctx is None:
-        try:
-            return replay_prefix.final_logprob_repair(
-                req,
-                final_output_len,
-                error_prefix=error_prefix,
-            )
-        except RuntimeError as exc:
-            message = str(exc)
-            if (
-                "missing verify logprobs" not in message
-                and "is incomplete" not in message
-            ):
-                raise
-            if linear_state_ctx is None:
-                raise
+    if not (force_final_logprob_replay and linear_state_ctx is not None):
+        return replay_prefix.final_logprob_repair(
+            req,
+            final_output_len,
+            error_prefix=error_prefix,
+        )
 
     # EAGLE/MTP uses compact suffix replay to pair verify logits with hidden
     # states for the next draft.  Final non-streaming logprobs are stricter:
@@ -888,7 +818,7 @@ def _build_final_logprob_repair(
         error_prefix=error_prefix,
     )
     extend_len = len(replay_ids)
-    replay_batch = _build_private_extend_batch(
+    replay_batch = build_dvr_private_extend_batch(
         batch,
         reqs=[req],
         input_ids=replay_ids,

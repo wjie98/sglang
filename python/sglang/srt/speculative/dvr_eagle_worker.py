@@ -22,7 +22,6 @@ from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
     DVRVerifyInput,
     build_dvr_spec_result_aux,
-    compact_dvr_accepted_tokens_and_cache_locs,
 )
 from sglang.srt.speculative.dvr_replay import (
     replay_dvr_accepted_suffix_for_live_state,
@@ -32,10 +31,10 @@ from sglang.srt.speculative.dvr_replay import (
 )
 from sglang.srt.speculative.dvr_linear_state import (
     DVRLinearStateLifecycle,
-    commit_dvr_verify_linear_state,
 )
 from sglang.srt.speculative.dvr_worker import (
     dvr_has_graph_unsafe_short_prompt,
+    finalize_dvr_verify_linear_state,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
@@ -193,7 +192,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         # target worker.  Keep the worker-local target boundary backup as the
         # verifier authority instead of refreshing it from a slot the draft
         # phase may have already mutated.
-        self.linear_state.finish_prepare_for_separate_draft(batch)
+        self.linear_state.backup_boundary_state(batch, preserve_existing=True)
 
     def _target_suffix_extend_verify_output(
         self,
@@ -240,29 +239,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 use_forward_batch=True,
             )
             return draft_logits, draft_hidden_states
-
-    def _replay_accepted_suffix_for_partial_verify(
-        self,
-        *,
-        batch: ScheduleBatch,
-        linear_state_ctx,
-        base_seq_lens_cpu: list[int],
-        accepted_token_counts_cpu: list[int],
-        accepted_ids: torch.Tensor,
-        accepted_cache_locs: torch.Tensor,
-    ) -> torch.Tensor | None:
-        return replay_dvr_accepted_suffix_for_live_state(
-            batch=batch,
-            target_worker=self.target_worker,
-            linear_state=self.linear_state,
-            linear_state_ctx=linear_state_ctx,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            accepted_token_counts_cpu=accepted_token_counts_cpu,
-            accepted_ids=accepted_ids,
-            accepted_cache_locs=accepted_cache_locs,
-            num_draft_tokens=self.speculative_num_draft_tokens,
-            request_token_ids_for_replay=self._request_token_ids_for_replay,
-        )
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -519,39 +495,29 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
 
         pending_track_indices = None
         pending_track_seqlens = None
-        live_state_already_replayed = None
         if linear_state_ctx is not None:
-            if accept_lens_cpu is None:
-                accept_lens_cpu = accept_lens.detach().cpu().tolist()
-            if torch.any(accept_lens < verify_input.draft_token_num).item():
-                accepted_ids, accepted_cache_locs = (
-                    compact_dvr_accepted_tokens_and_cache_locs(
-                        batch=batch,
-                        predict=predict,
-                        accept_index=accept_index,
-                        accept_lens=accept_lens,
-                        num_draft_tokens=self.speculative_num_draft_tokens,
-                    )
-                )
-                live_state_already_replayed = (
-                    self._replay_accepted_suffix_for_partial_verify(
-                        batch=batch,
+            accept_lens_cpu, pending_track_indices, pending_track_seqlens = (
+                finalize_dvr_verify_linear_state(
+                    linear_state=self.linear_state,
+                    batch=batch,
+                    linear_state_ctx=linear_state_ctx,
+                    accept_lens=accept_lens,
+                    accept_lens_cpu=accept_lens_cpu,
+                    num_draft_tokens=self.speculative_num_draft_tokens,
+                    seq_lens_cpu=base_seq_lens_cpu,
+                    predict=predict,
+                    accept_index=accept_index,
+                    partial_suffix_replay_kwargs=dict(
+                        target_worker=self.target_worker,
+                        linear_state=self.linear_state,
                         linear_state_ctx=linear_state_ctx,
                         base_seq_lens_cpu=base_seq_lens_cpu,
-                        accepted_token_counts_cpu=accept_lens_cpu,
-                        accepted_ids=accepted_ids,
-                        accepted_cache_locs=accepted_cache_locs,
-                    )
+                        num_draft_tokens=self.speculative_num_draft_tokens,
+                        request_token_ids_for_replay=self._request_token_ids_for_replay,
+                    ),
                 )
-            pending_track_indices, pending_track_seqlens = commit_dvr_verify_linear_state(
-                linear_state=self.linear_state,
-                batch=batch,
-                linear_state_ctx=linear_state_ctx,
-                accept_lens=accept_lens,
-                accept_lens_cpu=accept_lens_cpu,
-                live_state_already_replayed=live_state_already_replayed,
             )
-            self.linear_state.refresh_boundary_backup(batch)
+            self.linear_state.backup_boundary_state(batch, preserve_existing=False)
         else:
             # Non-DVR mambaish fallback mirrors upstream EAGLE v2.  GDN DVR
             # commits through linear_state above to preserve rollback semantics.

@@ -187,18 +187,6 @@ class DVRPendingOutputPrefix:
             error_prefix=error_prefix,
         )
 
-    def try_request_output_prefix_token_ids(
-        self,
-        req: Any,
-        seq_len: int,
-    ) -> Optional[list[int]]:
-        """Best-effort client-visible output prefix reconstruction."""
-
-        return self._prefix_token_ids(
-            req,
-            seq_len,
-        )
-
     def append_batch_output_tokens(
         self,
         batch: Any,
