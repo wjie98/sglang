@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -25,10 +26,9 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.dvr_info import (
-    DVRAcceptedOutputRows,
     DVRPendingOutputPrefix,
     DVRSelfDraftVerifyInput,
-    DVRVerifyOutput,
+    compact_dvr_output_rows,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_scheduler import (
@@ -68,6 +68,17 @@ except ImportError:  # pragma: no cover - non-CUDA builds use the torch fallback
     tl = None
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _DVRVerifyOutput:
+    """Self-DVR spec-v1 verify output local to the compatibility worker."""
+
+    accept_tokens: torch.Tensor
+    padded_output_tokens: torch.Tensor
+    accept_indices: torch.Tensor
+    num_correct_drafts_per_req_cpu: List[int]
+    draft_extend_input: EagleDraftExtendInput
 
 
 def dvr_has_graph_unsafe_short_prompt(batch) -> bool:
@@ -1074,7 +1085,7 @@ class DecodeVerifyRollbackWorker:
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
         logits_output: LogitsProcessorOutput,
-    ) -> DVRVerifyOutput:
+    ) -> _DVRVerifyOutput:
         predict, accept_lens, accept_index = eagle_sample(
             spec_info, batch, logits_output, vocab_mask=None
         )
@@ -1103,7 +1114,7 @@ class DecodeVerifyRollbackWorker:
         ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
         accept_indices = accept_index[accept_mask].to(torch.long)
         accept_tokens = predict[compact_output_indices].to(torch.long)
-        return DVRVerifyOutput(
+        return _DVRVerifyOutput(
             accept_tokens=accept_tokens,
             padded_output_tokens=predict,
             accept_indices=accept_indices,
@@ -1219,7 +1230,8 @@ class DecodeVerifyRollbackWorker:
         batch: ScheduleBatch,
         linear_state_ctx,
         base_seq_lens_cpu: list[int],
-        output_rows: DVRAcceptedOutputRows,
+        accept_lens_cpu: list[int],
+        token_ids_per_req: list[list[int]],
     ) -> None:
         """Repair final non-streaming DVR output logprobs with a prefill oracle."""
 
@@ -1235,8 +1247,8 @@ class DecodeVerifyRollbackWorker:
             replay_prefix=DVRPendingOutputPrefix(),
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
-            accept_lens_cpu=output_rows.accept_lens_cpu,
-            compact_output_token_ids_per_req=output_rows.token_ids_per_req,
+            accept_lens_cpu=accept_lens_cpu,
+            compact_output_token_ids_per_req=token_ids_per_req,
             error_prefix="DVR spec-v1 final logprob",
         )
         apply_dvr_final_logprob_repairs(batch, repairs)
@@ -1307,7 +1319,7 @@ class DecodeVerifyRollbackWorker:
             _add_output_logprobs_for_dvr_spec_v1(
                 batch, verify_output, logits_output
             )
-            output_rows = DVRAcceptedOutputRows.from_flat_tokens(
+            _, output_accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
                 batch=batch,
                 output_tokens=verify_output.accept_tokens,
                 accept_lens=accept_lens_cpu,
@@ -1317,7 +1329,8 @@ class DecodeVerifyRollbackWorker:
                 batch=batch,
                 linear_state_ctx=linear_state_ctx,
                 base_seq_lens_cpu=base_seq_lens_cpu,
-                output_rows=output_rows,
+                accept_lens_cpu=output_accept_lens_cpu,
+                token_ids_per_req=token_ids_per_req,
             )
         if linear_state_ctx is not None:
             accepted_token_counts = torch.tensor(

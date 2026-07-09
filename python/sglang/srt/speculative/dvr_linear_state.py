@@ -11,7 +11,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.dvr_replay import (
     build_boundary_replay_batch,
-    build_boundary_replay_plan,
 )
 from sglang.srt.speculative.dvr_server_args import is_dvr_eagle_enabled
 
@@ -157,16 +156,15 @@ class DVRLinearStateLifecycle:
                         device=ctx.live_indices.device, dtype=torch.long
                     ),
                 )
-            replay_plan = build_boundary_replay_plan(
+            replay_batch = build_boundary_replay_batch(
                 batch=batch,
                 tasks=tasks,
                 state_adapter=ctx.state_adapter,
                 request_token_ids_for_replay=request_token_ids_for_replay,
             )
-            if replay_plan is None:
+            if replay_batch is None:
                 return
 
-            replay_batch = build_boundary_replay_batch(batch, replay_plan)
             forward_batch = ForwardBatch.init_new(replay_batch, self.model_runner)
             self.model_runner.forward(forward_batch)
         finally:

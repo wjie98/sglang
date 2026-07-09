@@ -17,10 +17,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.dvr_info import (
-    DVRAcceptedOutputRows,
     DVRPendingOutputPrefix,
     DVRSelfDraftVerifyInput,
     build_dvr_spec_result_aux,
+    compact_dvr_output_rows,
 )
 from sglang.srt.speculative.dvr_replay import (
     score_dvr_final_logprob_repairs,
@@ -242,16 +242,17 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
 
         if has_verify_tokens:
             base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-            output_rows = DVRAcceptedOutputRows.from_flat_tokens(
+            _, accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
                 batch=batch,
                 output_tokens=predict,
                 accept_lens=accept_lens,
                 tokens_per_req=self.num_draft_tokens,
                 base_seq_lens_cpu=base_seq_lens_cpu,
             )
-            output_rows.append_to_prefix(
-                self.dvr_output_replay_prefix,
+            self.dvr_output_replay_prefix.append_batch_output_tokens(
                 batch,
+                token_ids_per_req,
+                base_seq_lens_cpu=base_seq_lens_cpu,
                 error_prefix="DVR spec-v2 output prefix",
             )
             if batch.return_logprob:
@@ -261,8 +262,8 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     replay_prefix=self.dvr_output_replay_prefix,
                     linear_state_ctx=linear_state_ctx,
                     base_seq_lens_cpu=base_seq_lens_cpu,
-                    accept_lens_cpu=output_rows.accept_lens_cpu,
-                    compact_output_token_ids_per_req=output_rows.token_ids_per_req,
+                    accept_lens_cpu=accept_lens_cpu,
+                    compact_output_token_ids_per_req=token_ids_per_req,
                     error_prefix="DVR spec-v2 final logprob",
                     allow_preclaimed_final_token=True,
                 )
@@ -293,7 +294,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                                 batch=batch,
                                 spec_info=spec_info,
                                 linear_state_ctx=linear_state_ctx,
-                                accepted_token_counts_cpu=output_rows.accept_lens_cpu,
+                                accepted_token_counts_cpu=accept_lens_cpu,
                                 accepted_ids=accepted_ids,
                                 accepted_cache_locs=accepted_cache_locs,
                             )

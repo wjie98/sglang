@@ -3,11 +3,11 @@ from __future__ import annotations
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import torch
 
-from sglang.srt.speculative.eagle_info import EagleDraftExtendInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
 @dataclass
@@ -225,71 +225,45 @@ class DVRPendingOutputPrefix:
             stream.extend(int(token_id) for token_id in token_ids)
 
 
-@dataclass
-class DVRAcceptedOutputRows:
-    """Accepted tokens in the same per-request rows scheduler will emit."""
+def compact_dvr_output_rows(
+    *,
+    batch: Any,
+    output_tokens: torch.Tensor,
+    accept_lens,
+    tokens_per_req: Optional[int] = None,
+    base_seq_lens_cpu: Optional[list[int]] = None,
+) -> tuple[Optional[list[int]], list[int], list[list[int]]]:
+    """Return accepted output rows in the same order scheduler materializes."""
 
-    base_seq_lens_cpu: Optional[list[int]]
-    accept_lens_cpu: list[int]
-    token_ids_per_req: list[list[int]]
-
-    @classmethod
-    def from_flat_tokens(
-        cls,
-        *,
-        batch: Any,
-        output_tokens: torch.Tensor,
-        accept_lens,
-        tokens_per_req: Optional[int] = None,
-        base_seq_lens_cpu: Optional[list[int]] = None,
-    ) -> "DVRAcceptedOutputRows":
-        if base_seq_lens_cpu is None and getattr(batch, "seq_lens", None) is not None:
-            base_seq_lens_cpu = (
-                batch.seq_lens_cpu.tolist()
-                if getattr(batch, "seq_lens_cpu", None) is not None
-                else batch.seq_lens.detach().cpu().tolist()
-            )
-        if base_seq_lens_cpu is not None:
-            base_seq_lens_cpu = [int(seq_len) for seq_len in base_seq_lens_cpu]
-
-        if torch.is_tensor(accept_lens):
-            accept_lens_cpu = [int(x) for x in accept_lens.detach().cpu().tolist()]
-        else:
-            accept_lens_cpu = [int(x) for x in accept_lens]
-        token_ids = output_tokens.detach().cpu().reshape(-1).tolist()
-
-        token_ids_per_req = []
-        if tokens_per_req is None:
-            offset = 0
-            for accept_len in accept_lens_cpu:
-                end = offset + accept_len
-                token_ids_per_req.append([int(x) for x in token_ids[offset:end]])
-                offset = end
-        else:
-            for req_i, accept_len in enumerate(accept_lens_cpu):
-                start = req_i * tokens_per_req
-                end = start + accept_len
-                token_ids_per_req.append([int(x) for x in token_ids[start:end]])
-
-        return cls(
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            accept_lens_cpu=accept_lens_cpu,
-            token_ids_per_req=token_ids_per_req,
+    if base_seq_lens_cpu is None and getattr(batch, "seq_lens", None) is not None:
+        base_seq_lens_cpu = (
+            batch.seq_lens_cpu.tolist()
+            if getattr(batch, "seq_lens_cpu", None) is not None
+            else batch.seq_lens.detach().cpu().tolist()
         )
+    if base_seq_lens_cpu is not None:
+        base_seq_lens_cpu = [int(seq_len) for seq_len in base_seq_lens_cpu]
 
-    def append_to_prefix(
-        self,
-        prefix: DVRPendingOutputPrefix,
-        batch: Any,
-        *,
-        error_prefix: str = "DVR output prefix",
-    ) -> None:
-        prefix.append_batch_output_tokens(
-            batch,
-            self.token_ids_per_req,
-            base_seq_lens_cpu=self.base_seq_lens_cpu,
-            error_prefix=error_prefix,
-        )
+    if torch.is_tensor(accept_lens):
+        accept_lens_cpu = [int(x) for x in accept_lens.detach().cpu().tolist()]
+    else:
+        accept_lens_cpu = [int(x) for x in accept_lens]
+    token_ids = output_tokens.detach().cpu().reshape(-1).tolist()
+
+    token_ids_per_req = []
+    if tokens_per_req is None:
+        offset = 0
+        for accept_len in accept_lens_cpu:
+            end = offset + accept_len
+            token_ids_per_req.append([int(x) for x in token_ids[offset:end]])
+            offset = end
+    else:
+        for req_i, accept_len in enumerate(accept_lens_cpu):
+            start = req_i * tokens_per_req
+            end = start + accept_len
+            token_ids_per_req.append([int(x) for x in token_ids[start:end]])
+
+    return base_seq_lens_cpu, accept_lens_cpu, token_ids_per_req
 
 
 @contextmanager
@@ -411,14 +385,3 @@ class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
         from sglang.srt.speculative.dvr_worker import dvr_chain_uniform_samples
 
         return dvr_chain_uniform_samples(candidates, batch)
-
-
-@dataclass
-class DVRVerifyOutput:
-    """Compatibility view for DVR spec-v1 post-verify bookkeeping."""
-
-    accept_tokens: torch.Tensor
-    padded_output_tokens: torch.Tensor
-    accept_indices: torch.Tensor
-    num_correct_drafts_per_req_cpu: List[int]
-    draft_extend_input: EagleDraftExtendInput

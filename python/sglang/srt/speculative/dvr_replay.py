@@ -85,19 +85,6 @@ class _DVRSuffixReplayPlan:
     hidden_gather_indices: Optional[torch.Tensor] = None
 
 
-@dataclass
-class _DVRBoundaryReplayPlan:
-    """Plan an EXTEND replay that materializes missing chunk-boundary state."""
-
-    reqs: list[Any]
-    input_ids: list[int]
-    out_cache_locs: list[torch.Tensor]
-    prefix_lens: list[int]
-    extend_lens: list[int]
-    final_seq_lens: list[int]
-    boundary_indices: torch.Tensor
-
-
 def _suffix_replay_lengths(
     *,
     base_seq_lens_cpu: list[int],
@@ -483,14 +470,14 @@ def _build_accepted_suffix_replay_plan(
     )
 
 
-def build_boundary_replay_plan(
+def build_boundary_replay_batch(
     *,
     batch,
     tasks,
     state_adapter,
     request_token_ids_for_replay,
-) -> Optional[_DVRBoundaryReplayPlan]:
-    """Build replay inputs for missing chunk-boundary checkpoints.
+) -> Optional[ScheduleBatch]:
+    """Create the private batch for missing chunk-boundary checkpoints.
 
     Boundary replay is a real checkpoint materialization step, not a temporary
     verifier oracle.  It therefore runs on a narrow ScheduleBatch containing
@@ -522,45 +509,31 @@ def build_boundary_replay_plan(
     if not input_ids:
         return None
 
+    device = batch.device
     boundary_indices = state_adapter.get_boundary_indices_for_reqs(
         reqs=reqs,
         track_indices=[task.boundary_track_idx for task in tasks],
         device=batch.device,
     )
-    return _DVRBoundaryReplayPlan(
-        reqs=reqs,
-        input_ids=input_ids,
-        out_cache_locs=out_cache_locs,
-        prefix_lens=prefix_lens,
-        extend_lens=extend_lens,
-        final_seq_lens=final_seq_lens,
-        boundary_indices=boundary_indices,
-    )
-
-
-def build_boundary_replay_batch(batch, plan: _DVRBoundaryReplayPlan) -> ScheduleBatch:
-    """Create the narrow ScheduleBatch used for boundary checkpoint replay."""
-
-    device = batch.device
     return _build_private_extend_batch(
         batch,
         _DVRPrivateExtendBatchSpec(
-            reqs=plan.reqs,
-            input_ids=plan.input_ids,
-            out_cache_locs=plan.out_cache_locs,
-            prefix_lens=plan.prefix_lens,
-            extend_lens=plan.extend_lens,
-            final_seq_lens=plan.final_seq_lens,
-            extend_logprob_start_lens=plan.prefix_lens,
+            reqs=reqs,
+            input_ids=input_ids,
+            out_cache_locs=out_cache_locs,
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+            final_seq_lens=final_seq_lens,
+            extend_logprob_start_lens=prefix_lens,
             is_extend_in_batch=False,
             all_extend_in_batch=False,
             is_prefill_only=True,
-            mamba_track_indices=plan.boundary_indices,
+            mamba_track_indices=boundary_indices,
             mamba_track_mask=torch.ones(
-                len(plan.reqs), dtype=torch.bool, device=device
+                len(reqs), dtype=torch.bool, device=device
             ),
             mamba_track_seqlens=torch.tensor(
-                plan.final_seq_lens, dtype=torch.int64, device=device
+                final_seq_lens, dtype=torch.int64, device=device
             ),
         ),
     )

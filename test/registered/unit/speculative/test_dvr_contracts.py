@@ -19,11 +19,11 @@ from sglang.srt.speculative.dvr_replay import (
     _try_live_cache_locs_for_final_replay,
 )
 from sglang.srt.speculative.dvr_info import (
-    DVRAcceptedOutputRows,
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
     DVRSpecResultAux,
+    compact_dvr_output_rows,
 )
 from sglang.srt.speculative.dvr_scheduler import (
     _commit_pending_mamba_checkpoint_from_result,
@@ -590,13 +590,14 @@ def test_dvr_eagle_compacts_accepted_output_rows():
     )
     accept_lens = torch.tensor([2, 3], dtype=torch.int32)
 
-    output_rows = DVRAcceptedOutputRows.from_flat_tokens(
+    _, accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
         batch=SimpleNamespace(seq_lens=None),
         output_tokens=accept_tokens,
         accept_lens=accept_lens,
         tokens_per_req=4,
     )
-    assert output_rows.token_ids_per_req == [[10, 11], [20, 21, 22]]
+    assert accept_lens_cpu == [2, 3]
+    assert token_ids_per_req == [[10, 11], [20, 21, 22]]
 
 
 def test_dvr_eagle_replay_tokens_follow_spec_v2_output_order():
