@@ -519,6 +519,11 @@ class DecodeVerifyRollbackWorker:
         # initializes it before calling this self-draft worker hook.
         pass
 
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
+        pass
+
     def init_cuda_graphs(self):
         # Capture the dedicated self-draft decode graph after target attention
         # backends exist. This matches upstream's separated init order.
