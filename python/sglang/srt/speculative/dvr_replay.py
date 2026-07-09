@@ -9,10 +9,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler_components.output_policy import (
-    defer_req_non_streaming_logprob_output,
-    try_claim_req_final_logprob_repair,
-)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -25,6 +21,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
     DVRPendingOutputPrefix,
+)
+from sglang.srt.speculative.dvr_output_policy import (
+    defer_dvr_non_streaming_logprob_output,
+    try_claim_dvr_final_logprob_repair,
 )
 
 
@@ -927,7 +927,7 @@ def defer_dvr_non_streaming_logprob_output_until_finish(
                 )
                 if prefix_output_len >= int(max_new_tokens):
                     continue
-        defer_req_non_streaming_logprob_output(req)
+        defer_dvr_non_streaming_logprob_output(req)
 
 
 def score_dvr_final_logprob_repairs(
@@ -984,7 +984,7 @@ def score_dvr_final_logprob_repairs(
             compact_output_token_ids_per_req=compact_output_token_ids_per_req,
             error_prefix=error_prefix,
         )
-        if not try_claim_req_final_logprob_repair(req):
+        if not try_claim_dvr_final_logprob_repair(req):
             continue
 
         # Keep final repair request-by-request. Generation and verify stay

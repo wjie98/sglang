@@ -24,11 +24,11 @@ from sglang.srt.speculative.dvr_scheduler import (
     maybe_filter_running_batch_with_dvr_state,
 )
 from sglang.srt.speculative.dvr_eagle_worker import DecodeVerifyRollbackEagleWorkerV2
-from sglang.srt.managers.scheduler_components.output_policy import (
-    allow_req_non_streaming_logprob_output,
-    defer_req_non_streaming_logprob_output,
-    should_hold_non_streaming_logprob_output,
-    try_claim_req_final_logprob_repair,
+from sglang.srt.speculative.dvr_output_policy import (
+    allow_dvr_non_streaming_logprob_output,
+    defer_dvr_non_streaming_logprob_output,
+    should_hold_dvr_non_streaming_logprob_output,
+    try_claim_dvr_final_logprob_repair,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -187,33 +187,33 @@ def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
         )
 
 
-def test_output_policy_defer_non_streaming_logprob():
+def test_dvr_output_policy_defer_non_streaming_logprob():
     req = SimpleNamespace(
         return_logprob=True,
         stream=False,
         output_ids=[1, 2],
     )
 
-    assert not should_hold_non_streaming_logprob_output(
+    assert not should_hold_dvr_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
     )
 
-    defer_req_non_streaming_logprob_output(req)
-    assert should_hold_non_streaming_logprob_output(
+    defer_dvr_non_streaming_logprob_output(req)
+    assert should_hold_dvr_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
     )
 
 
-def test_output_policy_does_not_defer_streaming_or_non_logprob_output():
+def test_dvr_output_policy_does_not_defer_streaming_or_non_logprob_output():
     streaming_req = SimpleNamespace(
         return_logprob=True,
         stream=True,
         output_ids=[1, 2],
     )
-    defer_req_non_streaming_logprob_output(streaming_req)
-    assert not should_hold_non_streaming_logprob_output(
+    defer_dvr_non_streaming_logprob_output(streaming_req)
+    assert not should_hold_dvr_non_streaming_logprob_output(
         req=streaming_req,
         return_logprob=True,
     )
@@ -223,40 +223,40 @@ def test_output_policy_does_not_defer_streaming_or_non_logprob_output():
         stream=False,
         output_ids=[1, 2],
     )
-    defer_req_non_streaming_logprob_output(no_logprob_req)
-    assert not should_hold_non_streaming_logprob_output(
+    defer_dvr_non_streaming_logprob_output(no_logprob_req)
+    assert not should_hold_dvr_non_streaming_logprob_output(
         req=no_logprob_req,
         return_logprob=True,
     )
-    assert not should_hold_non_streaming_logprob_output(
+    assert not should_hold_dvr_non_streaming_logprob_output(
         req=no_logprob_req,
         return_logprob=False,
     )
 
 
-def test_output_policy_final_logprob_repair_claim_is_once_only():
+def test_dvr_output_policy_final_logprob_repair_claim_is_once_only():
     req = SimpleNamespace(
         return_logprob=True,
         stream=False,
         output_ids=[1, 2],
     )
 
-    defer_req_non_streaming_logprob_output(req)
-    assert try_claim_req_final_logprob_repair(req)
-    assert not try_claim_req_final_logprob_repair(req)
-    assert should_hold_non_streaming_logprob_output(
+    defer_dvr_non_streaming_logprob_output(req)
+    assert try_claim_dvr_final_logprob_repair(req)
+    assert not try_claim_dvr_final_logprob_repair(req)
+    assert should_hold_dvr_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
         require_final_repair=True,
     )
 
-    allow_req_non_streaming_logprob_output(req)
-    assert not should_hold_non_streaming_logprob_output(
+    allow_dvr_non_streaming_logprob_output(req)
+    assert not should_hold_dvr_non_streaming_logprob_output(
         req=req,
         return_logprob=True,
         require_final_repair=True,
     )
-    assert not try_claim_req_final_logprob_repair(req)
+    assert not try_claim_dvr_final_logprob_repair(req)
 
 
 def test_dvr_final_logprob_repair_applies_after_materialization():

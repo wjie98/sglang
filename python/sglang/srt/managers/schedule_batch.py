@@ -898,8 +898,8 @@ class Req(ReqDllmMixin):
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
         self.input_logprob_sent: bool = False
-        self.defer_non_streaming_logprob_output: bool = False
-        self.final_logprob_repair_claimed: bool = False
+        self.dvr_defer_non_streaming_logprob_output: bool = False
+        self.dvr_final_logprob_repair_claimed: bool = False
         # Temporary holder to store input_token_logprobs.
         self.input_token_logprobs: Optional[List[Tuple[int]]] = None
         self.temp_input_top_logprobs_val: Optional[List[torch.Tensor]] = None

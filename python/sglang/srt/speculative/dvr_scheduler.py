@@ -3,12 +3,12 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
-from sglang.srt.managers.scheduler_components.output_policy import (
-    allow_req_non_streaming_logprob_output,
-)
 from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
+)
+from sglang.srt.speculative.dvr_output_policy import (
+    allow_dvr_non_streaming_logprob_output,
 )
 
 
@@ -51,7 +51,7 @@ def apply_dvr_final_logprob_repairs(
         if req.logprob.output_token_logprobs_val is not None:
             req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
             req.logprob.output_token_logprobs_idx[:] = repair.output_ids
-        allow_req_non_streaming_logprob_output(req)
+        allow_dvr_non_streaming_logprob_output(req)
 
 
 def _commit_pending_mamba_checkpoint_from_result(

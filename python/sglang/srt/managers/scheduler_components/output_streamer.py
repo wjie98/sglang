@@ -25,8 +25,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.managers.scheduler_components.output_policy import (
-    should_hold_non_streaming_logprob_output,
+from sglang.srt.speculative.dvr_output_policy import (
+    should_hold_dvr_non_streaming_logprob_output,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -325,7 +325,7 @@ class _GenerationStreamAccumulator:
             # For generation, keep finished non-streaming logprob responses
             # buffered until the producing algorithm clears the defer flag.
             if len(req.output_ids_through_stop) > 0 and (
-                should_hold_non_streaming_logprob_output(
+                should_hold_dvr_non_streaming_logprob_output(
                     req=req,
                     return_logprob=self.return_logprob,
                     require_final_repair=True,
@@ -354,10 +354,10 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
-                # Some algorithms repair non-streaming logprobs at the final
-                # response. Defer those chunks through a request flag instead
-                # of making the streamer depend on a specific spec algorithm.
-                should_output = not should_hold_non_streaming_logprob_output(
+                # DVR repairs exact non-streaming logprobs at the final response.
+                # The streamer only checks the DVR-owned request flag; repair
+                # state and scoring stay inside the DVR speculative path.
+                should_output = not should_hold_dvr_non_streaming_logprob_output(
                     req=req,
                     return_logprob=self.return_logprob,
                 ) and len(req.output_ids) % self.default_force_stream_interval == 0

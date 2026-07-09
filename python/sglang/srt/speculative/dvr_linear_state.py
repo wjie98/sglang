@@ -327,29 +327,6 @@ class DVRLinearStateLifecycle:
             else None
         )
 
-    def commit_after_verify_v2(
-        self,
-        *,
-        batch: ScheduleBatch,
-        accepted_token_counts: torch.Tensor,
-        accepted_steps: torch.Tensor,
-        ctx: Optional[DVRLinearStateContext],
-        live_state_already_replayed: Optional[torch.Tensor] = None,
-        use_fast_self_draft_commit: bool = False,
-    ):
-        return self.commit_after_verify(
-            batch=batch,
-            accepted_token_counts=accepted_token_counts,
-            accepted_steps=accepted_steps,
-            accepted_token_counts_cpu=accepted_token_counts.cpu().tolist(),
-            ctx=ctx,
-            seq_lens_cpu=self.batch_seq_lens_cpu(batch),
-            live_state_already_replayed=live_state_already_replayed,
-            use_fast_self_draft_commit=use_fast_self_draft_commit,
-            publish_boundary_checkpoint=False,
-            return_pending_boundary=True,
-        )
-
     def sync_active_reqs(
         self,
         batch: ScheduleBatch,

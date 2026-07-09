@@ -534,24 +534,6 @@ class DecodeVerifyRollbackWorker:
         batch.mamba_track_seqlens = None
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
-    def _draft_preprocess_decode(self, batch: ScheduleBatch):
-        batch.maybe_evict_swa()
-
-        spec_info = batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
-
-        penalizer_orchestrator = batch.sampling_info.penalizer_orchestrator
-        if penalizer_orchestrator is not None and penalizer_orchestrator.is_required:
-            # Keep draft sampling close to normal autoregressive decode by
-            # accounting for the anchor token before sampling following tokens.
-            penalizer_orchestrator.cumulate_output_tokens(
-                self._draft_anchor_tokens(spec_info).to(torch.int64)
-            )
-
-        batch.out_cache_loc = self._draft_cache_locs_from_req_to_token(batch)
-        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum().item())
-        self._finish_dvr_draft_preprocess_decode(batch, spec_info)
-
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
@@ -1212,10 +1194,10 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     accept_lens < self.num_draft_tokens
                 ).item():
                     accepted_ids, accepted_cache_locs = (
-                            self._compact_accepted_tokens_and_cache_locs(
-                                batch=batch,
-                                predict=predict,
-                                accept_index=accept_index,
+                        self._compact_accepted_tokens_and_cache_locs(
+                            batch=batch,
+                            predict=predict,
+                            accept_index=accept_index,
                             accept_lens=accept_lens,
                         )
                     )
@@ -1231,13 +1213,17 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                             )
                         )
             pending_track_indices, pending_track_seqlens = (
-                self.linear_state.commit_after_verify_v2(
+                self.linear_state.commit_after_verify(
                     batch=batch,
                     accepted_token_counts=accept_lens.to(torch.long),
                     accepted_steps=(accept_lens - 1).to(torch.long),
+                    accepted_token_counts_cpu=accept_lens.cpu().tolist(),
                     ctx=linear_state_ctx,
+                    seq_lens_cpu=self.linear_state.batch_seq_lens_cpu(batch),
                     live_state_already_replayed=live_state_already_replayed,
                     use_fast_self_draft_commit=is_self_dvr,
+                    publish_boundary_checkpoint=False,
+                    return_pending_boundary=True,
                 )
             )
 

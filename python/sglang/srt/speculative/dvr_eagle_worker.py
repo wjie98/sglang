@@ -554,12 +554,16 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                     )
                 )
             pending_track_indices, pending_track_seqlens = (
-                self.linear_state.commit_after_verify_v2(
+                self.linear_state.commit_after_verify(
                     batch=batch,
                     accepted_token_counts=accept_lens.to(torch.long),
                     accepted_steps=(accept_lens - 1).to(torch.long),
+                    accepted_token_counts_cpu=accept_lens.cpu().tolist(),
                     ctx=linear_state_ctx,
+                    seq_lens_cpu=self.linear_state.batch_seq_lens_cpu(batch),
                     live_state_already_replayed=live_state_already_replayed,
+                    publish_boundary_checkpoint=False,
+                    return_pending_boundary=True,
                 )
             )
             self.linear_state.refresh_boundary_backup(batch)
