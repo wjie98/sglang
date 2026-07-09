@@ -537,6 +537,8 @@ class DecodeVerifyRollbackWorker:
         return draft_input.bonus_tokens
 
     def __getattr__(self, name):
+        if name == "target_worker":
+            raise AttributeError(name)
         return getattr(self.target_worker, name)
 
     def init_attention_backends(self):
