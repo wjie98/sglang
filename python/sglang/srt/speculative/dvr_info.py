@@ -262,12 +262,10 @@ def _dvr_causal_verify_cuda_graph_metadata(
 ):
     """Build DVR target-verify graph metadata without selecting custom masks."""
 
+    del model_runner, fallback_custom_mask
     old_custom_mask = getattr(spec_info, "custom_mask", None)
     should_clear_custom_mask = (
-        (
-            model_runner.spec_algorithm.is_dvr_self_draft()
-            or getattr(model_runner, "enable_dvr_target_verify_cuda_graph", False)
-        )
+        getattr(spec_info, "use_dvr_causal_verify_metadata", False)
         and forward_mode.is_target_verify()
         and spec_info is not None
     )
@@ -294,6 +292,8 @@ def _dvr_causal_verify_cuda_graph_metadata(
 
 class DVRTargetVerifyMixin:
     """DVR target-verify CUDA graph fixups shared by DVR draft variants."""
+
+    use_dvr_causal_verify_metadata = True
 
     @classmethod
     def from_eagle_verify_input(cls, verify_input: EagleVerifyInput):

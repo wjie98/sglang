@@ -50,25 +50,7 @@ from sglang.srt.utils.common import is_npu
 _is_npu = is_npu()
 
 
-@contextmanager
-def dvr_eagle_target_verify_cuda_graph_context(model_runner):
-    """Capture/replay DVR-EAGLE target verify with DVR target semantics."""
-
-    saved_flag = getattr(model_runner, "enable_dvr_target_verify_cuda_graph", None)
-    model_runner.enable_dvr_target_verify_cuda_graph = True
-    try:
-        yield
-    finally:
-        if saved_flag is None:
-            try:
-                delattr(model_runner, "enable_dvr_target_verify_cuda_graph")
-            except AttributeError:
-                pass
-        else:
-            model_runner.enable_dvr_target_verify_cuda_graph = saved_flag
-
-
-class DVREagleTargetVerifyCudaGraphRunner:
+class DVREagleTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     """CUDA graph runner for DVR-EAGLE target verify.
 
     The target worker's default graph is captured with generic EAGLE verifier
@@ -76,16 +58,12 @@ class DVREagleTargetVerifyCudaGraphRunner:
     state-input windows follow DVR verifier rules.
     """
 
+    skip_prefill_only_deterministic_for_capture = True
+
     def __init__(self, dvr_eagle_worker):
         self.dvr_eagle_worker = dvr_eagle_worker
         model_runner = dvr_eagle_worker.target_worker.model_runner
-        with dvr_eagle_target_verify_cuda_graph_context(model_runner):
-            self.runner = DecodeCudaGraphRunner(model_runner)
-
-    def __getattr__(self, name):
-        if name == "runner":
-            raise AttributeError(name)
-        return getattr(self.runner, name)
+        super().__init__(model_runner)
 
 
 class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
