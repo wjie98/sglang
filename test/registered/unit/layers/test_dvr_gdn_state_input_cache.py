@@ -172,14 +172,18 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         extend_seq_lens_cpu=[2],
         req_pool_indices=torch.tensor([0]),
     )
-    draft_adapter.cache_gdn_extend_tail(
-        forward_batch=draft_batch,
-        state_cache=state_cache,
+    state_inputs = DVRGDNStateInputs.from_extend_forward(
         q=q,
         k=k,
         v=v,
         g=g,
         beta=beta,
+    )
+
+    draft_adapter.cache_extend_tail(
+        forward_batch=draft_batch,
+        state_cache=state_cache,
+        state_inputs=state_inputs,
     )
     assert torch.equal(cache.tail_lens[1], torch.tensor(0, dtype=torch.int32))
 
@@ -188,14 +192,10 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         extend_seq_lens_cpu=[2],
         req_pool_indices=torch.tensor([0]),
     )
-    target_adapter.cache_gdn_extend_tail(
+    target_adapter.cache_extend_tail(
         forward_batch=target_batch,
         state_cache=state_cache,
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
+        state_inputs=state_inputs,
     )
     assert torch.equal(cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
     layer_inputs = cache.state_inputs()

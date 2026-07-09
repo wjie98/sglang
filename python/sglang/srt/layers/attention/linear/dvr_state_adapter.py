@@ -370,16 +370,12 @@ class DVRGatedStateAdapter:
             for conv, saved_conv in zip(state_cache.conv, live_backup.conv, strict=True):
                 conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)
 
-    def cache_gdn_extend_tail(
+    def cache_extend_tail(
         self,
         *,
         forward_batch,
         state_cache,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
+        state_inputs: DVRStateInputs,
     ):
         if self.is_draft_worker:
             # DVR state-input windows are target-model prefill oracles.  EAGLE
@@ -395,15 +391,8 @@ class DVRGatedStateAdapter:
         ):
             return
 
-        state_inputs = DVRGDNStateInputs.from_extend_forward(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-        )
         state_input_indices = forward_batch.req_pool_indices.to(
-            device=state_inputs.q.device, dtype=torch.long
+            device=state_inputs.tensors()[0].device, dtype=torch.long
         )
         state_inputs.write_extend_tail(
             state_window,
