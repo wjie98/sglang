@@ -329,16 +329,13 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     def verify(
         self,
         batch: ScheduleBatch,
-        draft_result: DVRDraftResult | None = None,
+        draft_result: DVRDraftResult,
     ):
         fwd_stream = torch.get_device_module(self.device).current_stream()
-        verify_input = batch.spec_info if draft_result is None else draft_result.verify_input
+        verify_input = draft_result.verify_input
         if not isinstance(verify_input, DVRVerifyInput):
             verify_input = DVRVerifyInput.from_eagle_verify_input(verify_input)
-        if draft_result is None:
-            draft_result = DVRDraftResult.external_draft(verify_input)
-        else:
-            draft_result.verify_input = verify_input
+        draft_result.verify_input = verify_input
         batch.spec_info = verify_input
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
@@ -475,7 +472,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         partial_suffix_replay_kwargs = None
         if (
             linear_state_ctx is not None
-            and draft_result.kv_state.needs_accepted_suffix_repair
+            and draft_result.needs_accepted_suffix_repair
         ):
             partial_suffix_replay_kwargs = dict(
                 target_worker=self.target_worker,

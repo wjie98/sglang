@@ -1079,10 +1079,7 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
             # return_logprob is an output-scoring concern.  Keep self-DVR on the
             # same fast state commit path as no-logprob; only non-self callers
             # need an accepted-suffix replay before commit.
-            if (
-                has_verify_tokens
-                and draft_result.kv_state.needs_accepted_suffix_repair
-            ):
+            if has_verify_tokens and draft_result.needs_accepted_suffix_repair:
                 partial_suffix_replay_kwargs = dict(
                     target_worker=self.target_worker,
                     linear_state=self.linear_state,
@@ -1111,7 +1108,7 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
                 accept_index if partial_suffix_replay_kwargs is not None else None
             ),
             partial_suffix_replay_kwargs=partial_suffix_replay_kwargs,
-            use_fast_self_draft_commit=not draft_result.kv_state.owns_draft_kv_cache,
+            use_fast_self_draft_commit=not draft_result.needs_accepted_suffix_repair,
         )
 
         if has_verify_tokens:

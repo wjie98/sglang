@@ -22,47 +22,21 @@ from sglang.srt.speculative.dvr_replay import (
 
 
 @dataclass
-class DVRDraftKVState:
-    """Draft-model KV ownership seen by DVR core.
-
-    Self draft shares the target model's scheduler-owned speculative KV window,
-    so it does not need a separate accepted-suffix repair.  EAGLE/MTP keeps its
-    own draft KV and asks DVR core to repair the target live recurrent state
-    after partial acceptance.
-    """
-
-    owns_draft_kv_cache: bool
-
-    @classmethod
-    def self_draft(cls) -> "DVRDraftKVState":
-        return cls(owns_draft_kv_cache=False)
-
-    @classmethod
-    def external_draft(cls) -> "DVRDraftKVState":
-        return cls(owns_draft_kv_cache=True)
-
-    @property
-    def needs_accepted_suffix_repair(self) -> bool:
-        return self.owns_draft_kv_cache
-
-
-@dataclass
 class DVRDraftResult:
     """Draft adapter output consumed by DVR target verify."""
 
     verify_input: Any
-    kv_state: DVRDraftKVState
+    # External draft models own separate draft KV.  After partial acceptance,
+    # DVR must replay the accepted suffix to repair target recurrent state.
+    needs_accepted_suffix_repair: bool
 
     @classmethod
     def self_draft(cls, verify_input: Any) -> "DVRDraftResult":
-        return cls(verify_input=verify_input, kv_state=DVRDraftKVState.self_draft())
+        return cls(verify_input=verify_input, needs_accepted_suffix_repair=False)
 
     @classmethod
     def external_draft(cls, verify_input: Any) -> "DVRDraftResult":
-        return cls(
-            verify_input=verify_input,
-            kv_state=DVRDraftKVState.external_draft(),
-        )
+        return cls(verify_input=verify_input, needs_accepted_suffix_repair=True)
 
 
 @dataclass
