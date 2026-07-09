@@ -87,17 +87,14 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         *,
         seq_lens_cpu: Optional[List[int]] = None,
-        use_request_seqlen: bool = False,
     ) -> List[DVRBoundaryReplayTask]:
         self.sync_active_reqs(
             batch,
             seq_lens_cpu=seq_lens_cpu,
-            use_request_seqlen=use_request_seqlen,
         )
         return self.ensure_boundary_state(
             batch,
             seq_lens_cpu=seq_lens_cpu,
-            use_request_seqlen=use_request_seqlen,
         )
 
     def replay_boundary_tasks(
@@ -332,7 +329,6 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         *,
         seq_lens_cpu: Optional[List[int]] = None,
-        use_request_seqlen: bool = False,
     ):
         active_rids = {req.rid for req in batch.reqs}
         for rid in list(self.boundary_seqlen):
@@ -340,19 +336,13 @@ class DVRLinearStateLifecycle:
                 self.boundary_seqlen.pop(rid, None)
                 self.boundary_track_idx.pop(rid, None)
 
-        seq_lens_cpu = (
-            None
-            if use_request_seqlen
-            else (seq_lens_cpu or self.batch_seq_lens_cpu(batch))
-        )
+        seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
         for i, req in enumerate(batch.reqs):
             recorded_boundary = self.boundary_seqlen.get(req.rid)
             if recorded_boundary is None:
                 continue
-            current_boundary, _ = (
-                self.boundary_and_tail(req)
-                if use_request_seqlen
-                else self.boundary_and_tail_for_seq_len(int(seq_lens_cpu[i]))
+            current_boundary, _ = self.boundary_and_tail_for_seq_len(
+                int(seq_lens_cpu[i])
             )
             if (
                 req.rid not in self.boundary_track_idx
@@ -394,12 +384,6 @@ class DVRLinearStateLifecycle:
         )
 
     @staticmethod
-    def boundary_and_tail(req) -> Tuple[int, int]:
-        boundary_seqlen = ((req.seqlen - 1) // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
-        verified_tail_len = (req.seqlen - 1) - boundary_seqlen
-        return boundary_seqlen, verified_tail_len
-
-    @staticmethod
     def boundary_and_tail_for_seq_len(seq_len: int) -> Tuple[int, int]:
         boundary_seqlen = (seq_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
         verified_tail_len = seq_len - boundary_seqlen
@@ -415,10 +399,8 @@ class DVRLinearStateLifecycle:
         self,
         batch: ScheduleBatch,
         req,
-        boundary_seqlen: Optional[int] = None,
+        boundary_seqlen: int,
     ) -> Optional[int]:
-        if boundary_seqlen is None:
-            boundary_seqlen, _ = self.boundary_and_tail(req)
         assert boundary_seqlen % FLA_CHUNK_SIZE == 0
         last_track_seqlen = req.mamba_last_track_seqlen
         if last_track_seqlen is not None and last_track_seqlen > 0:
@@ -447,11 +429,9 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         req,
         track_idx: int,
-        boundary_seqlen: Optional[int] = None,
+        boundary_seqlen: int,
     ):
         self.boundary_track_idx[req.rid] = track_idx
-        if boundary_seqlen is None:
-            boundary_seqlen, _ = self.boundary_and_tail(req)
         self.boundary_seqlen[req.rid] = boundary_seqlen
         self.publish_request_boundary_checkpoint(
             batch=batch, req=req, track_idx=track_idx, boundary_seqlen=boundary_seqlen
@@ -625,7 +605,6 @@ class DVRLinearStateLifecycle:
         ctx: Optional[DVRLinearStateContext] = None,
         *,
         seq_lens_cpu: Optional[List[int]] = None,
-        use_request_seqlen: bool = False,
     ) -> List[DVRBoundaryReplayTask]:
         ctx = ctx or self.state_context(batch)
         if ctx is None:
@@ -634,17 +613,11 @@ class DVRLinearStateLifecycle:
         zero_boundary_indices = []
         reset_pos_indices = []
         reset_pos_values = []
-        seq_lens_cpu = (
-            None
-            if use_request_seqlen
-            else (seq_lens_cpu or self.batch_seq_lens_cpu(batch))
-        )
+        seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
         for i, req in enumerate(batch.reqs):
             if req.rid not in self.boundary_seqlen:
                 boundary_seqlen, verified_tail_len = (
-                    self.boundary_and_tail(req)
-                    if use_request_seqlen
-                    else self.boundary_and_tail_for_seq_len(int(seq_lens_cpu[i]))
+                    self.boundary_and_tail_for_seq_len(int(seq_lens_cpu[i]))
                 )
                 reset_pos_indices.append(ctx.state_input_indices[i])
                 reset_pos_values.append(verified_tail_len)
@@ -679,7 +652,6 @@ class DVRLinearStateLifecycle:
         tasks: List[DVRBoundaryReplayTask],
         *,
         seq_lens_cpu: Optional[List[int]] = None,
-        use_request_seqlen: bool = False,
     ):
         if not tasks:
             return
@@ -687,24 +659,19 @@ class DVRLinearStateLifecycle:
         if ctx is None:
             return
         task_rids = {task.req.rid for task in tasks}
-        seq_lens_by_rid = None
-        if not use_request_seqlen:
-            seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
-            seq_lens_by_rid = {
-                req.rid: int(seq_len)
-                for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
-            }
+        seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
+        seq_lens_by_rid = {
+            req.rid: int(seq_len)
+            for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
+        }
         state_input_indices = []
         tail_lens = []
         for i, req in enumerate(batch.reqs):
             if req.rid not in task_rids:
                 continue
-            if use_request_seqlen:
-                _, verified_tail_len = self.boundary_and_tail(req)
-            else:
-                seq_len = seq_lens_by_rid[req.rid]
-                boundary = self.boundary_seqlen[req.rid]
-                verified_tail_len = seq_len - boundary
+            seq_len = seq_lens_by_rid[req.rid]
+            boundary = self.boundary_seqlen[req.rid]
+            verified_tail_len = seq_len - boundary
             state_input_indices.append(ctx.state_input_indices[i])
             tail_lens.append(verified_tail_len)
         if not state_input_indices:
