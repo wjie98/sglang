@@ -415,7 +415,7 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
             return DVRVerifyInput.from_eagle_verify_input(spec_info)
         return spec_info
 
-    def _prepare_spec_replay_buffers(
+    def _fill_replay_side_buffers(
         self, forward_batch: ForwardBatch, raw_num_token: int
     ) -> None:
         if not self.capture_forward_mode.is_target_verify():
@@ -425,7 +425,7 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
         self.buffers.num_token_non_padded.fill_(raw_num_token)
 
     @contextmanager
-    def _cuda_graph_metadata_context(
+    def _forward_metadata_out_graph_context(
         self,
         *,
         forward_batch: ForwardBatch,

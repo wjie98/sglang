@@ -756,12 +756,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
-    def _prepare_spec_replay_buffers(
+    def _fill_replay_side_buffers(
         self, forward_batch: ForwardBatch, raw_num_token: int
     ) -> None:
-        """Let specialized speculative graph runners fill replay-only buffers."""
+        """Let specialized graph runners fill buffers absent from ForwardBatch."""
 
-    def _cuda_graph_metadata_context(
+    def _forward_metadata_out_graph_context(
         self,
         *,
         forward_batch: ForwardBatch,
@@ -769,7 +769,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_mode: ForwardMode,
         fallback_custom_mask=None,
     ):
-        """Scoped metadata fixups for specialized graph runners."""
+        """Scoped fixups around init_forward_metadata_out_graph."""
 
         return empty_context()
 
@@ -802,7 +802,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            metadata_context = self._cuda_graph_metadata_context(
+            metadata_context = self._forward_metadata_out_graph_context(
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
                 forward_mode=forward_batch.forward_mode,
@@ -959,7 +959,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        self._prepare_spec_replay_buffers(forward_batch, raw_num_token)
+        self._fill_replay_side_buffers(forward_batch, raw_num_token)
         if (
             self.model_runner.spec_algorithm.is_dflash()
             and self.model_runner.is_draft_worker
@@ -991,7 +991,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        metadata_context = self._cuda_graph_metadata_context(
+        metadata_context = self._forward_metadata_out_graph_context(
             forward_batch=forward_batch,
             attn_backend=attn_backend,
             forward_mode=self.capture_forward_mode,
