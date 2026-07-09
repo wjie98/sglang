@@ -109,31 +109,19 @@ def _pending_mamba_checkpoint_is_committable(
     if checkpoint.seqlen > materialized_len:
         return False
 
-    if not _pending_mamba_checkpoint_track_idx_is_valid(
-        checkpoint=checkpoint,
-        req=req,
-    ):
-        return False
-
-    page_size = getattr(tree_cache, "page_size", 1)
-    return page_size == 1 or checkpoint.seqlen % page_size == 0
-
-
-def _pending_mamba_checkpoint_track_idx_is_valid(
-    *,
-    checkpoint: DVRMambaCheckpoint,
-    req: Any,
-) -> bool:
     buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
     if buffer is None:
         return False
     if checkpoint.track_idx < 0 or checkpoint.track_idx >= buffer.numel():
         return False
-
     # A pending DVR boundary names the request-local ping-pong slot that holds
     # the just-verified GDN state.  A freed lazy slot is marked as -1 and must
     # never become the scheduler-owned checkpoint for future radix inserts.
-    return buffer[checkpoint.track_idx].item() != -1
+    if buffer[checkpoint.track_idx].item() == -1:
+        return False
+
+    page_size = getattr(tree_cache, "page_size", 1)
+    return page_size == 1 or checkpoint.seqlen % page_size == 0
 
 
 def _set_req_radix_insert_snapshot_from_batch(
@@ -156,13 +144,6 @@ def _set_req_radix_insert_snapshot_from_batch(
         indices=batch.mamba_track_indices[req_index].reshape(1),
         seqlen=int(batch.mamba_track_cache_seqlens[req_index].item()),
     )
-
-
-def _is_dvr_spec_v2(batch: Any) -> bool:
-    spec_algorithm = batch.spec_algorithm
-    if not spec_algorithm.is_dvr():
-        return False
-    return spec_algorithm.is_dvr_eagle() or getattr(batch, "enable_overlap", False)
 
 
 def maybe_filter_running_batch_with_spec_state(
@@ -225,18 +206,14 @@ def apply_spec_final_logprob_repairs_from_result(batch: Any, result: Any) -> Non
     apply_dvr_final_logprob_repairs(batch, repairs)
 
 
-def _is_dvr_self_draft_spec_v1(batch: Any) -> bool:
-    return batch.spec_algorithm.is_dvr_self_draft() and not getattr(
-        batch, "enable_overlap", False
-    )
-
-
 def should_skip_dvr_spec_v1_decode_logprob_append(*, batch: Any, result: Any) -> bool:
     """DVR spec-v1 computes request logprobs inside the worker compatibility path."""
 
-    return _is_dvr_self_draft_spec_v1(batch) and getattr(
-        result, "num_correct_drafts_per_req_cpu", None
-    ) is not None
+    return (
+        batch.spec_algorithm.is_dvr_self_draft()
+        and not getattr(batch, "enable_overlap", False)
+        and getattr(result, "num_correct_drafts_per_req_cpu", None) is not None
+    )
 
 
 def maybe_cache_unfinished_prefill_req_with_spec_state(
@@ -258,7 +235,9 @@ def maybe_cache_unfinished_prefill_req_with_spec_state(
     # checkpoint from an overlap prefill; if that prefill advanced more than one
     # token, the radix-cache insert must carry the matching mamba snapshot.
     should_cache_unfinished = not batch.decoding_reqs or req not in batch.decoding_reqs
-    is_dvr_spec_v2 = _is_dvr_spec_v2(batch)
+    is_dvr_spec_v2 = batch.spec_algorithm.is_dvr_eagle() or getattr(
+        batch, "enable_overlap", False
+    )
     if is_dvr_spec_v2 and not should_cache_unfinished:
         scheduled_extend_len = (
             batch.extend_lens[req_index]
@@ -296,7 +275,7 @@ def maybe_handle_spec_mamba_checkpoint_after_decode(
         return False
 
     mark_req_skip_mamba_radix_finished_insert(req)
-    if _is_dvr_spec_v2(batch):
+    if batch.spec_algorithm.is_dvr_eagle() or getattr(batch, "enable_overlap", False):
         _commit_pending_mamba_checkpoint_from_result(
             req=req,
             batch=batch,
