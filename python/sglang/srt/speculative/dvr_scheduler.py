@@ -62,7 +62,7 @@ def _commit_pending_mamba_checkpoint_from_result(
     req_index: int,
     tree_cache: Any,
 ) -> None:
-    aux = getattr(result, "spec_aux", None)
+    aux = getattr(result, "dvr_aux", None)
     checkpoints = getattr(aux, "pending_mamba_checkpoints", None)
     checkpoint = (
         checkpoints[req_index]
@@ -119,7 +119,7 @@ def _pending_mamba_checkpoint_is_committable(
     return page_size == 1 or checkpoint.seqlen % page_size == 0
 
 
-def maybe_filter_running_batch_with_spec_state(
+def maybe_filter_running_batch_with_dvr_state(
     *,
     batch: Any,
     future_map: Any,
@@ -166,30 +166,20 @@ def _dvr_is_finished_by_published_seq_len(*, batch: Any, req_index: int) -> bool
     return seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
 
 
-def apply_spec_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
+def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
     """Apply DVR final-response logprob repairs, if any."""
 
     if not batch.spec_algorithm.is_dvr():
         return
 
-    aux = getattr(result, "spec_aux", None)
+    aux = getattr(result, "dvr_aux", None)
     repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = getattr(
         aux, "final_logprob_repairs", None
     )
     apply_dvr_final_logprob_repairs(batch, repairs)
 
 
-def should_skip_dvr_spec_v1_decode_logprob_append(*, batch: Any, result: Any) -> bool:
-    """DVR spec-v1 computes request logprobs inside the worker compatibility path."""
-
-    return (
-        batch.spec_algorithm.is_dvr_self_draft()
-        and not getattr(batch, "enable_overlap", False)
-        and getattr(result, "num_correct_drafts_per_req_cpu", None) is not None
-    )
-
-
-def maybe_cache_unfinished_prefill_req_with_spec_state(
+def maybe_cache_unfinished_prefill_req_with_dvr_state(
     *,
     req: Any,
     batch: Any,
@@ -224,7 +214,7 @@ def maybe_cache_unfinished_prefill_req_with_spec_state(
     return True
 
 
-def maybe_handle_spec_mamba_checkpoint_after_decode(
+def maybe_handle_dvr_mamba_checkpoint_after_decode(
     *,
     req: Any,
     batch: Any,

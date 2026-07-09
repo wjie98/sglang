@@ -20,8 +20,8 @@ from sglang.srt.speculative.dvr_info import (
 )
 from sglang.srt.speculative.dvr_scheduler import (
     _commit_pending_mamba_checkpoint_from_result,
-    apply_spec_final_logprob_repairs_from_result,
-    maybe_filter_running_batch_with_spec_state,
+    apply_dvr_final_logprob_repairs_from_result,
+    maybe_filter_running_batch_with_dvr_state,
 )
 from sglang.srt.speculative.dvr_eagle_worker import DecodeVerifyRollbackEagleWorkerV2
 from sglang.srt.managers.scheduler_components.output_policy import (
@@ -72,7 +72,7 @@ def test_dvr_published_seq_len_filter_hook():
         )
     )
 
-    assert maybe_filter_running_batch_with_spec_state(
+    assert maybe_filter_running_batch_with_dvr_state(
         batch=batch,
         future_map=future_map,
         enable_overlap=True,
@@ -81,7 +81,7 @@ def test_dvr_published_seq_len_filter_hook():
     assert batch.filtered_keep_indices == []
 
     batch.seq_lens_cpu = torch.tensor([5])
-    assert maybe_filter_running_batch_with_spec_state(
+    assert maybe_filter_running_batch_with_dvr_state(
         batch=batch,
         future_map=future_map,
         enable_overlap=True,
@@ -89,7 +89,7 @@ def test_dvr_published_seq_len_filter_hook():
     assert batch.filtered_keep_indices == [0]
 
     batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
-    assert not maybe_filter_running_batch_with_spec_state(
+    assert not maybe_filter_running_batch_with_dvr_state(
         batch=batch,
         future_map=future_map,
         enable_overlap=True,
@@ -114,7 +114,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     tree_cache = SimpleNamespace(page_size=64)
 
     result = SimpleNamespace(
-        spec_aux=DVRSpecResultAux(
+        dvr_aux=DVRSpecResultAux(
             pending_mamba_checkpoints=[
                 DVRMambaCheckpoint(track_idx=0, seqlen=128),
             ],
@@ -130,7 +130,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    result.spec_aux.pending_mamba_checkpoints = [
+    result.dvr_aux.pending_mamba_checkpoints = [
         DVRMambaCheckpoint(track_idx=1, seqlen=128)
     ]
     _commit_pending_mamba_checkpoint_from_result(
@@ -143,7 +143,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    result.spec_aux.pending_mamba_checkpoints = [
+    result.dvr_aux.pending_mamba_checkpoints = [
         DVRMambaCheckpoint(track_idx=2, seqlen=192)
     ]
     _commit_pending_mamba_checkpoint_from_result(
@@ -270,7 +270,7 @@ def test_dvr_final_logprob_repair_applies_after_materialization():
         ),
     )
     result = SimpleNamespace(
-        spec_aux=DVRSpecResultAux(
+        dvr_aux=DVRSpecResultAux(
             final_logprob_repairs=[
                 DVRFinalLogprobRepair(
                     output_ids=[10, 11, 12],
@@ -280,7 +280,7 @@ def test_dvr_final_logprob_repair_applies_after_materialization():
         )
     )
 
-    apply_spec_final_logprob_repairs_from_result(
+    apply_dvr_final_logprob_repairs_from_result(
         SimpleNamespace(
             reqs=[req],
             spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
@@ -303,7 +303,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
         ),
     )
     result = SimpleNamespace(
-        spec_aux=DVRSpecResultAux(
+        dvr_aux=DVRSpecResultAux(
             final_logprob_repairs=[
                 DVRFinalLogprobRepair(
                     output_ids=[10, 11],
@@ -314,7 +314,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
     )
 
     with pytest.raises(RuntimeError, match="materialized output ids"):
-        apply_spec_final_logprob_repairs_from_result(
+        apply_dvr_final_logprob_repairs_from_result(
             SimpleNamespace(
                 reqs=[req],
                 spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
@@ -334,7 +334,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
         ),
     )
     result = SimpleNamespace(
-        spec_aux=DVRSpecResultAux(
+        dvr_aux=DVRSpecResultAux(
             final_logprob_repairs=[
                 DVRFinalLogprobRepair(
                     output_ids=[10, 11],
@@ -345,7 +345,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
     )
 
     with pytest.raises(RuntimeError, match="inconsistent ids/logprobs length"):
-        apply_spec_final_logprob_repairs_from_result(
+        apply_dvr_final_logprob_repairs_from_result(
             SimpleNamespace(
                 reqs=[req],
                 spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,

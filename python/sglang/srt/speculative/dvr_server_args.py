@@ -186,8 +186,8 @@ def handle_dvr_speculative_decoding(server_args):
     else:
         logger.warning(
             "Overlap scheduler is disabled for DVR, so self-draft uses the "
-            "spec-v1 worker. Omit --disable-overlap-schedule to use DVR "
-            "spec-v2 overlap scheduling."
+            "synchronous DVR worker path. Omit --disable-overlap-schedule to "
+            "use overlap scheduling."
         )
     server_args.enable_mixed_chunk = False
     logger.warning("Mixed chunked prefill is disabled for DVR.")

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import weakref
-from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from typing import Any, Optional
 
@@ -256,92 +255,27 @@ def compact_dvr_output_rows(
     return base_seq_lens_cpu, accept_lens_cpu, token_ids_per_req
 
 
-@contextmanager
-def _dvr_causal_verify_cuda_graph_metadata(
-    model_runner, attn_backend, forward_mode, spec_info, fallback_custom_mask=None
-):
-    """Build DVR target-verify graph metadata without selecting custom masks."""
+@dataclass
+class DVRVerifyInput(EagleVerifyInput):
+    """DVR target verify input for both self-draft and EAGLE/MTP draft.
 
-    del model_runner, fallback_custom_mask
-    old_custom_mask = getattr(spec_info, "custom_mask", None)
-    should_clear_custom_mask = (
-        getattr(spec_info, "use_dvr_causal_verify_metadata", False)
-        and forward_mode.is_target_verify()
-        and spec_info is not None
-    )
-    if should_clear_custom_mask:
-        spec_info.custom_mask = None
-    try:
-        yield
-    finally:
-        if should_clear_custom_mask:
-            spec_info.custom_mask = old_custom_mask
-            backends = [attn_backend]
-            full_attn_backend = getattr(attn_backend, "full_attn_backend", None)
-            if full_attn_backend is not None:
-                backends.append(full_attn_backend)
-            for backend in backends:
-                metadata = getattr(backend, "forward_metadata", None)
-                if metadata is None:
-                    continue
-                if hasattr(metadata, "custom_mask"):
-                    metadata.custom_mask = None
-                if hasattr(metadata, "mask_indptr"):
-                    metadata.mask_indptr = None
+    The verifier shape is EAGLE-compatible in both modes.  ``is_self_draft``
+    selects the chain accept/reject sampler and fast self-draft state commit;
+    EAGLE/MTP leaves it false and uses target-only sampling.
+    """
 
-
-class DVRTargetVerifyMixin:
-    """DVR target-verify CUDA graph fixups shared by DVR draft variants."""
-
-    use_dvr_causal_verify_metadata = True
+    is_self_draft: bool = False
 
     @classmethod
-    def from_eagle_verify_input(cls, verify_input: EagleVerifyInput):
-        """Preserve EAGLE draft metadata while swapping in DVR verify hooks."""
+    def from_eagle_verify_input(
+        cls, verify_input: EagleVerifyInput, *, is_self_draft: bool = False
+    ):
+        """Preserve EAGLE draft metadata while adding DVR mode selection."""
 
         return cls(
             **{
                 field.name: getattr(verify_input, field.name)
                 for field in fields(EagleVerifyInput)
-            }
+            },
+            is_self_draft=is_self_draft,
         )
-
-    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
-        if not graph_runner.capture_forward_mode.is_target_verify():
-            return
-        # The generic num_token_non_padded slot is enabled only for EP. GDN DVR
-        # verify also needs the raw token count to mask padded graph rows.
-        graph_runner.buffers.num_token_non_padded.fill_(raw_num_token)
-
-    def cuda_graph_metadata_context(
-        self,
-        *,
-        model_runner,
-        attn_backend,
-        forward_mode,
-        fallback_custom_mask=None,
-    ):
-        return _dvr_causal_verify_cuda_graph_metadata(
-            model_runner,
-            attn_backend,
-            forward_mode,
-            self,
-            fallback_custom_mask,
-        )
-
-
-class DVREagleVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
-    """DVR target verify with a standard EAGLE target-only sampler."""
-
-
-@dataclass
-class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
-    """DVR verify input with classic chain speculative sampling.
-
-    Shared EAGLE verification is target-only. DVR self-draft records the draft
-    sampling distribution and must use the chain accept/reject kernel to keep
-    the generated distribution and acceptance rate aligned with the reference
-    branch.
-    """
-
-    draft_probs: Optional[torch.Tensor] = None

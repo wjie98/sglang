@@ -214,8 +214,6 @@ class SpeculativeAlgorithm(Enum):
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
 
-        enable_overlap = not server_args.disable_overlap_schedule
-
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
@@ -240,16 +238,11 @@ class SpeculativeAlgorithm(Enum):
             return DecodeVerifyRollbackEagleWorkerV2
 
         if self.is_dvr_self_draft():
-            if enable_overlap:
-                from sglang.srt.speculative.dvr_worker import (
-                    DecodeVerifyRollbackWorkerV2,
-                )
+            from sglang.srt.speculative.dvr_worker import (
+                DecodeVerifyRollbackWorkerV2,
+            )
 
-                return DecodeVerifyRollbackWorkerV2
-
-            from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
-
-            return DecodeVerifyRollbackWorker
+            return DecodeVerifyRollbackWorkerV2
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).

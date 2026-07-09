@@ -245,7 +245,7 @@ from sglang.srt.speculative.dflash_utils import (
     validate_dflash_request,
 )
 from sglang.srt.speculative.dvr_scheduler import (
-    maybe_filter_running_batch_with_spec_state,
+    maybe_filter_running_batch_with_dvr_state,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -3017,7 +3017,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        if not maybe_filter_running_batch_with_spec_state(
+        if not maybe_filter_running_batch_with_dvr_state(
             batch=batch,
             future_map=self.future_map,
             enable_overlap=self.enable_overlap,

@@ -62,9 +62,8 @@ class GenerationBatchResult:
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
     extra_keep_alive_refs: Optional[List[Any]] = None
 
-    # Optional algorithm-owned metadata consumed by result processing. Keep it
-    # as one opaque object so new spec algorithms do not add fields here.
-    spec_aux: Optional[Any] = None
+    # DVR-owned metadata consumed after result processing materializes outputs.
+    dvr_aux: Optional[Any] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None

@@ -2699,7 +2699,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "npu": NPUGraphRunner,
                 },
             )
-            self.decode_cuda_graph_runner = graph_runners[self.device](self)
+            if (
+                self.spec_algorithm.is_dvr()
+                and not self.is_draft_worker
+                and self.device == "cuda"
+            ):
+                from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+                    DVRTargetVerifyCudaGraphRunner,
+                )
+
+                self.decode_cuda_graph_runner = DVRTargetVerifyCudaGraphRunner(
+                    self,
+                    skip_prefill_only_deterministic_for_capture=(
+                        self.spec_algorithm.is_dvr_eagle()
+                    ),
+                )
+            else:
+                self.decode_cuda_graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem

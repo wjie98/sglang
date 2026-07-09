@@ -27,10 +27,9 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dvr_scheduler import (
-    apply_spec_final_logprob_repairs_from_result,
-    maybe_cache_unfinished_prefill_req_with_spec_state,
-    maybe_handle_spec_mamba_checkpoint_after_decode,
-    should_skip_dvr_spec_v1_decode_logprob_append,
+    apply_dvr_final_logprob_repairs_from_result,
+    maybe_cache_unfinished_prefill_req_with_dvr_state,
+    maybe_handle_dvr_mamba_checkpoint_after_decode,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -249,7 +248,7 @@ class SchedulerBatchResultProcessor:
                         # checkpoint to a cache insert that upstream would not
                         # normally see.  If it does not handle this request,
                         # keep the original unfinished-prefill cache path.
-                        spec_cached = maybe_cache_unfinished_prefill_req_with_spec_state(
+                        dvr_cached = maybe_cache_unfinished_prefill_req_with_dvr_state(
                             req=req,
                             batch=batch,
                             req_index=i,
@@ -257,7 +256,7 @@ class SchedulerBatchResultProcessor:
                             enable_hisparse=self.server_args.enable_hisparse,
                             hisparse_coordinator=self.hisparse_coordinator,
                         )
-                        if not spec_cached and (
+                        if not dvr_cached and (
                             not batch.decoding_reqs or req not in batch.decoding_reqs
                         ):
                             maybe_cache_unfinished_req(req, self.tree_cache)
@@ -683,10 +682,6 @@ class SchedulerBatchResultProcessor:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
-        skip_decode_logprob_append = should_skip_dvr_spec_v1_decode_logprob_append(
-            batch=batch, result=result
-        )
-
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
             result=result,
@@ -737,7 +732,7 @@ class SchedulerBatchResultProcessor:
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
-            if req.return_logprob and not skip_decode_logprob_append:
+            if req.return_logprob:
                 self._apply_decode_logprobs(
                     req=req,
                     i=i,
@@ -773,9 +768,9 @@ class SchedulerBatchResultProcessor:
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
-        # Some spec workers return aux data whose ownership starts only after
-        # the scheduler materializes accepted tokens into Req.
-        apply_spec_final_logprob_repairs_from_result(batch, result)
+        # DVR final logprob repairs become valid only after accepted tokens are
+        # materialized into Req.output_ids.
+        apply_dvr_final_logprob_repairs_from_result(batch, result)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -934,7 +929,7 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        if maybe_handle_spec_mamba_checkpoint_after_decode(
+        if maybe_handle_dvr_mamba_checkpoint_after_decode(
             req=req,
             batch=batch,
             result=result,

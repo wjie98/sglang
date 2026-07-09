@@ -376,6 +376,89 @@ def dvr_self_draft_eager_context(model_runner):
     )
 
 
+class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
+    """Target-verify graph runner for DVR self-draft and DVR-EAGLE.
+
+    DVR target verify uses the standard EAGLE verifier shape, but the graph
+    metadata must follow DVR's causal verifier and GDN state-input windows. Keep
+    those rules on the graph runner instead of attaching execution hooks to the
+    spec_info data object.
+    """
+
+    skip_prefill_only_deterministic_for_capture = False
+
+    def __init__(
+        self,
+        model_runner,
+        *,
+        skip_prefill_only_deterministic_for_capture: bool = False,
+        **kwargs,
+    ):
+        self.skip_prefill_only_deterministic_for_capture = (
+            skip_prefill_only_deterministic_for_capture
+        )
+        super().__init__(model_runner, **kwargs)
+
+    def get_spec_info(self, num_tokens: int):
+        spec_info = super().get_spec_info(num_tokens)
+        if spec_info is None:
+            return None
+        if self.model_runner.spec_algorithm.is_dvr_self_draft():
+            from sglang.srt.speculative.dvr_info import DVRVerifyInput
+
+            return DVRVerifyInput.from_eagle_verify_input(
+                spec_info, is_self_draft=True
+            )
+        if self.model_runner.spec_algorithm.is_dvr_eagle():
+            from sglang.srt.speculative.dvr_info import DVRVerifyInput
+
+            return DVRVerifyInput.from_eagle_verify_input(spec_info)
+        return spec_info
+
+    def _prepare_spec_replay_buffers(
+        self, forward_batch: ForwardBatch, raw_num_token: int
+    ) -> None:
+        if not self.capture_forward_mode.is_target_verify():
+            return
+        # The generic num_token_non_padded slot is enabled only for EP. GDN DVR
+        # verify also needs the raw token count to mask padded graph rows.
+        self.buffers.num_token_non_padded.fill_(raw_num_token)
+
+    @contextmanager
+    def _cuda_graph_metadata_context(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        forward_mode,
+        fallback_custom_mask=None,
+    ):
+        del fallback_custom_mask
+        spec_info = getattr(forward_batch, "spec_info", None)
+        old_custom_mask = getattr(spec_info, "custom_mask", None)
+        should_clear_custom_mask = (
+            self.model_runner.spec_algorithm.is_dvr()
+            and forward_mode.is_target_verify()
+            and spec_info is not None
+        )
+        if should_clear_custom_mask:
+            spec_info.custom_mask = None
+        try:
+            yield
+        finally:
+            if not should_clear_custom_mask:
+                return
+            spec_info.custom_mask = old_custom_mask
+            for backend in iter_dvr_attention_backends(attn_backend):
+                metadata = getattr(backend, "forward_metadata", None)
+                if metadata is None:
+                    continue
+                if hasattr(metadata, "custom_mask"):
+                    metadata.custom_mask = None
+                if hasattr(metadata, "mask_indptr"):
+                    metadata.mask_indptr = None
+
+
 class DVRDraftDecodeCudaGraphRunner:
     """CUDA graph runner for DVR self-draft decode.
 

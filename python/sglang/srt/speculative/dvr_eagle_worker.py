@@ -11,16 +11,16 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+    DVRTargetVerifyCudaGraphRunner,
     iter_dvr_attention_backends,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
-from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.dvr_info import (
-    DVREagleVerifyInput,
     DVRPendingOutputPrefix,
+    DVRVerifyInput,
     build_dvr_spec_result_aux,
     compact_dvr_output_rows,
 )
@@ -48,22 +48,6 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
-
-
-class DVREagleTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
-    """CUDA graph runner for DVR-EAGLE target verify.
-
-    The target worker's default graph is captured with generic EAGLE verifier
-    metadata. DVR-EAGLE needs a target verify graph whose padded rows and GDN
-    state-input windows follow DVR verifier rules.
-    """
-
-    skip_prefill_only_deterministic_for_capture = True
-
-    def __init__(self, dvr_eagle_worker):
-        self.dvr_eagle_worker = dvr_eagle_worker
-        model_runner = dvr_eagle_worker.target_worker.model_runner
-        super().__init__(model_runner)
 
 
 class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
@@ -105,7 +89,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             # initialized during the normal target graph setup.  Build the
             # DVR-EAGLE target-verify graph here, not in __init__.
             self.cuda_graph_runner_for_target_verify = (
-                DVREagleTargetVerifyCudaGraphRunner(self)
+                DVRTargetVerifyCudaGraphRunner(
+                    self.target_worker.model_runner,
+                    skip_prefill_only_deterministic_for_capture=True,
+                )
             )
 
     def clear_cache_pool(self):
@@ -155,7 +142,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         return None if runner is None else runner.bs
 
     def _update_verify_buffers_to_fill_after_draft(
-        self, verify_input: DVREagleVerifyInput, can_run_cuda_graph: bool
+        self, verify_input: DVRVerifyInput, can_run_cuda_graph: bool
     ):
         cuda_graph_bs = self._target_verify_graph_runner_bs(can_run_cuda_graph)
         for backend in iter_dvr_attention_backends(
@@ -209,7 +196,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         self,
         *,
         batch: ScheduleBatch,
-        verify_input: DVREagleVerifyInput,
+        verify_input: DVRVerifyInput,
         linear_state_ctx,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Compute verifier outputs by replaying the deterministic suffix prefill.
@@ -385,8 +372,8 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input = batch.spec_info
-        if not isinstance(verify_input, DVREagleVerifyInput):
-            verify_input = DVREagleVerifyInput.from_eagle_verify_input(verify_input)
+        if not isinstance(verify_input, DVRVerifyInput):
+            verify_input = DVRVerifyInput.from_eagle_verify_input(verify_input)
         batch.spec_info = verify_input
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
@@ -610,7 +597,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
-            spec_aux=build_dvr_spec_result_aux(
+            dvr_aux=build_dvr_spec_result_aux(
                 track_indices=pending_track_indices,
                 seqlens=pending_track_seqlens,
                 final_logprob_repairs=final_logprob_repairs,
