@@ -23,12 +23,10 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
     build_dvr_spec_result_aux,
 )
-from sglang.srt.speculative.dvr_logprob_repair import (
-    score_deferred_dvr_final_logprob_repairs,
-)
 from sglang.srt.speculative.dvr_target_replay import (
     replay_accepted_suffix_for_live_state,
     run_suffix_draft_replay_oracle,
+    score_deferred_dvr_final_logprob_repairs,
     suffix_draft_replay_batch_context,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle

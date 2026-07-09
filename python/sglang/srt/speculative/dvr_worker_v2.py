@@ -20,7 +20,7 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
     build_dvr_spec_result_aux,
 )
-from sglang.srt.speculative.dvr_logprob_repair import (
+from sglang.srt.speculative.dvr_target_replay import (
     score_deferred_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_worker import (

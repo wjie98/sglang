@@ -27,17 +27,15 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
-from sglang.srt.speculative.dvr_logprob_repair import (
-    defer_dvr_non_streaming_logprob_output_until_finish,
-    score_deferred_dvr_final_logprob_repairs,
-)
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
     apply_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_target_replay import (
+    defer_dvr_non_streaming_logprob_output_until_finish,
     replay_accepted_suffix_for_live_state,
     run_suffix_draft_replay_oracle,
+    score_deferred_dvr_final_logprob_repairs,
     suffix_draft_replay_batch_context,
 )
 from sglang.srt.speculative.eagle_info import (
