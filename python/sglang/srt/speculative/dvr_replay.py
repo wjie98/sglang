@@ -281,42 +281,6 @@ def _build_suffix_draft_mrope_positions(
     return torch.cat(mrope_chunks, dim=1)
 
 
-def _build_suffix_target_replay_batch(
-    batch,
-    replay_plan: _DVRSuffixReplayPlan,
-    *,
-    capture_hidden_mode: CaptureHiddenMode,
-    return_logprob: bool = False,
-    mamba_track_indices: Optional[torch.Tensor] = None,
-    mamba_track_mask: Optional[torch.Tensor] = None,
-    mamba_track_seqlens: Optional[torch.Tensor] = None,
-    mamba_cow_src_indices: Optional[torch.Tensor] = None,
-    mamba_cow_dst_indices: Optional[torch.Tensor] = None,
-    mamba_clear_indices: Optional[torch.Tensor] = None,
-) -> ScheduleBatch:
-    """Create the private target EXTEND batch for a suffix replay oracle."""
-
-    return _build_private_extend_batch(
-        batch,
-        reqs=batch.reqs,
-        input_ids=replay_plan.input_ids,
-        out_cache_locs=replay_plan.out_cache_locs,
-        prefix_lens=[int(x) for x in replay_plan.boundary_lens],
-        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-        final_seq_lens=replay_plan.final_seq_lens_cpu,
-        return_logprob=return_logprob,
-        extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-        capture_hidden_mode=capture_hidden_mode,
-        is_prefill_only=batch.is_prefill_only,
-        mamba_track_indices=mamba_track_indices,
-        mamba_track_mask=mamba_track_mask,
-        mamba_track_seqlens=mamba_track_seqlens,
-        mamba_cow_src_indices=mamba_cow_src_indices,
-        mamba_cow_dst_indices=mamba_cow_dst_indices,
-        mamba_clear_indices=mamba_clear_indices,
-    )
-
-
 def build_boundary_replay_batch(
     *,
     batch,
@@ -595,10 +559,17 @@ def dvr_suffix_replay_context(
         if not bool(boundary_track_mask.any().item()):
             boundary_track_mask = None
     linear_state.set_suffix_replay_boundary_track_mask(boundary_track_mask)
-    replay_batch = _build_suffix_target_replay_batch(
+    replay_batch = _build_private_extend_batch(
         batch,
-        replay_plan,
+        reqs=batch.reqs,
+        input_ids=replay_plan.input_ids,
+        out_cache_locs=replay_plan.out_cache_locs,
+        prefix_lens=[int(x) for x in replay_plan.boundary_lens],
+        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        final_seq_lens=replay_plan.final_seq_lens_cpu,
+        extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
         capture_hidden_mode=CaptureHiddenMode.FULL,
+        is_prefill_only=batch.is_prefill_only,
         mamba_track_indices=boundary_indices if boundary_track_mask is not None else None,
         mamba_track_mask=boundary_track_mask,
         mamba_track_seqlens=(
@@ -711,10 +682,17 @@ def replay_dvr_accepted_suffix_for_live_state(
     # Commit repair, not checkpoint publication: leave the live recurrent slot
     # updated by the replay so the normal commit path can copy it directly.
     linear_state.set_suffix_replay_boundary_track_mask(None)
-    replay_batch = _build_suffix_target_replay_batch(
+    replay_batch = _build_private_extend_batch(
         batch,
-        replay_plan,
+        reqs=batch.reqs,
+        input_ids=replay_plan.input_ids,
+        out_cache_locs=replay_plan.out_cache_locs,
+        prefix_lens=[int(x) for x in replay_plan.boundary_lens],
+        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        final_seq_lens=replay_plan.final_seq_lens_cpu,
+        extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
         capture_hidden_mode=CaptureHiddenMode.NULL,
+        is_prefill_only=batch.is_prefill_only,
         mamba_cow_src_indices=boundary_indices,
         mamba_cow_dst_indices=live_indices,
     )
