@@ -4,7 +4,6 @@ import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.dvr_state_adapter import DVRGatedStateAdapter
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -285,11 +284,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        self.dvr_state_adapter = DVRGatedStateAdapter.for_gdn(
-            self.kernel_dispatcher,
-            model_runner=model_runner,
-            is_draft_worker=self.is_draft_worker,
-        )
+        self.dvr_state_adapter = None
+        if model_runner.spec_algorithm.is_dvr():
+            from sglang.srt.layers.attention.linear.dvr_state_adapter import (
+                DVRGatedStateAdapter,
+            )
+
+            self.dvr_state_adapter = DVRGatedStateAdapter.for_gdn(
+                self.kernel_dispatcher,
+                model_runner=model_runner,
+                is_draft_worker=self.is_draft_worker,
+            )
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -403,25 +408,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        mamba_cache_params = self.dvr_state_adapter.get_layer_state_cache(
-            req_to_token_pool=self.req_to_token_pool,
-            state_cache=mamba_cache_params,
-            layer_id=layer.layer_id,
-        )
-        if self.dvr_state_adapter.is_dvr_target_verify(
-            state_cache=mamba_cache_params, is_target_verify=is_target_verify
-        ):
-            # DVR target verify replays GDN state with prefill-equivalent inputs.
-            return self.dvr_state_adapter.forward_gdn_target_verify(
-                layer=layer,
-                forward_batch=forward_batch,
-                mixed_qkv=mixed_qkv,
-                a=a,
-                b=b,
+        dvr_state_adapter = self.dvr_state_adapter
+        if dvr_state_adapter is not None:
+            mamba_cache_params = dvr_state_adapter.get_layer_state_cache(
+                req_to_token_pool=self.req_to_token_pool,
                 state_cache=mamba_cache_params,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
+                layer_id=layer.layer_id,
             )
+            if dvr_state_adapter.is_dvr_target_verify(
+                state_cache=mamba_cache_params, is_target_verify=is_target_verify
+            ):
+                # DVR target verify replays GDN state with prefill-equivalent inputs.
+                return dvr_state_adapter.forward_gdn_target_verify(
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    state_cache=mamba_cache_params,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                )
 
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
@@ -528,16 +535,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
-            # Cache target-model GDN tail inputs for later DVR verify/replay.
-            self.dvr_state_adapter.cache_gdn_extend_tail(
-                forward_batch=forward_batch,
-                state_cache=mamba_cache_params,
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-            )
+            if dvr_state_adapter is not None:
+                # Cache target-model GDN tail inputs for later DVR verify/replay.
+                dvr_state_adapter.cache_gdn_extend_tail(
+                    forward_batch=forward_batch,
+                    state_cache=mamba_cache_params,
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
