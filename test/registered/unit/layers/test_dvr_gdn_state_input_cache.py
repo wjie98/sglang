@@ -117,7 +117,6 @@ def test_dvr_gdn_adapter_lazily_adds_state_input_cache_view():
     )
     adapter = DVRGatedStateAdapter(
         ops=None,
-        enabled=True,
         state_shape=state_shape,
         conv_dtype=torch.float32,
         device="cpu",

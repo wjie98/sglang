@@ -147,7 +147,7 @@ class DVRLinearStateLifecycle:
                 if task.source_state_indices is not None and task.source_seqlen > 0
             ]
             if replay_source_indices:
-                ctx.state_adapter.copy_state_indices(
+                self.copy_state_indices(
                     batch=batch,
                     src_indices=torch.cat(replay_source_indices).to(
                         device=ctx.live_indices.device, dtype=torch.long
@@ -159,7 +159,11 @@ class DVRLinearStateLifecycle:
             replay_batch = build_boundary_replay_batch(
                 batch=batch,
                 tasks=tasks,
-                state_adapter=ctx.state_adapter,
+                boundary_indices=self.boundary_indices_for_reqs(
+                    reqs=[task.req for task in tasks],
+                    track_indices=[task.boundary_track_idx for task in tasks],
+                    device=batch.device,
+                ),
                 request_token_ids_for_replay=request_token_ids_for_replay,
             )
             if replay_batch is None:
@@ -301,7 +305,7 @@ class DVRLinearStateLifecycle:
                 self.boundary_seqlen[req.rid] = new_boundary_seqlen
                 track_idx = self.boundary_track_idx[req.rid]
                 if publish_boundary_checkpoint:
-                    ctx.state_adapter.set_request_boundary_checkpoint(
+                    self.publish_request_boundary_checkpoint(
                         batch=batch,
                         req=req,
                         track_idx=track_idx,
@@ -400,9 +404,8 @@ class DVRLinearStateLifecycle:
         state_adapter.validate_state_cache(state_cache=state_cache)
         boundary_indices = None
         if require_boundary:
-            boundary_indices = state_adapter.get_boundary_indices(
+            boundary_indices = self.boundary_indices_for_batch(
                 batch=batch,
-                boundary_track_idx_by_rid=self.boundary_track_idx,
                 device=live_indices.device,
             )
         return DVRLinearStateContext(
@@ -435,14 +438,21 @@ class DVRLinearStateLifecycle:
         self,
         batch: ScheduleBatch,
         req,
-        state_adapter,
         boundary_seqlen: Optional[int] = None,
     ) -> Optional[int]:
         if boundary_seqlen is None:
             boundary_seqlen, _ = self.boundary_and_tail(req)
         assert boundary_seqlen % FLA_CHUNK_SIZE == 0
-        return state_adapter.get_current_prefill_checkpoint_track_idx(
-            batch=batch, req=req, boundary_seqlen=boundary_seqlen
+        last_track_seqlen = req.mamba_last_track_seqlen
+        if last_track_seqlen is not None and last_track_seqlen > 0:
+            assert last_track_seqlen % FLA_CHUNK_SIZE == 0, (
+                "DVR linear-state verify must not reuse non-chunk-boundary "
+                "checkpoints."
+            )
+        if boundary_seqlen <= 0 or last_track_seqlen != boundary_seqlen:
+            return None
+        return self.other_track_idx(
+            batch=batch, track_idx=req.mamba_next_track_idx
         )
 
     def state_adapter(self):
@@ -460,19 +470,94 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         req,
         track_idx: int,
-        state_adapter,
         boundary_seqlen: Optional[int] = None,
     ):
         self.boundary_track_idx[req.rid] = track_idx
         if boundary_seqlen is None:
             boundary_seqlen, _ = self.boundary_and_tail(req)
         self.boundary_seqlen[req.rid] = boundary_seqlen
-        state_adapter.set_request_boundary_checkpoint(
-            batch=batch,
-            req=req,
-            track_idx=track_idx,
-            boundary_seqlen=boundary_seqlen,
+        self.publish_request_boundary_checkpoint(
+            batch=batch, req=req, track_idx=track_idx, boundary_seqlen=boundary_seqlen
         )
+
+    @staticmethod
+    def other_track_idx(*, batch: ScheduleBatch, track_idx: int) -> int:
+        return batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
+
+    def publish_request_boundary_checkpoint(
+        self, *, batch: ScheduleBatch, req, track_idx: int, boundary_seqlen: int
+    ):
+        req.mamba_last_track_seqlen = boundary_seqlen
+        req.mamba_next_track_idx = self.other_track_idx(batch=batch, track_idx=track_idx)
+
+    @staticmethod
+    def reserve_boundary_checkpoint(*, req) -> Tuple[int, torch.Tensor]:
+        track_idx = req.mamba_next_track_idx
+        return track_idx, req.mamba_ping_pong_track_buffer[track_idx]
+
+    @staticmethod
+    def copy_state_indices(
+        *, batch: ScheduleBatch, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ):
+        batch.req_to_token_pool.mamba_pool.copy_from(
+            src_indices.reshape(-1), dst_indices.reshape(-1)
+        )
+
+    @staticmethod
+    def boundary_indices_for_reqs(*, reqs, track_indices, device) -> torch.Tensor:
+        return torch.stack(
+            [
+                req.mamba_ping_pong_track_buffer[track_idx]
+                for req, track_idx in zip(reqs, track_indices, strict=True)
+            ]
+        ).to(device=device, dtype=torch.long)
+
+    def boundary_indices_for_batch(
+        self, *, batch: ScheduleBatch, device
+    ) -> torch.Tensor:
+        return self.boundary_indices_for_reqs(
+            reqs=batch.reqs,
+            track_indices=[self.boundary_track_idx[req.rid] for req in batch.reqs],
+            device=device,
+        )
+
+    @staticmethod
+    def radix_node_state_indices(node) -> Optional[torch.Tensor]:
+        return None if node is None else getattr(node, "mamba_value", None)
+
+    @staticmethod
+    def radix_node_seqlen(node) -> int:
+        seqlen = 0
+        while node is not None:
+            key = getattr(node, "key", None)
+            if key is not None:
+                seqlen += len(key)
+            node = getattr(node, "parent", None)
+        return seqlen
+
+    def find_exact_radix_boundary_node(self, *, req, boundary_seqlen: int):
+        node = getattr(req, "last_node", None)
+        while node is not None:
+            if (
+                self.radix_node_state_indices(node) is not None
+                and self.radix_node_seqlen(node) == boundary_seqlen
+            ):
+                return node
+            node = getattr(node, "parent", None)
+        return None
+
+    def find_nearest_radix_state_node(self, *, req, boundary_seqlen: int):
+        node = getattr(req, "last_node", None)
+        while node is not None:
+            node_seqlen = self.radix_node_seqlen(node)
+            if (
+                self.radix_node_state_indices(node) is not None
+                and node_seqlen < boundary_seqlen
+                and node_seqlen % FLA_CHUNK_SIZE == 0
+            ):
+                return node, node_seqlen
+            node = getattr(node, "parent", None)
+        return None, 0
 
     def materialize_radix_boundary_for_req(
         self,
@@ -480,14 +565,19 @@ class DVRLinearStateLifecycle:
         req,
         boundary_seqlen: int,
         dst: torch.Tensor,
-        state_adapter,
     ) -> bool:
-        node = state_adapter.find_exact_radix_boundary_node(
+        node = self.find_exact_radix_boundary_node(
             req=req, boundary_seqlen=boundary_seqlen
         )
-        return state_adapter.copy_boundary_state_from_radix_node(
-            batch=batch, node=node, dst_indices=dst
+        state_indices = self.radix_node_state_indices(node)
+        if state_indices is None:
+            return False
+        self.copy_state_indices(
+            batch=batch,
+            src_indices=state_indices,
+            dst_indices=dst,
         )
+        return True
 
     def init_boundary_for_req(
         self,
@@ -495,11 +585,10 @@ class DVRLinearStateLifecycle:
         req,
         boundary_seqlen: int,
         live_idx: torch.Tensor,
-        state_adapter,
     ) -> Tuple[Optional[torch.Tensor], Optional[DVRBoundaryReplayTask]]:
         assert boundary_seqlen % FLA_CHUNK_SIZE == 0
         checkpoint_track_idx = self.current_prefill_checkpoint_track_idx(
-            batch, req, state_adapter, boundary_seqlen
+            batch, req, boundary_seqlen
         )
         if checkpoint_track_idx is not None:
             # Normal prefill already wrote the chunk-aligned state into the
@@ -507,11 +596,9 @@ class DVRLinearStateLifecycle:
             # slot after every accepted chunk, so copy-on-write the prefill
             # checkpoint into the request's next writable ping-pong slot before
             # registering it as the DVR boundary.
-            boundary_track_idx, dst = state_adapter.reserve_boundary_checkpoint(
-                req=req
-            )
+            boundary_track_idx, dst = self.reserve_boundary_checkpoint(req=req)
             src = req.mamba_ping_pong_track_buffer[checkpoint_track_idx]
-            state_adapter.copy_state_indices(
+            self.copy_state_indices(
                 batch=batch,
                 src_indices=src.unsqueeze(0),
                 dst_indices=dst.unsqueeze(0),
@@ -520,38 +607,37 @@ class DVRLinearStateLifecycle:
                 batch,
                 req,
                 boundary_track_idx,
-                state_adapter,
                 boundary_seqlen,
             )
             return None, None
-        boundary_track_idx, dst = state_adapter.reserve_boundary_checkpoint(req=req)
+        boundary_track_idx, dst = self.reserve_boundary_checkpoint(req=req)
         if boundary_seqlen == 0:
             self.set_boundary_checkpoint(
-                batch, req, boundary_track_idx, state_adapter, boundary_seqlen
+                batch, req, boundary_track_idx, boundary_seqlen
             )
             return dst, None
         if (
             not is_dvr_eagle_enabled(self.server_args)
             and self.materialize_radix_boundary_for_req(
-                batch, req, boundary_seqlen, dst, state_adapter
+                batch, req, boundary_seqlen, dst
             )
         ):
             self.set_boundary_checkpoint(
-                batch, req, boundary_track_idx, state_adapter, boundary_seqlen
+                batch, req, boundary_track_idx, boundary_seqlen
             )
             return None, None
 
-        source_node, source_seqlen = state_adapter.find_nearest_radix_state_node(
+        source_node, source_seqlen = self.find_nearest_radix_state_node(
             req=req, boundary_seqlen=boundary_seqlen
         )
         self.set_boundary_checkpoint(
-            batch, req, boundary_track_idx, state_adapter, boundary_seqlen
+            batch, req, boundary_track_idx, boundary_seqlen
         )
         return None, DVRBoundaryReplayTask(
             req=req,
             source_seqlen=source_seqlen,
             boundary_seqlen=boundary_seqlen,
-            source_state_indices=state_adapter.radix_node_state_indices(source_node),
+            source_state_indices=self.radix_node_state_indices(source_node),
             boundary_track_idx=boundary_track_idx,
             live_idx=live_idx,
         )
@@ -590,7 +676,6 @@ class DVRLinearStateLifecycle:
                     req,
                     boundary_seqlen,
                     ctx.live_indices[i],
-                    ctx.state_adapter,
                 )
                 if zero_boundary_idx is not None:
                     zero_boundary_indices.append(zero_boundary_idx)

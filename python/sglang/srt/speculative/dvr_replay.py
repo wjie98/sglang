@@ -474,7 +474,7 @@ def build_boundary_replay_batch(
     *,
     batch,
     tasks,
-    state_adapter,
+    boundary_indices: torch.Tensor,
     request_token_ids_for_replay,
 ) -> Optional[ScheduleBatch]:
     """Create the private batch for missing chunk-boundary checkpoints.
@@ -510,11 +510,6 @@ def build_boundary_replay_batch(
         return None
 
     device = batch.device
-    boundary_indices = state_adapter.get_boundary_indices_for_reqs(
-        reqs=reqs,
-        track_indices=[task.boundary_track_idx for task in tasks],
-        device=batch.device,
-    )
     return _build_private_extend_batch(
         batch,
         _DVRPrivateExtendBatchSpec(
