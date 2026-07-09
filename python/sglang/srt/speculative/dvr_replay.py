@@ -17,8 +17,6 @@ from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
     DVRPendingOutputPrefix,
     compact_dvr_output_rows,
-)
-from sglang.srt.speculative.dvr_output_policy import (
     defer_dvr_non_streaming_logprob_output,
     try_claim_dvr_final_logprob_repair,
 )

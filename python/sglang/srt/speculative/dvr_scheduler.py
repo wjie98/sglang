@@ -6,8 +6,6 @@ from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
-)
-from sglang.srt.speculative.dvr_output_policy import (
     allow_dvr_non_streaming_logprob_output,
 )
 

@@ -15,19 +15,17 @@ from sglang.srt.speculative.dvr_info import (
     DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
     DVRSpecResultAux,
+    allow_dvr_non_streaming_logprob_output,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
+    defer_dvr_non_streaming_logprob_output,
+    should_hold_dvr_non_streaming_logprob_output,
+    try_claim_dvr_final_logprob_repair,
 )
 from sglang.srt.speculative.dvr_scheduler import (
     _commit_pending_mamba_checkpoint_from_result,
     apply_dvr_final_logprob_repairs_from_result,
     maybe_filter_running_batch_with_dvr_state,
-)
-from sglang.srt.speculative.dvr_output_policy import (
-    allow_dvr_non_streaming_logprob_output,
-    defer_dvr_non_streaming_logprob_output,
-    should_hold_dvr_non_streaming_logprob_output,
-    try_claim_dvr_final_logprob_repair,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
