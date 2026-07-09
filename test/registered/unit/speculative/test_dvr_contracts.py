@@ -6,13 +6,6 @@ import torch
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
-from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
-    get_req_mamba_radix_insert_snapshot,
-    get_unfinished_insert_state,
-    mark_req_skip_mamba_radix_finished_insert,
-    set_req_mamba_radix_insert_snapshot,
-    should_insert_finished_req,
-)
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_replay import (
     _final_output_len_if_repair_needed,
@@ -55,8 +48,6 @@ def test_dvr_spec_algorithm_contracts():
     assert eagle_draft.is_dvr()
     assert eagle_draft.is_dvr_eagle()
     assert not eagle_draft.is_eagle()
-    assert self_draft.supports_spec_v2()
-    assert eagle_draft.supports_spec_v2()
 
 
 def test_dvr_published_seq_len_filter_hook():
@@ -103,51 +94,6 @@ def test_dvr_published_seq_len_filter_hook():
         future_map=future_map,
         enable_overlap=True,
     )
-
-
-def test_mamba_radix_request_policy_helpers():
-    req = SimpleNamespace()
-
-    assert should_insert_finished_req(req, default_is_insert=True)
-    assert not should_insert_finished_req(req, default_is_insert=False)
-    assert get_req_mamba_radix_insert_snapshot(req) is None
-
-    mark_req_skip_mamba_radix_finished_insert(req)
-    assert not should_insert_finished_req(req, default_is_insert=True)
-
-    set_req_mamba_radix_insert_snapshot(req, indices="idx", seqlen=64)
-    snapshot = get_req_mamba_radix_insert_snapshot(req)
-    assert snapshot.indices == "idx"
-    assert snapshot.seqlen == 64
-
-
-def test_mamba_radix_unfinished_insert_plan_prefers_snapshot():
-    req = SimpleNamespace(mamba_last_track_seqlen=32)
-
-    cache_len, snapshot_indices = get_unfinished_insert_state(
-        req,
-        enable_mamba_extra_buffer=True,
-        token_count=96,
-    )
-    assert cache_len == 32
-    assert snapshot_indices is None
-
-    set_req_mamba_radix_insert_snapshot(req, indices="snapshot_idx", seqlen=64)
-    cache_len, snapshot_indices = get_unfinished_insert_state(
-        req,
-        enable_mamba_extra_buffer=True,
-        token_count=96,
-    )
-    assert cache_len == 64
-    assert snapshot_indices == "snapshot_idx"
-
-    cache_len, snapshot_indices = get_unfinished_insert_state(
-        req,
-        enable_mamba_extra_buffer=False,
-        token_count=96,
-    )
-    assert cache_len == 96
-    assert snapshot_indices is None
 
 
 def test_dvr_pending_mamba_checkpoint_commit_guards():

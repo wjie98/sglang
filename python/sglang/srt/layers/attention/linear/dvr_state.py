@@ -307,11 +307,6 @@ class DVRStateInputCache:
             tail_lens=self.tail_lens[layer],
         )
 
-    def mem_usage_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self.tensors) + (
-            self.tail_lens.numel() * self.tail_lens.element_size()
-        )
-
     def state_inputs(self) -> DVRStateInputs:
         return DVRStateInputs.from_tensors(self.tensors)
 
@@ -328,8 +323,6 @@ class DVRStateOps:
     Concrete subclasses bind model-family kernels. The adapter depends on this
     interface rather than on FLA/GDN-specific function names.
     """
-
-    chunk_size: int = FLA_CHUNK_SIZE
 
     def scan_chunkwise(self, *, state_inputs: DVRStateInputs, **kwargs) -> tuple:
         raise NotImplementedError

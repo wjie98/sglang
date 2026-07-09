@@ -376,24 +376,6 @@ def dvr_self_draft_eager_context(model_runner):
     )
 
 
-def dvr_eagle_draft_decode_context(
-    model_runner,
-    *,
-    graph_capture: bool = False,
-    clear_kernel_config_caches: bool = False,
-    attn_backends=(),
-):
-    """Run DVR-EAGLE/MTP draft as provisional, performance-first decode."""
-
-    return _dvr_draft_decode_context(
-        model_runner,
-        graph_capture=graph_capture,
-        disable_batch_invariant_ops=True,
-        clear_kernel_config_caches=clear_kernel_config_caches,
-        extra_attn_backends=attn_backends,
-    )
-
-
 class DVRDraftDecodeCudaGraphRunner:
     """CUDA graph runner for DVR self-draft decode.
 

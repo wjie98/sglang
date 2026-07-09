@@ -802,8 +802,6 @@ class Req(ReqDllmMixin):
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
-        self.dvr_mamba_radix_skip_finished_insert: bool = False
-        self.dvr_mamba_radix_insert_snapshot: Any = None
 
         # Check finish
         self.tokenizer = None
@@ -1624,7 +1622,6 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_mask: bool
     track_index: int
     track_seqlen: int
-    track_cache_seqlen: int
 
 
 def set_mamba_track_indices_from_reqs(batch):
@@ -1802,8 +1799,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
-    # Worker-side snapshot seqlens for spec-v2 unfinished prefill inserts.
-    mamba_track_cache_seqlens: torch.Tensor = None  # shape: [b], int64
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -2103,11 +2098,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
-        use_mamba_radix_snapshot = (
-            self.spec_algorithm.is_dvr_eagle()
-            or (self.spec_algorithm.is_dvr_self_draft() and self.enable_overlap)
-        )
-        mamba_track_cache_seqlens_cpu = [] if use_mamba_radix_snapshot else None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_input_len
@@ -2187,10 +2177,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
-                if mamba_track_cache_seqlens_cpu is not None:
-                    mamba_track_cache_seqlens_cpu.append(
-                        track_entry.track_cache_seqlen
-                    )
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -2292,7 +2278,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():
-            self.mamba_track_cache_seqlens = None
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -2308,12 +2293,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
-            if mamba_track_cache_seqlens_cpu is not None:
-                self.mamba_track_cache_seqlens = torch.tensor(
-                    mamba_track_cache_seqlens_cpu,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
@@ -2348,7 +2327,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mask = req.extend_input_len >= mamba_cache_chunk_size
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
-        mamba_track_cache_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
             # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
@@ -2407,13 +2385,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
-            mamba_track_cache_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
-            track_cache_seqlen=mamba_track_cache_seqlen,
         )
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
@@ -2729,7 +2705,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_pool_indices_cpu,
             )
 
-        self.mamba_track_cache_seqlens = None
         if get_global_server_args().enable_mamba_extra_buffer():
             mamba_track_interval = get_global_server_args().mamba_track_interval
 
@@ -2806,7 +2781,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
-        self.mamba_track_cache_seqlens = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -2864,7 +2838,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
-        self.mamba_track_cache_seqlens = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -2913,7 +2886,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
-            mamba_track_cache_seqlens=self.mamba_track_cache_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

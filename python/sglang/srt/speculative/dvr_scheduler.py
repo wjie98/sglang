@@ -3,11 +3,6 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
-from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
-    clear_req_mamba_radix_insert_snapshot,
-    mark_req_skip_mamba_radix_finished_insert,
-    set_req_mamba_radix_insert_snapshot,
-)
 from sglang.srt.managers.scheduler_components.output_policy import (
     allow_req_non_streaming_logprob_output,
 )
@@ -124,28 +119,6 @@ def _pending_mamba_checkpoint_is_committable(
     return page_size == 1 or checkpoint.seqlen % page_size == 0
 
 
-def _set_req_radix_insert_snapshot_from_batch(
-    *,
-    req: Any,
-    batch: Any,
-    req_index: int,
-) -> None:
-    clear_req_mamba_radix_insert_snapshot(req)
-    if (
-        batch.mamba_track_mask is None
-        or batch.mamba_track_indices is None
-        or batch.mamba_track_cache_seqlens is None
-    ):
-        return
-    if not bool(batch.mamba_track_mask[req_index].item()):
-        return
-    set_req_mamba_radix_insert_snapshot(
-        req,
-        indices=batch.mamba_track_indices[req_index].reshape(1),
-        seqlen=int(batch.mamba_track_cache_seqlens[req_index].item()),
-    )
-
-
 def maybe_filter_running_batch_with_spec_state(
     *,
     batch: Any,
@@ -225,15 +198,11 @@ def maybe_cache_unfinished_prefill_req_with_spec_state(
     enable_hisparse: bool,
     hisparse_coordinator: Any,
 ) -> bool:
-    """Cache unfinished prefill reqs while preserving DVR mamba checkpoints."""
+    """Cache unfinished prefill reqs that DVR spec-v2 overlap materialized."""
 
     if not batch.spec_algorithm.is_dvr():
         return False
 
-    # Normal prefill caching only inserts requests that are not already in the
-    # decode set. DVR spec-v2 overlap can materialize a generated-prefix
-    # checkpoint from an overlap prefill; if that prefill advanced more than one
-    # token, the radix-cache insert must carry the matching mamba snapshot.
     should_cache_unfinished = not batch.decoding_reqs or req not in batch.decoding_reqs
     is_dvr_spec_v2 = batch.spec_algorithm.is_dvr_eagle() or getattr(
         batch, "enable_overlap", False
@@ -249,12 +218,6 @@ def maybe_cache_unfinished_prefill_req_with_spec_state(
     if not should_cache_unfinished:
         return False
 
-    if is_dvr_spec_v2:
-        _set_req_radix_insert_snapshot_from_batch(
-            req=req,
-            batch=batch,
-            req_index=req_index,
-        )
     maybe_cache_unfinished_req(req, tree_cache)
     if enable_hisparse:
         hisparse_coordinator.admit_request_into_staging(req)
@@ -274,7 +237,6 @@ def maybe_handle_spec_mamba_checkpoint_after_decode(
     if not batch.spec_algorithm.is_dvr():
         return False
 
-    mark_req_skip_mamba_radix_finished_insert(req)
     if batch.spec_algorithm.is_dvr_eagle() or getattr(batch, "enable_overlap", False):
         _commit_pending_mamba_checkpoint_from_result(
             req=req,

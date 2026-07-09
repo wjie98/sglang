@@ -346,10 +346,6 @@ class DVRLinearStateLifecycle:
             return_pending_boundary=True,
         )
 
-    def has_dvr_state(self, batch: ScheduleBatch) -> bool:
-        state_adapter = self.state_adapter()
-        return state_adapter is not None and state_adapter.has_dvr_state(batch=batch)
-
     def sync_active_reqs(
         self,
         batch: ScheduleBatch,

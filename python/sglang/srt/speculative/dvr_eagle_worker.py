@@ -11,7 +11,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    dvr_eagle_draft_decode_context,
     iter_dvr_attention_backends,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -83,59 +82,8 @@ class DVREagleTargetVerifyCudaGraphRunner:
         with dvr_eagle_target_verify_cuda_graph_context(model_runner):
             self.runner = DecodeCudaGraphRunner(model_runner)
 
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
-        with dvr_eagle_target_verify_cuda_graph_context(
-            self.dvr_eagle_worker.target_worker.model_runner
-        ):
-            return self.runner.can_run_graph(forward_batch)
-
-    def replay_prepare(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
-        with dvr_eagle_target_verify_cuda_graph_context(
-            self.dvr_eagle_worker.target_worker.model_runner
-        ):
-            return self.runner.load_batch(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
-            )
-
-    def replay(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
-        with dvr_eagle_target_verify_cuda_graph_context(
-            self.dvr_eagle_worker.target_worker.model_runner
-        ):
-            return self.runner.execute(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
-            )
-
     def __getattr__(self, name):
         return getattr(self.runner, name)
-
-
-class DVREagleDraftWorker(EagleDraftWorker):
-    """EAGLE draft worker with DVR's provisional decode policy.
-
-    Standard EAGLE keeps the normal deterministic/runtime settings.  DVR-EAGLE
-    verifies every draft with the target model, so its draft decode path should
-    use the same performance-first context as self-DVR without making the
-    upstream EagleDraftWorker depend on DVR internals.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def _draft_decode_context(
-        self,
-        *,
-        graph_capture: bool = False,
-        clear_kernel_config_caches: bool = False,
-    ):
-        return dvr_eagle_draft_decode_context(
-            self.draft_runner,
-            graph_capture=graph_capture,
-            clear_kernel_config_caches=clear_kernel_config_caches,
-            attn_backends=(
-                getattr(self, "draft_attn_backend", None),
-                getattr(self, "draft_extend_attn_backend", None),
-            ),
-        )
 
 
 class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
@@ -147,7 +95,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     worker.
     """
 
-    draft_worker_cls = DVREagleDraftWorker
+    draft_worker_cls = EagleDraftWorker
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -579,7 +527,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 accept_index.shape[1],
             )
         else:
-            accept_tokens = None
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         accept_lens_cpu = None

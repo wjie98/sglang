@@ -1403,11 +1403,6 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
     def draft_worker(self):
         return self
 
-    def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
-    ) -> None:
-        pass
-
     def clear_cache_pool(self):
         super().clear_cache_pool()
         self.dvr_output_replay_prefix.clear()
@@ -1645,9 +1640,6 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     use_fast_self_draft_commit=is_self_dvr,
                 )
             )
-
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if has_verify_tokens:
             select_index = (

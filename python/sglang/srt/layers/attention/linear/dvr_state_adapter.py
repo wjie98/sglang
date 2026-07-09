@@ -119,29 +119,20 @@ class DVRGatedStateAdapter:
         cls,
         kernel_dispatcher,
         *,
-        model_runner: Any = None,
+        model_runner: Any,
         is_draft_worker: bool = False,
-        enabled: bool = False,
-        state_shape=None,
-        conv_dtype: Optional[torch.dtype] = None,
-        device: Optional[str] = None,
     ) -> "DVRGatedStateAdapter":
         from sglang.srt.layers.attention.linear.dvr_gdn_state import DVRGDNStateOps
 
-        if model_runner is not None:
-            mamba_cache_params = model_runner.mambaish_config.mamba2_cache_params
-            enabled = model_runner.spec_algorithm.is_dvr()
-            state_shape = mamba_cache_params.shape
-            conv_dtype = mamba_cache_params.dtype.conv
-            device = model_runner.device
+        mamba_cache_params = model_runner.mambaish_config.mamba2_cache_params
 
         return cls(
             DVRGDNStateOps.create(kernel_dispatcher),
             is_draft_worker=is_draft_worker,
-            enabled=enabled,
-            state_shape=state_shape,
-            conv_dtype=conv_dtype,
-            device=device,
+            enabled=model_runner.spec_algorithm.is_dvr(),
+            state_shape=mamba_cache_params.shape,
+            conv_dtype=mamba_cache_params.dtype.conv,
+            device=model_runner.device,
         )
 
     def has_dvr_state(self, *, batch) -> bool:

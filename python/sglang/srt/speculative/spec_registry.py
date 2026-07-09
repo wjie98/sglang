@@ -91,9 +91,6 @@ class CustomSpecAlgo:
     def is_dvr_eagle(self) -> bool:
         return False
 
-    def supports_spec_v2(self) -> bool:
-        return False
-
     def supports_target_verify_for_draft(self) -> bool:
         return False
 

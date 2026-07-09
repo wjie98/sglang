@@ -126,14 +126,6 @@ class SpeculativeAlgorithm(Enum):
     def is_dvr(self) -> bool:
         return self.is_dvr_self_draft() or self.is_dvr_eagle()
 
-    def supports_spec_v2(self) -> bool:
-        return (
-            self.is_eagle()
-            or self.is_dflash()
-            or self.is_standalone()
-            or self.is_dvr()
-        )
-
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 

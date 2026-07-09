@@ -71,7 +71,6 @@ if not is_cpu():
         token_count,
         scale,
         T: tl.constexpr,
-        B: tl.constexpr,
         H: tl.constexpr,
         HV: tl.constexpr,
         K: tl.constexpr,
@@ -174,7 +173,6 @@ def _rebuild_gdn_state_from_qkvg_beta_triton(
         token_count=token_count,
         scale=K**-0.5,
         T=T,
-        B=B,
         H=H,
         HV=HV,
         K=K,
@@ -415,7 +413,6 @@ class DVRGDNStateOps(DVRStateOps):
         )
 
         return cls(
-            chunk_size=FLA_CHUNK_SIZE,
             chunkwise_scan_fn=kernel_dispatcher.extend,
             rebuild_recurrent_state_fn=_rebuild_gdn_state_from_qkvg_beta_triton,
             verify_conv_fn=causal_conv1d_fn,

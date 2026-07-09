@@ -179,16 +179,6 @@ class DVRPendingOutputPrefix:
             seq_len,
         )
 
-    def _append_tokens(
-        self,
-        req: Any,
-        token_ids,
-        *,
-        error_prefix: str,
-    ) -> None:
-        stream = self._stream_for_req(req, error_prefix=error_prefix)
-        stream.extend(int(token_id) for token_id in token_ids)
-
     def append_batch_output_tokens(
         self,
         batch: Any,
@@ -281,15 +271,6 @@ def _dvr_causal_verify_cuda_graph_metadata(
         and forward_mode.is_target_verify()
         and spec_info is not None
     )
-    if (
-        should_clear_custom_mask
-        and old_custom_mask is None
-        and fallback_custom_mask is not None
-    ):
-        # DVR target verify is a topk=1 chain, so the real attention mask is
-        # causal. Some graph metadata builders still read custom_mask.shape;
-        # provide the graph buffer only for that shape bookkeeping.
-        spec_info.custom_mask = fallback_custom_mask
     if should_clear_custom_mask:
         spec_info.custom_mask = None
     try:
@@ -352,14 +333,6 @@ class DVRTargetVerifyMixin:
 class DVREagleVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
     """DVR target verify with a standard EAGLE target-only sampler."""
 
-    def _sampling_uniforms(self, candidates: torch.Tensor, batch):
-        # EAGLE target-only verification has rejection/final-sampling coins
-        # outside the normal sampler. Honor request-level sampling_seed here so
-        # DVR-EAGLE sync/overlap comparisons are reproducible under sampling.
-        from sglang.srt.speculative.dvr_worker import dvr_chain_uniform_samples
-
-        return dvr_chain_uniform_samples(candidates, batch)
-
 
 @dataclass
 class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
@@ -372,16 +345,3 @@ class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
     """
 
     draft_probs: Optional[torch.Tensor] = None
-
-    def _sampling_fn_and_draft_probs(self, target_probs: torch.Tensor, batch):
-        if self.draft_probs is None:
-            return super()._sampling_fn_and_draft_probs(target_probs, batch)
-
-        from sglang.srt.speculative.dvr_worker import chain_speculative_sampling
-
-        return chain_speculative_sampling, self.draft_probs
-
-    def _sampling_uniforms(self, candidates: torch.Tensor, batch):
-        from sglang.srt.speculative.dvr_worker import dvr_chain_uniform_samples
-
-        return dvr_chain_uniform_samples(candidates, batch)

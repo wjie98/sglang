@@ -642,7 +642,6 @@ def _build_private_extend_batch(
         mamba_track_indices=spec.mamba_track_indices,
         mamba_track_mask=spec.mamba_track_mask,
         mamba_track_seqlens=spec.mamba_track_seqlens,
-        mamba_track_cache_seqlens=None,
         mamba_cow_src_indices=spec.mamba_cow_src_indices,
         mamba_cow_dst_indices=spec.mamba_cow_dst_indices,
         mamba_clear_indices=spec.mamba_clear_indices,
