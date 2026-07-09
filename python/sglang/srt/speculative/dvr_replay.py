@@ -29,41 +29,6 @@ from sglang.srt.speculative.dvr_output_policy import (
 
 
 @dataclass
-class _DVRPrivateExtendBatchSpec:
-    """Inputs for a DVR-owned EXTEND batch detached from scheduler mutation.
-
-    DVR uses private EXTEND batches for target verify oracles, boundary-state
-    materialization, and final logprob scoring.  Keeping their ScheduleBatch
-    construction in one place avoids three copies of upstream-sensitive field
-    plumbing while leaving each replay path responsible for its own semantics.
-    """
-
-    reqs: list[Any]
-    input_ids: list[int]
-    out_cache_locs: Optional[list[torch.Tensor] | torch.Tensor]
-    prefix_lens: list[int]
-    extend_lens: list[int]
-    final_seq_lens: list[int]
-    return_logprob: bool = False
-    top_logprobs_nums: Optional[list[int]] = None
-    token_ids_logprobs: Optional[list[Any]] = None
-    extend_logprob_start_lens: Optional[list[int]] = None
-    extend_input_logprob_token_ids: Optional[list[int]] = None
-    multimodal_inputs: Optional[list[Any]] = None
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
-    is_extend_in_batch: bool = True
-    all_extend_in_batch: bool = True
-    is_prefill_only: Optional[bool] = None
-    with_sampling_info: bool = False
-    mamba_track_indices: Optional[torch.Tensor] = None
-    mamba_track_mask: Optional[torch.Tensor] = None
-    mamba_track_seqlens: Optional[torch.Tensor] = None
-    mamba_cow_src_indices: Optional[torch.Tensor] = None
-    mamba_cow_dst_indices: Optional[torch.Tensor] = None
-    mamba_clear_indices: Optional[torch.Tensor] = None
-
-
-@dataclass
 class _DVRSuffixReplayPlan:
     """Plan a target EXTEND replay over unclosed prefix tail plus appended rows.
 
@@ -353,24 +318,22 @@ def _build_suffix_target_replay_batch(
 
     return _build_private_extend_batch(
         batch,
-        _DVRPrivateExtendBatchSpec(
-            reqs=batch.reqs,
-            input_ids=replay_plan.input_ids,
-            out_cache_locs=replay_plan.out_cache_locs,
-            prefix_lens=[int(x) for x in replay_plan.boundary_lens],
-            extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-            final_seq_lens=replay_plan.final_seq_lens_cpu,
-            return_logprob=return_logprob,
-            extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-            capture_hidden_mode=capture_hidden_mode,
-            is_prefill_only=batch.is_prefill_only,
-            mamba_track_indices=mamba_track_indices,
-            mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=mamba_track_seqlens,
-            mamba_cow_src_indices=mamba_cow_src_indices,
-            mamba_cow_dst_indices=mamba_cow_dst_indices,
-            mamba_clear_indices=mamba_clear_indices,
-        ),
+        reqs=batch.reqs,
+        input_ids=replay_plan.input_ids,
+        out_cache_locs=replay_plan.out_cache_locs,
+        prefix_lens=[int(x) for x in replay_plan.boundary_lens],
+        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        final_seq_lens=replay_plan.final_seq_lens_cpu,
+        return_logprob=return_logprob,
+        extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        capture_hidden_mode=capture_hidden_mode,
+        is_prefill_only=batch.is_prefill_only,
+        mamba_track_indices=mamba_track_indices,
+        mamba_track_mask=mamba_track_mask,
+        mamba_track_seqlens=mamba_track_seqlens,
+        mamba_cow_src_indices=mamba_cow_src_indices,
+        mamba_cow_dst_indices=mamba_cow_dst_indices,
+        mamba_clear_indices=mamba_clear_indices,
     )
 
 
@@ -512,31 +475,50 @@ def build_boundary_replay_batch(
     device = batch.device
     return _build_private_extend_batch(
         batch,
-        _DVRPrivateExtendBatchSpec(
-            reqs=reqs,
-            input_ids=input_ids,
-            out_cache_locs=out_cache_locs,
-            prefix_lens=prefix_lens,
-            extend_lens=extend_lens,
-            final_seq_lens=final_seq_lens,
-            extend_logprob_start_lens=prefix_lens,
-            is_extend_in_batch=False,
-            all_extend_in_batch=False,
-            is_prefill_only=True,
-            mamba_track_indices=boundary_indices,
-            mamba_track_mask=torch.ones(
-                len(reqs), dtype=torch.bool, device=device
-            ),
-            mamba_track_seqlens=torch.tensor(
-                final_seq_lens, dtype=torch.int64, device=device
-            ),
+        reqs=reqs,
+        input_ids=input_ids,
+        out_cache_locs=out_cache_locs,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+        final_seq_lens=final_seq_lens,
+        extend_logprob_start_lens=prefix_lens,
+        is_extend_in_batch=False,
+        all_extend_in_batch=False,
+        is_prefill_only=True,
+        mamba_track_indices=boundary_indices,
+        mamba_track_mask=torch.ones(len(reqs), dtype=torch.bool, device=device),
+        mamba_track_seqlens=torch.tensor(
+            final_seq_lens, dtype=torch.int64, device=device
         ),
     )
 
 
 def _build_private_extend_batch(
     batch,
-    spec: _DVRPrivateExtendBatchSpec,
+    *,
+    reqs: list[Any],
+    input_ids: list[int],
+    out_cache_locs: Optional[list[torch.Tensor] | torch.Tensor],
+    prefix_lens: list[int],
+    extend_lens: list[int],
+    final_seq_lens: list[int],
+    return_logprob: bool = False,
+    top_logprobs_nums: Optional[list[int]] = None,
+    token_ids_logprobs: Optional[list[Any]] = None,
+    extend_logprob_start_lens: Optional[list[int]] = None,
+    extend_input_logprob_token_ids: Optional[list[int]] = None,
+    multimodal_inputs: Optional[list[Any]] = None,
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+    is_extend_in_batch: bool = True,
+    all_extend_in_batch: bool = True,
+    is_prefill_only: Optional[bool] = None,
+    with_sampling_info: bool = False,
+    mamba_track_indices: Optional[torch.Tensor] = None,
+    mamba_track_mask: Optional[torch.Tensor] = None,
+    mamba_track_seqlens: Optional[torch.Tensor] = None,
+    mamba_cow_src_indices: Optional[torch.Tensor] = None,
+    mamba_cow_dst_indices: Optional[torch.Tensor] = None,
+    mamba_clear_indices: Optional[torch.Tensor] = None,
 ) -> ScheduleBatch:
     """Create a DVR-owned EXTEND batch with upstream ScheduleBatch plumbing."""
 
@@ -545,35 +527,37 @@ def _build_private_extend_batch(
     global_num_tokens_for_logprob = None
     if batch.global_num_tokens is not None:
         dp_world = len(batch.global_num_tokens)
-        global_num_tokens = [len(spec.input_ids)] * dp_world
-        global_num_tokens_for_logprob = [len(spec.input_ids)] * dp_world
+        global_num_tokens = [len(input_ids)] * dp_world
+        global_num_tokens_for_logprob = [len(input_ids)] * dp_world
 
     req_pool_indices = torch.tensor(
-        [req.req_pool_idx for req in spec.reqs],
+        [req.req_pool_idx for req in reqs],
         dtype=torch.int64,
         device=device,
     )
-    final_seq_lens = torch.tensor(spec.final_seq_lens, dtype=torch.int64, device=device)
+    final_seq_lens_tensor = torch.tensor(
+        final_seq_lens, dtype=torch.int64, device=device
+    )
     out_cache_loc = None
-    if spec.out_cache_locs is not None:
+    if out_cache_locs is not None:
         out_cache_loc = (
-            torch.cat(spec.out_cache_locs)
-            if isinstance(spec.out_cache_locs, list)
-            else spec.out_cache_locs
+            torch.cat(out_cache_locs)
+            if isinstance(out_cache_locs, list)
+            else out_cache_locs
         ).to(device=device)
     extend_logprob_start_lens = (
-        spec.prefix_lens
-        if spec.extend_logprob_start_lens is None
-        else spec.extend_logprob_start_lens
+        prefix_lens
+        if extend_logprob_start_lens is None
+        else extend_logprob_start_lens
     )
     multimodal_inputs = (
-        [req.multimodal_inputs for req in spec.reqs]
-        if spec.multimodal_inputs is None
-        else spec.multimodal_inputs
+        [req.multimodal_inputs for req in reqs]
+        if multimodal_inputs is None
+        else multimodal_inputs
     )
 
     replay_batch = ScheduleBatch.init_new(
-        reqs=spec.reqs,
+        reqs=reqs,
         req_to_token_pool=batch.req_to_token_pool,
         token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
         tree_cache=batch.tree_cache,
@@ -584,36 +568,36 @@ def _build_private_extend_batch(
     )
     replay_batch.forward_mode = ForwardMode.EXTEND
     replay_batch.input_ids = torch.tensor(
-        spec.input_ids, dtype=torch.int64, device=device
+        input_ids, dtype=torch.int64, device=device
     )
     replay_batch.req_pool_indices = req_pool_indices
     replay_batch.req_pool_indices_cpu = req_pool_indices.cpu()
-    replay_batch.seq_lens = final_seq_lens
-    replay_batch.seq_lens_cpu = final_seq_lens.cpu()
-    replay_batch.seq_lens_sum = sum(spec.final_seq_lens)
+    replay_batch.seq_lens = final_seq_lens_tensor
+    replay_batch.seq_lens_cpu = final_seq_lens_tensor.cpu()
+    replay_batch.seq_lens_sum = sum(final_seq_lens)
     replay_batch.out_cache_loc = out_cache_loc
-    replay_batch.orig_seq_lens = final_seq_lens.to(dtype=torch.int32)
-    replay_batch.extend_num_tokens = len(spec.input_ids)
-    replay_batch.extend_lens = spec.extend_lens
-    replay_batch.prefix_lens = spec.prefix_lens
+    replay_batch.orig_seq_lens = final_seq_lens_tensor.to(dtype=torch.int32)
+    replay_batch.extend_num_tokens = len(input_ids)
+    replay_batch.extend_lens = extend_lens
+    replay_batch.prefix_lens = prefix_lens
     replay_batch.extend_logprob_start_lens = extend_logprob_start_lens
     replay_batch.extend_input_logprob_token_ids = (
         None
-        if spec.extend_input_logprob_token_ids is None
+        if extend_input_logprob_token_ids is None
         else torch.tensor(
-            spec.extend_input_logprob_token_ids,
+            extend_input_logprob_token_ids,
             dtype=torch.int64,
             device=device,
         )
     )
     replay_batch.multimodal_inputs = multimodal_inputs
-    replay_batch.return_logprob = spec.return_logprob
-    replay_batch.top_logprobs_nums = spec.top_logprobs_nums
-    replay_batch.token_ids_logprobs = spec.token_ids_logprobs
+    replay_batch.return_logprob = return_logprob
+    replay_batch.top_logprobs_nums = top_logprobs_nums
+    replay_batch.token_ids_logprobs = token_ids_logprobs
     replay_batch.global_num_tokens = global_num_tokens
     replay_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
-    replay_batch.is_extend_in_batch = spec.is_extend_in_batch
-    replay_batch.all_extend_in_batch = spec.all_extend_in_batch
+    replay_batch.is_extend_in_batch = is_extend_in_batch
+    replay_batch.all_extend_in_batch = all_extend_in_batch
     replay_batch.can_run_dp_cuda_graph = False
     replay_batch.can_run_dp_breakable_cuda_graph = False
     replay_batch.tbo_split_seq_index = None
@@ -626,22 +610,22 @@ def _build_private_extend_batch(
     replay_batch.input_embeds = None
     replay_batch.ne_token_table = None
     replay_batch.spec_info = None
-    replay_batch.capture_hidden_mode = spec.capture_hidden_mode
+    replay_batch.capture_hidden_mode = capture_hidden_mode
     replay_batch.hicache_consumer_index = -1
     replay_batch.is_prefill_only = (
-        batch.is_prefill_only if spec.is_prefill_only is None else spec.is_prefill_only
+        batch.is_prefill_only if is_prefill_only is None else is_prefill_only
     )
     replay_batch.has_grammar = False
     replay_batch.return_hidden_states = False
     replay_batch.return_hidden_states_before_norm = False
-    replay_batch.mamba_track_indices = spec.mamba_track_indices
-    replay_batch.mamba_track_mask = spec.mamba_track_mask
-    replay_batch.mamba_track_seqlens = spec.mamba_track_seqlens
-    replay_batch.mamba_cow_src_indices = spec.mamba_cow_src_indices
-    replay_batch.mamba_cow_dst_indices = spec.mamba_cow_dst_indices
-    replay_batch.mamba_clear_indices = spec.mamba_clear_indices
+    replay_batch.mamba_track_indices = mamba_track_indices
+    replay_batch.mamba_track_mask = mamba_track_mask
+    replay_batch.mamba_track_seqlens = mamba_track_seqlens
+    replay_batch.mamba_cow_src_indices = mamba_cow_src_indices
+    replay_batch.mamba_cow_dst_indices = mamba_cow_dst_indices
+    replay_batch.mamba_clear_indices = mamba_clear_indices
 
-    if spec.with_sampling_info:
+    if with_sampling_info:
         from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
         replay_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1159,22 +1143,20 @@ def _run_final_logprob_replay(
     extend_len = len(input_ids)
     replay_batch = _build_private_extend_batch(
         batch,
-        _DVRPrivateExtendBatchSpec(
-            reqs=[req],
-            input_ids=input_ids,
-            out_cache_locs=None,
-            prefix_lens=[0],
-            extend_lens=[extend_len],
-            final_seq_lens=[extend_len],
-            return_logprob=True,
-            top_logprobs_nums=[0],
-            token_ids_logprobs=[None],
-            extend_logprob_start_lens=[0],
-            extend_input_logprob_token_ids=input_ids[1:] + [0],
-            multimodal_inputs=[None],
-            is_prefill_only=True,
-            with_sampling_info=True,
-        ),
+        reqs=[req],
+        input_ids=input_ids,
+        out_cache_locs=None,
+        prefix_lens=[0],
+        extend_lens=[extend_len],
+        final_seq_lens=[extend_len],
+        return_logprob=True,
+        top_logprobs_nums=[0],
+        token_ids_logprobs=[None],
+        extend_logprob_start_lens=[0],
+        extend_input_logprob_token_ids=input_ids[1:] + [0],
+        multimodal_inputs=[None],
+        is_prefill_only=True,
+        with_sampling_info=True,
     )
     replay_linear_state_ctx = _subset_linear_state_ctx(linear_state_ctx, [req_i])
     with _temporary_final_replay_cache_mapping(
