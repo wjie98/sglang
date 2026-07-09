@@ -24,8 +24,7 @@ class DVRFinalLogprobRepair:
     """Exact final output logprobs produced by a DVR worker.
 
     Spec-v2 overlap materializes accepted tokens into ``Req.output_ids`` after
-    the worker returns.  DVR workers may still compute a full-prefix logprob
-    oracle on the forward stream; carry the final rows here and apply them only
+    the worker returns.  DVR carries the final rows here and applies them only
     after scheduler result processing owns the final output token list.
     """
 
@@ -86,19 +85,25 @@ class DVRPendingOutputPrefix:
         self._tokens_by_req: weakref.WeakKeyDictionary[Any, list[int]] = (
             weakref.WeakKeyDictionary()
         )
+        self._logprobs_by_req: weakref.WeakKeyDictionary[
+            Any, list[Optional[float]]
+        ] = weakref.WeakKeyDictionary()
 
     def clear(self) -> None:
         self._tokens_by_req.clear()
+        self._logprobs_by_req.clear()
 
     def prune_to_batch(self, batch: Any) -> None:
         if batch.reqs is None:
             self._tokens_by_req.clear()
+            self._logprobs_by_req.clear()
             return
 
         active_reqs = set(batch.reqs)
         for req in list(self._tokens_by_req):
             if req not in active_reqs:
                 self._tokens_by_req.pop(req, None)
+                self._logprobs_by_req.pop(req, None)
 
     def _stream_for_req(
         self, req: Any, *, error_prefix: Optional[str] = None
@@ -118,6 +123,22 @@ class DVRPendingOutputPrefix:
             if len(output_ids) > len(stream):
                 stream.extend(int(token_id) for token_id in output_ids[len(stream) :])
         return stream
+
+    def _logprob_stream_for_req(self, req: Any) -> list[Optional[float]]:
+        logprob_stream = self._logprobs_by_req.setdefault(req, [])
+        req_logprobs = getattr(
+            getattr(req, "logprob", None), "output_token_logprobs_val", None
+        )
+        if not req_logprobs:
+            return logprob_stream
+
+        for i, value in enumerate(req_logprobs):
+            if i < len(logprob_stream):
+                if logprob_stream[i] is None:
+                    logprob_stream[i] = float(value)
+            else:
+                logprob_stream.append(float(value))
+        return logprob_stream
 
     def observed_output_len(self, req: Any) -> int:
         """Return the best known client-visible output length for final repair."""
@@ -183,6 +204,7 @@ class DVRPendingOutputPrefix:
         batch: Any,
         tokens_per_req,
         *,
+        token_logprobs_per_req: Optional[list[Optional[list[float]]]] = None,
         base_seq_lens_cpu: Optional[list[int]] = None,
         error_prefix: str = "DVR output prefix",
     ) -> None:
@@ -198,11 +220,24 @@ class DVRPendingOutputPrefix:
 
         if base_seq_lens_cpu is None:
             base_seq_lens_cpu = [None] * len(batch.reqs)
+        if token_logprobs_per_req is None:
+            token_logprobs_per_req = [None] * len(batch.reqs)
 
-        for req, base_seq_len, token_ids in zip(
-            batch.reqs, base_seq_lens_cpu, tokens_per_req, strict=True
+        for req, base_seq_len, token_ids, token_logprobs in zip(
+            batch.reqs,
+            base_seq_lens_cpu,
+            tokens_per_req,
+            token_logprobs_per_req,
+            strict=True,
         ):
             stream = self._stream_for_req(req, error_prefix=error_prefix)
+            logprob_stream = self._logprob_stream_for_req(req)
+            if len(logprob_stream) < len(stream):
+                # Tokens can be learned from Req.output_ids before their
+                # logprobs are visible to the worker.  Keep positional
+                # alignment and fill the holes once result processing exposes
+                # them through Req.logprob or the next verify journal append.
+                logprob_stream.extend([None] * (len(stream) - len(logprob_stream)))
             if base_seq_len is not None:
                 required_len = max(0, int(base_seq_len) - len(req.origin_input_ids))
                 if len(stream) < required_len:
@@ -212,6 +247,46 @@ class DVRPendingOutputPrefix:
                         f"required={required_len}."
                     )
             stream.extend(int(token_id) for token_id in token_ids)
+            if token_logprobs is not None:
+                if len(token_logprobs) != len(token_ids):
+                    raise RuntimeError(
+                        f"{error_prefix} has inconsistent token/logprob counts: "
+                        f"rid={req.rid}, token_count={len(token_ids)}, "
+                        f"logprob_count={len(token_logprobs)}."
+                    )
+                logprob_stream.extend(float(value) for value in token_logprobs)
+            else:
+                logprob_stream.extend([None] * len(token_ids))
+
+    def final_logprob_repair(
+        self,
+        req: Any,
+        output_len: int,
+        *,
+        error_prefix: str,
+    ) -> DVRFinalLogprobRepair:
+        """Build final repair rows from the verify-step output journal."""
+
+        token_stream = self._stream_for_req(req, error_prefix=error_prefix)
+        logprob_stream = self._logprob_stream_for_req(req)
+        if len(token_stream) < output_len or len(logprob_stream) < output_len:
+            raise RuntimeError(
+                f"{error_prefix} is incomplete: rid={req.rid}, "
+                f"output_len={output_len}, tracked_tokens={len(token_stream)}, "
+                f"tracked_logprobs={len(logprob_stream)}."
+            )
+
+        repair_logprobs = logprob_stream[:output_len]
+        if any(value is None for value in repair_logprobs):
+            missing = [i for i, value in enumerate(repair_logprobs) if value is None]
+            raise RuntimeError(
+                f"{error_prefix} is missing verify logprobs: rid={req.rid}, "
+                f"missing_positions={missing[:8]}, output_len={output_len}."
+            )
+        return DVRFinalLogprobRepair(
+            output_ids=token_stream[:output_len],
+            output_logprobs=[float(value) for value in repair_logprobs],
+        )
 
 
 def compact_dvr_output_rows(

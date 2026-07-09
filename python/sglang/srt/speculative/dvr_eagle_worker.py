@@ -304,9 +304,20 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             # replay prefix must learn it regardless of logprob settings.
             if batch_output.next_token_ids is not None:
                 next_token_ids_cpu = batch_output.next_token_ids.detach().cpu().tolist()
+                token_logprobs_per_req = None
+                if batch_output.logits_output.next_token_logprobs is not None:
+                    logprob_values = (
+                        batch_output.logits_output.next_token_logprobs.detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    token_logprobs_per_req = [
+                        [float(value)] for value in logprob_values
+                    ]
                 self.dvr_output_prefix.append_batch_output_tokens(
                     batch,
                     [[token_id] for token_id in next_token_ids_cpu],
+                    token_logprobs_per_req=token_logprobs_per_req,
                     error_prefix="DVR EAGLE prefill output prefix",
                 )
             if on_publish is not None:
@@ -501,13 +512,20 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
 
         accept_lens_cpu = None
         if not batch.forward_mode.is_idle():
+            if batch.return_logprob:
+                compute_spec_v2_logprobs(
+                    batch,
+                    logits_output,
+                    predict,
+                    accept_index,
+                    self.speculative_num_steps,
+                )
             accept_lens_cpu, final_logprob_repairs = score_dvr_verify_outputs(
                 batch=batch,
-                target_worker=self.target_worker,
                 replay_prefix=self.dvr_output_prefix,
-                linear_state_ctx=linear_state_ctx,
                 output_tokens=predict,
                 accept_lens=accept_lens,
+                token_logprobs=logits_output.next_token_logprobs,
                 tokens_per_req=verify_input.draft_token_num,
                 base_seq_lens_cpu=base_seq_lens_cpu,
                 error_prefix="DVR EAGLE",
@@ -558,15 +576,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 accept_lens,
                 accept_index,
                 self.speculative_num_draft_tokens,
-            )
-
-        if batch.return_logprob and not batch.forward_mode.is_idle():
-            compute_spec_v2_logprobs(
-                batch,
-                logits_output,
-                predict,
-                accept_index,
-                self.speculative_num_steps,
             )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)

@@ -529,8 +529,8 @@ class DecodeVerifyRollbackWorker:
     def _forward_target_verify_for_dvr(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
-        # DVR exact output logprobs are derived from the full-prefix oracle after
-        # target verify. The ordinary target-verify pass only needs logits for
+        # DVR derives exact output logprobs from target-verify logits after
+        # sampling. The ordinary target-verify pass only needs logits for
         # accept/reject and GDN state commit, so keep its logprob metadata path
         # disabled.
         need_return_logprob = batch.return_logprob
@@ -957,13 +957,19 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             error_prefix="DVR spec-v2",
         )
 
-    def _advance_replay_prefix(self, batch: ScheduleBatch, tokens_per_req) -> None:
+    def _advance_replay_prefix(
+        self,
+        batch: ScheduleBatch,
+        tokens_per_req,
+        token_logprobs_per_req=None,
+    ) -> None:
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
         self.dvr_output_replay_prefix.append_batch_output_tokens(
             batch,
             tokens_per_req,
+            token_logprobs_per_req=token_logprobs_per_req,
         )
 
     def forward_batch_generation(
@@ -998,9 +1004,14 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         logits_output, next_token_ids, can_run_cuda_graph = self.forward_target_extend(
             batch
         )
+        token_logprobs_per_req = None
+        if logits_output.next_token_logprobs is not None:
+            logprob_values = logits_output.next_token_logprobs.detach().cpu().tolist()
+            token_logprobs_per_req = [[float(value)] for value in logprob_values]
         self._advance_replay_prefix(
             batch,
             [[token_id] for token_id in next_token_ids.detach().cpu().tolist()],
+            token_logprobs_per_req=token_logprobs_per_req,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -1135,13 +1146,16 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
 
         if has_verify_tokens:
             base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
+            if batch.return_logprob:
+                self._compute_compact_logprobs(
+                    batch, logits_output, predict, accept_index
+                )
             accept_lens_cpu, final_logprob_repairs = score_dvr_verify_outputs(
                 batch=batch,
-                target_worker=self.target_worker,
                 replay_prefix=self.dvr_output_replay_prefix,
-                linear_state_ctx=linear_state_ctx,
                 output_tokens=predict,
                 accept_lens=accept_lens,
+                token_logprobs=logits_output.next_token_logprobs,
                 tokens_per_req=self.num_draft_tokens,
                 base_seq_lens_cpu=base_seq_lens_cpu,
                 error_prefix="DVR spec-v2",
@@ -1200,11 +1214,6 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             verified_id = predict[select_index]
         else:
             verified_id = torch.empty((0,), dtype=torch.int32, device=self.device)
-
-        if batch.return_logprob and has_verify_tokens:
-            self._compute_compact_logprobs(
-                batch, logits_output, predict, accept_index
-            )
 
         next_draft_input = self._next_self_draft_input_from_bonus_tokens(verified_id)
 

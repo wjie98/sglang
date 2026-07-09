@@ -9,7 +9,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
 from sglang.srt.speculative.dvr_replay import (
     _final_output_len_if_repair_needed,
-    _try_live_cache_locs_for_final_replay,
 )
 from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
@@ -433,6 +432,58 @@ def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
     ) == [101, 102, 201, 202, 203]
 
 
+def test_dvr_output_journal_builds_final_logprob_repair():
+    req = _MockReq(
+        rid="r0",
+        origin_input_ids=[101, 102],
+        output_ids=[201],
+        logprob=SimpleNamespace(output_token_logprobs_val=[-0.1]),
+    )
+    batch = SimpleNamespace(reqs=[req])
+    prefix = DVRPendingOutputPrefix()
+
+    prefix.append_batch_output_tokens(
+        batch,
+        [[202, 203]],
+        token_logprobs_per_req=[[-0.2, -0.3]],
+        base_seq_lens_cpu=[3],
+        error_prefix="DVR spec-v2",
+    )
+
+    repair = prefix.final_logprob_repair(
+        req,
+        3,
+        error_prefix="DVR spec-v2 final logprob",
+    )
+    assert repair.output_ids == [201, 202, 203]
+    assert repair.output_logprobs == [-0.1, -0.2, -0.3]
+
+
+def test_dvr_output_journal_requires_exact_logprobs():
+    req = _MockReq(
+        rid="r0",
+        origin_input_ids=[101, 102],
+        output_ids=[201],
+        logprob=SimpleNamespace(output_token_logprobs_val=[]),
+    )
+    batch = SimpleNamespace(reqs=[req])
+    prefix = DVRPendingOutputPrefix()
+
+    prefix.append_batch_output_tokens(
+        batch,
+        [[202]],
+        base_seq_lens_cpu=[3],
+        error_prefix="DVR spec-v2",
+    )
+
+    with pytest.raises(RuntimeError, match="missing verify logprobs"):
+        prefix.final_logprob_repair(
+            req,
+            2,
+            error_prefix="DVR spec-v2 final logprob",
+        )
+
+
 def test_dvr_output_replay_prefix_is_req_lifecycle_scoped():
     old_req = _MockReq(
         rid="reused",
@@ -509,21 +560,6 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
         )
         == 17
     )
-
-
-def test_dvr_final_logprob_replay_reuses_only_complete_live_mapping():
-    req = SimpleNamespace(req_pool_idx=0)
-    batch = SimpleNamespace(
-        reqs=[req],
-        req_to_token_pool=SimpleNamespace(
-            req_to_token=torch.tensor([[3, 4, 5, 6]], dtype=torch.int32)
-        ),
-    )
-
-    assert _try_live_cache_locs_for_final_replay(batch, 3).tolist() == [3, 4, 5]
-
-    batch.req_to_token_pool.req_to_token[0, 1] = 0
-    assert _try_live_cache_locs_for_final_replay(batch, 3) is None
 
 
 def test_dvr_eagle_compacts_accepted_output_rows():
