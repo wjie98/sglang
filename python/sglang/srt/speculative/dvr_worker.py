@@ -33,12 +33,12 @@ from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_scheduler_utils import (
     apply_dvr_final_logprob_repairs,
 )
-from sglang.srt.speculative.dvr_target_replay import (
+from sglang.srt.speculative.dvr_replay import (
     defer_dvr_non_streaming_logprob_output_until_finish,
-    replay_accepted_suffix_for_live_state,
-    run_suffix_draft_replay_oracle,
-    score_deferred_dvr_final_logprob_repairs,
-    suffix_draft_replay_batch_context,
+    replay_dvr_accepted_suffix_for_live_state,
+    run_dvr_suffix_replay_oracle,
+    score_dvr_final_logprob_repairs,
+    dvr_suffix_replay_context,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -1110,7 +1110,7 @@ class DecodeVerifyRollbackWorker:
         """
 
         base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
-        with suffix_draft_replay_batch_context(
+        with dvr_suffix_replay_context(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
@@ -1124,7 +1124,7 @@ class DecodeVerifyRollbackWorker:
             if replay is None:
                 return None
             replay_batch, replay_plan = replay
-            draft_logits, _ = run_suffix_draft_replay_oracle(
+            draft_logits, _ = run_dvr_suffix_replay_oracle(
                 target_worker=self.target_worker,
                 replay_batch=replay_batch,
                 replay_plan=replay_plan,
@@ -1162,7 +1162,7 @@ class DecodeVerifyRollbackWorker:
         if accepted_ids is None or accepted_ids.numel() == 0:
             return None
         base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
-        return replay_accepted_suffix_for_live_state(
+        return replay_dvr_accepted_suffix_for_live_state(
             batch=batch,
             target_worker=self.target_worker,
             linear_state=self.linear_state,
@@ -1225,7 +1225,7 @@ class DecodeVerifyRollbackWorker:
         ):
             return
 
-        repairs = score_deferred_dvr_final_logprob_repairs(
+        repairs = score_dvr_final_logprob_repairs(
             batch=batch,
             target_worker=self.target_worker,
             replay_prefix=DVRPendingOutputPrefix(),

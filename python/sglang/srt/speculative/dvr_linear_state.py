@@ -9,7 +9,7 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.layers.attention.linear.dvr_state import DVRRecurrentStateBackup
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.speculative.dvr_target_replay import (
+from sglang.srt.speculative.dvr_replay import (
     build_boundary_replay_batch,
     build_boundary_replay_plan,
 )

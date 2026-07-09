@@ -21,8 +21,8 @@ from sglang.srt.speculative.dvr_info import (
     DVRSelfDraftVerifyInput,
     build_dvr_spec_result_aux,
 )
-from sglang.srt.speculative.dvr_target_replay import (
-    score_deferred_dvr_final_logprob_repairs,
+from sglang.srt.speculative.dvr_replay import (
+    score_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorker,
@@ -254,7 +254,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 compact_output_token_ids_per_req,
             )
             if batch.return_logprob:
-                final_logprob_repairs = score_deferred_dvr_final_logprob_repairs(
+                final_logprob_repairs = score_dvr_final_logprob_repairs(
                     batch=batch,
                     target_worker=self.target_worker,
                     replay_prefix=self.dvr_output_replay_prefix,

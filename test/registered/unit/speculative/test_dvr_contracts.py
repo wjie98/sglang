@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
     should_insert_finished_req,
 )
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
-from sglang.srt.speculative.dvr_target_replay import (
+from sglang.srt.speculative.dvr_replay import (
     _final_output_len_if_repair_needed,
     _try_live_cache_locs_for_final_replay,
 )

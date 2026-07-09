@@ -685,7 +685,7 @@ def _build_private_extend_batch(
 
 
 @contextmanager
-def suffix_draft_replay_batch_context(
+def dvr_suffix_replay_context(
     *,
     batch,
     linear_state,
@@ -832,7 +832,7 @@ def _gather_replay_hidden_states(
     return hidden_states[gather_indices]
 
 
-def replay_accepted_suffix_for_live_state(
+def replay_dvr_accepted_suffix_for_live_state(
     *,
     batch: ScheduleBatch,
     target_worker,
@@ -903,7 +903,7 @@ def replay_accepted_suffix_for_live_state(
         )
 
 
-def run_suffix_draft_replay_oracle(
+def run_dvr_suffix_replay_oracle(
     *,
     target_worker,
     replay_batch: ScheduleBatch,
@@ -963,7 +963,7 @@ def defer_dvr_non_streaming_logprob_output_until_finish(
         defer_req_non_streaming_logprob_output(req)
 
 
-def score_deferred_dvr_final_logprob_repairs(
+def score_dvr_final_logprob_repairs(
     *,
     batch: ScheduleBatch,
     target_worker: Any,

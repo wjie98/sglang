@@ -24,11 +24,11 @@ from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
     build_dvr_spec_result_aux,
 )
-from sglang.srt.speculative.dvr_target_replay import (
-    replay_accepted_suffix_for_live_state,
-    run_suffix_draft_replay_oracle,
-    score_deferred_dvr_final_logprob_repairs,
-    suffix_draft_replay_batch_context,
+from sglang.srt.speculative.dvr_replay import (
+    replay_dvr_accepted_suffix_for_live_state,
+    run_dvr_suffix_replay_oracle,
+    score_dvr_final_logprob_repairs,
+    dvr_suffix_replay_context,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_worker import (
@@ -316,7 +316,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             return None
 
         base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        with suffix_draft_replay_batch_context(
+        with dvr_suffix_replay_context(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
@@ -330,7 +330,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             if replay is None:
                 return None
             replay_batch, replay_plan = replay
-            draft_logits, draft_hidden_states = run_suffix_draft_replay_oracle(
+            draft_logits, draft_hidden_states = run_dvr_suffix_replay_oracle(
                 target_worker=self.target_worker,
                 replay_batch=replay_batch,
                 replay_plan=replay_plan,
@@ -372,7 +372,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         accepted_ids: torch.Tensor,
         accepted_cache_locs: torch.Tensor,
     ) -> torch.Tensor | None:
-        return replay_accepted_suffix_for_live_state(
+        return replay_dvr_accepted_suffix_for_live_state(
             batch=batch,
             target_worker=self.target_worker,
             linear_state=self.linear_state,
@@ -616,7 +616,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         final_logprob_repairs = None
         if batch.return_logprob and not batch.forward_mode.is_idle():
             assert compact_output_token_ids_per_req is not None
-            final_logprob_repairs = score_deferred_dvr_final_logprob_repairs(
+            final_logprob_repairs = score_dvr_final_logprob_repairs(
                 batch=batch,
                 target_worker=self.target_worker,
                 replay_prefix=self.dvr_output_prefix,
