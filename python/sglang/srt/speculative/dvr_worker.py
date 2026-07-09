@@ -992,18 +992,11 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
             )
 
         seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        replay_tasks = self.linear_state.prepare_for_draft(
-            batch, seq_lens_cpu=seq_lens_cpu
+        self.linear_state.prepare_for_draft(
+            batch,
+            seq_lens_cpu=seq_lens_cpu,
+            request_token_ids_for_replay=self._request_token_ids_for_replay,
         )
-        if replay_tasks:
-            self.linear_state.replay_boundary_tasks(
-                batch,
-                replay_tasks,
-                request_token_ids_for_replay=self._request_token_ids_for_replay,
-            )
-            self.linear_state.restore_tail_lens_after_replay(
-                batch, replay_tasks, seq_lens_cpu=seq_lens_cpu
-            )
         self.linear_state.backup_boundary_state(batch, preserve_existing=False)
         self._draft_preprocess_decode_for_self_dvr(batch)
 

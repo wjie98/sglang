@@ -487,7 +487,9 @@ def dvr_suffix_replay_context(
         )
         if not bool(boundary_track_mask.any().item()):
             boundary_track_mask = None
-    linear_state.set_suffix_replay_boundary_track_mask(boundary_track_mask)
+    linear_state.suffix_replay_boundary_track_mask = (
+        None if boundary_track_mask is None else boundary_track_mask.detach()
+    )
     replay_batch = build_dvr_private_extend_batch(
         batch,
         reqs=batch.reqs,
@@ -527,7 +529,17 @@ def dvr_suffix_replay_context(
         restore_live_state=True,
     ):
         if restore_boundary_state and not full_prefix_replay:
-            linear_state.restore_boundary_state_for_suffix_replay(linear_state_ctx)
+            boundary_backup = linear_state.boundary_backup
+            if boundary_backup is None:
+                boundary_backup = linear_state_ctx.state_adapter.backup_recurrent_state(
+                    state_cache=linear_state_ctx.state_cache,
+                    indices=boundary_indices,
+                )
+            linear_state_ctx.state_adapter.restore_recurrent_state(
+                state_cache=linear_state_ctx.state_cache,
+                backup=boundary_backup,
+                indices=live_indices,
+            )
 
         # Draft KV rows must be visible at absolute positions
         # base_seq_len..base_seq_len+draft during the oracle forward.
@@ -610,7 +622,7 @@ def replay_dvr_accepted_suffix_for_live_state(
 
     # Commit repair, not checkpoint publication: leave the live recurrent slot
     # updated by the replay so the normal commit path can copy it directly.
-    linear_state.set_suffix_replay_boundary_track_mask(None)
+    linear_state.suffix_replay_boundary_track_mask = None
     replay_batch = build_dvr_private_extend_batch(
         batch,
         reqs=batch.reqs,

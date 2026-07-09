@@ -172,18 +172,11 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         # verifier. Use batch logical lengths explicitly because overlap can run
         # the next forward before Req.output_ids has been materialized.
         seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        replay_tasks = self.linear_state.prepare_for_draft(
-            batch, seq_lens_cpu=seq_lens_cpu
+        self.linear_state.prepare_for_draft(
+            batch,
+            seq_lens_cpu=seq_lens_cpu,
+            request_token_ids_for_replay=self._request_token_ids_for_replay,
         )
-        if replay_tasks:
-            self.linear_state.replay_boundary_tasks(
-                batch,
-                replay_tasks,
-                request_token_ids_for_replay=self._request_token_ids_for_replay,
-            )
-            self.linear_state.restore_tail_lens_after_replay(
-                batch, replay_tasks, seq_lens_cpu=seq_lens_cpu
-            )
         # In overlap mode, the EAGLE/MTP draft worker can run before the next
         # target verify and may share low-level linear-state slots with the
         # target worker.  Keep the worker-local target boundary backup as the

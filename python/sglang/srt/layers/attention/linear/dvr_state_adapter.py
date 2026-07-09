@@ -1,9 +1,4 @@
-"""Adapter boundary between model backends and DVR linear-state lifecycle.
-
-External callers:
-- gdn_backend enters process_target_verify_* during TARGET_VERIFY.
-- dvr_linear_state uses backup/restore/commit methods around draft and verify.
-"""
+"""Adapter boundary between model backends and DVR linear-state lifecycle."""
 
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
@@ -38,61 +33,6 @@ class DVRSpeculativeStateCacheView:
 
     def __getattr__(self, name):
         return getattr(self.base, name)
-
-
-@dataclass(frozen=True)
-class DVRGatedForwardContext:
-    """Layer-local DVR state context for one gated linear-state forward."""
-
-    layer: Any
-    forward_batch: Any
-    state_cache: Any
-    cache_indices: torch.Tensor
-    query_start_loc: Optional[torch.Tensor]
-    conv_states: torch.Tensor
-    ssm_states: torch.Tensor
-    seq_len: int
-    is_target_verify: bool
-
-    @property
-    def spec_info(self):
-        return self.forward_batch.spec_info
-
-    @property
-    def draft_token_num(self) -> int:
-        return self.spec_info.draft_token_num
-
-    @property
-    def verify_batch_size(self) -> int:
-        return self.seq_len // self.draft_token_num
-
-    def valid_request_mask(self) -> torch.Tensor:
-        batch_size = self.verify_batch_size
-        device = self.cache_indices.device
-        rows = torch.arange(batch_size, dtype=torch.long, device=device)
-        num_token_non_padded = self.forward_batch.num_token_non_padded
-        if num_token_non_padded is None:
-            return torch.ones(batch_size, dtype=torch.bool, device=device)
-        if torch.is_tensor(num_token_non_padded):
-            num_token_non_padded = num_token_non_padded.to(
-                device=device, dtype=torch.long
-            )
-        return rows * self.draft_token_num < num_token_non_padded
-
-    def padded_cache_indices(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        indices = self.cache_indices[: self.verify_batch_size].to(torch.long)
-        valid_mask = self.valid_request_mask()
-        # Slot 0 is the shared dummy mamba slot used by padded graph rows.
-        return torch.where(valid_mask, indices, torch.zeros_like(indices)), valid_mask
-
-    def padded_state_input_indices(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        indices = self.forward_batch.req_pool_indices[: self.verify_batch_size].to(
-            device=self.cache_indices.device, dtype=torch.long
-        )
-        indices = indices + 1
-        valid_mask = self.valid_request_mask()
-        # Slot 0 is the shared dummy DVR state-input slot used by padded graph rows.
-        return torch.where(valid_mask, indices, torch.zeros_like(indices)), valid_mask
 
 
 @dataclass
@@ -416,24 +356,73 @@ class DVRGatedStateAdapter:
     ) -> torch.Tensor:
         """Run GDN target verify using DVR's prefill-equivalent state replay."""
 
-        context = DVRGatedForwardContext(
-            layer=layer,
-            forward_batch=forward_batch,
+        assert self.is_dvr_target_verify(
             state_cache=state_cache,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            conv_states=state_cache.conv[0],
-            ssm_states=state_cache.temporal,
-            seq_len=mixed_qkv.shape[0],
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
         )
-        mixed_qkv = self.process_target_verify_conv(
-            context=context,
-            conv_input=mixed_qkv,
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        batch_size = mixed_qkv.shape[0] // draft_token_num
+        rows = torch.arange(batch_size, dtype=torch.long, device=cache_indices.device)
+        num_token_non_padded = forward_batch.num_token_non_padded
+        if num_token_non_padded is None:
+            valid_mask = torch.ones(
+                batch_size, dtype=torch.bool, device=cache_indices.device
+            )
+        else:
+            if torch.is_tensor(num_token_non_padded):
+                num_token_non_padded = num_token_non_padded.to(
+                    device=cache_indices.device, dtype=torch.long
+                )
+            valid_mask = rows * draft_token_num < num_token_non_padded
+
+        # Slot 0 is the shared dummy row used by padded CUDA graph requests.
+        dvr_indices = cache_indices[:batch_size].to(torch.long)
+        dvr_indices = torch.where(valid_mask, dvr_indices, torch.zeros_like(dvr_indices))
+        state_input_indices = forward_batch.req_pool_indices[:batch_size].to(
+            device=cache_indices.device, dtype=torch.long
+        )
+        state_input_indices = state_input_indices + 1
+        state_input_indices = torch.where(
+            valid_mask, state_input_indices, torch.zeros_like(state_input_indices)
+        )
+
+        has_initial_states = (forward_batch.seq_lens[:batch_size] > 0).to(
+            dtype=torch.bool,
+            device=forward_batch.input_ids.device,
+        )
+        has_initial_states = has_initial_states & valid_mask.to(
+            device=has_initial_states.device
+        )
+        conv_input_reshaped = mixed_qkv.view(
+            batch_size, draft_token_num, -1
+        ).transpose(1, 2)
+        initial_conv_windows = state_cache.conv[0][dvr_indices].clone()
+        conv_output = self.ops.run_verify_conv(
+            mixed_qkv.transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=state_cache.conv[0],
+            has_initial_state=has_initial_states,
+            cache_indices=dvr_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=[draft_token_num] * batch_size,
+        ).transpose(0, 1)[: mixed_qkv.shape[0]]
+
+        write_dvr_conv_windows(
+            intermediate_conv_window_cache=state_cache.intermediate_conv_window[0],
+            intermediate_state_indices=torch.arange(
+                cache_indices.shape[0],
+                dtype=torch.int32,
+                device=cache_indices.device,
+            ),
+            initial_conv_windows=initial_conv_windows,
+            conv_input_reshaped=conv_input_reshaped,
+            num_draft_tokens=draft_token_num,
         )
 
         query, key, value = torch.split(
-            mixed_qkv,
+            conv_output,
             [layer.q_dim, layer.k_dim, layer.v_dim],
             dim=-1,
         )
@@ -449,8 +438,8 @@ class DVRGatedStateAdapter:
             v=value,
             g=g,
             beta=beta,
-            batch_size=context.verify_batch_size,
-            draft_token_num=context.draft_token_num,
+            batch_size=batch_size,
+            draft_token_num=draft_token_num,
             num_q_heads=layer.num_q_heads,
             head_q_dim=layer.head_q_dim,
             num_k_heads=layer.num_k_heads,
@@ -458,81 +447,7 @@ class DVRGatedStateAdapter:
             num_v_heads=layer.num_v_heads,
             head_v_dim=layer.head_v_dim,
         )
-        return self.process_target_verify_state(
-            context=context,
-            draft_state_inputs=draft_state_inputs,
-        )
-
-    def process_target_verify_conv(
-        self,
-        *,
-        context: DVRGatedForwardContext,
-        conv_input: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run DVR draft conv and export absolute-offset conv windows."""
-
-        assert self.is_dvr_target_verify(
-            state_cache=context.state_cache, is_target_verify=context.is_target_verify
-        )
-
-        draft_token_num = context.draft_token_num
-        batch_size = context.verify_batch_size
-        forward_batch = context.forward_batch
-        dvr_indices, valid_mask = context.padded_cache_indices()
-        has_initial_states = (forward_batch.seq_lens[:batch_size] > 0).to(
-            dtype=torch.bool,
-            device=forward_batch.input_ids.device,
-        )
-        has_initial_states = has_initial_states & valid_mask.to(
-            device=has_initial_states.device
-        )
-        conv_input_linear = conv_input
-        conv_input_reshaped = conv_input_linear.view(
-            batch_size, draft_token_num, -1
-        ).transpose(1, 2)
-        initial_conv_windows = context.conv_states[dvr_indices].clone()
-        conv_output = self.ops.run_verify_conv(
-            conv_input_linear.transpose(0, 1),
-            context.layer.conv_weights,
-            context.layer.bias,
-            activation=context.layer.activation,
-            conv_states=context.conv_states,
-            has_initial_state=has_initial_states,
-            cache_indices=dvr_indices,
-            query_start_loc=context.query_start_loc,
-            seq_lens_cpu=[draft_token_num] * batch_size,
-        ).transpose(0, 1)[: conv_input.shape[0]]
-
-        write_dvr_conv_windows(
-            intermediate_conv_window_cache=context.state_cache.intermediate_conv_window[
-                0
-            ],
-            intermediate_state_indices=torch.arange(
-                context.cache_indices.shape[0],
-                dtype=torch.int32,
-                device=context.cache_indices.device,
-            ),
-            initial_conv_windows=initial_conv_windows,
-            conv_input_reshaped=conv_input_reshaped,
-            num_draft_tokens=draft_token_num,
-        )
-        return conv_output
-
-    def process_target_verify_state(
-        self,
-        *,
-        context: DVRGatedForwardContext,
-        draft_state_inputs: DVRStateInputs,
-    ) -> torch.Tensor:
-        assert self.is_dvr_target_verify(
-            state_cache=context.state_cache, is_target_verify=context.is_target_verify
-        )
-
-        draft_token_num = context.draft_token_num
-        batch_size = context.verify_batch_size
-        dvr_indices, valid_mask = context.padded_cache_indices()
-        state_input_indices, _ = context.padded_state_input_indices()
-        state_window = DVRStateInputWindow.from_cache(context.state_cache)
+        state_window = DVRStateInputWindow.from_cache(state_cache)
         tail_lens = state_window.tail_lens(indices=state_input_indices).to(torch.long)
         tail_lens = torch.where(
             valid_mask,
@@ -543,15 +458,15 @@ class DVRGatedStateAdapter:
             state_ops=self.ops,
             state_window=state_window,
             draft_state_inputs=draft_state_inputs,
-            ssm_states=context.ssm_states,
+            ssm_states=state_cache.temporal,
             cache_indices=dvr_indices,
             state_input_indices=state_input_indices,
             tail_lens=tail_lens,
-            intermediate_state_cache=context.state_cache.intermediate_ssm,
+            intermediate_state_cache=state_cache.intermediate_ssm,
             intermediate_state_indices=torch.arange(
-                context.cache_indices.shape[0],
+                cache_indices.shape[0],
                 dtype=torch.int32,
-                device=context.cache_indices.device,
+                device=cache_indices.device,
             ),
             batch_size=batch_size,
             draft_token_num=draft_token_num,
