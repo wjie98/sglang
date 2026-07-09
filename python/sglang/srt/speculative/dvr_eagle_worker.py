@@ -499,13 +499,20 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 )
             accept_lens_cpu, final_logprob_repairs = score_dvr_verify_outputs(
                 batch=batch,
+                target_worker=self.target_worker,
                 replay_prefix=self.dvr_output_prefix,
+                linear_state_ctx=linear_state_ctx,
                 output_tokens=predict,
                 accept_lens=accept_lens,
                 token_logprobs=logits_output.next_token_logprobs,
                 tokens_per_req=verify_input.draft_token_num,
                 base_seq_lens_cpu=base_seq_lens_cpu,
                 error_prefix="DVR EAGLE",
+                # EAGLE verify logits/hidden states come from a compact suffix
+                # oracle.  That is enough for sampling and next-draft seeding,
+                # but exact final logprobs must be scored by a full target
+                # EXTEND for GDN chunk-boundary cases.
+                force_final_logprob_replay=linear_state_ctx is not None,
             )
         else:
             final_logprob_repairs = None

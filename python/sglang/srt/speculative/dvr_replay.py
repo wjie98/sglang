@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -913,7 +918,9 @@ def run_dvr_suffix_replay_oracle(
 def score_dvr_verify_outputs(
     *,
     batch: ScheduleBatch,
+    target_worker: Any,
     replay_prefix: DVRPendingOutputPrefix,
+    linear_state_ctx: Any,
     output_tokens: torch.Tensor,
     accept_lens: torch.Tensor,
     token_logprobs: Optional[torch.Tensor],
@@ -921,6 +928,7 @@ def score_dvr_verify_outputs(
     base_seq_lens_cpu: list[int],
     error_prefix: str,
     allow_preclaimed_final_token: bool = True,
+    force_final_logprob_replay: bool = False,
 ) -> tuple[list[int], Optional[list[Optional[DVRFinalLogprobRepair]]]]:
     """Record accepted DVR tokens and carry exact final non-streaming logprobs."""
 
@@ -982,13 +990,222 @@ def score_dvr_verify_outputs(
 
         if not try_claim_dvr_final_logprob_repair(req):
             continue
-        repairs[req_i] = replay_prefix.final_logprob_repair(
-            req,
-            final_output_len,
+        repairs[req_i] = _build_final_logprob_repair(
+            batch=batch,
+            target_worker=target_worker,
+            linear_state_ctx=linear_state_ctx,
+            replay_prefix=replay_prefix,
+            req_i=req_i,
+            req=req,
+            final_output_len=final_output_len,
             error_prefix=f"{error_prefix} final logprob",
+            force_final_logprob_replay=force_final_logprob_replay,
         )
         has_repair = True
     return accept_lens_cpu, repairs if has_repair else None
+
+
+def _build_final_logprob_repair(
+    *,
+    batch: ScheduleBatch,
+    target_worker: Any,
+    linear_state_ctx: Any,
+    replay_prefix: DVRPendingOutputPrefix,
+    req_i: int,
+    req: Any,
+    final_output_len: int,
+    error_prefix: str,
+    force_final_logprob_replay: bool,
+) -> DVRFinalLogprobRepair:
+    if not force_final_logprob_replay or linear_state_ctx is None:
+        try:
+            return replay_prefix.final_logprob_repair(
+                req,
+                final_output_len,
+                error_prefix=error_prefix,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if (
+                "missing verify logprobs" not in message
+                and "is incomplete" not in message
+            ):
+                raise
+            if linear_state_ctx is None:
+                raise
+
+    # EAGLE/MTP uses compact suffix replay to pair verify logits with hidden
+    # states for the next draft.  Final non-streaming logprobs are stricter:
+    # return the same rows as a full target EXTEND over prompt + output.
+    prompt_len = len(req.origin_input_ids)
+    replay_seq_len = prompt_len + final_output_len
+    replay_ids = replay_prefix.request_output_prefix_token_ids(
+        req,
+        replay_seq_len,
+        error_prefix=error_prefix,
+    )
+    input_token_logprobs = _run_final_logprob_replay(
+        batch=batch,
+        target_worker=target_worker,
+        linear_state_ctx=linear_state_ctx,
+        req_i=req_i,
+        req=req,
+        input_ids=replay_ids,
+    )
+    output_logprob_start = prompt_len - 1
+    final_output_ids = replay_ids[prompt_len : prompt_len + final_output_len]
+    output_logprob_end = output_logprob_start + len(final_output_ids)
+    return DVRFinalLogprobRepair(
+        output_ids=final_output_ids,
+        output_logprobs=input_token_logprobs[
+            output_logprob_start:output_logprob_end
+        ]
+        .detach()
+        .cpu()
+        .tolist(),
+    )
+
+
+def _run_final_logprob_replay(
+    *,
+    batch: ScheduleBatch,
+    target_worker: Any,
+    linear_state_ctx: Any,
+    req_i: int,
+    req: Any,
+    input_ids: list[int],
+) -> torch.Tensor:
+    extend_len = len(input_ids)
+    replay_batch = _build_private_extend_batch(
+        batch,
+        reqs=[req],
+        input_ids=input_ids,
+        out_cache_locs=None,
+        prefix_lens=[0],
+        extend_lens=[extend_len],
+        final_seq_lens=[extend_len],
+        return_logprob=True,
+        top_logprobs_nums=[0],
+        token_ids_logprobs=[None],
+        extend_logprob_start_lens=[0],
+        extend_input_logprob_token_ids=input_ids[1:] + [0],
+        multimodal_inputs=[None],
+        is_prefill_only=True,
+        with_sampling_info=True,
+    )
+    replay_linear_state_ctx = _subset_linear_state_ctx(linear_state_ctx, [req_i])
+    with _temporary_final_replay_cache_mapping(
+        replay_batch,
+        extend_len,
+    ) as temp_cache_locs:
+        device = replay_batch.seq_lens.device
+        replay_batch.out_cache_loc = temp_cache_locs.to(
+            device=device, dtype=torch.long
+        )
+        replay_batch.mamba_clear_indices = replay_linear_state_ctx.live_indices
+
+        with (
+            envs.SGLANG_EAGER_INPUT_NO_COPY.override(True),
+            _linear_state_replay_context(
+                replay_linear_state_ctx,
+                clear_state_input_window=True,
+                restore_live_state=True,
+            ),
+        ):
+            replay_linear_state_ctx.state_adapter.zero_recurrent_state(
+                state_cache=replay_linear_state_ctx.state_cache,
+                indices=replay_linear_state_ctx.live_indices,
+            )
+            score_output = target_worker.forward_batch_generation(
+                batch=replay_batch,
+            )
+            input_token_logprobs = score_output.logits_output.input_token_logprobs
+            if input_token_logprobs is not None:
+                input_token_logprobs = input_token_logprobs.detach().cpu()
+        if input_token_logprobs is None:
+            raise RuntimeError("DVR final logprob replay did not return logprobs.")
+        return input_token_logprobs
+
+
+def _subset_linear_state_ctx(linear_state_ctx: Any, req_indices: list[int]) -> Any:
+    index = torch.tensor(
+        req_indices, dtype=torch.long, device=linear_state_ctx.live_indices.device
+    )
+    boundary_indices = getattr(linear_state_ctx, "boundary_indices", None)
+    if boundary_indices is not None:
+        boundary_indices = boundary_indices[index]
+    return replace(
+        linear_state_ctx,
+        state_input_indices=linear_state_ctx.state_input_indices[index],
+        live_indices=linear_state_ctx.live_indices[index],
+        boundary_indices=boundary_indices,
+    )
+
+
+@contextmanager
+def _temporary_final_replay_cache_mapping(
+    batch: ScheduleBatch,
+    extend_len: int,
+):
+    temp_cache_locs = _alloc_final_replay_cache_locs(batch, extend_len)
+    write_rows, write_offsets = _final_replay_req_to_token_indices(batch, extend_len)
+    saved_locs = batch.req_to_token_pool.req_to_token[
+        write_rows, write_offsets
+    ].clone()
+    try:
+        batch.req_to_token_pool.write(
+            (write_rows, write_offsets), temp_cache_locs.to(torch.int32)
+        )
+        yield temp_cache_locs
+    finally:
+        batch.req_to_token_pool.write((write_rows, write_offsets), saved_locs)
+        batch.token_to_kv_pool_allocator.free(temp_cache_locs)
+
+
+def _alloc_final_replay_cache_locs(
+    batch: ScheduleBatch,
+    extend_len: int,
+) -> torch.Tensor:
+    page_size = getattr(batch.tree_cache, "page_size", 1)
+    if page_size == 1:
+        return alloc_token_slots(batch.tree_cache, extend_len)
+
+    device = batch.seq_lens.device
+    prefix_lens_cpu = torch.zeros(1, dtype=torch.int64)
+    seq_lens_cpu = torch.tensor([extend_len], dtype=torch.int64)
+    prefix_lens = prefix_lens_cpu.to(device=device, non_blocking=True)
+    seq_lens = seq_lens_cpu.to(device=device, non_blocking=True)
+    last_loc = torch.full(
+        (1,),
+        -1,
+        dtype=torch.long,
+        device=device,
+    )
+    return alloc_paged_token_slots_extend(
+        tree_cache=batch.tree_cache,
+        prefix_lens=prefix_lens,
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        last_loc=last_loc,
+        extend_num_tokens=extend_len,
+    )
+
+
+def _final_replay_req_to_token_indices(
+    batch: ScheduleBatch,
+    extend_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = batch.seq_lens.device
+    req = batch.reqs[0]
+    rows = torch.full(
+        (int(extend_len),),
+        int(req.req_pool_idx),
+        dtype=torch.long,
+        device=device,
+    )
+    offsets = torch.arange(int(extend_len), dtype=torch.long, device=device)
+    return rows, offsets
 
 
 def _final_output_len_if_repair_needed(

@@ -1154,7 +1154,9 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                 )
             accept_lens_cpu, final_logprob_repairs = score_dvr_verify_outputs(
                 batch=batch,
+                target_worker=self.target_worker,
                 replay_prefix=self.dvr_output_replay_prefix,
+                linear_state_ctx=linear_state_ctx,
                 output_tokens=predict,
                 accept_lens=accept_lens,
                 token_logprobs=logits_output.next_token_logprobs,
