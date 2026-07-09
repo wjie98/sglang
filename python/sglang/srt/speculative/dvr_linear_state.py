@@ -485,11 +485,6 @@ class DVRLinearStateLifecycle:
         )
 
     @staticmethod
-    def reserve_boundary_checkpoint(*, req) -> Tuple[int, torch.Tensor]:
-        track_idx = req.mamba_next_track_idx
-        return track_idx, req.mamba_ping_pong_track_buffer[track_idx]
-
-    @staticmethod
     def copy_state_indices(
         *, batch: ScheduleBatch, src_indices: torch.Tensor, dst_indices: torch.Tensor
     ):
@@ -560,7 +555,8 @@ class DVRLinearStateLifecycle:
             # slot after every accepted chunk, so copy-on-write the prefill
             # checkpoint into the request's next writable ping-pong slot before
             # registering it as the DVR boundary.
-            boundary_track_idx, dst = self.reserve_boundary_checkpoint(req=req)
+            boundary_track_idx = req.mamba_next_track_idx
+            dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
             src = req.mamba_ping_pong_track_buffer[checkpoint_track_idx]
             self.copy_state_indices(
                 batch=batch,
@@ -574,7 +570,8 @@ class DVRLinearStateLifecycle:
                 boundary_seqlen,
             )
             return None, None
-        boundary_track_idx, dst = self.reserve_boundary_checkpoint(req=req)
+        boundary_track_idx = req.mamba_next_track_idx
+        dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
         if boundary_seqlen == 0:
             self.set_boundary_checkpoint(
                 batch, req, boundary_track_idx, boundary_seqlen
