@@ -30,13 +30,15 @@ from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
     DVRVerifyInput,
     build_dvr_spec_result_aux,
-    compact_dvr_output_rows,
 )
-from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
+from sglang.srt.speculative.dvr_linear_state import (
+    DVRLinearStateLifecycle,
+    commit_dvr_verify_linear_state,
+)
 from sglang.srt.speculative.dvr_replay import (
     replay_dvr_accepted_suffix_for_live_state,
     run_dvr_suffix_replay_oracle,
-    score_dvr_final_logprob_repairs,
+    score_dvr_verify_outputs,
     dvr_suffix_replay_context,
 )
 from sglang.srt.speculative.eagle_info import (
@@ -1155,31 +1157,19 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
 
         if has_verify_tokens:
             base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-            _, accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
+            accept_lens_cpu, final_logprob_repairs = score_dvr_verify_outputs(
                 batch=batch,
+                target_worker=self.target_worker,
+                replay_prefix=self.dvr_output_replay_prefix,
+                linear_state_ctx=linear_state_ctx,
                 output_tokens=predict,
                 accept_lens=accept_lens,
                 tokens_per_req=self.num_draft_tokens,
                 base_seq_lens_cpu=base_seq_lens_cpu,
+                error_prefix="DVR spec-v2",
             )
-            self.dvr_output_replay_prefix.append_batch_output_tokens(
-                batch,
-                token_ids_per_req,
-                base_seq_lens_cpu=base_seq_lens_cpu,
-                error_prefix="DVR spec-v2 output prefix",
-            )
-            if batch.return_logprob:
-                final_logprob_repairs = score_dvr_final_logprob_repairs(
-                    batch=batch,
-                    target_worker=self.target_worker,
-                    replay_prefix=self.dvr_output_replay_prefix,
-                    linear_state_ctx=linear_state_ctx,
-                    base_seq_lens_cpu=base_seq_lens_cpu,
-                    accept_lens_cpu=accept_lens_cpu,
-                    compact_output_token_ids_per_req=token_ids_per_req,
-                    error_prefix="DVR spec-v2 final logprob",
-                    allow_preclaimed_final_token=True,
-                )
+        else:
+            accept_lens_cpu = accept_lens.cpu().tolist()
 
         pending_track_indices = None
         pending_track_seqlens = None
@@ -1212,19 +1202,14 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                                 accepted_cache_locs=accepted_cache_locs,
                             )
                         )
-            pending_track_indices, pending_track_seqlens = (
-                self.linear_state.commit_after_verify(
-                    batch=batch,
-                    accepted_token_counts=accept_lens.to(torch.long),
-                    accepted_steps=(accept_lens - 1).to(torch.long),
-                    accepted_token_counts_cpu=accept_lens.cpu().tolist(),
-                    ctx=linear_state_ctx,
-                    seq_lens_cpu=self.linear_state.batch_seq_lens_cpu(batch),
-                    live_state_already_replayed=live_state_already_replayed,
-                    use_fast_self_draft_commit=is_self_dvr,
-                    publish_boundary_checkpoint=False,
-                    return_pending_boundary=True,
-                )
+            pending_track_indices, pending_track_seqlens = commit_dvr_verify_linear_state(
+                linear_state=self.linear_state,
+                batch=batch,
+                linear_state_ctx=linear_state_ctx,
+                accept_lens=accept_lens,
+                accept_lens_cpu=accept_lens_cpu,
+                live_state_already_replayed=live_state_already_replayed,
+                use_fast_self_draft_commit=is_self_dvr,
             )
 
         if has_verify_tokens:

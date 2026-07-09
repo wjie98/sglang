@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
     DVRPendingOutputPrefix,
+    compact_dvr_output_rows,
 )
 from sglang.srt.speculative.dvr_output_policy import (
     defer_dvr_non_streaming_logprob_output,
@@ -891,51 +892,48 @@ def run_dvr_suffix_replay_oracle(
     )
 
 
-def defer_dvr_non_streaming_logprob_output_until_finish(
-    batch: ScheduleBatch,
-    *,
-    base_seq_lens_cpu: Optional[list[int]] = None,
-) -> None:
-    """Hold non-streaming DVR logprob chunks until final repair can overwrite them."""
-
-    for req_i, req in enumerate(batch.reqs):
-        if not (req.return_logprob and not req.stream):
-            continue
-        if base_seq_lens_cpu is not None:
-            max_new_tokens = req.sampling_params.max_new_tokens
-            if max_new_tokens is not None:
-                prompt_len = len(req.origin_input_ids)
-                prefix_output_len = max(
-                    0,
-                    int(base_seq_lens_cpu[req_i]) - prompt_len,
-                )
-                if prefix_output_len >= int(max_new_tokens):
-                    continue
-        defer_dvr_non_streaming_logprob_output(req)
-
-
-def score_dvr_final_logprob_repairs(
+def score_dvr_verify_outputs(
     *,
     batch: ScheduleBatch,
     target_worker: Any,
     replay_prefix: DVRPendingOutputPrefix,
     linear_state_ctx: Any,
+    output_tokens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    tokens_per_req: int,
     base_seq_lens_cpu: list[int],
-    accept_lens_cpu: list[int],
-    compact_output_token_ids_per_req: Optional[list[list[int]]] = None,
     error_prefix: str,
-    allow_preclaimed_final_token: bool = False,
-) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
-    """Defer non-streaming output and score exact final DVR logprob repairs."""
+    allow_preclaimed_final_token: bool = True,
+) -> tuple[list[int], Optional[list[Optional[DVRFinalLogprobRepair]]]]:
+    """Record accepted DVR tokens and repair exact final non-streaming logprobs."""
 
-    if not batch.return_logprob:
-        return None
-    defer_dvr_non_streaming_logprob_output_until_finish(
-        batch,
+    _, accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
+        batch=batch,
+        output_tokens=output_tokens,
+        accept_lens=accept_lens,
+        tokens_per_req=tokens_per_req,
         base_seq_lens_cpu=base_seq_lens_cpu,
     )
+    replay_prefix.append_batch_output_tokens(
+        batch,
+        token_ids_per_req,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        error_prefix=f"{error_prefix} output prefix",
+    )
+    if not batch.return_logprob:
+        return accept_lens_cpu, None
+    for req_i, req in enumerate(batch.reqs):
+        if not (req.return_logprob and not req.stream):
+            continue
+        max_new_tokens = req.sampling_params.max_new_tokens
+        if max_new_tokens is not None:
+            prompt_len = len(req.origin_input_ids)
+            prefix_output_len = max(0, int(base_seq_lens_cpu[req_i]) - prompt_len)
+            if prefix_output_len >= int(max_new_tokens):
+                continue
+        defer_dvr_non_streaming_logprob_output(req)
     if batch.forward_mode.is_idle() or linear_state_ctx is None:
-        return None
+        return accept_lens_cpu, None
 
     repairs: list[Optional[DVRFinalLogprobRepair]] = [
         None for _ in range(len(batch.reqs))
@@ -951,7 +949,7 @@ def score_dvr_final_logprob_repairs(
             seq_len=int(seq_len),
             accept_len=int(accept_len),
             observed_output_len=observed_output_len,
-            compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+            compact_output_token_ids_per_req=token_ids_per_req,
             allow_preclaimed_final_token=allow_preclaimed_final_token,
         )
         if final_output_len is None:
@@ -965,8 +963,8 @@ def score_dvr_final_logprob_repairs(
             replay_prefix=replay_prefix,
             base_seq_len=int(seq_len),
             replay_seq_len=replay_seq_len,
-            compact_output_token_ids_per_req=compact_output_token_ids_per_req,
-            error_prefix=error_prefix,
+            compact_output_token_ids_per_req=token_ids_per_req,
+            error_prefix=f"{error_prefix} final logprob",
         )
         if not try_claim_dvr_final_logprob_repair(req):
             continue
@@ -995,7 +993,7 @@ def score_dvr_final_logprob_repairs(
             .tolist(),
         )
         has_repair = True
-    return repairs if has_repair else None
+    return accept_lens_cpu, repairs if has_repair else None
 
 
 def _final_output_len_if_repair_needed(

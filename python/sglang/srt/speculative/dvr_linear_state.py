@@ -849,3 +849,31 @@ class DVRLinearStateLifecycle:
         self.restore_boundary_backup_for_mask(ctx, tracked & ~crosses)
         boundary_already_tracked = tracked & crosses
         return boundary_already_tracked if boundary_already_tracked.any() else None
+
+
+def commit_dvr_verify_linear_state(
+    *,
+    linear_state: DVRLinearStateLifecycle,
+    batch: ScheduleBatch,
+    linear_state_ctx: Optional[DVRLinearStateContext],
+    accept_lens: torch.Tensor,
+    accept_lens_cpu: list[int],
+    live_state_already_replayed: Optional[torch.Tensor] = None,
+    use_fast_self_draft_commit: bool = False,
+):
+    """Commit DVR target-verify state and return pending boundary checkpoints."""
+
+    if linear_state_ctx is None:
+        return None, None
+    return linear_state.commit_after_verify(
+        batch=batch,
+        accepted_token_counts=accept_lens.to(torch.long),
+        accepted_steps=(accept_lens - 1).to(torch.long),
+        accepted_token_counts_cpu=accept_lens_cpu,
+        ctx=linear_state_ctx,
+        seq_lens_cpu=linear_state.batch_seq_lens_cpu(batch),
+        live_state_already_replayed=live_state_already_replayed,
+        use_fast_self_draft_commit=use_fast_self_draft_commit,
+        publish_boundary_checkpoint=False,
+        return_pending_boundary=True,
+    )
