@@ -20,6 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.dvr_info import (
+    DVRAcceptedOutputRows,
     DVREagleVerifyInput,
     DVRPendingOutputPrefix,
     build_dvr_spec_result_aux,
@@ -48,22 +49,6 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
-
-
-def _compact_output_token_rows(output_tokens, output_lens):
-    """Return per-request output token rows without padded verify tail tokens."""
-
-    if output_tokens is None:
-        return None
-
-    output_lens_cpu = output_lens.detach().cpu().tolist()
-    output_tokens_cpu = output_tokens.detach().cpu().tolist()
-    return [
-        [int(token_id) for token_id in token_row[: int(output_len)]]
-        for token_row, output_len in zip(
-            output_tokens_cpu, output_lens_cpu, strict=True
-        )
-    ]
 
 
 @contextmanager
@@ -597,33 +582,31 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             accept_tokens = None
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
-        compact_output_token_ids_per_req = _compact_output_token_rows(
-            (
-                None
-                if batch.forward_mode.is_idle()
-                else predict.reshape(bs, verify_input.draft_token_num)
-            ),
-            accept_lens,
-        )
-        if compact_output_token_ids_per_req is not None:
-            self.dvr_output_prefix.append_batch_output_tokens(
-                batch,
-                compact_output_token_ids_per_req,
+        output_rows = None
+        if not batch.forward_mode.is_idle():
+            output_rows = DVRAcceptedOutputRows.from_flat_tokens(
+                batch=batch,
+                output_tokens=predict,
+                accept_lens=accept_lens,
+                tokens_per_req=verify_input.draft_token_num,
                 base_seq_lens_cpu=base_seq_lens_cpu,
+            )
+            output_rows.append_to_prefix(
+                self.dvr_output_prefix,
+                batch,
                 error_prefix="DVR EAGLE output prefix",
             )
 
         final_logprob_repairs = None
-        if batch.return_logprob and not batch.forward_mode.is_idle():
-            assert compact_output_token_ids_per_req is not None
+        if batch.return_logprob and output_rows is not None:
             final_logprob_repairs = score_dvr_final_logprob_repairs(
                 batch=batch,
                 target_worker=self.target_worker,
                 replay_prefix=self.dvr_output_prefix,
                 linear_state_ctx=linear_state_ctx,
                 base_seq_lens_cpu=base_seq_lens_cpu,
-                accept_lens_cpu=accept_lens.detach().cpu().tolist(),
-                compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+                accept_lens_cpu=output_rows.accept_lens_cpu,
+                compact_output_token_ids_per_req=output_rows.token_ids_per_req,
                 error_prefix="DVR EAGLE final logprob",
                 allow_preclaimed_final_token=True,
             )
@@ -632,7 +615,11 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         pending_track_seqlens = None
         live_state_already_replayed = None
         if linear_state_ctx is not None:
-            accept_lens_cpu = accept_lens.detach().cpu().tolist()
+            accept_lens_cpu = (
+                output_rows.accept_lens_cpu
+                if output_rows is not None
+                else accept_lens.detach().cpu().tolist()
+            )
             if torch.any(accept_lens < verify_input.draft_token_num).item():
                 accepted_ids, accepted_cache_locs = (
                     self._compact_accepted_tokens_and_cache_locs(

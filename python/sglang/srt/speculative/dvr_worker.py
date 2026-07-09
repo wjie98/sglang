@@ -25,6 +25,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.dvr_info import (
+    DVRAcceptedOutputRows,
     DVRPendingOutputPrefix,
     DVRSelfDraftVerifyInput,
     DVRVerifyOutput,
@@ -1186,36 +1187,13 @@ class DecodeVerifyRollbackWorker:
             return [int(x) for x in batch.seq_lens_cpu.tolist()]
         return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
-    @staticmethod
-    def _compact_flat_tokens_by_accept_lens(
-        flat_tokens: torch.Tensor,
-        accept_lens_cpu: list[int],
-        *,
-        tokens_per_req: Optional[int] = None,
-    ) -> list[list[int]]:
-        token_ids = flat_tokens.detach().cpu().tolist()
-        compact_tokens = []
-        if tokens_per_req is None:
-            offset = 0
-            for accept_len in accept_lens_cpu:
-                next_offset = offset + int(accept_len)
-                compact_tokens.append([int(x) for x in token_ids[offset:next_offset]])
-                offset = next_offset
-        else:
-            for req_i, accept_len in enumerate(accept_lens_cpu):
-                start = req_i * tokens_per_req
-                end = start + int(accept_len)
-                compact_tokens.append([int(x) for x in token_ids[start:end]])
-        return compact_tokens
-
     def _repair_final_logprobs_for_spec_v1(
         self,
         *,
         batch: ScheduleBatch,
         linear_state_ctx,
         base_seq_lens_cpu: list[int],
-        accept_lens_cpu: list[int],
-        compact_output_token_ids_per_req: list[list[int]],
+        output_rows: DVRAcceptedOutputRows,
     ) -> None:
         """Repair final non-streaming DVR output logprobs with a prefill oracle."""
 
@@ -1231,8 +1209,8 @@ class DecodeVerifyRollbackWorker:
             replay_prefix=DVRPendingOutputPrefix(),
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
-            accept_lens_cpu=accept_lens_cpu,
-            compact_output_token_ids_per_req=compact_output_token_ids_per_req,
+            accept_lens_cpu=output_rows.accept_lens_cpu,
+            compact_output_token_ids_per_req=output_rows.token_ids_per_req,
             error_prefix="DVR spec-v1 final logprob",
         )
         apply_dvr_final_logprob_repairs(batch, repairs)
@@ -1303,17 +1281,17 @@ class DecodeVerifyRollbackWorker:
             _add_output_logprobs_for_dvr_spec_v1(
                 batch, verify_output, logits_output
             )
+            output_rows = DVRAcceptedOutputRows.from_flat_tokens(
+                batch=batch,
+                output_tokens=verify_output.accept_tokens,
+                accept_lens=accept_lens_cpu,
+                base_seq_lens_cpu=base_seq_lens_cpu,
+            )
             self._repair_final_logprobs_for_spec_v1(
                 batch=batch,
                 linear_state_ctx=linear_state_ctx,
                 base_seq_lens_cpu=base_seq_lens_cpu,
-                accept_lens_cpu=accept_lens_cpu,
-                compact_output_token_ids_per_req=(
-                    self._compact_flat_tokens_by_accept_lens(
-                        verify_output.accept_tokens,
-                        accept_lens_cpu,
-                    )
-                ),
+                output_rows=output_rows,
             )
         if linear_state_ctx is not None:
             accepted_token_counts = torch.tensor(

@@ -19,6 +19,7 @@ from sglang.srt.speculative.dvr_replay import (
     _try_live_cache_locs_for_final_replay,
 )
 from sglang.srt.speculative.dvr_info import (
+    DVRAcceptedOutputRows,
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
@@ -29,10 +30,7 @@ from sglang.srt.speculative.dvr_scheduler import (
     apply_spec_final_logprob_repairs_from_result,
     maybe_filter_running_batch_with_spec_state,
 )
-from sglang.srt.speculative.dvr_eagle_worker import (
-    DecodeVerifyRollbackEagleWorkerV2,
-    _compact_output_token_rows,
-)
+from sglang.srt.speculative.dvr_eagle_worker import DecodeVerifyRollbackEagleWorkerV2
 from sglang.srt.managers.scheduler_components.output_policy import (
     allow_req_non_streaming_logprob_output,
     defer_req_non_streaming_logprob_output,
@@ -592,17 +590,13 @@ def test_dvr_eagle_compacts_accepted_output_rows():
     )
     accept_lens = torch.tensor([2, 3], dtype=torch.int32)
 
-    assert _compact_output_token_rows(
-        accept_tokens,
-        accept_lens,
-    ) == [[10, 11], [20, 21, 22]]
-    assert (
-        _compact_output_token_rows(
-            None,
-            accept_lens,
-        )
-        is None
+    output_rows = DVRAcceptedOutputRows.from_flat_tokens(
+        batch=SimpleNamespace(seq_lens=None),
+        output_tokens=accept_tokens,
+        accept_lens=accept_lens,
+        tokens_per_req=4,
     )
+    assert output_rows.token_ids_per_req == [[10, 11], [20, 21, 22]]
 
 
 def test_dvr_eagle_replay_tokens_follow_spec_v2_output_order():
