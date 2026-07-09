@@ -135,6 +135,72 @@ def _append_position_rows_and_offsets(
     return torch.cat(rows), torch.cat(offsets)
 
 
+def _build_suffix_replay_plan(
+    *,
+    batch,
+    base_seq_lens_cpu: list[int],
+    boundary_lens: list[int],
+    append_tokens_cpu_by_req: list[list[int]],
+    append_cache_locs_by_req: list[torch.Tensor],
+    append_cache_locs: torch.Tensor,
+    append_token_counts_cpu: list[int],
+    request_token_ids_for_replay,
+    hidden_gather_append_count: Optional[int] = None,
+) -> Optional[_DVRSuffixReplayPlan]:
+    tail_lens_cpu, extend_lens_cpu, final_seq_lens_cpu = _suffix_replay_lengths(
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        append_token_counts_cpu=append_token_counts_cpu,
+    )
+    input_ids, out_cache_locs = _suffix_replay_inputs(
+        batch=batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        tail_lens_cpu=tail_lens_cpu,
+        append_tokens_cpu_by_req=append_tokens_cpu_by_req,
+        append_cache_locs_by_req=append_cache_locs_by_req,
+        request_token_ids_for_replay=request_token_ids_for_replay,
+    )
+    if not input_ids:
+        return None
+
+    append_rows, append_offsets = _append_position_rows_and_offsets(
+        batch=batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        append_token_counts_cpu=append_token_counts_cpu,
+    )
+    hidden_gather_indices = None
+    if hidden_gather_append_count is not None:
+        gather_indices = []
+        offset = 0
+        for tail_len, extend_len in zip(tail_lens_cpu, extend_lens_cpu, strict=True):
+            gather_indices.extend(
+                range(
+                    offset + int(tail_len),
+                    offset + int(tail_len) + hidden_gather_append_count,
+                )
+            )
+            offset += int(extend_len)
+        hidden_gather_indices = torch.tensor(
+            gather_indices, dtype=torch.long, device=batch.seq_lens.device
+        )
+
+    return _DVRSuffixReplayPlan(
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        boundary_lens=boundary_lens,
+        tail_lens_cpu=tail_lens_cpu,
+        extend_lens_cpu=extend_lens_cpu,
+        final_seq_lens_cpu=final_seq_lens_cpu,
+        append_token_counts_cpu=append_token_counts_cpu,
+        input_ids=input_ids,
+        out_cache_locs=out_cache_locs,
+        append_cache_locs=append_cache_locs.to(torch.long).reshape(-1),
+        append_rows=append_rows,
+        append_offsets=append_offsets,
+        hidden_gather_indices=hidden_gather_indices,
+    )
+
+
 @contextmanager
 def _linear_state_replay_context(
     linear_state_ctx,
@@ -219,56 +285,17 @@ def _build_suffix_draft_replay_plan(
     draft_token_num = draft_tokens.numel() // max(bs, 1)
     draft_tokens = draft_tokens.reshape(bs, draft_token_num)
     draft_cache_locs = draft_cache_locs.reshape(bs, draft_token_num)
-    draft_tokens_cpu = draft_tokens.detach().cpu().tolist()
-    tail_lens_cpu, extend_lens_cpu, final_seq_lens_cpu = _suffix_replay_lengths(
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        append_token_counts_cpu=[draft_token_num] * bs,
-    )
-    input_ids, out_cache_locs = _suffix_replay_inputs(
-        batch=batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        tail_lens_cpu=tail_lens_cpu,
-        append_tokens_cpu_by_req=draft_tokens_cpu,
-        append_cache_locs_by_req=[draft_cache_locs[i] for i in range(bs)],
-        request_token_ids_for_replay=request_token_ids_for_replay,
-    )
-
-    if not input_ids:
-        return None
-
     append_token_counts_cpu = [draft_token_num] * bs
-    append_rows, append_offsets = _append_position_rows_and_offsets(
+    return _build_suffix_replay_plan(
         batch=batch,
         base_seq_lens_cpu=base_seq_lens_cpu,
-        append_token_counts_cpu=append_token_counts_cpu,
-    )
-
-    gather_indices = []
-    offset = 0
-    for tail_len, extend_len in zip(tail_lens_cpu, extend_lens_cpu, strict=True):
-        gather_indices.extend(
-            range(offset + int(tail_len), offset + int(tail_len) + draft_token_num)
-        )
-        offset += int(extend_len)
-    hidden_gather_indices = torch.tensor(
-        gather_indices, dtype=torch.long, device=batch.seq_lens.device
-    )
-
-    return _DVRSuffixReplayPlan(
-        base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
-        tail_lens_cpu=tail_lens_cpu,
-        extend_lens_cpu=extend_lens_cpu,
-        final_seq_lens_cpu=final_seq_lens_cpu,
+        append_tokens_cpu_by_req=draft_tokens.detach().cpu().tolist(),
+        append_cache_locs_by_req=[draft_cache_locs[i] for i in range(bs)],
+        append_cache_locs=draft_cache_locs,
         append_token_counts_cpu=append_token_counts_cpu,
-        input_ids=input_ids,
-        out_cache_locs=out_cache_locs,
-        append_cache_locs=draft_cache_locs.reshape(-1),
-        append_rows=append_rows,
-        append_offsets=append_offsets,
-        hidden_gather_indices=hidden_gather_indices,
+        request_token_ids_for_replay=request_token_ids_for_replay,
+        hidden_gather_append_count=draft_token_num,
     )
 
 
@@ -392,12 +419,6 @@ def _build_accepted_suffix_replay_plan(
         return None
 
     accepted_cache_locs = accepted_cache_locs.to(torch.long)
-    tail_lens_cpu, extend_lens_cpu, final_seq_lens_cpu = _suffix_replay_lengths(
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        append_token_counts_cpu=accepted_token_counts_cpu,
-    )
-
     accepted_tokens_cpu = accepted_tokens.detach().cpu().tolist()
     accepted_tokens_by_req = []
     accepted_cache_locs_by_req = []
@@ -418,36 +439,15 @@ def _build_accepted_suffix_replay_plan(
         )
         token_offset += accepted_count
 
-    input_ids, out_cache_locs = _suffix_replay_inputs(
+    return _build_suffix_replay_plan(
         batch=batch,
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
-        tail_lens_cpu=tail_lens_cpu,
         append_tokens_cpu_by_req=accepted_tokens_by_req,
         append_cache_locs_by_req=accepted_cache_locs_by_req,
-        request_token_ids_for_replay=request_token_ids_for_replay,
-    )
-
-    if not input_ids:
-        return None
-
-    append_rows, append_offsets = _append_position_rows_and_offsets(
-        batch=batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        append_token_counts_cpu=accepted_token_counts_cpu,
-    )
-    return _DVRSuffixReplayPlan(
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        tail_lens_cpu=tail_lens_cpu,
-        extend_lens_cpu=extend_lens_cpu,
-        final_seq_lens_cpu=final_seq_lens_cpu,
-        append_token_counts_cpu=accepted_token_counts_cpu,
-        input_ids=input_ids,
-        out_cache_locs=out_cache_locs,
         append_cache_locs=accepted_cache_locs,
-        append_rows=append_rows,
-        append_offsets=append_offsets,
+        append_token_counts_cpu=accepted_token_counts_cpu,
+        request_token_ids_for_replay=request_token_ids_for_replay,
     )
 
 
