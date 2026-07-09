@@ -38,6 +38,7 @@ class _DVRSuffixReplayPlan:
     tail_lens_cpu: list[int]
     extend_lens_cpu: list[int]
     final_seq_lens_cpu: list[int]
+    append_token_counts_cpu: list[int]
     input_ids: list[int]
     out_cache_locs: list[torch.Tensor]
     append_cache_locs: torch.Tensor
@@ -102,6 +103,36 @@ def _suffix_replay_inputs(
         if len(append_tokens) > 0:
             out_cache_locs.append(append_cache_locs.to(torch.long))
     return input_ids, out_cache_locs
+
+
+def _append_position_rows_and_offsets(
+    *,
+    batch,
+    base_seq_lens_cpu: list[int],
+    append_token_counts_cpu: list[int],
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    rows = []
+    offsets = []
+    for req_i, (seq_len, append_count) in enumerate(
+        zip(base_seq_lens_cpu, append_token_counts_cpu, strict=True)
+    ):
+        append_count = int(append_count)
+        if append_count <= 0:
+            continue
+        rows.append(
+            batch.req_pool_indices[req_i].to(dtype=torch.long).repeat(append_count)
+        )
+        offsets.append(
+            torch.arange(
+                int(seq_len),
+                int(seq_len) + append_count,
+                dtype=torch.long,
+                device=batch.seq_lens.device,
+            )
+        )
+    if not rows:
+        return None, None
+    return torch.cat(rows), torch.cat(offsets)
 
 
 @contextmanager
@@ -207,11 +238,11 @@ def _build_suffix_draft_replay_plan(
     if not input_ids:
         return None
 
-    draft_offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
-        draft_token_num, dtype=torch.long, device=batch.seq_lens.device
-    ).unsqueeze(0)
-    draft_rows = batch.req_pool_indices.to(torch.long).unsqueeze(1).expand_as(
-        draft_offsets
+    append_token_counts_cpu = [draft_token_num] * bs
+    append_rows, append_offsets = _append_position_rows_and_offsets(
+        batch=batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        append_token_counts_cpu=append_token_counts_cpu,
     )
 
     gather_indices = []
@@ -231,11 +262,12 @@ def _build_suffix_draft_replay_plan(
         tail_lens_cpu=tail_lens_cpu,
         extend_lens_cpu=extend_lens_cpu,
         final_seq_lens_cpu=final_seq_lens_cpu,
+        append_token_counts_cpu=append_token_counts_cpu,
         input_ids=input_ids,
         out_cache_locs=out_cache_locs,
-        append_cache_locs=draft_cache_locs,
-        append_rows=draft_rows,
-        append_offsets=draft_offsets,
+        append_cache_locs=draft_cache_locs.reshape(-1),
+        append_rows=append_rows,
+        append_offsets=append_offsets,
         hidden_gather_indices=hidden_gather_indices,
     )
 
@@ -246,7 +278,7 @@ def _build_suffix_draft_mrope_positions(
 ) -> torch.Tensor:
     """Build flattened mrope positions matching suffix tail+draft input order."""
 
-    draft_token_num = int(replay_plan.append_cache_locs.shape[1])
+    draft_token_num = int(replay_plan.append_token_counts_cpu[0])
     device = replay_batch.seq_lens.device
     mrope_chunks = []
     mm_inputs = replay_batch.multimodal_inputs
@@ -369,8 +401,6 @@ def _build_accepted_suffix_replay_plan(
     accepted_tokens_cpu = accepted_tokens.detach().cpu().tolist()
     accepted_tokens_by_req = []
     accepted_cache_locs_by_req = []
-    accepted_rows = []
-    accepted_offsets = []
     token_offset = 0
     for req_i, (seq_len, accepted_count) in enumerate(
         zip(
@@ -386,20 +416,6 @@ def _build_accepted_suffix_replay_plan(
         accepted_cache_locs_by_req.append(
             accepted_cache_locs[token_offset : token_offset + accepted_count]
         )
-        if accepted_count > 0:
-            accepted_rows.append(
-                batch.req_pool_indices[req_i].to(dtype=torch.long).repeat(
-                    accepted_count
-                )
-            )
-            accepted_offsets.append(
-                torch.arange(
-                    int(seq_len),
-                    int(seq_len) + accepted_count,
-                    dtype=torch.long,
-                    device=batch.seq_lens.device,
-                )
-            )
         token_offset += accepted_count
 
     input_ids, out_cache_locs = _suffix_replay_inputs(
@@ -415,17 +431,23 @@ def _build_accepted_suffix_replay_plan(
     if not input_ids:
         return None
 
+    append_rows, append_offsets = _append_position_rows_and_offsets(
+        batch=batch,
+        base_seq_lens_cpu=base_seq_lens_cpu,
+        append_token_counts_cpu=accepted_token_counts_cpu,
+    )
     return _DVRSuffixReplayPlan(
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
         tail_lens_cpu=tail_lens_cpu,
         extend_lens_cpu=extend_lens_cpu,
         final_seq_lens_cpu=final_seq_lens_cpu,
+        append_token_counts_cpu=accepted_token_counts_cpu,
         input_ids=input_ids,
         out_cache_locs=out_cache_locs,
         append_cache_locs=accepted_cache_locs,
-        append_rows=torch.cat(accepted_rows) if accepted_rows else None,
-        append_offsets=torch.cat(accepted_offsets) if accepted_offsets else None,
+        append_rows=append_rows,
+        append_offsets=append_offsets,
     )
 
 
@@ -684,12 +706,15 @@ def dvr_suffix_replay_context(
     # checkpoint is actually accepted.
     boundary_track_mask = None
     if track_replay_boundary_checkpoint and not full_prefix_replay:
-        append_count = int(replay_plan.append_cache_locs.shape[1])
         chunk_size = int(linear_state.server_args.mamba_track_interval)
         boundary_track_mask = torch.tensor(
             [
-                int(tail_len) + append_count >= chunk_size
-                for tail_len in replay_plan.tail_lens_cpu
+                int(tail_len) + int(append_count) >= chunk_size
+                for tail_len, append_count in zip(
+                    replay_plan.tail_lens_cpu,
+                    replay_plan.append_token_counts_cpu,
+                    strict=True,
+                )
             ],
             dtype=torch.bool,
             device=batch.seq_lens.device,
