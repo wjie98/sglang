@@ -17,31 +17,6 @@ from sglang.srt.layers.attention.linear.dvr_state import (
 )
 
 
-def write_dvr_chunk_boundary_state(
-    *,
-    h: Optional[torch.Tensor],
-    intermediate_state_cache: torch.Tensor,
-    intermediate_state_indices: torch.Tensor,
-    batch_size: int,
-):
-    """Copy the first chunk-boundary state exported by chunkwise scan.
-
-    DVR verifies a fixed physical window of `CHUNK_SIZE + draft_tokens`. Only
-    the state at the first `CHUNK_SIZE` boundary can become the next deterministic
-    prefill-equivalent checkpoint. FLA/GDN exports `h[:, 0]` as the initial state
-    and `h[:, 1]` as the first complete chunk boundary for the fixed
-    `CHUNK_SIZE + draft_tokens` verify window.
-    """
-
-    if h is None or h.shape[1] <= 1:
-        return
-
-    intermediate_state_cache[
-        intermediate_state_indices[:batch_size].to(torch.long),
-        0,
-    ] = h[:batch_size, 1].to(intermediate_state_cache.dtype)
-
-
 def write_dvr_conv_windows(
     *,
     intermediate_conv_window_cache: torch.Tensor,
@@ -76,40 +51,6 @@ def write_dvr_conv_windows(
         device=intermediate_state_indices.device,
     ).unsqueeze(0)
     intermediate_conv_window_cache[rows, cols] = conv_windows
-
-
-def select_dvr_draft_suffix(
-    core_attn_out: torch.Tensor,
-    *,
-    tail_lens: torch.Tensor,
-    batch_size: int,
-    verify_window_size: int,
-    draft_token_num: int,
-) -> torch.Tensor:
-    """Select the newly drafted suffix from a physical chunk+draft output.
-
-    The chunkwise scan computes outputs for the whole physical window. The
-    verifier should only consume logits for the draft tokens, whose columns are
-    offset by the already-verified tail length of each request.
-    """
-
-    value_shape = core_attn_out.shape[-2:]
-    core_attn_out = core_attn_out.view(
-        batch_size, verify_window_size, *value_shape
-    )
-    rows = (
-        torch.arange(batch_size, dtype=torch.long, device=core_attn_out.device)
-        .unsqueeze(1)
-        .expand(-1, draft_token_num)
-    )
-    cols = (
-        torch.arange(draft_token_num, dtype=torch.long, device=core_attn_out.device)
-        .unsqueeze(0)
-        .add(tail_lens.unsqueeze(1))
-    )
-    return core_attn_out[rows, cols].reshape(
-        1, batch_size * draft_token_num, *value_shape
-    ).contiguous()
 
 
 def run_dvr_chunkwise_verify(
@@ -164,19 +105,33 @@ def run_dvr_chunkwise_verify(
         # preparation, which can synchronize CPU/GPU and is not graph-safe.
         query_start_loc=None,
     )
-    write_dvr_chunk_boundary_state(
-        h=h,
-        intermediate_state_cache=intermediate_state_cache,
-        intermediate_state_indices=intermediate_state_indices,
-        batch_size=batch_size,
+    if h is not None and h.shape[1] > 1:
+        # FLA/GDN exports h[:, 0] as the initial state and h[:, 1] as the first
+        # complete chunk boundary for the fixed chunk+draft verify window.
+        intermediate_state_cache[
+            intermediate_state_indices[:batch_size].to(torch.long),
+            0,
+        ] = h[:batch_size, 1].to(intermediate_state_cache.dtype)
+
+    # The chunkwise scan computes the full physical window; target verify only
+    # consumes the draft-token suffix offset by each request's verified tail.
+    value_shape = core_attn_out.shape[-2:]
+    core_attn_out = core_attn_out.view(
+        batch_size, verify_window_size, *value_shape
     )
-    return select_dvr_draft_suffix(
-        core_attn_out,
-        tail_lens=tail_lens,
-        batch_size=batch_size,
-        verify_window_size=verify_window_size,
-        draft_token_num=draft_token_num,
+    rows = (
+        torch.arange(batch_size, dtype=torch.long, device=core_attn_out.device)
+        .unsqueeze(1)
+        .expand(-1, draft_token_num)
     )
+    cols = (
+        torch.arange(draft_token_num, dtype=torch.long, device=core_attn_out.device)
+        .unsqueeze(0)
+        .add(tail_lens.unsqueeze(1))
+    )
+    return core_attn_out[rows, cols].reshape(
+        1, batch_size * draft_token_num, *value_shape
+    ).contiguous()
 
 
 def rebuild_dvr_live_state_grouped(
