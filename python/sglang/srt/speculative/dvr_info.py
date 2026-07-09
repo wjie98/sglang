@@ -33,21 +33,53 @@ class DVRFinalLogprobRepair:
 
 
 @dataclass
-class DVRSpecResultAux:
-    """Worker-to-scheduler DVR metadata carried by GenerationBatchResult."""
+class DVRDeferredOutput:
+    """Client-visible output work that must wait for scheduler materialization."""
 
-    pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
     final_logprob_repairs: Optional[
         list[Optional[DVRFinalLogprobRepair]]
     ] = None
+    final_logprob_repair_claimed: bool = False
 
 
-def build_dvr_spec_result_aux(
+@dataclass(init=False)
+class DVRDeferredActions:
+    """DVR postprocess work carried by GenerationBatchResult.dvr_aux."""
+
+    pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
+    output: Optional[DVRDeferredOutput] = None
+
+    def __init__(
+        self,
+        *,
+        pending_mamba_checkpoints: Optional[
+            list[Optional[DVRMambaCheckpoint]]
+        ] = None,
+        output: Optional[DVRDeferredOutput] = None,
+        final_logprob_repairs: Optional[
+            list[Optional[DVRFinalLogprobRepair]]
+        ] = None,
+    ) -> None:
+        self.pending_mamba_checkpoints = pending_mamba_checkpoints
+        self.output = output
+        if self.output is None and final_logprob_repairs is not None:
+            self.output = DVRDeferredOutput(
+                final_logprob_repairs=final_logprob_repairs
+            )
+
+    @property
+    def final_logprob_repairs(
+        self,
+    ) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
+        return None if self.output is None else self.output.final_logprob_repairs
+
+
+def build_dvr_deferred_actions(
     *,
     track_indices: Optional[list[Optional[int]]],
     seqlens: Optional[list[Optional[int]]],
     final_logprob_repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = None,
-) -> Optional[DVRSpecResultAux]:
+) -> Optional[DVRDeferredActions]:
     if track_indices is None and seqlens is None and final_logprob_repairs is None:
         return None
 
@@ -64,10 +96,18 @@ def build_dvr_spec_result_aux(
         )
         for track_idx, seqlen in zip(track_indices, seqlens, strict=True)
     ]
-    return DVRSpecResultAux(
+    return DVRDeferredActions(
         pending_mamba_checkpoints=checkpoints or None,
-        final_logprob_repairs=final_logprob_repairs,
+        output=(
+            DVRDeferredOutput(final_logprob_repairs=final_logprob_repairs)
+            if final_logprob_repairs is not None
+            else None
+        ),
     )
+
+
+DVRSpecResultAux = DVRDeferredActions
+build_dvr_spec_result_aux = build_dvr_deferred_actions
 
 
 class DVRPendingOutputPrefix:
@@ -280,22 +320,26 @@ class DVRPendingOutputPrefix:
 def defer_dvr_non_streaming_logprob_output(req: Any) -> None:
     """Hold DVR non-streaming logprob output until final repair overwrites it."""
 
-    req.dvr_defer_non_streaming_logprob_output = True
+    if getattr(req, "dvr_deferred_output", None) is None:
+        req.dvr_deferred_output = DVRDeferredOutput()
 
 
 def allow_dvr_non_streaming_logprob_output(req: Any) -> None:
     """Release a DVR non-streaming logprob response after final repair."""
 
-    req.dvr_defer_non_streaming_logprob_output = False
+    req.dvr_deferred_output = None
 
 
 def try_claim_dvr_final_logprob_repair(req: Any) -> bool:
     """Claim the request's DVR final logprob repair exactly once."""
 
-    if getattr(req, "dvr_final_logprob_repair_claimed", False):
+    deferred_output = getattr(req, "dvr_deferred_output", None)
+    if deferred_output is None:
+        return False
+    if deferred_output.final_logprob_repair_claimed:
         return False
 
-    req.dvr_final_logprob_repair_claimed = True
+    deferred_output.final_logprob_repair_claimed = True
     return True
 
 
@@ -307,17 +351,12 @@ def should_hold_dvr_non_streaming_logprob_output(
 ) -> bool:
     """Return whether DVR still owns this non-streaming logprob chunk."""
 
-    should_hold = (
-        return_logprob
-        and req.return_logprob
-        and not req.stream
-        and getattr(req, "dvr_defer_non_streaming_logprob_output", False)
-    )
+    deferred_output = getattr(req, "dvr_deferred_output", None)
+    should_hold = return_logprob and req.return_logprob and not req.stream
+    should_hold = should_hold and deferred_output is not None
     if not should_hold:
         return False
-    return not require_final_repair or getattr(
-        req, "dvr_final_logprob_repair_claimed", False
-    )
+    return not require_final_repair or deferred_output.final_logprob_repair_claimed
 
 
 def compact_dvr_output_rows(

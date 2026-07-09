@@ -6,10 +6,10 @@ import torch
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
-from sglang.srt.speculative.dvr_worker import _DVRSelfDraftCore
-from sglang.srt.speculative.dvr_replay import (
+from sglang.srt.speculative.dvr_core import (
     _final_output_len_if_repair_needed,
 )
+from sglang.srt.speculative.dvr_worker import _DVRSelfDraftCore
 from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,

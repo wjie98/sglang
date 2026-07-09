@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.dvr_scheduler import (
-    apply_dvr_final_logprob_repairs_from_result,
+    apply_dvr_deferred_output_from_result,
     maybe_cache_unfinished_prefill_req_with_dvr_state,
     maybe_handle_dvr_mamba_checkpoint_after_decode,
 )
@@ -768,9 +768,9 @@ class SchedulerBatchResultProcessor:
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
-        # DVR final logprob repairs become valid only after accepted tokens are
+        # DVR output repairs become valid only after accepted tokens are
         # materialized into Req.output_ids.
-        apply_dvr_final_logprob_repairs_from_result(batch, result)
+        apply_dvr_deferred_output_from_result(batch, result)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 

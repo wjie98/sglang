@@ -164,8 +164,8 @@ def _dvr_is_finished_by_published_seq_len(*, batch: Any, req_index: int) -> bool
     return seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
 
 
-def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
-    """Apply DVR final-response logprob repairs, if any."""
+def apply_dvr_deferred_output_from_result(batch: Any, result: Any) -> None:
+    """Apply DVR-owned output work after scheduler materializes tokens."""
 
     if not batch.spec_algorithm.is_dvr():
         return
@@ -175,6 +175,9 @@ def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None
         aux, "final_logprob_repairs", None
     )
     apply_dvr_final_logprob_repairs(batch, repairs)
+
+
+apply_dvr_final_logprob_repairs_from_result = apply_dvr_deferred_output_from_result
 
 
 def maybe_cache_unfinished_prefill_req_with_dvr_state(
