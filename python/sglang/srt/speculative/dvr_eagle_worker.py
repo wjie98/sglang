@@ -22,7 +22,6 @@ from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRReplayPrefixTracker,
     build_dvr_spec_result_aux,
-    compact_output_token_rows,
 )
 from sglang.srt.speculative.dvr_logprob_repair import (
     score_deferred_dvr_final_logprob_repairs,
@@ -51,6 +50,22 @@ from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import is_npu, require_gathered_buffer
 
 _is_npu = is_npu()
+
+
+def _compact_output_token_rows(output_tokens, output_lens):
+    """Return per-request output token rows without padded verify tail tokens."""
+
+    if output_tokens is None:
+        return None
+
+    output_lens_cpu = output_lens.detach().cpu().tolist()
+    output_tokens_cpu = output_tokens.detach().cpu().tolist()
+    return [
+        [int(token_id) for token_id in token_row[: int(output_len)]]
+        for token_row, output_len in zip(
+            output_tokens_cpu, output_lens_cpu, strict=True
+        )
+    ]
 
 
 def _uses_draft_extend_selected_logits(*, topk, model, requires_gathered_buffer):
@@ -616,7 +631,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             accept_tokens = None
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
-        compact_output_token_ids_per_req = compact_output_token_rows(
+        compact_output_token_ids_per_req = _compact_output_token_rows(
             accept_tokens,
             accept_lens,
         )

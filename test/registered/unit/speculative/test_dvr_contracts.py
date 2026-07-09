@@ -23,11 +23,11 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRMambaCheckpoint,
     DVRReplayPrefixTracker,
     DVRSpecResultAux,
-    apply_dvr_final_logprob_repairs_from_result,
-    compact_output_token_rows,
-    commit_pending_mamba_checkpoint_from_result,
+    _commit_pending_mamba_checkpoint_from_result,
+    apply_spec_final_logprob_repairs_from_result,
     maybe_filter_running_batch_with_spec_state,
 )
+from sglang.srt.speculative.dvr_eagle_worker import _compact_output_token_rows
 from sglang.srt.managers.scheduler_components.output_policy import (
     allow_req_non_streaming_logprob_output,
     defer_req_non_streaming_logprob_output,
@@ -166,7 +166,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
             ],
         )
     )
-    commit_pending_mamba_checkpoint_from_result(
+    _commit_pending_mamba_checkpoint_from_result(
         req=req,
         batch=batch,
         result=result,
@@ -179,7 +179,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     result.spec_aux.pending_mamba_checkpoints = [
         DVRMambaCheckpoint(track_idx=1, seqlen=128)
     ]
-    commit_pending_mamba_checkpoint_from_result(
+    _commit_pending_mamba_checkpoint_from_result(
         req=req,
         batch=batch,
         result=result,
@@ -192,7 +192,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     result.spec_aux.pending_mamba_checkpoints = [
         DVRMambaCheckpoint(track_idx=2, seqlen=192)
     ]
-    commit_pending_mamba_checkpoint_from_result(
+    _commit_pending_mamba_checkpoint_from_result(
         req=req,
         batch=batch,
         result=result,
@@ -326,7 +326,13 @@ def test_dvr_final_logprob_repair_applies_after_materialization():
         )
     )
 
-    apply_dvr_final_logprob_repairs_from_result(SimpleNamespace(reqs=[req]), result)
+    apply_spec_final_logprob_repairs_from_result(
+        SimpleNamespace(
+            reqs=[req],
+            spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+        ),
+        result,
+    )
 
     assert req.logprob.output_token_logprobs_val == [-0.1, -0.2, -0.3]
     assert req.logprob.output_token_logprobs_idx == [10, 11, 12]
@@ -354,7 +360,13 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
     )
 
     with pytest.raises(RuntimeError, match="materialized output ids"):
-        apply_dvr_final_logprob_repairs_from_result(SimpleNamespace(reqs=[req]), result)
+        apply_spec_final_logprob_repairs_from_result(
+            SimpleNamespace(
+                reqs=[req],
+                spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+            ),
+            result,
+        )
 
 
 def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
@@ -379,7 +391,13 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
     )
 
     with pytest.raises(RuntimeError, match="inconsistent ids/logprobs length"):
-        apply_dvr_final_logprob_repairs_from_result(SimpleNamespace(reqs=[req]), result)
+        apply_spec_final_logprob_repairs_from_result(
+            SimpleNamespace(
+                reqs=[req],
+                spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+            ),
+            result,
+        )
 
 
 def test_dvr_eagle_replay_prefix_splits_verifier_and_output_streams():
@@ -536,12 +554,12 @@ def test_dvr_eagle_compacts_accepted_output_rows():
     )
     accept_lens = torch.tensor([2, 3], dtype=torch.int32)
 
-    assert compact_output_token_rows(
+    assert _compact_output_token_rows(
         accept_tokens,
         accept_lens,
     ) == [[10, 11], [20, 21, 22]]
     assert (
-        compact_output_token_rows(
+        _compact_output_token_rows(
             None,
             accept_lens,
         )

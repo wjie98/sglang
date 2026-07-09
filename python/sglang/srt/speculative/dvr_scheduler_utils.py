@@ -76,35 +76,6 @@ def build_dvr_spec_result_aux(
     )
 
 
-def compact_output_token_rows(
-    output_tokens: Any,
-    output_lens: Any,
-) -> Optional[list[list[int]]]:
-    """Return per-request output token rows without padded verify tail tokens."""
-
-    if output_tokens is None:
-        return None
-
-    output_lens_cpu = output_lens.detach().cpu().tolist()
-    output_tokens_cpu = output_tokens.detach().cpu().tolist()
-    return [
-        [int(token_id) for token_id in token_row[: int(output_len)]]
-        for token_row, output_len in zip(
-            output_tokens_cpu, output_lens_cpu, strict=True
-        )
-    ]
-
-
-def apply_dvr_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
-    """Apply DVR exact final logprob repairs after Spec-v2 output materializes."""
-
-    aux = getattr(result, "spec_aux", None)
-    repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = getattr(
-        aux, "final_logprob_repairs", None
-    )
-    apply_dvr_final_logprob_repairs(batch, repairs)
-
-
 def apply_dvr_final_logprob_repairs(
     batch: Any,
     repairs: Optional[list[Optional[DVRFinalLogprobRepair]]],
@@ -452,7 +423,7 @@ class DVRReplayPrefixTracker:
         stream.extend(int(token_id) for token_id in real_output_ids)
 
 
-def commit_pending_mamba_checkpoint_from_result(
+def _commit_pending_mamba_checkpoint_from_result(
     *,
     req: Any,
     batch: Any,
@@ -527,73 +498,6 @@ def _pending_mamba_checkpoint_track_idx_is_valid(
     # the just-verified GDN state.  A freed lazy slot is marked as -1 and must
     # never become the scheduler-owned checkpoint for future radix inserts.
     return buffer[checkpoint.track_idx].item() != -1
-
-
-def maybe_handle_dvr_mamba_checkpoint_after_decode(
-    *,
-    req: Any,
-    batch: Any,
-    result: Any,
-    req_index: int,
-    tree_cache: Any,
-) -> bool:
-    """Handle DVR's decode-time mamba checkpoint commit if applicable."""
-
-    if not batch.spec_algorithm.is_dvr():
-        return False
-
-    mark_req_skip_mamba_radix_finished_insert(req)
-    if _is_dvr_spec_v2(batch):
-        commit_pending_mamba_checkpoint_from_result(
-            req=req,
-            batch=batch,
-            result=result,
-            req_index=req_index,
-            tree_cache=tree_cache,
-        )
-    return True
-
-
-def cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
-    *,
-    req: Any,
-    batch: Any,
-    req_index: int,
-    tree_cache: Any,
-    enable_hisparse: bool,
-    hisparse_coordinator: Any,
-) -> bool:
-    """Cache unfinished prefill reqs while preserving DVR mamba checkpoints.
-
-    Normal prefill caching only inserts requests that are not already in the
-    decode set. DVR spec-v2 overlap can materialize a generated-prefix
-    checkpoint from an overlap prefill; if that prefill advanced more than one
-    token, the radix-cache insert must carry the matching mamba track snapshot.
-    """
-
-    should_cache_unfinished = not batch.decoding_reqs or req not in batch.decoding_reqs
-    is_dvr_spec_v2 = _is_dvr_spec_v2(batch)
-    if is_dvr_spec_v2 and not should_cache_unfinished:
-        scheduled_extend_len = (
-            batch.extend_lens[req_index]
-            if batch.extend_lens is not None
-            else req.extend_input_len
-        )
-        should_cache_unfinished = scheduled_extend_len > 1
-
-    if not should_cache_unfinished:
-        return False
-
-    if is_dvr_spec_v2:
-        _set_req_radix_insert_snapshot_from_batch(
-            req=req,
-            batch=batch,
-            req_index=req_index,
-        )
-    maybe_cache_unfinished_req(req, tree_cache)
-    if enable_hisparse:
-        hisparse_coordinator.admit_request_into_staging(req)
-    return True
 
 
 def _set_req_radix_insert_snapshot_from_batch(
@@ -675,8 +579,14 @@ def _dvr_is_finished_by_published_seq_len(*, batch: Any, req_index: int) -> bool
 def apply_spec_final_logprob_repairs_from_result(batch: Any, result: Any) -> None:
     """Apply DVR final-response logprob repairs, if any."""
 
-    if batch.spec_algorithm.is_dvr():
-        apply_dvr_final_logprob_repairs_from_result(batch, result)
+    if not batch.spec_algorithm.is_dvr():
+        return
+
+    aux = getattr(result, "spec_aux", None)
+    repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = getattr(
+        aux, "final_logprob_repairs", None
+    )
+    apply_dvr_final_logprob_repairs(batch, repairs)
 
 
 def _is_dvr_spec_v1_result(batch: Any, result: Any) -> bool:
@@ -778,14 +688,34 @@ def maybe_cache_unfinished_prefill_req_with_spec_state(
 
     if not batch.spec_algorithm.is_dvr():
         return False
-    return cache_unfinished_prefill_req_with_dvr_mamba_snapshot(
-        req=req,
-        batch=batch,
-        req_index=req_index,
-        tree_cache=tree_cache,
-        enable_hisparse=enable_hisparse,
-        hisparse_coordinator=hisparse_coordinator,
-    )
+
+    # Normal prefill caching only inserts requests that are not already in the
+    # decode set. DVR spec-v2 overlap can materialize a generated-prefix
+    # checkpoint from an overlap prefill; if that prefill advanced more than one
+    # token, the radix-cache insert must carry the matching mamba snapshot.
+    should_cache_unfinished = not batch.decoding_reqs or req not in batch.decoding_reqs
+    is_dvr_spec_v2 = _is_dvr_spec_v2(batch)
+    if is_dvr_spec_v2 and not should_cache_unfinished:
+        scheduled_extend_len = (
+            batch.extend_lens[req_index]
+            if batch.extend_lens is not None
+            else req.extend_input_len
+        )
+        should_cache_unfinished = scheduled_extend_len > 1
+
+    if not should_cache_unfinished:
+        return False
+
+    if is_dvr_spec_v2:
+        _set_req_radix_insert_snapshot_from_batch(
+            req=req,
+            batch=batch,
+            req_index=req_index,
+        )
+    maybe_cache_unfinished_req(req, tree_cache)
+    if enable_hisparse:
+        hisparse_coordinator.admit_request_into_staging(req)
+    return True
 
 
 def maybe_handle_spec_mamba_checkpoint_after_decode(
@@ -800,10 +730,14 @@ def maybe_handle_spec_mamba_checkpoint_after_decode(
 
     if not batch.spec_algorithm.is_dvr():
         return False
-    return maybe_handle_dvr_mamba_checkpoint_after_decode(
-        req=req,
-        batch=batch,
-        result=result,
-        req_index=req_index,
-        tree_cache=tree_cache,
-    )
+
+    mark_req_skip_mamba_radix_finished_insert(req)
+    if _is_dvr_spec_v2(batch):
+        _commit_pending_mamba_checkpoint_from_result(
+            req=req,
+            batch=batch,
+            result=result,
+            req_index=req_index,
+            tree_cache=tree_cache,
+        )
+    return True
