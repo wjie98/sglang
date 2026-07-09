@@ -1,21 +1,116 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.speculative.dvr_info import (
-    DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
     allow_dvr_non_streaming_logprob_output,
 )
 
 
-def apply_dvr_final_logprob_repairs(
+def _commit_pending_mamba_checkpoint_from_result(
+    *,
+    req: Any,
     batch: Any,
-    repairs: Optional[list[Optional[DVRFinalLogprobRepair]]],
+    result: Any,
+    req_index: int,
+    tree_cache: Any,
 ) -> None:
-    """Apply exact final DVR output logprobs after output tokens materialize."""
+    aux = getattr(result, "dvr_aux", None)
+    checkpoints = getattr(aux, "pending_mamba_checkpoints", None)
+    checkpoint = (
+        checkpoints[req_index]
+        if checkpoints is not None
+        and req_index < len(checkpoints)
+        and checkpoints[req_index] is not None
+        else DVRMambaCheckpoint()
+    )
+    if not checkpoint.valid or checkpoint.seqlen <= 0:
+        return
 
+    last_track_seqlen = getattr(req, "mamba_last_track_seqlen", None)
+    if last_track_seqlen is not None and checkpoint.seqlen <= last_track_seqlen:
+        return
+
+    materialized_len = len(req.origin_input_ids) + len(req.output_ids)
+    if checkpoint.seqlen > materialized_len:
+        return
+
+    buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+    if buffer is None:
+        return
+    if checkpoint.track_idx < 0 or checkpoint.track_idx >= buffer.numel():
+        return
+    # A pending DVR boundary names the request-local ping-pong slot that holds
+    # the just-verified GDN state.  A freed lazy slot is marked as -1 and must
+    # never become the scheduler-owned checkpoint for future radix inserts.
+    if buffer[checkpoint.track_idx].item() == -1:
+        return
+
+    page_size = getattr(tree_cache, "page_size", 1)
+    if page_size != 1 and checkpoint.seqlen % page_size != 0:
+        return
+
+    req.mamba_last_track_seqlen = checkpoint.seqlen
+    req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+        checkpoint.track_idx
+    )
+
+
+def maybe_filter_running_batch_with_dvr_state(
+    *,
+    batch: Any,
+    future_map: Any,
+    enable_overlap: bool,
+) -> bool:
+    """Filter running batch with DVR's spec-v2 logical-finish state if needed."""
+
+    spec_algorithm = batch.spec_algorithm
+    if not enable_overlap or not spec_algorithm.is_dvr():
+        return False
+    if spec_algorithm.is_dvr_self_draft() and not batch.enable_overlap:
+        return False
+
+    future_map.resolve_seq_lens_cpu(batch)
+    keep_indices = []
+    for i, req in enumerate(batch.reqs):
+        if req.finished():
+            continue
+
+        max_new_tokens = req.sampling_params.max_new_tokens
+        dvr_finished = False
+        if max_new_tokens is not None:
+            max_new_tokens = int(max_new_tokens)
+            if batch.seq_lens_cpu is not None:
+                seq_len = int(batch.seq_lens_cpu[i].item())
+            elif batch.seq_lens is not None:
+                seq_len = int(batch.seq_lens[i].item())
+            else:
+                seq_len = None
+            if max_new_tokens > 0 and seq_len is not None:
+                # Decode seq_lens includes KV-visible generated tokens; the
+                # newest sampled bonus token is materialized into Req.output_ids
+                # one result-processing step later, hence the final visible
+                # token corresponds to max_new_tokens - 1.
+                dvr_finished = (
+                    seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
+                )
+        if not dvr_finished:
+            keep_indices.append(i)
+    batch.filter_batch(keep_indices=keep_indices)
+    return True
+
+
+def apply_dvr_deferred_output_from_result(batch: Any, result: Any) -> None:
+    """Apply DVR-owned output work after scheduler materializes tokens."""
+
+    if not batch.spec_algorithm.is_dvr():
+        return
+
+    aux = getattr(result, "dvr_aux", None)
+    output = None if aux is None else getattr(aux, "output", None)
+    repairs = None if output is None else output.final_logprob_repairs
     if repairs is None:
         return
 
@@ -50,134 +145,6 @@ def apply_dvr_final_logprob_repairs(
             req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
             req.logprob.output_token_logprobs_idx[:] = repair.output_ids
         allow_dvr_non_streaming_logprob_output(req)
-
-
-def _commit_pending_mamba_checkpoint_from_result(
-    *,
-    req: Any,
-    batch: Any,
-    result: Any,
-    req_index: int,
-    tree_cache: Any,
-) -> None:
-    aux = getattr(result, "dvr_aux", None)
-    checkpoints = getattr(aux, "pending_mamba_checkpoints", None)
-    checkpoint = (
-        checkpoints[req_index]
-        if checkpoints is not None
-        and req_index < len(checkpoints)
-        and checkpoints[req_index] is not None
-        else DVRMambaCheckpoint()
-    )
-    if not _pending_mamba_checkpoint_is_committable(
-        checkpoint=checkpoint,
-        req=req,
-        tree_cache=tree_cache,
-    ):
-        return
-
-    req.mamba_last_track_seqlen = checkpoint.seqlen
-    req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-        checkpoint.track_idx
-    )
-
-
-def _pending_mamba_checkpoint_is_committable(
-    *,
-    checkpoint: DVRMambaCheckpoint,
-    req: Any,
-    tree_cache: Any,
-) -> bool:
-    if not checkpoint.valid:
-        return False
-
-    if checkpoint.seqlen <= 0:
-        return False
-
-    last_track_seqlen = getattr(req, "mamba_last_track_seqlen", None)
-    if last_track_seqlen is not None and checkpoint.seqlen <= last_track_seqlen:
-        return False
-
-    materialized_len = len(req.origin_input_ids) + len(req.output_ids)
-    if checkpoint.seqlen > materialized_len:
-        return False
-
-    buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
-    if buffer is None:
-        return False
-    if checkpoint.track_idx < 0 or checkpoint.track_idx >= buffer.numel():
-        return False
-    # A pending DVR boundary names the request-local ping-pong slot that holds
-    # the just-verified GDN state.  A freed lazy slot is marked as -1 and must
-    # never become the scheduler-owned checkpoint for future radix inserts.
-    if buffer[checkpoint.track_idx].item() == -1:
-        return False
-
-    page_size = getattr(tree_cache, "page_size", 1)
-    return page_size == 1 or checkpoint.seqlen % page_size == 0
-
-
-def maybe_filter_running_batch_with_dvr_state(
-    *,
-    batch: Any,
-    future_map: Any,
-    enable_overlap: bool,
-) -> bool:
-    """Filter running batch with DVR's spec-v2 logical-finish state if needed."""
-
-    spec_algorithm = batch.spec_algorithm
-    if not enable_overlap or not spec_algorithm.is_dvr():
-        return False
-    if spec_algorithm.is_dvr_self_draft() and not batch.enable_overlap:
-        return False
-
-    future_map.resolve_seq_lens_cpu(batch)
-    keep_indices = [
-        i
-        for i, req in enumerate(batch.reqs)
-        if not req.finished()
-        and not _dvr_is_finished_by_published_seq_len(batch=batch, req_index=i)
-    ]
-    batch.filter_batch(keep_indices=keep_indices)
-    return True
-
-
-def _dvr_is_finished_by_published_seq_len(*, batch: Any, req_index: int) -> bool:
-    req = batch.reqs[req_index]
-    max_new_tokens = req.sampling_params.max_new_tokens
-    if max_new_tokens is None:
-        return False
-    max_new_tokens = int(max_new_tokens)
-    if max_new_tokens <= 0:
-        return False
-
-    if batch.seq_lens_cpu is not None:
-        seq_len = int(batch.seq_lens_cpu[req_index].item())
-    elif batch.seq_lens is not None:
-        seq_len = int(batch.seq_lens[req_index].item())
-    else:
-        return False
-
-    # Decode seq_lens includes KV-visible generated tokens; the newest sampled
-    # bonus token is materialized into Req.output_ids one result-processing step
-    # later, hence the final visible token corresponds to max_new_tokens - 1.
-    return seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
-
-
-def apply_dvr_deferred_output_from_result(batch: Any, result: Any) -> None:
-    """Apply DVR-owned output work after scheduler materializes tokens."""
-
-    if not batch.spec_algorithm.is_dvr():
-        return
-
-    aux = getattr(result, "dvr_aux", None)
-    repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = getattr(
-        aux, "final_logprob_repairs", None
-    )
-    apply_dvr_final_logprob_repairs(batch, repairs)
-
-
-apply_dvr_final_logprob_repairs_from_result = apply_dvr_deferred_output_from_result
 
 
 def maybe_cache_unfinished_prefill_req_with_dvr_state(

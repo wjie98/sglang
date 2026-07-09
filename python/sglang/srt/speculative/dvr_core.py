@@ -13,9 +13,10 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
+    DVRDeferredOutput,
     DVRFinalLogprobRepair,
+    DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
-    build_dvr_deferred_actions,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
@@ -359,21 +360,8 @@ def _final_output_len_if_repair_needed(
     if compact_output_token_ids_per_req is None:
         return None
 
-    stop_pos = _first_token_finish_pos(
-        req,
-        compact_output_token_ids_per_req[req_i],
-    )
-    if stop_pos is not None and stop_pos < accept_len:
-        return prefix_output_len + stop_pos + 1
-    return None
-
-
-def _first_token_finish_pos(req: Any, token_ids: list[int]) -> Optional[int]:
-    """Return the first accepted-token index that would finish this request."""
-
     if req.sampling_params.ignore_eos:
         return None
-
     stop_token_ids = req.sampling_params.stop_token_ids or set()
     eos_token_ids = req.eos_token_ids or set()
     tokenizer = getattr(req, "tokenizer", None)
@@ -381,8 +369,7 @@ def _first_token_finish_pos(req: Any, token_ids: list[int]) -> Optional[int]:
     additional_stop_ids = (
         getattr(tokenizer, "additional_stop_token_ids", None) if tokenizer else None
     ) or set()
-
-    for i, token_id in enumerate(token_ids):
+    for i, token_id in enumerate(compact_output_token_ids_per_req[req_i]):
         token_id = int(token_id)
         if (
             token_id in stop_token_ids
@@ -390,9 +377,9 @@ def _first_token_finish_pos(req: Any, token_ids: list[int]) -> Optional[int]:
             or token_id == tokenizer_eos
             or token_id in additional_stop_ids
         ):
-            return i
+            return prefix_output_len + i + 1 if i < accept_len else None
         if token_id > req.vocab_size or token_id < 0:
-            return i
+            return prefix_output_len + i + 1 if i < accept_len else None
     return None
 
 
@@ -497,11 +484,38 @@ def finish_dvr_verify(
             return_pending_boundary=True,
         )
 
+    deferred_actions = None
+    if (
+        pending_track_indices is not None
+        or pending_track_seqlens is not None
+        or final_logprob_repairs is not None
+    ):
+        if pending_track_indices is None:
+            pending_track_indices = [
+                None
+            ] * (len(pending_track_seqlens) if pending_track_seqlens is not None else 0)
+        if pending_track_seqlens is None:
+            pending_track_seqlens = [None] * len(pending_track_indices)
+        checkpoints = [
+            (
+                DVRMambaCheckpoint(track_idx=track_idx, seqlen=seqlen)
+                if track_idx is not None and seqlen is not None
+                else None
+            )
+            for track_idx, seqlen in zip(
+                pending_track_indices, pending_track_seqlens, strict=True
+            )
+        ]
+        deferred_actions = DVRDeferredActions(
+            pending_mamba_checkpoints=checkpoints or None,
+            output=(
+                DVRDeferredOutput(final_logprob_repairs=final_logprob_repairs)
+                if final_logprob_repairs is not None
+                else None
+            ),
+        )
+
     return DVRVerifyResult(
         accept_lens_cpu=accept_lens_cpu,
-        deferred_actions=build_dvr_deferred_actions(
-            track_indices=pending_track_indices,
-            seqlens=pending_track_seqlens,
-            final_logprob_repairs=final_logprob_repairs,
-        ),
+        deferred_actions=deferred_actions,
     )

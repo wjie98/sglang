@@ -42,72 +42,12 @@ class DVRDeferredOutput:
     final_logprob_repair_claimed: bool = False
 
 
-@dataclass(init=False)
+@dataclass
 class DVRDeferredActions:
     """DVR postprocess work carried by GenerationBatchResult.dvr_aux."""
 
     pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
     output: Optional[DVRDeferredOutput] = None
-
-    def __init__(
-        self,
-        *,
-        pending_mamba_checkpoints: Optional[
-            list[Optional[DVRMambaCheckpoint]]
-        ] = None,
-        output: Optional[DVRDeferredOutput] = None,
-        final_logprob_repairs: Optional[
-            list[Optional[DVRFinalLogprobRepair]]
-        ] = None,
-    ) -> None:
-        self.pending_mamba_checkpoints = pending_mamba_checkpoints
-        self.output = output
-        if self.output is None and final_logprob_repairs is not None:
-            self.output = DVRDeferredOutput(
-                final_logprob_repairs=final_logprob_repairs
-            )
-
-    @property
-    def final_logprob_repairs(
-        self,
-    ) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
-        return None if self.output is None else self.output.final_logprob_repairs
-
-
-def build_dvr_deferred_actions(
-    *,
-    track_indices: Optional[list[Optional[int]]],
-    seqlens: Optional[list[Optional[int]]],
-    final_logprob_repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = None,
-) -> Optional[DVRDeferredActions]:
-    if track_indices is None and seqlens is None and final_logprob_repairs is None:
-        return None
-
-    if track_indices is None:
-        track_indices = [None] * (len(seqlens) if seqlens is not None else 0)
-    if seqlens is None:
-        seqlens = [None] * len(track_indices)
-
-    checkpoints = [
-        (
-            DVRMambaCheckpoint(track_idx=track_idx, seqlen=seqlen)
-            if track_idx is not None and seqlen is not None
-            else None
-        )
-        for track_idx, seqlen in zip(track_indices, seqlens, strict=True)
-    ]
-    return DVRDeferredActions(
-        pending_mamba_checkpoints=checkpoints or None,
-        output=(
-            DVRDeferredOutput(final_logprob_repairs=final_logprob_repairs)
-            if final_logprob_repairs is not None
-            else None
-        ),
-    )
-
-
-DVRSpecResultAux = DVRDeferredActions
-build_dvr_spec_result_aux = build_dvr_deferred_actions
 
 
 class DVRPendingOutputPrefix:

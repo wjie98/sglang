@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -468,37 +468,6 @@ class _DVRSelfDraftCore:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
-    def forward_target_extend(
-        self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, bool]:
-        batch.capture_hidden_mode = CaptureHiddenMode.NULL
-        batch_result = self.target_worker.forward_batch_generation(batch)
-        logits_output, next_token_ids = (
-            batch_result.logits_output,
-            batch_result.next_token_ids,
-        )
-        topk_index = next_token_ids.to(torch.long).unsqueeze(-1)
-        batch.spec_info = EagleDraftInput(
-            hidden_states=(
-                logits_output.hidden_states
-                if logits_output.hidden_states is not None
-                else self._dummy_hidden_states(
-                    next_token_ids.shape[0], device=next_token_ids.device
-                )
-            ),
-            bonus_tokens=next_token_ids,
-            topk_p=torch.ones(
-                (next_token_ids.shape[0], self.topk),
-                dtype=torch.float32,
-                device=next_token_ids.device,
-            ),
-            topk_index=topk_index,
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
-        return logits_output, next_token_ids, batch_result.can_run_cuda_graph
-
     # Self-draft path. DVR uses the target model's decode path as a draft model,
     # but keeps EAGLE-compatible tree/retrieve metadata for verification.
 
@@ -911,27 +880,53 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
             error_prefix="DVR spec-v2",
         )
 
-    def _advance_replay_prefix(
-        self,
-        batch: ScheduleBatch,
-        tokens_per_req,
-        token_logprobs_per_req=None,
-    ) -> None:
-        if batch.forward_mode.is_idle() or batch.reqs is None:
-            return
-
-        self.dvr_output_replay_prefix.append_batch_output_tokens(
-            batch,
-            tokens_per_req,
-            token_logprobs_per_req=token_logprobs_per_req,
-        )
-
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
         batch = model_worker_batch
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            batch_result = self.forward_target_extend_result(batch)
+            batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            target_result = self.target_worker.forward_batch_generation(batch)
+            logits_output, next_token_ids = (
+                target_result.logits_output,
+                target_result.next_token_ids,
+            )
+            batch.spec_info = EagleDraftInput(
+                hidden_states=(
+                    logits_output.hidden_states
+                    if logits_output.hidden_states is not None
+                    else self._dummy_hidden_states(
+                        next_token_ids.shape[0], device=next_token_ids.device
+                    )
+                ),
+                bonus_tokens=next_token_ids,
+                topk_p=torch.ones(
+                    (next_token_ids.shape[0], self.topk),
+                    dtype=torch.float32,
+                    device=next_token_ids.device,
+                ),
+                topk_index=next_token_ids.to(torch.long).unsqueeze(-1),
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+            token_logprobs_per_req = None
+            if logits_output.next_token_logprobs is not None:
+                logprob_values = logits_output.next_token_logprobs.detach().cpu().tolist()
+                token_logprobs_per_req = [[float(value)] for value in logprob_values]
+            if not batch.forward_mode.is_idle() and batch.reqs is not None:
+                self.dvr_output_replay_prefix.append_batch_output_tokens(
+                    batch,
+                    [[token_id] for token_id in next_token_ids.detach().cpu().tolist()],
+                    token_logprobs_per_req=token_logprobs_per_req,
+                )
+            batch_result = GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                can_run_cuda_graph=target_result.can_run_cuda_graph,
+                next_draft_input=batch.spec_info,
+                new_seq_lens=batch.seq_lens,
+            )
             if on_publish is not None:
                 on_publish(batch_result.new_seq_lens)
             return batch_result
@@ -952,29 +947,6 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
         if on_publish is not None:
             on_publish(batch_result.new_seq_lens)
         return batch_result
-
-    def forward_target_extend_result(
-        self, batch: ScheduleBatch
-    ) -> GenerationBatchResult:
-        logits_output, next_token_ids, can_run_cuda_graph = self.forward_target_extend(
-            batch
-        )
-        token_logprobs_per_req = None
-        if logits_output.next_token_logprobs is not None:
-            logprob_values = logits_output.next_token_logprobs.detach().cpu().tolist()
-            token_logprobs_per_req = [[float(value)] for value in logprob_values]
-        self._advance_replay_prefix(
-            batch,
-            [[token_id] for token_id in next_token_ids.detach().cpu().tolist()],
-            token_logprobs_per_req=token_logprobs_per_req,
-        )
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            can_run_cuda_graph=can_run_cuda_graph,
-            next_draft_input=batch.spec_info,
-            new_seq_lens=batch.seq_lens,
-        )
 
     def _draft_preprocess_decode_for_self_dvr(self, batch: ScheduleBatch):
         spec_info = batch.spec_info

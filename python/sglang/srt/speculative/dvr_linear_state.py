@@ -53,17 +53,6 @@ class DVRLinearStateLifecycle:
         self.boundary_backup_keys = None
         self.live_backup = None
         self.suffix_replay_boundary_track_mask = None
-        self.validate_args()
-
-    def clear_cache_state(self):
-        self.boundary_seqlen.clear()
-        self.boundary_track_idx.clear()
-        self.boundary_backup = None
-        self.boundary_backup_keys = None
-        self.live_backup = None
-        self.suffix_replay_boundary_track_mask = None
-
-    def validate_args(self):
         if self.state_adapter() is None:
             return
         if self.server_args.mamba_track_interval != FLA_CHUNK_SIZE:
@@ -80,16 +69,42 @@ class DVRLinearStateLifecycle:
                 "DVR linear-state verify requires fp32 recurrent state storage."
             )
 
+    def clear_cache_state(self):
+        self.boundary_seqlen.clear()
+        self.boundary_track_idx.clear()
+        self.boundary_backup = None
+        self.boundary_backup_keys = None
+        self.live_backup = None
+        self.suffix_replay_boundary_track_mask = None
+
     def prepare_for_draft(
         self,
         batch: ScheduleBatch,
         *,
         seq_lens_cpu: Optional[List[int]] = None,
     ) -> List[DVRBoundaryReplayTask]:
-        self.sync_active_reqs(
-            batch,
-            seq_lens_cpu=seq_lens_cpu,
-        )
+        active_rids = {req.rid for req in batch.reqs}
+        for rid in list(self.boundary_seqlen):
+            if rid not in active_rids:
+                self.boundary_seqlen.pop(rid, None)
+                self.boundary_track_idx.pop(rid, None)
+
+        seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
+        for i, req in enumerate(batch.reqs):
+            recorded_boundary = self.boundary_seqlen.get(req.rid)
+            if recorded_boundary is None:
+                continue
+            current_boundary, _ = self.boundary_and_tail_for_seq_len(
+                int(seq_lens_cpu[i])
+            )
+            if (
+                req.rid not in self.boundary_track_idx
+                or recorded_boundary != current_boundary
+                or recorded_boundary % FLA_CHUNK_SIZE != 0
+            ):
+                self.boundary_seqlen.pop(req.rid, None)
+                self.boundary_track_idx.pop(req.rid, None)
+
         return self.ensure_boundary_state(
             batch,
             seq_lens_cpu=seq_lens_cpu,
@@ -395,34 +410,6 @@ class DVRLinearStateLifecycle:
             else None
         )
 
-    def sync_active_reqs(
-        self,
-        batch: ScheduleBatch,
-        *,
-        seq_lens_cpu: Optional[List[int]] = None,
-    ):
-        active_rids = {req.rid for req in batch.reqs}
-        for rid in list(self.boundary_seqlen):
-            if rid not in active_rids:
-                self.boundary_seqlen.pop(rid, None)
-                self.boundary_track_idx.pop(rid, None)
-
-        seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
-        for i, req in enumerate(batch.reqs):
-            recorded_boundary = self.boundary_seqlen.get(req.rid)
-            if recorded_boundary is None:
-                continue
-            current_boundary, _ = self.boundary_and_tail_for_seq_len(
-                int(seq_lens_cpu[i])
-            )
-            if (
-                req.rid not in self.boundary_track_idx
-                or recorded_boundary != current_boundary
-                or recorded_boundary % FLA_CHUNK_SIZE != 0
-            ):
-                self.boundary_seqlen.pop(req.rid, None)
-                self.boundary_track_idx.pop(req.rid, None)
-
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
     ) -> Optional[DVRLinearStateContext]:
@@ -442,8 +429,11 @@ class DVRLinearStateLifecycle:
         state_adapter.validate_state_cache(state_cache=state_cache)
         boundary_indices = None
         if require_boundary:
-            boundary_indices = self.boundary_indices_for_batch(
-                batch=batch,
+            boundary_indices = self.boundary_indices_for_reqs(
+                reqs=batch.reqs,
+                track_indices=[
+                    self.boundary_track_idx[req.rid] for req in batch.reqs
+                ],
                 device=live_indices.device,
             )
         return DVRLinearStateContext(
@@ -489,15 +479,13 @@ class DVRLinearStateLifecycle:
             batch=batch, req=req, track_idx=track_idx, boundary_seqlen=boundary_seqlen
         )
 
-    @staticmethod
-    def other_track_idx(*, batch: ScheduleBatch, track_idx: int) -> int:
-        return batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
-
     def publish_request_boundary_checkpoint(
         self, *, batch: ScheduleBatch, req, track_idx: int, boundary_seqlen: int
     ):
         req.mamba_last_track_seqlen = boundary_seqlen
-        req.mamba_next_track_idx = self.other_track_idx(batch=batch, track_idx=track_idx)
+        req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+            track_idx
+        )
 
     @staticmethod
     def reserve_boundary_checkpoint(*, req) -> Tuple[int, torch.Tensor]:
@@ -520,15 +508,6 @@ class DVRLinearStateLifecycle:
                 for req, track_idx in zip(reqs, track_indices, strict=True)
             ]
         ).to(device=device, dtype=torch.long)
-
-    def boundary_indices_for_batch(
-        self, *, batch: ScheduleBatch, device
-    ) -> torch.Tensor:
-        return self.boundary_indices_for_reqs(
-            reqs=batch.reqs,
-            track_indices=[self.boundary_track_idx[req.rid] for req in batch.reqs],
-            device=device,
-        )
 
     @staticmethod
     def radix_node_state_indices(node) -> Optional[torch.Tensor]:
@@ -572,7 +551,9 @@ class DVRLinearStateLifecycle:
                 "checkpoints."
             )
         checkpoint_track_idx = (
-            self.other_track_idx(batch=batch, track_idx=req.mamba_next_track_idx)
+            batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                req.mamba_next_track_idx
+            )
             if boundary_seqlen > 0 and last_track_seqlen == boundary_seqlen
             else None
         )
@@ -763,34 +744,6 @@ class DVRLinearStateLifecycle:
     ) -> None:
         self.suffix_replay_boundary_track_mask = None if mask is None else mask.detach()
 
-    @staticmethod
-    def _select_recurrent_backup(
-        backup: DVRRecurrentStateBackup, indices: torch.Tensor
-    ) -> DVRRecurrentStateBackup:
-        data_indices = indices.to(device=backup.temporal.device, dtype=torch.long)
-        meta_indices = indices.to(device=backup.indices.device, dtype=torch.long)
-        return DVRRecurrentStateBackup(
-            conv=tuple(conv[:, data_indices].clone() for conv in backup.conv),
-            temporal=backup.temporal[:, data_indices].clone(),
-            indices=backup.indices[meta_indices].clone(),
-        )
-
-    def restore_boundary_backup_for_mask(
-        self, ctx: DVRLinearStateContext, mask: torch.Tensor
-    ) -> None:
-        if self.boundary_backup is None:
-            return
-        selected_cpu = torch.nonzero(mask.detach().cpu(), as_tuple=True)[0]
-        if selected_cpu.numel() == 0:
-            return
-        backup = self._select_recurrent_backup(self.boundary_backup, selected_cpu)
-        selected = selected_cpu.to(device=ctx.boundary_indices.device, dtype=torch.long)
-        ctx.state_adapter.restore_recurrent_state(
-            state_cache=ctx.state_cache,
-            backup=backup,
-            indices=ctx.boundary_indices[selected],
-        )
-
     def prepare_suffix_replay_boundary_commit(
         self,
         *,
@@ -817,6 +770,31 @@ class DVRLinearStateLifecycle:
             dtype=torch.bool,
             device=ctx.live_indices.device,
         )
-        self.restore_boundary_backup_for_mask(ctx, tracked & ~crosses)
+        restore_mask = tracked & ~crosses
+        if self.boundary_backup is not None:
+            selected_cpu = torch.nonzero(restore_mask.detach().cpu(), as_tuple=True)[0]
+            if selected_cpu.numel() > 0:
+                backup = self.boundary_backup
+                data_indices = selected_cpu.to(
+                    device=backup.temporal.device, dtype=torch.long
+                )
+                meta_indices = selected_cpu.to(
+                    device=backup.indices.device, dtype=torch.long
+                )
+                selected_backup = DVRRecurrentStateBackup(
+                    conv=tuple(
+                        conv[:, data_indices].clone() for conv in backup.conv
+                    ),
+                    temporal=backup.temporal[:, data_indices].clone(),
+                    indices=backup.indices[meta_indices].clone(),
+                )
+                selected = selected_cpu.to(
+                    device=ctx.boundary_indices.device, dtype=torch.long
+                )
+                ctx.state_adapter.restore_recurrent_state(
+                    state_cache=ctx.state_cache,
+                    backup=selected_backup,
+                    indices=ctx.boundary_indices[selected],
+                )
         boundary_already_tracked = tracked & crosses
         return boundary_already_tracked if boundary_already_tracked.any() else None

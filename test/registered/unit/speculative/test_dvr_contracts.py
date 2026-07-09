@@ -11,10 +11,11 @@ from sglang.srt.speculative.dvr_core import (
 )
 from sglang.srt.speculative.dvr_worker import _DVRSelfDraftCore
 from sglang.srt.speculative.dvr_info import (
+    DVRDeferredActions,
+    DVRDeferredOutput,
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
-    DVRSpecResultAux,
     allow_dvr_non_streaming_logprob_output,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
@@ -24,7 +25,7 @@ from sglang.srt.speculative.dvr_info import (
 )
 from sglang.srt.speculative.dvr_scheduler import (
     _commit_pending_mamba_checkpoint_from_result,
-    apply_dvr_final_logprob_repairs_from_result,
+    apply_dvr_deferred_output_from_result,
     maybe_filter_running_batch_with_dvr_state,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -111,7 +112,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     tree_cache = SimpleNamespace(page_size=64)
 
     result = SimpleNamespace(
-        dvr_aux=DVRSpecResultAux(
+        dvr_aux=DVRDeferredActions(
             pending_mamba_checkpoints=[
                 DVRMambaCheckpoint(track_idx=0, seqlen=128),
             ],
@@ -267,17 +268,19 @@ def test_dvr_final_logprob_repair_applies_after_materialization():
         ),
     )
     result = SimpleNamespace(
-        dvr_aux=DVRSpecResultAux(
-            final_logprob_repairs=[
-                DVRFinalLogprobRepair(
-                    output_ids=[10, 11, 12],
-                    output_logprobs=[-0.1, -0.2, -0.3],
-                )
-            ]
+        dvr_aux=DVRDeferredActions(
+            output=DVRDeferredOutput(
+                final_logprob_repairs=[
+                    DVRFinalLogprobRepair(
+                        output_ids=[10, 11, 12],
+                        output_logprobs=[-0.1, -0.2, -0.3],
+                    )
+                ]
+            )
         )
     )
 
-    apply_dvr_final_logprob_repairs_from_result(
+    apply_dvr_deferred_output_from_result(
         SimpleNamespace(
             reqs=[req],
             spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
@@ -300,18 +303,20 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
         ),
     )
     result = SimpleNamespace(
-        dvr_aux=DVRSpecResultAux(
-            final_logprob_repairs=[
-                DVRFinalLogprobRepair(
-                    output_ids=[10, 11],
-                    output_logprobs=[-0.1, -0.2],
-                )
-            ]
+        dvr_aux=DVRDeferredActions(
+            output=DVRDeferredOutput(
+                final_logprob_repairs=[
+                    DVRFinalLogprobRepair(
+                        output_ids=[10, 11],
+                        output_logprobs=[-0.1, -0.2],
+                    )
+                ]
+            )
         )
     )
 
     with pytest.raises(RuntimeError, match="materialized output ids"):
-        apply_dvr_final_logprob_repairs_from_result(
+        apply_dvr_deferred_output_from_result(
             SimpleNamespace(
                 reqs=[req],
                 spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
@@ -331,18 +336,20 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
         ),
     )
     result = SimpleNamespace(
-        dvr_aux=DVRSpecResultAux(
-            final_logprob_repairs=[
-                DVRFinalLogprobRepair(
-                    output_ids=[10, 11],
-                    output_logprobs=[-0.1],
-                )
-            ]
+        dvr_aux=DVRDeferredActions(
+            output=DVRDeferredOutput(
+                final_logprob_repairs=[
+                    DVRFinalLogprobRepair(
+                        output_ids=[10, 11],
+                        output_logprobs=[-0.1],
+                    )
+                ]
+            )
         )
     )
 
     with pytest.raises(RuntimeError, match="inconsistent ids/logprobs length"):
-        apply_dvr_final_logprob_repairs_from_result(
+        apply_dvr_deferred_output_from_result(
             SimpleNamespace(
                 reqs=[req],
                 spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
