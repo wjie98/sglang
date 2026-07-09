@@ -343,7 +343,7 @@ def chain_speculative_sampling(
         BLOCK_V=4096,
     )
 
-class DecodeVerifyRollbackWorker:
+class _DVRSelfDraftCore:
     """Core self-DVR implementation shared by sync and overlap scheduling.
 
     User-visible "spec v1" now means synchronous consumption of the v2 result
@@ -929,7 +929,7 @@ class DecodeVerifyRollbackWorker:
             return [int(x) for x in batch.seq_lens_cpu.tolist()]
         return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
-class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
+class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
     """Overlap-scheduler DVR worker.
 
     DVR has no standalone draft model.  The scheduler still expects a spec-v2

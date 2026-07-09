@@ -6,7 +6,7 @@ import torch
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
-from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorker
+from sglang.srt.speculative.dvr_worker import _DVRSelfDraftCore
 from sglang.srt.speculative.dvr_replay import (
     _final_output_len_if_repair_needed,
 )
@@ -174,7 +174,7 @@ def test_dvr_self_draft_graph_runner_only_skips_known_short_boundary():
 
 
 def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
-    worker = object.__new__(DecodeVerifyRollbackWorker)
+    worker = object.__new__(_DVRSelfDraftCore)
     worker.cuda_graph_runner_for_draft_decode = None
     worker.model_runner = SimpleNamespace(hybrid_gdn_config=object())
 
