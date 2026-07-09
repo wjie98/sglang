@@ -249,7 +249,7 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dvr_self_draft():
             if enable_overlap:
-                from sglang.srt.speculative.dvr_worker_v2 import (
+                from sglang.srt.speculative.dvr_worker import (
                     DecodeVerifyRollbackWorkerV2,
                 )
 
