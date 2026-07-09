@@ -50,94 +50,6 @@ class _DVRSuffixReplayPlan:
     hidden_gather_indices: Optional[torch.Tensor] = None
 
 
-def _suffix_replay_lengths(
-    *,
-    base_seq_lens_cpu: list[int],
-    boundary_lens: list[int],
-    append_token_counts_cpu: list[int],
-) -> tuple[list[int], list[int], list[int]]:
-    tail_lens_cpu = [
-        int(seq_len) - int(boundary)
-        for seq_len, boundary in zip(base_seq_lens_cpu, boundary_lens, strict=True)
-    ]
-    extend_lens_cpu = [
-        int(tail) + int(append_count)
-        for tail, append_count in zip(
-            tail_lens_cpu, append_token_counts_cpu, strict=True
-        )
-    ]
-    final_seq_lens_cpu = [
-        int(boundary) + int(extend_len)
-        for boundary, extend_len in zip(boundary_lens, extend_lens_cpu, strict=True)
-    ]
-    return tail_lens_cpu, extend_lens_cpu, final_seq_lens_cpu
-
-
-def _suffix_replay_inputs(
-    *,
-    batch,
-    base_seq_lens_cpu: list[int],
-    boundary_lens: list[int],
-    tail_lens_cpu: list[int],
-    append_tokens_cpu_by_req: list[list[int]],
-    append_cache_locs_by_req: list[torch.Tensor],
-    request_token_ids_for_replay,
-) -> tuple[list[int], list[torch.Tensor]]:
-    input_ids = []
-    out_cache_locs = []
-    for req, seq_len, boundary, tail_len, append_tokens, append_cache_locs in zip(
-        batch.reqs,
-        base_seq_lens_cpu,
-        boundary_lens,
-        tail_lens_cpu,
-        append_tokens_cpu_by_req,
-        append_cache_locs_by_req,
-        strict=True,
-    ):
-        token_ids = request_token_ids_for_replay(req, int(seq_len))
-        input_ids.extend(token_ids[int(boundary) : int(seq_len)])
-        input_ids.extend(append_tokens)
-        if int(tail_len) > 0:
-            out_cache_locs.append(
-                batch.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, int(boundary) : int(seq_len)
-                ].to(torch.long)
-            )
-        if len(append_tokens) > 0:
-            out_cache_locs.append(append_cache_locs.to(torch.long))
-    return input_ids, out_cache_locs
-
-
-def _append_position_rows_and_offsets(
-    *,
-    batch,
-    base_seq_lens_cpu: list[int],
-    append_token_counts_cpu: list[int],
-) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    rows = []
-    offsets = []
-    for req_i, (seq_len, append_count) in enumerate(
-        zip(base_seq_lens_cpu, append_token_counts_cpu, strict=True)
-    ):
-        append_count = int(append_count)
-        if append_count <= 0:
-            continue
-        rows.append(
-            batch.req_pool_indices[req_i].to(dtype=torch.long).repeat(append_count)
-        )
-        offsets.append(
-            torch.arange(
-                int(seq_len),
-                int(seq_len) + append_count,
-                dtype=torch.long,
-                device=batch.seq_lens.device,
-            )
-        )
-    if not rows:
-        return None, None
-    return torch.cat(rows), torch.cat(offsets)
-
-
 def _build_suffix_replay_plan(
     *,
     batch,
@@ -150,28 +62,67 @@ def _build_suffix_replay_plan(
     request_token_ids_for_replay,
     hidden_gather_append_count: Optional[int] = None,
 ) -> Optional[_DVRSuffixReplayPlan]:
-    tail_lens_cpu, extend_lens_cpu, final_seq_lens_cpu = _suffix_replay_lengths(
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        append_token_counts_cpu=append_token_counts_cpu,
-    )
-    input_ids, out_cache_locs = _suffix_replay_inputs(
-        batch=batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        tail_lens_cpu=tail_lens_cpu,
-        append_tokens_cpu_by_req=append_tokens_cpu_by_req,
-        append_cache_locs_by_req=append_cache_locs_by_req,
-        request_token_ids_for_replay=request_token_ids_for_replay,
-    )
+    tail_lens_cpu = []
+    extend_lens_cpu = []
+    final_seq_lens_cpu = []
+    input_ids = []
+    out_cache_locs = []
+    append_rows = []
+    append_offsets = []
+
+    for req_i, (
+        req,
+        seq_len,
+        boundary,
+        append_tokens,
+        append_locs,
+        append_count,
+    ) in enumerate(
+        zip(
+            batch.reqs,
+            base_seq_lens_cpu,
+            boundary_lens,
+            append_tokens_cpu_by_req,
+            append_cache_locs_by_req,
+            append_token_counts_cpu,
+            strict=True,
+        )
+    ):
+        seq_len = int(seq_len)
+        boundary = int(boundary)
+        append_count = int(append_count)
+        tail_len = seq_len - boundary
+        extend_len = tail_len + append_count
+
+        tail_lens_cpu.append(tail_len)
+        extend_lens_cpu.append(extend_len)
+        final_seq_lens_cpu.append(boundary + extend_len)
+
+        token_ids = request_token_ids_for_replay(req, seq_len)
+        input_ids.extend(token_ids[boundary:seq_len])
+        input_ids.extend(append_tokens)
+        if tail_len > 0:
+            out_cache_locs.append(
+                batch.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, boundary:seq_len
+                ].to(torch.long)
+            )
+        if append_count > 0:
+            out_cache_locs.append(append_locs.to(torch.long))
+            append_rows.append(
+                batch.req_pool_indices[req_i].to(dtype=torch.long).repeat(append_count)
+            )
+            append_offsets.append(
+                torch.arange(
+                    seq_len,
+                    seq_len + append_count,
+                    dtype=torch.long,
+                    device=batch.seq_lens.device,
+                )
+            )
     if not input_ids:
         return None
 
-    append_rows, append_offsets = _append_position_rows_and_offsets(
-        batch=batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        append_token_counts_cpu=append_token_counts_cpu,
-    )
     hidden_gather_indices = None
     if hidden_gather_append_count is not None:
         gather_indices = []
@@ -198,8 +149,8 @@ def _build_suffix_replay_plan(
         input_ids=input_ids,
         out_cache_locs=out_cache_locs,
         append_cache_locs=append_cache_locs.to(torch.long).reshape(-1),
-        append_rows=append_rows,
-        append_offsets=append_offsets,
+        append_rows=torch.cat(append_rows) if append_rows else None,
+        append_offsets=torch.cat(append_offsets) if append_offsets else None,
         hidden_gather_indices=hidden_gather_indices,
     )
 
