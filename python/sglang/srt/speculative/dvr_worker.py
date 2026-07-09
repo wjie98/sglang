@@ -30,6 +30,8 @@ from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
     DVRVerifyInput,
     build_dvr_spec_result_aux,
+    compact_dvr_accepted_tokens_and_cache_locs,
+    dvr_compact_output_indices,
 )
 from sglang.srt.speculative.dvr_linear_state import (
     DVRLinearStateLifecycle,
@@ -1176,11 +1178,12 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
                     accept_lens < self.num_draft_tokens
                 ).item():
                     accepted_ids, accepted_cache_locs = (
-                        self._compact_accepted_tokens_and_cache_locs(
+                        compact_dvr_accepted_tokens_and_cache_locs(
                             batch=batch,
                             predict=predict,
                             accept_index=accept_index,
                             accept_lens=accept_lens,
+                            num_draft_tokens=self.num_draft_tokens,
                         )
                     )
                     if accepted_ids.numel() > 0:
@@ -1396,10 +1399,10 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         max_accept = self.num_draft_steps + 1
         device = predict.device
 
-        compact_output_idx = self._compact_output_indices(
+        compact_output_idx = dvr_compact_output_indices(
             accept_index=accept_index,
+            num_draft_tokens=self.num_draft_tokens,
             max_accept=max_accept,
-            device=device,
         ).reshape(-1)
         flat_accept_idx = accept_index.clamp_min(0).long().reshape(-1)
         gathered_logits = logits_output.next_token_logits[flat_accept_idx]
@@ -1454,57 +1457,3 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
             ) = get_token_ids_logprobs(
                 gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
             )
-
-    def _compact_accepted_tokens_and_cache_locs(
-        self,
-        *,
-        batch: ScheduleBatch,
-        predict: torch.Tensor,
-        accept_index: torch.Tensor,
-        accept_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return accepted tokens/cache slots in scheduler output order.
-
-        DVR's partial-verify suffix replay must replay the same compact token
-        stream that result processing will materialize. Tree ``accept_index``
-        names KV slots, while ``predict`` is emitted as fixed per-request
-        windows; keep that mapping in one place so replay and logprob code do
-        not drift.
-        """
-
-        max_accept = accept_index.shape[1]
-        valid_accept = torch.arange(
-            max_accept, dtype=torch.long, device=self.device
-        ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
-        compact_predict_indices = self._compact_output_indices(
-            accept_index=accept_index,
-            max_accept=max_accept,
-            device=self.device,
-        )
-        return (
-            predict[compact_predict_indices[valid_accept]],
-            batch.out_cache_loc[accept_index.clamp_min(0).long()[valid_accept]],
-        )
-
-    def _compact_output_indices(
-        self,
-        *,
-        accept_index: torch.Tensor,
-        max_accept: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Return the flat predict slots consumed by DVR result processing.
-
-        EAGLE V2 gathers logprobs through tree accept indices. DVR topk=1 is a
-        chain and the scheduler emits tokens by compact per-request slices of
-        ``predict``.  Keep logprob rows in that same compact order so returned
-        logprobs line up with output token ids.
-        """
-
-        bs = accept_index.shape[0]
-        base = (
-            torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
-            * self.num_draft_tokens
-        )
-        offsets = torch.arange(max_accept, dtype=torch.long, device=device).unsqueeze(0)
-        return base + offsets

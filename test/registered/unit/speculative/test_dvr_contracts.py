@@ -15,6 +15,7 @@ from sglang.srt.speculative.dvr_info import (
     DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
     DVRSpecResultAux,
+    compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
 )
 from sglang.srt.speculative.dvr_scheduler import (
@@ -22,7 +23,6 @@ from sglang.srt.speculative.dvr_scheduler import (
     apply_dvr_final_logprob_repairs_from_result,
     maybe_filter_running_batch_with_dvr_state,
 )
-from sglang.srt.speculative.dvr_eagle_worker import DecodeVerifyRollbackEagleWorkerV2
 from sglang.srt.speculative.dvr_output_policy import (
     allow_dvr_non_streaming_logprob_output,
     defer_dvr_non_streaming_logprob_output,
@@ -583,10 +583,6 @@ def test_dvr_eagle_compacts_accepted_output_rows():
 
 
 def test_dvr_eagle_replay_tokens_follow_spec_v2_output_order():
-    worker = SimpleNamespace(
-        device=torch.device("cpu"),
-        speculative_num_draft_tokens=4,
-    )
     batch = SimpleNamespace(
         out_cache_loc=torch.tensor(
             [100, 101, 102, 103, 200, 201, 202, 203], dtype=torch.int64
@@ -596,14 +592,12 @@ def test_dvr_eagle_replay_tokens_follow_spec_v2_output_order():
     accept_index = torch.tensor([[0, 2, -1], [4, 7, 6]], dtype=torch.int32)
     accept_lens = torch.tensor([2, 3], dtype=torch.int32)
 
-    tokens, cache_locs = (
-        DecodeVerifyRollbackEagleWorkerV2._compact_accepted_tokens_and_cache_locs(
-            worker,
-            batch=batch,
-            predict=predict,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-        )
+    tokens, cache_locs = compact_dvr_accepted_tokens_and_cache_locs(
+        batch=batch,
+        predict=predict,
+        accept_index=accept_index,
+        accept_lens=accept_lens,
+        num_draft_tokens=4,
     )
 
     # Spec-v2 output processing emits compact per-request predict slices.

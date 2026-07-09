@@ -330,6 +330,56 @@ def compact_dvr_output_rows(
     return base_seq_lens_cpu, accept_lens_cpu, token_ids_per_req
 
 
+def dvr_compact_output_indices(
+    *,
+    accept_index: torch.Tensor,
+    num_draft_tokens: int,
+    max_accept: Optional[int] = None,
+) -> torch.Tensor:
+    """Return flat predict slots in the order DVR result processing emits."""
+
+    if max_accept is None:
+        max_accept = accept_index.shape[1]
+    bs = accept_index.shape[0]
+    device = accept_index.device
+    base = (
+        torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
+        * int(num_draft_tokens)
+    )
+    offsets = torch.arange(max_accept, dtype=torch.long, device=device).unsqueeze(0)
+    return base + offsets
+
+
+def compact_dvr_accepted_tokens_and_cache_locs(
+    *,
+    batch: Any,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    num_draft_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return accepted tokens/cache slots in scheduler output order.
+
+    DVR replay must follow the same compact per-request output slices that
+    result processing materializes, while ``accept_index`` still names the
+    verifier KV/cache rows for the accepted path.
+    """
+
+    max_accept = accept_index.shape[1]
+    valid_accept = torch.arange(
+        max_accept, dtype=torch.long, device=accept_index.device
+    ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
+    compact_predict_indices = dvr_compact_output_indices(
+        accept_index=accept_index,
+        num_draft_tokens=num_draft_tokens,
+        max_accept=max_accept,
+    )
+    return (
+        predict[compact_predict_indices[valid_accept]],
+        batch.out_cache_loc[accept_index.clamp_min(0).long()[valid_accept]],
+    )
+
+
 @dataclass
 class DVRVerifyInput(EagleVerifyInput):
     """DVR target verify input for both self-draft and EAGLE/MTP draft.

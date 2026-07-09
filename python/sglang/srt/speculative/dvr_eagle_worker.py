@@ -22,6 +22,7 @@ from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
     DVRVerifyInput,
     build_dvr_spec_result_aux,
+    compact_dvr_accepted_tokens_and_cache_locs,
 )
 from sglang.srt.speculative.dvr_replay import (
     replay_dvr_accepted_suffix_for_live_state,
@@ -239,30 +240,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 use_forward_batch=True,
             )
             return draft_logits, draft_hidden_states
-
-    def _compact_accepted_tokens_and_cache_locs(
-        self,
-        *,
-        batch: ScheduleBatch,
-        predict: torch.Tensor,
-        accept_index: torch.Tensor,
-        accept_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        max_accept = accept_index.shape[1]
-        valid_accept = torch.arange(
-            max_accept, dtype=torch.long, device=self.device
-        ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
-        bs = accept_index.shape[0]
-        compact_predict_indices = (
-            torch.arange(bs, dtype=torch.long, device=self.device).unsqueeze(1)
-            * self.speculative_num_draft_tokens
-            + torch.arange(max_accept, dtype=torch.long, device=self.device).unsqueeze(0)
-        )
-        accepted_indices = accept_index.clamp_min(0).long()
-        return (
-            predict[compact_predict_indices[valid_accept]],
-            batch.out_cache_loc[accepted_indices[valid_accept]],
-        )
 
     def _replay_accepted_suffix_for_partial_verify(
         self,
@@ -541,11 +518,12 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 accept_lens_cpu = accept_lens.detach().cpu().tolist()
             if torch.any(accept_lens < verify_input.draft_token_num).item():
                 accepted_ids, accepted_cache_locs = (
-                    self._compact_accepted_tokens_and_cache_locs(
+                    compact_dvr_accepted_tokens_and_cache_locs(
                         batch=batch,
                         predict=predict,
                         accept_index=accept_index,
                         accept_lens=accept_lens,
+                        num_draft_tokens=self.speculative_num_draft_tokens,
                     )
                 )
                 live_state_already_replayed = (
