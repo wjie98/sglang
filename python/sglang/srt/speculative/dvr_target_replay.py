@@ -157,7 +157,7 @@ def _suffix_replay_inputs(
 
 
 @contextmanager
-def linear_state_replay_context(
+def _linear_state_replay_context(
     linear_state_ctx,
     *,
     clear_state_input_window: bool = False,
@@ -225,7 +225,7 @@ def linear_state_replay_context(
         )
 
 
-def build_suffix_draft_replay_plan(
+def _build_suffix_draft_replay_plan(
     *,
     batch,
     base_seq_lens_cpu: list[int],
@@ -292,7 +292,7 @@ def build_suffix_draft_replay_plan(
     )
 
 
-def build_suffix_draft_mrope_positions(
+def _build_suffix_draft_mrope_positions(
     replay_batch: ScheduleBatch,
     replay_plan: DVRSuffixReplayPlan,
 ) -> torch.Tensor:
@@ -349,7 +349,7 @@ def build_suffix_draft_mrope_positions(
     return torch.cat(mrope_chunks, dim=1)
 
 
-def build_suffix_target_replay_batch(
+def _build_suffix_target_replay_batch(
     batch,
     replay_plan: DVRSuffixReplayPlan,
     *,
@@ -364,7 +364,7 @@ def build_suffix_target_replay_batch(
 ) -> ScheduleBatch:
     """Create the private target EXTEND batch for a suffix replay oracle."""
 
-    return build_private_extend_batch(
+    return _build_private_extend_batch(
         batch,
         DVRPrivateExtendBatchSpec(
             reqs=batch.reqs,
@@ -387,7 +387,7 @@ def build_suffix_target_replay_batch(
     )
 
 
-def build_accepted_suffix_replay_plan(
+def _build_accepted_suffix_replay_plan(
     *,
     batch,
     base_seq_lens_cpu: list[int],
@@ -542,7 +542,7 @@ def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleB
     """Create the narrow ScheduleBatch used for boundary checkpoint replay."""
 
     device = batch.device
-    return build_private_extend_batch(
+    return _build_private_extend_batch(
         batch,
         DVRPrivateExtendBatchSpec(
             reqs=plan.reqs,
@@ -566,7 +566,7 @@ def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleB
     )
 
 
-def build_private_extend_batch(
+def _build_private_extend_batch(
     batch,
     spec: DVRPrivateExtendBatchSpec,
 ) -> ScheduleBatch:
@@ -719,7 +719,7 @@ def suffix_draft_replay_batch_context(
     boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
     if full_prefix_replay:
         boundary_lens = [0 for _ in boundary_lens]
-    replay_plan = build_suffix_draft_replay_plan(
+    replay_plan = _build_suffix_draft_replay_plan(
         batch=batch,
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
@@ -750,7 +750,7 @@ def suffix_draft_replay_batch_context(
         if not bool(boundary_track_mask.any().item()):
             boundary_track_mask = None
     linear_state.set_suffix_replay_boundary_track_mask(boundary_track_mask)
-    replay_batch = build_suffix_target_replay_batch(
+    replay_batch = _build_suffix_target_replay_batch(
         batch,
         replay_plan,
         capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -776,7 +776,7 @@ def suffix_draft_replay_batch_context(
         mamba_clear_indices=live_indices if full_prefix_replay else None,
     )
 
-    with linear_state_replay_context(
+    with _linear_state_replay_context(
         linear_state_ctx,
         clear_state_input_window=full_prefix_replay,
         restore_live_state=True,
@@ -795,7 +795,7 @@ def suffix_draft_replay_batch_context(
         yield replay_batch, replay_plan
 
 
-def draft_row_logits_from_replay_hidden_states(
+def _draft_row_logits_from_replay_hidden_states(
     *,
     target_worker,
     forward_batch,
@@ -853,7 +853,7 @@ def replay_accepted_suffix_for_live_state(
     assert boundary_indices is not None
 
     boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
-    replay_plan = build_accepted_suffix_replay_plan(
+    replay_plan = _build_accepted_suffix_replay_plan(
         batch=batch,
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
@@ -869,14 +869,14 @@ def replay_accepted_suffix_for_live_state(
     # Commit repair, not checkpoint publication: leave the live recurrent slot
     # updated by the replay so the normal commit path can copy it directly.
     linear_state.set_suffix_replay_boundary_track_mask(None)
-    replay_batch = build_suffix_target_replay_batch(
+    replay_batch = _build_suffix_target_replay_batch(
         batch,
         replay_plan,
         capture_hidden_mode=CaptureHiddenMode.NULL,
         mamba_cow_src_indices=boundary_indices,
         mamba_cow_dst_indices=live_indices,
     )
-    with linear_state_replay_context(linear_state_ctx, restore_live_state=False):
+    with _linear_state_replay_context(linear_state_ctx, restore_live_state=False):
         if replay_plan.append_rows is not None:
             assert replay_plan.append_offsets is not None
             replay_batch.req_to_token_pool.write(
@@ -905,7 +905,7 @@ def run_suffix_draft_replay_oracle(
     if use_forward_batch:
         forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
         if model_runner.model_is_mrope:
-            forward_batch.mrope_positions = build_suffix_draft_mrope_positions(
+            forward_batch.mrope_positions = _build_suffix_draft_mrope_positions(
                 replay_batch, replay_plan
             )
         oracle_output = target_worker.forward_batch_generation(
@@ -921,7 +921,7 @@ def run_suffix_draft_replay_oracle(
         forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
 
     assert replay_plan.hidden_gather_indices is not None
-    return draft_row_logits_from_replay_hidden_states(
+    return _draft_row_logits_from_replay_hidden_states(
         target_worker=target_worker,
         forward_batch=forward_batch,
         hidden_states=oracle_output.logits_output.hidden_states,
@@ -972,33 +972,6 @@ def score_deferred_dvr_final_logprob_repairs(
         batch,
         base_seq_lens_cpu=base_seq_lens_cpu,
     )
-    return score_dvr_final_logprob_repairs(
-        batch=batch,
-        target_worker=target_worker,
-        replay_prefix=replay_prefix,
-        linear_state_ctx=linear_state_ctx,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        accept_lens_cpu=accept_lens_cpu,
-        compact_output_token_ids_per_req=compact_output_token_ids_per_req,
-        error_prefix=error_prefix,
-        allow_preclaimed_final_token=allow_preclaimed_final_token,
-    )
-
-
-def score_dvr_final_logprob_repairs(
-    *,
-    batch: ScheduleBatch,
-    target_worker: Any,
-    replay_prefix: DVRReplayPrefixTracker,
-    linear_state_ctx: Any,
-    base_seq_lens_cpu: list[int],
-    accept_lens_cpu: list[int],
-    compact_output_token_ids_per_req: Optional[list[list[int]]] = None,
-    error_prefix: str,
-    allow_preclaimed_final_token: bool = False,
-) -> Optional[list[Optional[DVRFinalLogprobRepair]]]:
-    """Score final non-streaming DVR output logprobs with exact replay oracles."""
-
     if batch.forward_mode.is_idle() or linear_state_ctx is None:
         return None
 
@@ -1206,7 +1179,7 @@ def _run_final_logprob_replay(
     input_ids: list[int],
 ) -> torch.Tensor:
     extend_len = len(input_ids)
-    replay_batch = build_private_extend_batch(
+    replay_batch = _build_private_extend_batch(
         batch,
         DVRPrivateExtendBatchSpec(
             reqs=[req],
@@ -1238,7 +1211,7 @@ def _run_final_logprob_replay(
 
         with (
             envs.SGLANG_EAGER_INPUT_NO_COPY.override(True),
-            linear_state_replay_context(
+            _linear_state_replay_context(
                 replay_linear_state_ctx,
                 clear_state_input_window=True,
                 restore_live_state=True,
