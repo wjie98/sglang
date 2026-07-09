@@ -29,7 +29,7 @@ from sglang.srt.speculative.dvr_scheduler_utils import (
 
 
 @dataclass
-class DVRPrivateExtendBatchSpec:
+class _DVRPrivateExtendBatchSpec:
     """Inputs for a DVR-owned EXTEND batch detached from scheduler mutation.
 
     DVR uses private EXTEND batches for target verify oracles, boundary-state
@@ -64,7 +64,7 @@ class DVRPrivateExtendBatchSpec:
 
 
 @dataclass
-class DVRSuffixReplayPlan:
+class _DVRSuffixReplayPlan:
     """Plan a target EXTEND replay over unclosed prefix tail plus appended rows.
 
     The appended rows are draft rows for verifier oracles and accepted rows for
@@ -86,7 +86,7 @@ class DVRSuffixReplayPlan:
 
 
 @dataclass
-class DVRBoundaryReplayPlan:
+class _DVRBoundaryReplayPlan:
     """Plan an EXTEND replay that materializes missing chunk-boundary state."""
 
     reqs: list[Any]
@@ -233,7 +233,7 @@ def _build_suffix_draft_replay_plan(
     draft_tokens: torch.Tensor,
     draft_cache_locs: torch.Tensor,
     request_token_ids_for_replay,
-) -> Optional[DVRSuffixReplayPlan]:
+) -> Optional[_DVRSuffixReplayPlan]:
     """Build the common tail+draft replay shape for self-DVR and DVR-EAGLE."""
 
     bs = len(batch.seq_lens)
@@ -277,7 +277,7 @@ def _build_suffix_draft_replay_plan(
         gather_indices, dtype=torch.long, device=batch.seq_lens.device
     )
 
-    return DVRSuffixReplayPlan(
+    return _DVRSuffixReplayPlan(
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
         tail_lens_cpu=tail_lens_cpu,
@@ -294,7 +294,7 @@ def _build_suffix_draft_replay_plan(
 
 def _build_suffix_draft_mrope_positions(
     replay_batch: ScheduleBatch,
-    replay_plan: DVRSuffixReplayPlan,
+    replay_plan: _DVRSuffixReplayPlan,
 ) -> torch.Tensor:
     """Build flattened mrope positions matching suffix tail+draft input order."""
 
@@ -351,7 +351,7 @@ def _build_suffix_draft_mrope_positions(
 
 def _build_suffix_target_replay_batch(
     batch,
-    replay_plan: DVRSuffixReplayPlan,
+    replay_plan: _DVRSuffixReplayPlan,
     *,
     capture_hidden_mode: CaptureHiddenMode,
     return_logprob: bool = False,
@@ -366,7 +366,7 @@ def _build_suffix_target_replay_batch(
 
     return _build_private_extend_batch(
         batch,
-        DVRPrivateExtendBatchSpec(
+        _DVRPrivateExtendBatchSpec(
             reqs=batch.reqs,
             input_ids=replay_plan.input_ids,
             out_cache_locs=replay_plan.out_cache_locs,
@@ -397,7 +397,7 @@ def _build_accepted_suffix_replay_plan(
     accepted_token_counts_cpu: list[int],
     num_draft_tokens: int,
     request_token_ids_for_replay,
-) -> Optional[DVRSuffixReplayPlan]:
+) -> Optional[_DVRSuffixReplayPlan]:
     """Build the live-state repair replay shape for partially accepted chains."""
 
     if accepted_tokens is None or accepted_tokens.numel() == 0:
@@ -469,7 +469,7 @@ def _build_accepted_suffix_replay_plan(
     if not input_ids:
         return None
 
-    return DVRSuffixReplayPlan(
+    return _DVRSuffixReplayPlan(
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
         tail_lens_cpu=tail_lens_cpu,
@@ -489,7 +489,7 @@ def build_boundary_replay_plan(
     tasks,
     state_adapter,
     request_token_ids_for_replay,
-) -> Optional[DVRBoundaryReplayPlan]:
+) -> Optional[_DVRBoundaryReplayPlan]:
     """Build replay inputs for missing chunk-boundary checkpoints.
 
     Boundary replay is a real checkpoint materialization step, not a temporary
@@ -527,7 +527,7 @@ def build_boundary_replay_plan(
         track_indices=[task.boundary_track_idx for task in tasks],
         device=batch.device,
     )
-    return DVRBoundaryReplayPlan(
+    return _DVRBoundaryReplayPlan(
         reqs=reqs,
         input_ids=input_ids,
         out_cache_locs=out_cache_locs,
@@ -538,13 +538,13 @@ def build_boundary_replay_plan(
     )
 
 
-def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleBatch:
+def build_boundary_replay_batch(batch, plan: _DVRBoundaryReplayPlan) -> ScheduleBatch:
     """Create the narrow ScheduleBatch used for boundary checkpoint replay."""
 
     device = batch.device
     return _build_private_extend_batch(
         batch,
-        DVRPrivateExtendBatchSpec(
+        _DVRPrivateExtendBatchSpec(
             reqs=plan.reqs,
             input_ids=plan.input_ids,
             out_cache_locs=plan.out_cache_locs,
@@ -568,7 +568,7 @@ def build_boundary_replay_batch(batch, plan: DVRBoundaryReplayPlan) -> ScheduleB
 
 def _build_private_extend_batch(
     batch,
-    spec: DVRPrivateExtendBatchSpec,
+    spec: _DVRPrivateExtendBatchSpec,
 ) -> ScheduleBatch:
     """Create a DVR-owned EXTEND batch with upstream ScheduleBatch plumbing."""
 
@@ -896,7 +896,7 @@ def run_suffix_draft_replay_oracle(
     *,
     target_worker,
     replay_batch: ScheduleBatch,
-    replay_plan: DVRSuffixReplayPlan,
+    replay_plan: _DVRSuffixReplayPlan,
     use_forward_batch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run a suffix+draft replay oracle and return only draft-row outputs."""
@@ -1181,7 +1181,7 @@ def _run_final_logprob_replay(
     extend_len = len(input_ids)
     replay_batch = _build_private_extend_batch(
         batch,
-        DVRPrivateExtendBatchSpec(
+        _DVRPrivateExtendBatchSpec(
             reqs=[req],
             input_ids=input_ids,
             out_cache_locs=None,
