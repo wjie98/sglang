@@ -83,6 +83,8 @@ class DVREagleTargetVerifyCudaGraphRunner:
             self.runner = DecodeCudaGraphRunner(model_runner)
 
     def __getattr__(self, name):
+        if name == "runner":
+            raise AttributeError(name)
         return getattr(self.runner, name)
 
 
@@ -374,6 +376,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 dtype=EagleDraftInput.dtype_for(self.draft_worker),
                 topk=self.topk,
                 capture_hidden_mode=capture_mode,
+                vocab_size=self.target_worker.model_config.vocab_size,
             )
 
         self._prepare_dvr_boundary_for_verify(batch)
