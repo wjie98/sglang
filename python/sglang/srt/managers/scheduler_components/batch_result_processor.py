@@ -248,14 +248,18 @@ class SchedulerBatchResultProcessor:
                         # checkpoint to a cache insert that upstream would not
                         # normally see.  If it does not handle this request,
                         # keep the original unfinished-prefill cache path.
-                        dvr_cached = maybe_cache_unfinished_prefill_req_with_dvr_state(
-                            req=req,
-                            batch=batch,
-                            req_index=i,
-                            tree_cache=self.tree_cache,
-                            enable_hisparse=self.server_args.enable_hisparse,
-                            hisparse_coordinator=self.hisparse_coordinator,
-                        )
+                        dvr_cached = False
+                        if batch.spec_algorithm.is_dvr():
+                            dvr_cached = (
+                                maybe_cache_unfinished_prefill_req_with_dvr_state(
+                                    req=req,
+                                    batch=batch,
+                                    req_index=i,
+                                    tree_cache=self.tree_cache,
+                                    enable_hisparse=self.server_args.enable_hisparse,
+                                    hisparse_coordinator=self.hisparse_coordinator,
+                                )
+                            )
                         if not dvr_cached and (
                             not batch.decoding_reqs or req not in batch.decoding_reqs
                         ):
@@ -770,7 +774,8 @@ class SchedulerBatchResultProcessor:
 
         # DVR output repairs become valid only after accepted tokens are
         # materialized into Req.output_ids.
-        apply_dvr_deferred_output_from_result(batch, result)
+        if batch.spec_algorithm.is_dvr():
+            apply_dvr_deferred_output_from_result(batch, result)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -929,13 +934,17 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        if maybe_handle_dvr_mamba_checkpoint_after_decode(
-            req=req,
-            batch=batch,
-            result=result,
-            req_index=i,
-            tree_cache=self.tree_cache,
-        ):
+        dvr_checkpoint_committed = (
+            batch.spec_algorithm.is_dvr()
+            and maybe_handle_dvr_mamba_checkpoint_after_decode(
+                req=req,
+                batch=batch,
+                result=result,
+                req_index=i,
+                tree_cache=self.tree_cache,
+            )
+        )
+        if dvr_checkpoint_committed:
             return
 
         lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()

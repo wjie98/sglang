@@ -64,10 +64,10 @@ def maybe_filter_running_batch_with_dvr_state(
     future_map: Any,
     enable_overlap: bool,
 ) -> bool:
-    """Filter running batch with DVR's spec-v2 logical-finish state if needed."""
+    """Filter a DVR running batch with spec-v2 logical-finish state if needed."""
 
     spec_algorithm = batch.spec_algorithm
-    if not enable_overlap or not spec_algorithm.is_dvr():
+    if not enable_overlap:
         return False
     if spec_algorithm.is_dvr_self_draft() and not batch.enable_overlap:
         return False
@@ -104,9 +104,6 @@ def maybe_filter_running_batch_with_dvr_state(
 
 def apply_dvr_deferred_output_from_result(batch: Any, result: Any) -> None:
     """Apply DVR-owned output work after scheduler materializes tokens."""
-
-    if not batch.spec_algorithm.is_dvr():
-        return
 
     aux = getattr(result, "dvr_aux", None)
     output = None if aux is None else getattr(aux, "output", None)
@@ -158,9 +155,6 @@ def maybe_cache_unfinished_prefill_req_with_dvr_state(
 ) -> bool:
     """Cache unfinished prefill reqs that DVR spec-v2 overlap materialized."""
 
-    if not batch.spec_algorithm.is_dvr():
-        return False
-
     should_cache_unfinished = not batch.decoding_reqs or req not in batch.decoding_reqs
     is_dvr_spec_v2 = batch.spec_algorithm.is_dvr_eagle() or getattr(
         batch, "enable_overlap", False
@@ -191,9 +185,6 @@ def maybe_handle_dvr_mamba_checkpoint_after_decode(
     tree_cache: Any,
 ) -> bool:
     """Handle DVR's decode-time mamba checkpoint commit if applicable."""
-
-    if not batch.spec_algorithm.is_dvr():
-        return False
 
     if batch.spec_algorithm.is_dvr_eagle() or getattr(batch, "enable_overlap", False):
         _commit_pending_mamba_checkpoint_from_result(

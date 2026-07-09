@@ -86,14 +86,6 @@ def test_dvr_published_seq_len_filter_hook():
     )
     assert batch.filtered_keep_indices == [0]
 
-    batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
-    assert not maybe_filter_running_batch_with_dvr_state(
-        batch=batch,
-        future_map=future_map,
-        enable_overlap=True,
-    )
-
-
 def test_dvr_pending_mamba_checkpoint_commit_guards():
     class Pool:
         @staticmethod

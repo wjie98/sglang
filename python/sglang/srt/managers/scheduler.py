@@ -3017,11 +3017,15 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        if not maybe_filter_running_batch_with_dvr_state(
-            batch=batch,
-            future_map=self.future_map,
-            enable_overlap=self.enable_overlap,
-        ):
+        dvr_filtered = (
+            batch.spec_algorithm.is_dvr()
+            and maybe_filter_running_batch_with_dvr_state(
+                batch=batch,
+                future_map=self.future_map,
+                enable_overlap=self.enable_overlap,
+            )
+        )
+        if not dvr_filtered:
             batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
