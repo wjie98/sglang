@@ -528,7 +528,6 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
             accept_len=16,
             observed_output_len=0,
             compact_output_token_ids_per_req=None,
-            allow_preclaimed_final_token=True,
         )
         == 17
     )
@@ -541,7 +540,6 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
             accept_len=0,
             observed_output_len=0,
             compact_output_token_ids_per_req=None,
-            allow_preclaimed_final_token=True,
         )
         is None
     )
@@ -554,7 +552,6 @@ def test_dvr_final_logprob_overlap_bonus_can_finish_request():
             accept_len=0,
             observed_output_len=17,
             compact_output_token_ids_per_req=None,
-            allow_preclaimed_final_token=True,
         )
         == 17
     )
