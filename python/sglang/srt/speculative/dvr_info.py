@@ -418,6 +418,7 @@ class DVRVerifyOutput:
     """Compatibility view for DVR spec-v1 post-verify bookkeeping."""
 
     accept_tokens: torch.Tensor
+    padded_output_tokens: torch.Tensor
     accept_indices: torch.Tensor
     num_correct_drafts_per_req_cpu: List[int]
     draft_extend_input: EagleDraftExtendInput

@@ -30,7 +30,6 @@ from sglang.srt.speculative.dvr_scheduler import (
     apply_spec_final_logprob_repairs_from_result,
     maybe_cache_unfinished_prefill_req_with_spec_state,
     maybe_handle_spec_mamba_checkpoint_after_decode,
-    maybe_resolve_dvr_spec_v1_decode_tokens_from_result,
     should_skip_dvr_spec_v1_decode_logprob_append,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -799,14 +798,7 @@ class SchedulerBatchResultProcessor:
     ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
         next_token_logprobs = None
         if not batch.spec_algorithm.is_none():
-            next_token_ids = maybe_resolve_dvr_spec_v1_decode_tokens_from_result(
-                batch=batch,
-                result=result,
-                model_worker=self.model_worker,
-                accept_grammar_tokens=self._accept_grammar_tokens,
-            )
-            if next_token_ids is None:
-                next_token_ids = self._resolve_spec_v2_tokens(result, batch)
+            next_token_ids = self._resolve_spec_v2_tokens(result, batch)
         elif isinstance(next_token_ids, list):
             pass  # MLX path: already a list[int], skip torch round-trip
         else:

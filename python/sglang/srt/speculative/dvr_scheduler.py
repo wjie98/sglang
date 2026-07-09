@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.mem_cache.dvr_mamba_radix_cache_policy import (
@@ -225,90 +225,18 @@ def apply_spec_final_logprob_repairs_from_result(batch: Any, result: Any) -> Non
     apply_dvr_final_logprob_repairs(batch, repairs)
 
 
-def _is_dvr_spec_v1_result(batch: Any, result: Any) -> bool:
-    """Return whether result uses DVR self-draft's legacy spec-v1 shape."""
-
-    return (
-        batch.spec_algorithm.is_dvr_self_draft()
-        and getattr(result, "accept_lens", None) is None
-        and getattr(result, "num_correct_drafts_per_req_cpu", None) is not None
+def _is_dvr_self_draft_spec_v1(batch: Any) -> bool:
+    return batch.spec_algorithm.is_dvr_self_draft() and not getattr(
+        batch, "enable_overlap", False
     )
-
-
-def maybe_resolve_dvr_spec_v1_decode_tokens_from_result(
-    *,
-    batch: Any,
-    result: Any,
-    model_worker: Any,
-    accept_grammar_tokens: Callable[[Any, Any], Any],
-) -> Optional[list[list[int]]]:
-    """Resolve DVR spec-v1 flat accepted tokens into per-request token runs."""
-
-    if not _is_dvr_spec_v1_result(batch, result):
-        return None
-
-    assert result.next_token_ids.is_cpu
-    flat_tokens = result.next_token_ids.tolist()
-    accept_lens = [x + 1 for x in result.num_correct_drafts_per_req_cpu]
-    if len(accept_lens) != len(batch.reqs):
-        raise RuntimeError(
-            "DVR spec-v1 result length mismatch: "
-            f"{len(accept_lens)=}, {len(batch.reqs)=}."
-        )
-    if sum(accept_lens) != len(flat_tokens):
-        raise RuntimeError(
-            "DVR spec-v1 accepted-token length mismatch: "
-            f"{sum(accept_lens)=}, {len(flat_tokens)=}."
-        )
-
-    result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
-    on_verify_complete_cpu = getattr(model_worker, "on_verify_complete_cpu", None)
-    if callable(on_verify_complete_cpu):
-        on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
-        )
-
-    default_proposed_per_verify = max(
-        0, int(getattr(result, "speculative_num_draft_tokens", 1) or 1) - 1
-    )
-    proposed_drafts_per_req = getattr(result, "num_proposed_drafts_per_req_cpu", None)
-
-    predict_tokens = []
-    offset = 0
-    for i, (req, accept_len) in enumerate(zip(batch.reqs, accept_lens, strict=True)):
-        accept_tokens = flat_tokens[offset : offset + accept_len]
-        offset += accept_len
-
-        if req.is_retracted:
-            pass
-        elif req.finished():
-            # Spec prepare_for_decode pre-claims one bonus slot.
-            req.kv_committed_len -= 1
-        else:
-            if req.grammar is not None:
-                accept_tokens = accept_grammar_tokens(req, accept_tokens)
-
-            num_accept_tokens = len(accept_tokens)
-            # Spec prepare_for_decode already committed the bonus slot.
-            req.kv_committed_len += num_accept_tokens - 1
-            req.record_spec_verify_metrics(
-                num_correct_drafts=result.num_correct_drafts_per_req_cpu[i],
-                num_proposed_drafts=(
-                    proposed_drafts_per_req[i]
-                    if proposed_drafts_per_req is not None
-                    else req.useful_spec_proposed_drafts(default_proposed_per_verify)
-                ),
-            )
-
-        predict_tokens.append(accept_tokens)
-
-    return predict_tokens
 
 
 def should_skip_dvr_spec_v1_decode_logprob_append(*, batch: Any, result: Any) -> bool:
     """DVR spec-v1 computes request logprobs inside the worker compatibility path."""
 
-    return _is_dvr_spec_v1_result(batch, result)
+    return _is_dvr_self_draft_spec_v1(batch) and getattr(
+        result, "num_correct_drafts_per_req_cpu", None
+    ) is not None
 
 
 def maybe_cache_unfinished_prefill_req_with_spec_state(

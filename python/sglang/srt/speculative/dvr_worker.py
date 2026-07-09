@@ -575,11 +575,12 @@ class DecodeVerifyRollbackWorker:
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=verify_output.accept_tokens,
+            next_token_ids=verify_output.padded_output_tokens,
             num_correct_drafts=sum(verify_output.num_correct_drafts_per_req_cpu),
             num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=batch.spec_info,
+            accept_lens=accept_lens,
             new_seq_lens=batch.seq_lens + accept_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
             num_proposed_drafts_per_req_cpu=[
@@ -1073,13 +1074,33 @@ class DecodeVerifyRollbackWorker:
             spec_info, batch, logits_output, vocab_mask=None
         )
         accept_lens_cpu = [int(x) for x in accept_lens.tolist()]
+        output_offsets = torch.arange(
+            spec_info.draft_token_num,
+            dtype=torch.long,
+            device=predict.device,
+        )
+        output_mask = output_offsets.unsqueeze(0) < accept_lens.to(
+            torch.long
+        ).unsqueeze(1)
+        # Scheduler-owned output tokens follow compact per-request predict
+        # prefixes.  accept_index still identifies the verifier logit/cache row.
+        compact_output_indices = (
+            torch.arange(
+                accept_lens.shape[0],
+                dtype=torch.long,
+                device=predict.device,
+            ).unsqueeze(1)
+            * spec_info.draft_token_num
+            + output_offsets.unsqueeze(0)
+        )[output_mask]
         accept_mask = torch.arange(
             accept_index.shape[1], dtype=torch.long, device=accept_index.device
         ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
         accept_indices = accept_index[accept_mask].to(torch.long)
-        accept_tokens = predict[accept_indices].to(torch.long)
+        accept_tokens = predict[compact_output_indices].to(torch.long)
         return DVRVerifyOutput(
             accept_tokens=accept_tokens,
+            padded_output_tokens=predict,
             accept_indices=accept_indices,
             num_correct_drafts_per_req_cpu=[
                 max(num_accept - 1, 0) for num_accept in accept_lens_cpu
