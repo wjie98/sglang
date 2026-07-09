@@ -24,7 +24,7 @@ from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
     DVRSpecResultAux,
 )
-from sglang.srt.speculative.dvr_scheduler_utils import (
+from sglang.srt.speculative.dvr_scheduler import (
     _commit_pending_mamba_checkpoint_from_result,
     apply_spec_final_logprob_repairs_from_result,
     maybe_filter_running_batch_with_spec_state,

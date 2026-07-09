@@ -30,7 +30,7 @@ from sglang.srt.speculative.dvr_info import (
     DVRVerifyOutput,
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
-from sglang.srt.speculative.dvr_scheduler_utils import (
+from sglang.srt.speculative.dvr_scheduler import (
     apply_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_replay import (
