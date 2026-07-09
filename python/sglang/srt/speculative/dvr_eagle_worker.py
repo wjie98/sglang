@@ -19,7 +19,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
-from sglang.srt.speculative.dvr_scheduler_utils import (
+from sglang.srt.speculative.dvr_info import (
+    DVREagleVerifyInput,
     DVRPendingOutputPrefix,
     build_dvr_spec_result_aux,
 )
@@ -31,7 +32,6 @@ from sglang.srt.speculative.dvr_target_replay import (
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_worker import (
-    DVREagleVerifyInput,
     dvr_has_graph_unsafe_short_prompt,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput

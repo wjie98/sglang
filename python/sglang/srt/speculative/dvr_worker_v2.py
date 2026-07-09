@@ -16,15 +16,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
-from sglang.srt.speculative.dvr_scheduler_utils import (
+from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
+    DVRSelfDraftVerifyInput,
     build_dvr_spec_result_aux,
 )
 from sglang.srt.speculative.dvr_target_replay import (
     score_deferred_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_worker import (
-    DVRSelfDraftVerifyInput,
     DecodeVerifyRollbackWorker,
     chain_speculative_sampling,
     dvr_chain_uniform_samples,

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
-from dataclasses import dataclass, fields
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -26,9 +24,13 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     dvr_self_draft_graph_skip_reason,
     _min_seq_len_cpu,
 )
+from sglang.srt.speculative.dvr_info import (
+    DVRPendingOutputPrefix,
+    DVRSelfDraftVerifyInput,
+    DVRVerifyOutput,
+)
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_scheduler_utils import (
-    DVRPendingOutputPrefix,
     apply_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_target_replay import (
@@ -65,49 +67,6 @@ except ImportError:  # pragma: no cover - non-CUDA builds use the torch fallback
     tl = None
 
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def _dvr_causal_verify_cuda_graph_metadata(
-    model_runner, attn_backend, forward_mode, spec_info, fallback_custom_mask=None
-):
-    """Build DVR target-verify graph metadata without selecting custom masks."""
-
-    old_custom_mask = getattr(spec_info, "custom_mask", None)
-    should_clear_custom_mask = (
-        (
-            model_runner.spec_algorithm.is_dvr_self_draft()
-            or getattr(model_runner, "enable_dvr_target_verify_cuda_graph", False)
-        )
-        and forward_mode.is_target_verify()
-        and spec_info is not None
-    )
-    if (
-        should_clear_custom_mask
-        and old_custom_mask is None
-        and fallback_custom_mask is not None
-    ):
-        # DVR target verify is a topk=1 chain, so the real attention mask is
-        # causal. Some graph metadata builders still read custom_mask.shape;
-        # provide the graph buffer only for that shape bookkeeping.
-        spec_info.custom_mask = fallback_custom_mask
-    try:
-        yield
-    finally:
-        if should_clear_custom_mask:
-            spec_info.custom_mask = old_custom_mask
-            backends = [attn_backend]
-            full_attn_backend = getattr(attn_backend, "full_attn_backend", None)
-            if full_attn_backend is not None:
-                backends.append(full_attn_backend)
-            for backend in backends:
-                metadata = getattr(backend, "forward_metadata", None)
-                if metadata is None:
-                    continue
-                if hasattr(metadata, "custom_mask"):
-                    metadata.custom_mask = None
-                if hasattr(metadata, "mask_indptr"):
-                    metadata.mask_indptr = None
 
 
 def dvr_has_graph_unsafe_short_prompt(batch) -> bool:
@@ -466,85 +425,6 @@ def _add_output_logprobs_for_dvr_spec_v1(
                         token_ids_logprobs_idx[pt]
                     )
             pt += 1
-
-
-class DVRTargetVerifyMixin:
-    """DVR target-verify CUDA graph fixups shared by DVR draft variants."""
-
-    @classmethod
-    def from_eagle_verify_input(cls, verify_input: EagleVerifyInput):
-        """Preserve EAGLE draft metadata while swapping in DVR verify hooks."""
-
-        return cls(
-            **{
-                field.name: getattr(verify_input, field.name)
-                for field in fields(EagleVerifyInput)
-            }
-        )
-
-    def prepare_cuda_graph_replay_buffers(self, graph_runner, raw_num_token: int):
-        if not graph_runner.capture_forward_mode.is_target_verify():
-            return
-        # The generic num_token_non_padded slot is enabled only for EP. GDN DVR
-        # verify also needs the raw token count to mask padded graph rows.
-        graph_runner.buffers.num_token_non_padded.fill_(raw_num_token)
-
-    def cuda_graph_metadata_context(
-        self,
-        *,
-        model_runner,
-        attn_backend,
-        forward_mode,
-        fallback_custom_mask=None,
-    ):
-        return _dvr_causal_verify_cuda_graph_metadata(
-            model_runner,
-            attn_backend,
-            forward_mode,
-            self,
-            fallback_custom_mask,
-        )
-
-
-class DVREagleVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
-    """DVR target verify with a standard EAGLE target-only sampler."""
-
-    def _sampling_uniforms(self, candidates: torch.Tensor, batch):
-        # EAGLE target-only verification has rejection/final-sampling coins
-        # outside the normal sampler. Honor request-level sampling_seed here so
-        # DVR-EAGLE sync/overlap comparisons are reproducible under sampling.
-        return dvr_chain_uniform_samples(candidates, batch)
-
-
-@dataclass
-class DVRSelfDraftVerifyInput(DVRTargetVerifyMixin, EagleVerifyInput):
-    """DVR verify input with classic chain speculative sampling.
-
-    Shared EAGLE verification is target-only. DVR self-draft records the draft
-    sampling distribution and must use the chain accept/reject kernel to keep
-    the generated distribution and acceptance rate aligned with the reference
-    branch.
-    """
-
-    draft_probs: Optional[torch.Tensor] = None
-
-    def _sampling_fn_and_draft_probs(self, target_probs: torch.Tensor, batch):
-        if self.draft_probs is None:
-            return super()._sampling_fn_and_draft_probs(target_probs, batch)
-        return chain_speculative_sampling, self.draft_probs
-
-    def _sampling_uniforms(self, candidates: torch.Tensor, batch):
-        return dvr_chain_uniform_samples(candidates, batch)
-
-
-@dataclass
-class DVRVerifyOutput:
-    """Compatibility view for DVR spec-v1 post-verify bookkeeping."""
-
-    accept_tokens: torch.Tensor
-    accept_indices: torch.Tensor
-    num_correct_drafts_per_req_cpu: List[int]
-    draft_extend_input: EagleDraftExtendInput
 
 
 class DecodeVerifyRollbackWorker:

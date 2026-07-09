@@ -1104,11 +1104,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 seq_lens_cpu=None,
             )
             if self.model_runner.spec_algorithm.is_dvr_eagle():
-                from sglang.srt.speculative.dvr_worker import DVREagleVerifyInput
+                from sglang.srt.speculative.dvr_info import DVREagleVerifyInput
 
                 spec_info = DVREagleVerifyInput.from_eagle_verify_input(spec_info)
             elif self.model_runner.spec_algorithm.is_dvr_self_draft():
-                from sglang.srt.speculative.dvr_worker import DVRSelfDraftVerifyInput
+                from sglang.srt.speculative.dvr_info import DVRSelfDraftVerifyInput
 
                 spec_info = DVRSelfDraftVerifyInput.from_eagle_verify_input(spec_info)
 

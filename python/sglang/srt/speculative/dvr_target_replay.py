@@ -22,7 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.dvr_scheduler_utils import (
+from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
     DVRPendingOutputPrefix,
 )
