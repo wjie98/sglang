@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -118,119 +119,85 @@ def apply_dvr_final_logprob_repairs(
         allow_req_non_streaming_logprob_output(req)
 
 
-class DVRReplayPrefixTracker:
-    """Per-worker replay prefix stream for DVR overlap paths.
+class DVRPendingOutputPrefix:
+    """Worker-owned output prefix journal for DVR overlap paths.
 
-    Spec-v2 can start the next DVR replay before the scheduler has materialized
-    the just-verified tokens into ``Req.output_ids``.  Each tracker instance
-    owns exactly one logical stream: either verifier tokens or client-visible
-    output tokens.  Public methods name that stream explicitly so callers do not
-    pass semantic booleans at DVR worker call sites.
+    Spec-v2 can start the next replay before result processing appends accepted
+    tokens into ``Req.output_ids``.  DVR therefore records the real
+    client-visible accepted tokens produced by each verify step.  Replay
+    prefixes are built only from ``origin_input_ids`` + materialized
+    ``Req.output_ids`` + this pending output journal; draft-token streams and
+    broad fallback reconstruction are deliberately excluded.
     """
 
     def __init__(self) -> None:
-        self._tokens_by_rid: dict[Any, list[int]] = {}
+        self._tokens_by_req: weakref.WeakKeyDictionary[Any, list[int]] = (
+            weakref.WeakKeyDictionary()
+        )
 
     def clear(self) -> None:
-        self._tokens_by_rid.clear()
+        self._tokens_by_req.clear()
 
     def prune_to_batch(self, batch: Any) -> None:
         if batch.reqs is None:
-            self._tokens_by_rid.clear()
+            self._tokens_by_req.clear()
             return
 
-        active_rids = {req.rid for req in batch.reqs}
-        for rid in list(self._tokens_by_rid):
-            if rid not in active_rids:
-                self._tokens_by_rid.pop(rid, None)
+        active_reqs = set(batch.reqs)
+        for req in list(self._tokens_by_req):
+            if req not in active_reqs:
+                self._tokens_by_req.pop(req, None)
 
     def _stream_for_req(
-        self,
-        req: Any,
-        *,
-        seed_from_req_output: bool,
+        self, req: Any, *, error_prefix: Optional[str] = None
     ) -> list[int]:
-        initial_output_ids = list(req.output_ids) if seed_from_req_output else []
-        stream = self._tokens_by_rid.setdefault(req.rid, initial_output_ids)
-        if seed_from_req_output and len(stream) < len(req.output_ids):
-            stream[:] = list(req.output_ids)
+        stream = self._tokens_by_req.setdefault(req, [])
+        output_ids = list(req.output_ids)
+        if output_ids:
+            common_len = min(len(stream), len(output_ids))
+            if stream[:common_len] != output_ids[:common_len]:
+                prefix = error_prefix or "DVR output prefix"
+                raise RuntimeError(
+                    f"{prefix} diverged from materialized output ids: "
+                    f"rid={req.rid}, tracked_tail={stream[-8:]}, "
+                    f"req_tail={output_ids[-8:]}, tracked_len={len(stream)}, "
+                    f"req_output_len={len(output_ids)}."
+                )
+            if len(output_ids) > len(stream):
+                stream.extend(int(token_id) for token_id in output_ids[len(stream) :])
         return stream
 
     def observed_output_len(self, req: Any) -> int:
         """Return the best known client-visible output length for final repair."""
 
-        return max(
-            len(req.output_ids),
-            len(self._stream_for_req(req, seed_from_req_output=True)),
-        )
+        return len(self._stream_for_req(req))
 
     def _prefix_token_ids(
         self,
         req: Any,
         seq_len: int,
         *,
-        seed_from_req_output: bool,
-        include_full_untruncated_fill_ids: bool = False,
         error_prefix: Optional[str] = None,
     ) -> Optional[list[int]]:
-        """Reconstruct a DVR replay prefix, optionally raising on misses."""
+        """Return an explicitly owned DVR replay prefix."""
 
         origin_input_ids = list(req.origin_input_ids)
         output_len = seq_len - len(origin_input_ids)
         if output_len <= 0:
             return origin_input_ids[:seq_len]
 
-        stream = self._stream_for_req(req, seed_from_req_output=seed_from_req_output)
+        stream = self._stream_for_req(req, error_prefix=error_prefix)
         if len(stream) >= output_len:
             return origin_input_ids + stream[:output_len]
 
-        token_ids = origin_input_ids + list(req.output_ids)
-        if len(token_ids) >= seq_len:
-            return token_ids
-
-        if hasattr(req, "get_fill_ids"):
-            fill_ids = list(req.get_fill_ids())
-            if len(fill_ids) >= seq_len:
-                return fill_ids
-
-        if include_full_untruncated_fill_ids:
-            fill_ids = getattr(req, "full_untruncated_fill_ids", None)
-            if fill_ids is not None:
-                fill_ids = list(fill_ids)
-                if len(fill_ids) >= seq_len:
-                    return fill_ids
-
         if error_prefix is not None:
             raise RuntimeError(
-                f"{error_prefix} replay cannot reconstruct the verified prefix: "
+                f"{error_prefix} replay prefix is not yet owned by DVR: "
                 f"rid={req.rid}, origin_tokens={len(req.origin_input_ids)}, "
                 f"req_output_tokens={len(req.output_ids)}, "
                 f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
             )
         return None
-
-    def request_verifier_prefix_token_ids(
-        self,
-        req: Any,
-        seq_len: int,
-        *,
-        error_prefix: str,
-    ) -> list[int]:
-        """Reconstruct the verifier-side token prefix.
-
-        Self-DVR and DVR-EAGLE verifier replay can run before accepted tokens
-        are materialized in ``Req.output_ids``.  This stream is therefore owned
-        by the DVR worker and only falls back to scheduler fields when it has
-        not yet observed a token.
-        """
-
-        return self._prefix_token_ids(
-            req,
-            seq_len,
-            seed_from_req_output=False,
-            include_full_untruncated_fill_ids=True,
-            error_prefix=error_prefix,
-        )
 
     def request_output_prefix_token_ids(
         self,
@@ -239,19 +206,11 @@ class DVRReplayPrefixTracker:
         *,
         error_prefix: str,
     ) -> list[int]:
-        """Reconstruct the client-visible output prefix.
-
-        EAGLE verification has a verifier prefix and a client output stream
-        with different token semantics.  Final logprob repair must score the
-        latter, so this helper intentionally seeds from ``Req.output_ids`` when
-        the scheduler has already materialized those tokens.
-        """
+        """Return a client-visible output prefix for DVR replay."""
 
         return self._prefix_token_ids(
             req,
             seq_len,
-            seed_from_req_output=True,
-            include_full_untruncated_fill_ids=True,
             error_prefix=error_prefix,
         )
 
@@ -265,8 +224,6 @@ class DVRReplayPrefixTracker:
         return self._prefix_token_ids(
             req,
             seq_len,
-            seed_from_req_output=True,
-            include_full_untruncated_fill_ids=True,
         )
 
     def _append_tokens(
@@ -274,153 +231,45 @@ class DVRReplayPrefixTracker:
         req: Any,
         token_ids,
         *,
-        seed_from_req_output: bool,
+        error_prefix: str,
     ) -> None:
-        stream = self._stream_for_req(req, seed_from_req_output=seed_from_req_output)
+        stream = self._stream_for_req(req, error_prefix=error_prefix)
         stream.extend(int(token_id) for token_id in token_ids)
 
     def append_batch_output_tokens(
         self,
         batch: Any,
         tokens_per_req,
+        *,
+        base_seq_lens_cpu: Optional[list[int]] = None,
+        error_prefix: str = "DVR output prefix",
     ) -> None:
         """Advance the client-visible output stream for all active requests."""
 
         self.prune_to_batch(batch)
-        for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
-            self._append_tokens(req, token_ids, seed_from_req_output=True)
+        if base_seq_lens_cpu is None and getattr(batch, "seq_lens", None) is not None:
+            base_seq_lens_cpu = (
+                batch.seq_lens_cpu.tolist()
+                if getattr(batch, "seq_lens_cpu", None) is not None
+                else batch.seq_lens.detach().cpu().tolist()
+            )
 
-    def append_batch_verifier_tokens(
-        self,
-        batch: Any,
-        tokens_per_req,
-    ) -> None:
-        """Advance the verifier-prefix stream for all active requests."""
+        if base_seq_lens_cpu is None:
+            base_seq_lens_cpu = [None] * len(batch.reqs)
 
-        self.prune_to_batch(batch)
-        for req, token_ids in zip(batch.reqs, tokens_per_req, strict=True):
-            self._append_tokens(req, token_ids, seed_from_req_output=False)
-
-    def advance_output_stream_from_compact_rows(
-        self,
-        *,
-        batch: Any,
-        compact_output_token_ids_per_req: list[list[int]],
-        error_prefix: str,
-    ) -> None:
-        """Append compact client-visible output rows for DVR-EAGLE repair."""
-
-        if batch.forward_mode.is_idle() or batch.reqs is None:
-            return
-
-        self.prune_to_batch(batch)
-
-        seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if batch.seq_lens_cpu is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
-
-        for req, seq_len, compact_output_token_ids in zip(
-            batch.reqs,
-            seq_lens_cpu,
-            compact_output_token_ids_per_req,
-            strict=True,
+        for req, base_seq_len, token_ids in zip(
+            batch.reqs, base_seq_lens_cpu, tokens_per_req, strict=True
         ):
-            prompt_len = len(req.origin_input_ids)
-            stream = self._stream_for_req(req, seed_from_req_output=True)
-            # In spec-v2 overlap, model-side seq_len can lag the
-            # client-visible output stream by one result. Do not truncate a
-            # prefix already learned from Req.output_ids/tracker state.
-            prefix_output_len = max(0, int(seq_len) - prompt_len, len(stream))
-            prefix_ids = self.request_output_prefix_token_ids(
-                req,
-                prompt_len + prefix_output_len,
-                error_prefix=error_prefix,
-            )
-            # Overlap can compute final repair before the prefill/previous
-            # decode result is materialized into Req.output_ids. Seed from the
-            # best known prefix, then append this verify's compact output rows.
-            stream[:] = prefix_ids[prompt_len:]
-            stream.extend(compact_output_token_ids)
-
-    def advance_eagle_verifier_stream_from_draft_rows(
-        self,
-        *,
-        batch: Any,
-        draft_token: Any,
-        draft_token_num: int,
-        accept_lens: Any,
-        error_prefix: str,
-    ) -> None:
-        """Append accepted EAGLE/MTP draft rows to the verifier stream.
-
-        DVR-EAGLE has two token streams: client output uses target predictions,
-        while the next deterministic verifier prefix uses the accepted draft
-        tokens whose target KV/GDN state was just verified.  Keeping this update
-        here prevents the worker verify loop from duplicating replay-prefix
-        ownership details.
-        """
-
-        if batch.forward_mode.is_idle() or batch.reqs is None:
-            return
-
-        self.prune_to_batch(batch)
-
-        bs = len(batch.seq_lens)
-        seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if batch.seq_lens_cpu is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
-        accept_lens_cpu = accept_lens.detach().cpu().tolist()
-        draft_tokens_cpu = (
-            draft_token.reshape(bs, draft_token_num).detach().cpu().tolist()
-        )
-
-        for req, seq_len, accepted_len, draft_tokens in zip(
-            batch.reqs,
-            seq_lens_cpu,
-            accept_lens_cpu,
-            draft_tokens_cpu,
-            strict=True,
-        ):
-            prefix_output_len = max(0, int(seq_len) - len(req.origin_input_ids))
-            self._align_req_to_output_len(
-                req,
-                prefix_output_len,
-                error_prefix=error_prefix,
-            )
-
-            self._append_tokens(
-                req,
-                [int(token_id) for token_id in draft_tokens[: int(accepted_len)]],
-                seed_from_req_output=False,
-            )
-
-    def _align_req_to_output_len(
-        self,
-        req: Any,
-        output_len: int,
-        *,
-        error_prefix: str,
-    ) -> None:
-        stream = self._stream_for_req(req, seed_from_req_output=False)
-        if len(stream) > output_len:
-            del stream[output_len:]
-            return
-
-        if len(stream) == output_len:
-            return
-
-        missing = output_len - len(stream)
-        real_output_ids = req.output_ids[len(stream) : output_len]
-        if len(real_output_ids) != missing:
-            raise RuntimeError(
-                f"{error_prefix} is behind the batch logical length: "
-                f"rid={req.rid}, tracked={len(stream)}, required={output_len}."
-            )
-        stream.extend(int(token_id) for token_id in real_output_ids)
+            stream = self._stream_for_req(req, error_prefix=error_prefix)
+            if base_seq_len is not None:
+                required_len = max(0, int(base_seq_len) - len(req.origin_input_ids))
+                if len(stream) < required_len:
+                    raise RuntimeError(
+                        f"{error_prefix} is behind the batch logical length: "
+                        f"rid={req.rid}, tracked={len(stream)}, "
+                        f"required={required_len}."
+                    )
+            stream.extend(int(token_id) for token_id in token_ids)
 
 
 def _commit_pending_mamba_checkpoint_from_result(

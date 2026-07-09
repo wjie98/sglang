@@ -20,7 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.dvr_scheduler_utils import (
-    DVRReplayPrefixTracker,
+    DVRPendingOutputPrefix,
     build_dvr_spec_result_aux,
 )
 from sglang.srt.speculative.dvr_target_replay import (
@@ -45,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
 )
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
-from sglang.srt.utils.common import is_npu, require_gathered_buffer
+from sglang.srt.utils.common import is_npu
 
 _is_npu = is_npu()
 
@@ -64,14 +64,6 @@ def _compact_output_token_rows(output_tokens, output_lens):
             output_tokens_cpu, output_lens_cpu, strict=True
         )
     ]
-
-
-def _uses_draft_extend_selected_logits(*, topk, model, requires_gathered_buffer):
-    return (
-        topk == 1
-        and not requires_gathered_buffer
-        and getattr(model, "supports_draft_extend_selected_logits", False)
-    )
 
 
 @contextmanager
@@ -143,13 +135,6 @@ class DVREagleDraftWorker(EagleDraftWorker):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._draft_extend_selected_logits = _uses_draft_extend_selected_logits(
-            topk=self.topk,
-            model=self.draft_runner.model,
-            requires_gathered_buffer=require_gathered_buffer(
-                self.draft_runner.server_args
-            ),
-        )
 
     def _draft_decode_context(
         self,
@@ -190,13 +175,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             server_args=self.server_args,
             model_runner=self.model_runner,
         )
-        # EAGLE/MTP has two logical token streams:
-        # - verifier prefix: accepted draft/input tokens used to reconstruct the
-        #   next deterministic target verify replay.
-        # - client output prefix: target predictions exposed to the user, used
-        #   only by final exact logprob repair.
-        self.dvr_verifier_replay_prefix = DVRReplayPrefixTracker()
-        self.dvr_client_output_replay_prefix = DVRReplayPrefixTracker()
+        # Spec-v2 can run the next DVR replay before result processing appends
+        # verified tokens to Req.output_ids.  Keep one worker-owned journal of
+        # the same compact output stream that the scheduler will materialize.
+        self.dvr_output_prefix = DVRPendingOutputPrefix()
         self.cuda_graph_runner_for_target_verify = None
 
     def init_cuda_graphs(self):
@@ -216,8 +198,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     def clear_cache_pool(self):
         super().clear_cache_pool()
         self.linear_state.clear_cache_state()
-        self.dvr_verifier_replay_prefix.clear()
-        self.dvr_client_output_replay_prefix.clear()
+        self.dvr_output_prefix.clear()
 
     @contextmanager
     def _target_verify_context(
@@ -277,7 +258,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 continue
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
-        return self.dvr_verifier_replay_prefix.request_verifier_prefix_token_ids(
+        return self.dvr_output_prefix.request_output_prefix_token_ids(
             req,
             boundary_seqlen,
             error_prefix="DVR EAGLE",
@@ -375,9 +356,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             * self.speculative_num_draft_tokens
             + torch.arange(max_accept, dtype=torch.long, device=self.device).unsqueeze(0)
         )
+        accepted_indices = accept_index.clamp_min(0).long()
         return (
             predict[compact_predict_indices[valid_accept]],
-            batch.out_cache_loc[accept_index.clamp_min(0).long()[valid_accept]],
+            batch.out_cache_loc[accepted_indices[valid_accept]],
         )
 
     def _replay_accepted_suffix_for_partial_verify(
@@ -414,19 +396,17 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             batch_output = self.target_worker.forward_batch_generation(batch)
             batch_output.new_seq_lens = batch.seq_lens
             self._prepare_dvr_boundary_for_verify(batch)
-            if batch.return_logprob:
-                # This target token is the first client-visible output for a
-                # prefill/extend step.  In overlap it can be consumed by the
-                # first verify before Req.output_ids is materialized, so the
-                # DVR-EAGLE final-logprob stream must learn it here.
-                if batch_output.next_token_ids is not None:
-                    next_token_ids_cpu = (
-                        batch_output.next_token_ids.detach().cpu().tolist()
-                    )
-                    self.dvr_client_output_replay_prefix.append_batch_output_tokens(
-                        batch,
-                        [[token_id] for token_id in next_token_ids_cpu],
-                    )
+            # This target token is the first client-visible output for a
+            # prefill/extend step.  In overlap it can be consumed by the first
+            # verify before Req.output_ids is materialized, so the DVR-EAGLE
+            # replay prefix must learn it regardless of logprob settings.
+            if batch_output.next_token_ids is not None:
+                next_token_ids_cpu = batch_output.next_token_ids.detach().cpu().tolist()
+                self.dvr_output_prefix.append_batch_output_tokens(
+                    batch,
+                    [[token_id] for token_id in next_token_ids_cpu],
+                    error_prefix="DVR EAGLE prefill output prefix",
+                )
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
@@ -576,7 +556,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             oracle_logits, oracle_hidden_states = oracle_output
             logits_output.next_token_logits = oracle_logits
             logits_output.hidden_states = oracle_hidden_states
-        used_suffix_oracle = oracle_output is not None
 
         vocab_mask = None
         if batch.has_grammar:
@@ -604,17 +583,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             verify_input, batch, logits_output, vocab_mask
         )
         new_seq_lens = batch.seq_lens + accept_lens
-        # Replay-prefix tracking is needed whenever suffix replay may reconstruct
-        # the next deterministic tail. It copies accepted draft tokens to CPU,
-        # so non-GDN no-oracle EAGLE paths still keep it off the hot path.
-        if batch.return_logprob or used_suffix_oracle or not can_run_cuda_graph:
-            self.dvr_verifier_replay_prefix.advance_eagle_verifier_stream_from_draft_rows(
-                batch=batch,
-                draft_token=verify_input.draft_token,
-                draft_token_num=verify_input.draft_token_num,
-                accept_lens=accept_lens,
-                error_prefix="DVR EAGLE replay prefix",
-            )
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -630,24 +598,28 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         compact_output_token_ids_per_req = _compact_output_token_rows(
-            accept_tokens,
+            (
+                None
+                if batch.forward_mode.is_idle()
+                else predict.reshape(bs, verify_input.draft_token_num)
+            ),
             accept_lens,
         )
+        if compact_output_token_ids_per_req is not None:
+            self.dvr_output_prefix.append_batch_output_tokens(
+                batch,
+                compact_output_token_ids_per_req,
+                base_seq_lens_cpu=base_seq_lens_cpu,
+                error_prefix="DVR EAGLE output prefix",
+            )
+
         final_logprob_repairs = None
         if batch.return_logprob and not batch.forward_mode.is_idle():
             assert compact_output_token_ids_per_req is not None
-            # DVR-EAGLE may rewrite previously collected output logprobs with a
-            # final full-prefix oracle. Mark requests here so the generic
-            # streamer only sees a request-level defer policy.
-            self.dvr_client_output_replay_prefix.advance_output_stream_from_compact_rows(
-                batch=batch,
-                compact_output_token_ids_per_req=compact_output_token_ids_per_req,
-                error_prefix="DVR EAGLE final logprob output replay prefix",
-            )
             final_logprob_repairs = score_deferred_dvr_final_logprob_repairs(
                 batch=batch,
                 target_worker=self.target_worker,
-                replay_prefix=self.dvr_client_output_replay_prefix,
+                replay_prefix=self.dvr_output_prefix,
                 linear_state_ctx=linear_state_ctx,
                 base_seq_lens_cpu=base_seq_lens_cpu,
                 accept_lens_cpu=accept_lens.detach().cpu().tolist(),

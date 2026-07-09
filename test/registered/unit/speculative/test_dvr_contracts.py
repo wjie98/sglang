@@ -21,13 +21,16 @@ from sglang.srt.speculative.dvr_target_replay import (
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
-    DVRReplayPrefixTracker,
+    DVRPendingOutputPrefix,
     DVRSpecResultAux,
     _commit_pending_mamba_checkpoint_from_result,
     apply_spec_final_logprob_repairs_from_result,
     maybe_filter_running_batch_with_spec_state,
 )
-from sglang.srt.speculative.dvr_eagle_worker import _compact_output_token_rows
+from sglang.srt.speculative.dvr_eagle_worker import (
+    DecodeVerifyRollbackEagleWorkerV2,
+    _compact_output_token_rows,
+)
 from sglang.srt.managers.scheduler_components.output_policy import (
     allow_req_non_streaming_logprob_output,
     defer_req_non_streaming_logprob_output,
@@ -35,6 +38,11 @@ from sglang.srt.managers.scheduler_components.output_policy import (
     try_claim_req_final_logprob_repair,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+class _MockReq:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 def test_dvr_spec_algorithm_contracts():
@@ -400,64 +408,66 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
         )
 
 
-def test_dvr_eagle_replay_prefix_splits_verifier_and_output_streams():
-    req = SimpleNamespace(
+def test_dvr_replay_prefix_records_only_visible_output_tokens():
+    req = _MockReq(
         rid="r0",
         origin_input_ids=[101, 102, 103],
         output_ids=[],
     )
     batch = SimpleNamespace(reqs=[req])
-    verifier_prefix = DVRReplayPrefixTracker()
-    output_prefix = DVRReplayPrefixTracker()
+    prefix = DVRPendingOutputPrefix()
 
     # Target EXTEND publishes the first client-visible token before overlap
     # scheduling has necessarily materialized it into Req.output_ids.
-    output_prefix.append_batch_output_tokens(
+    prefix.append_batch_output_tokens(
         batch,
         [[748]],
     )
-    assert output_prefix.request_output_prefix_token_ids(
+    assert prefix.request_output_prefix_token_ids(
         req,
         4,
         error_prefix="DVR EAGLE output replay prefix",
     ) == [101, 102, 103, 748]
-    with pytest.raises(RuntimeError, match="cannot reconstruct"):
-        verifier_prefix.request_verifier_prefix_token_ids(
+    with pytest.raises(RuntimeError, match="not yet owned"):
+        prefix.request_output_prefix_token_ids(
             req,
-            4,
-            error_prefix="DVR EAGLE verifier replay prefix",
+            5,
+            error_prefix="DVR EAGLE output replay prefix",
         )
 
-    verifier_prefix.append_batch_verifier_tokens(
-        batch,
-        [[900, 901]],
-    )
-    output_prefix.append_batch_output_tokens(
+    # A rejected EAGLE draft must append the target-predicted output tokens,
+    # not the rejected draft candidates.
+    req.output_ids = [748]
+    prefix.append_batch_output_tokens(
         batch,
         [[749, 750]],
+        base_seq_lens_cpu=[4],
+        error_prefix="DVR EAGLE output replay prefix",
     )
-    req.output_ids = [748]
 
-    assert verifier_prefix.request_verifier_prefix_token_ids(
-        req,
-        5,
-        error_prefix="DVR EAGLE verifier replay prefix",
-    ) == [101, 102, 103, 900, 901]
-    assert output_prefix.request_output_prefix_token_ids(
+    assert prefix.request_output_prefix_token_ids(
         req,
         6,
         error_prefix="DVR EAGLE final logprob",
     ) == [101, 102, 103, 748, 749, 750]
 
+    req.output_ids = [748, 999]
+    with pytest.raises(RuntimeError, match="diverged"):
+        prefix.request_output_prefix_token_ids(
+            req,
+            5,
+            error_prefix="DVR EAGLE output replay prefix",
+        )
+
 
 def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
-    req = SimpleNamespace(
+    req = _MockReq(
         rid="r0",
         origin_input_ids=[101, 102],
         output_ids=[201],
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRReplayPrefixTracker()
+    prefix = DVRPendingOutputPrefix()
 
     assert prefix.request_output_prefix_token_ids(
         req,
@@ -475,6 +485,32 @@ def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
         5,
         error_prefix="DVR spec-v2",
     ) == [101, 102, 201, 202, 203]
+
+
+def test_dvr_output_replay_prefix_is_req_lifecycle_scoped():
+    old_req = _MockReq(
+        rid="reused",
+        origin_input_ids=[101, 102],
+        output_ids=[],
+    )
+    new_req = _MockReq(
+        rid="reused",
+        origin_input_ids=[101, 102],
+        output_ids=[301],
+    )
+    prefix = DVRPendingOutputPrefix()
+
+    prefix.append_batch_output_tokens(SimpleNamespace(reqs=[old_req]), [[201, 202]])
+    prefix.prune_to_batch(SimpleNamespace(reqs=[new_req]))
+
+    # rid is client/protocol state and can be reused.  The pending output
+    # journal must be scoped to the live Req object, otherwise a new request can
+    # inherit stale overlap output tokens from a completed request.
+    assert prefix.request_output_prefix_token_ids(
+        new_req,
+        3,
+        error_prefix="DVR spec-v2",
+    ) == [101, 102, 301]
 
 
 def test_dvr_final_logprob_overlap_bonus_can_finish_request():
@@ -565,3 +601,33 @@ def test_dvr_eagle_compacts_accepted_output_rows():
         )
         is None
     )
+
+
+def test_dvr_eagle_replay_tokens_follow_spec_v2_output_order():
+    worker = SimpleNamespace(
+        device=torch.device("cpu"),
+        speculative_num_draft_tokens=4,
+    )
+    batch = SimpleNamespace(
+        out_cache_loc=torch.tensor(
+            [100, 101, 102, 103, 200, 201, 202, 203], dtype=torch.int64
+        )
+    )
+    predict = torch.tensor([10, 11, 12, 13, 20, 21, 22, 23], dtype=torch.int32)
+    accept_index = torch.tensor([[0, 2, -1], [4, 7, 6]], dtype=torch.int32)
+    accept_lens = torch.tensor([2, 3], dtype=torch.int32)
+
+    tokens, cache_locs = (
+        DecodeVerifyRollbackEagleWorkerV2._compact_accepted_tokens_and_cache_locs(
+            worker,
+            batch=batch,
+            predict=predict,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+        )
+    )
+
+    # Spec-v2 output processing emits compact per-request predict slices.
+    # Tree accept_index still owns the KV/cache rows for the accepted path.
+    assert tokens.tolist() == [10, 11, 20, 21, 22]
+    assert cache_locs.tolist() == [100, 102, 200, 203, 202]

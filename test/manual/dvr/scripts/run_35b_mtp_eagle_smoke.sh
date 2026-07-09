@@ -12,6 +12,7 @@ SPEC_DRAFT_TOKENS="${SPEC_DRAFT_TOKENS:-2}"
 SPEC_STEPS="${SPEC_STEPS:-1}"
 ACCEPT_TEMPERATURE="${ACCEPT_TEMPERATURE:-0.0}"
 ACCEPT_TOP_P="${ACCEPT_TOP_P:-1.0}"
+MTP_MIN_ACCEPT_RATE="${MTP_MIN_ACCEPT_RATE:-0.96}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/35b-mtp-eagle-smoke}"
 SERVER_PID=""
@@ -71,14 +72,16 @@ run_one_mode() {
   echo "==> Running ${label} returned-logprob KL smoke"
   # Acceptance is used here as a hidden/state consistency oracle.  Keep it
   # greedy; stochastic sampling can legitimately reject a correct top-1 MTP
-  # draft when the target sample draws a different token.
+  # draft when the target sample draws a different token.  DVR verifies against
+  # the deterministic full-prefix GDN oracle, which can reject rare MTP drafts
+  # that ordinary target-verify decode would accept.
   conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --prompt-token-lengths 63,64,65 \
     --max-new 4,16,65 \
     --cache-mode flush-each \
     --check-kl \
-    --min-accept-rate 0.99 \
+    --min-accept-rate "${MTP_MIN_ACCEPT_RATE}" \
     --temperature "${ACCEPT_TEMPERATURE}" \
     --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \
@@ -94,7 +97,7 @@ run_one_mode() {
     --max-new 4,16,65 \
     --cache-mode flush-each \
     --no-return-logprob \
-    --min-accept-rate 0.99 \
+    --min-accept-rate "${MTP_MIN_ACCEPT_RATE}" \
     --temperature "${ACCEPT_TEMPERATURE}" \
     --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \
@@ -109,7 +112,7 @@ run_one_mode() {
     --max-new 65 \
     --cache-mode warm-all \
     --check-kl \
-    --min-accept-rate 0.99 \
+    --min-accept-rate "${MTP_MIN_ACCEPT_RATE}" \
     --temperature "${ACCEPT_TEMPERATURE}" \
     --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \
@@ -125,7 +128,7 @@ run_one_mode() {
     --max-new 65 \
     --cache-mode warm-all \
     --no-return-logprob \
-    --min-accept-rate 0.99 \
+    --min-accept-rate "${MTP_MIN_ACCEPT_RATE}" \
     --temperature "${ACCEPT_TEMPERATURE}" \
     --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \

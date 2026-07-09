@@ -24,7 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.dvr_scheduler_utils import (
     DVRFinalLogprobRepair,
-    DVRReplayPrefixTracker,
+    DVRPendingOutputPrefix,
 )
 
 
@@ -804,13 +804,10 @@ def _draft_row_logits_from_replay_hidden_states(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return logits/hidden states for replayed draft-token rows only."""
 
-    if hidden_states is None:
-        raise RuntimeError("DVR target replay did not return hidden states.")
-    gather_indices = hidden_gather_indices.to(
-        device=hidden_states.device,
-        dtype=torch.long,
+    draft_hidden_states = _gather_replay_hidden_states(
+        hidden_states=hidden_states,
+        hidden_gather_indices=hidden_gather_indices,
     )
-    draft_hidden_states = hidden_states[gather_indices]
     logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
     logits_metadata.next_token_logits_buffer = None
     draft_logits = target_worker.model_runner.model.logits_processor._get_logits(
@@ -819,6 +816,20 @@ def _draft_row_logits_from_replay_hidden_states(
         logits_metadata,
     )
     return draft_logits, draft_hidden_states
+
+
+def _gather_replay_hidden_states(
+    *,
+    hidden_states: torch.Tensor,
+    hidden_gather_indices: torch.Tensor,
+) -> torch.Tensor:
+    if hidden_states is None:
+        raise RuntimeError("DVR target replay did not return hidden states.")
+    gather_indices = hidden_gather_indices.to(
+        device=hidden_states.device,
+        dtype=torch.long,
+    )
+    return hidden_states[gather_indices]
 
 
 def replay_accepted_suffix_for_live_state(
@@ -956,7 +967,7 @@ def score_deferred_dvr_final_logprob_repairs(
     *,
     batch: ScheduleBatch,
     target_worker: Any,
-    replay_prefix: DVRReplayPrefixTracker,
+    replay_prefix: DVRPendingOutputPrefix,
     linear_state_ctx: Any,
     base_seq_lens_cpu: list[int],
     accept_lens_cpu: list[int],
@@ -1092,7 +1103,7 @@ def _final_replay_ids_for_req(
     *,
     req: Any,
     req_i: int,
-    replay_prefix: DVRReplayPrefixTracker,
+    replay_prefix: DVRPendingOutputPrefix,
     base_seq_len: int,
     replay_seq_len: int,
     compact_output_token_ids_per_req: Optional[list[list[int]]],

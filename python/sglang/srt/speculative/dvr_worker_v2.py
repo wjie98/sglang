@@ -17,7 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.dvr_scheduler_utils import (
-    DVRReplayPrefixTracker,
+    DVRPendingOutputPrefix,
     build_dvr_spec_result_aux,
 )
 from sglang.srt.speculative.dvr_target_replay import (
@@ -60,7 +60,7 @@ class DecodeVerifyRollbackWorkerV2(DecodeVerifyRollbackWorker):
         self.speculative_num_steps = self.num_draft_steps
         self.speculative_num_draft_tokens = self.num_draft_tokens
         self.draft_runner = self.model_runner
-        self.dvr_output_replay_prefix = DVRReplayPrefixTracker()
+        self.dvr_output_replay_prefix = DVRPendingOutputPrefix()
 
     @property
     def draft_worker(self):

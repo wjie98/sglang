@@ -28,7 +28,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 )
 from sglang.srt.speculative.dvr_linear_state import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_scheduler_utils import (
-    DVRReplayPrefixTracker,
+    DVRPendingOutputPrefix,
     apply_dvr_final_logprob_repairs,
 )
 from sglang.srt.speculative.dvr_target_replay import (
@@ -1348,7 +1348,7 @@ class DecodeVerifyRollbackWorker:
         repairs = score_deferred_dvr_final_logprob_repairs(
             batch=batch,
             target_worker=self.target_worker,
-            replay_prefix=DVRReplayPrefixTracker(),
+            replay_prefix=DVRPendingOutputPrefix(),
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
             accept_lens_cpu=accept_lens_cpu,
