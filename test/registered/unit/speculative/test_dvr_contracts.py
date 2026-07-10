@@ -24,8 +24,6 @@ from sglang.srt.speculative.dvr_info import (
     try_claim_dvr_final_logprob_repair,
 )
 from sglang.srt.speculative.dvr_scheduler import (
-    _commit_pending_mamba_checkpoint_from_result,
-    apply_dvr_deferred_output_from_result,
     maybe_filter_running_batch_with_dvr_state,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -100,46 +98,45 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
         mamba_next_track_idx=0,
         mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
     )
-    batch = SimpleNamespace(req_to_token_pool=Pool())
+    batch = SimpleNamespace(
+        req_to_token_pool=Pool(),
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+        enable_overlap=True,
+    )
     tree_cache = SimpleNamespace(page_size=64)
 
-    result = SimpleNamespace(
-        dvr_aux=DVRDeferredActions(
-            pending_mamba_checkpoints=[
-                DVRMambaCheckpoint(track_idx=0, seqlen=128),
-            ],
-        )
+    dvr_aux = DVRDeferredActions(
+        pending_mamba_checkpoints=[
+            DVRMambaCheckpoint(track_idx=0, seqlen=128),
+        ],
     )
-    _commit_pending_mamba_checkpoint_from_result(
+    assert dvr_aux.commit_mamba_checkpoint_after_decode(
         req=req,
         batch=batch,
-        result=result,
         req_index=0,
         tree_cache=tree_cache,
     )
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    result.dvr_aux.pending_mamba_checkpoints = [
+    dvr_aux.pending_mamba_checkpoints = [
         DVRMambaCheckpoint(track_idx=1, seqlen=128)
     ]
-    _commit_pending_mamba_checkpoint_from_result(
+    assert dvr_aux.commit_mamba_checkpoint_after_decode(
         req=req,
         batch=batch,
-        result=result,
         req_index=0,
         tree_cache=tree_cache,
     )
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    result.dvr_aux.pending_mamba_checkpoints = [
+    dvr_aux.pending_mamba_checkpoints = [
         DVRMambaCheckpoint(track_idx=2, seqlen=192)
     ]
-    _commit_pending_mamba_checkpoint_from_result(
+    assert dvr_aux.commit_mamba_checkpoint_after_decode(
         req=req,
         batch=batch,
-        result=result,
         req_index=0,
         tree_cache=tree_cache,
     )
@@ -272,12 +269,11 @@ def test_dvr_final_logprob_repair_applies_after_materialization():
         )
     )
 
-    apply_dvr_deferred_output_from_result(
-        SimpleNamespace(
+    result.dvr_aux.apply_output_after_materialize(
+        batch=SimpleNamespace(
             reqs=[req],
             spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-        ),
-        result,
+        )
     )
 
     assert req.logprob.output_token_logprobs_val == [-0.1, -0.2, -0.3]
@@ -308,12 +304,11 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
     )
 
     with pytest.raises(RuntimeError, match="materialized output ids"):
-        apply_dvr_deferred_output_from_result(
-            SimpleNamespace(
+        result.dvr_aux.apply_output_after_materialize(
+            batch=SimpleNamespace(
                 reqs=[req],
                 spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-            ),
-            result,
+            )
         )
 
 
@@ -341,12 +336,11 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
     )
 
     with pytest.raises(RuntimeError, match="inconsistent ids/logprobs length"):
-        apply_dvr_deferred_output_from_result(
-            SimpleNamespace(
+        result.dvr_aux.apply_output_after_materialize(
+            batch=SimpleNamespace(
                 reqs=[req],
                 spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-            ),
-            result,
+            )
         )
 
 

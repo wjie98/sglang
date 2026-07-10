@@ -44,7 +44,7 @@ class DVRVerifyResult:
     """Core DVR post-verify result shared by self draft and EAGLE/MTP."""
 
     accept_lens_cpu: list[int]
-    deferred_actions: Optional[DVRDeferredActions]
+    deferred_actions: DVRDeferredActions
 
 
 def score_dvr_verify_outputs(
@@ -278,7 +278,7 @@ def finish_dvr_verify(
             return_pending_boundary=True,
         )
 
-    deferred_actions = None
+    deferred_actions = DVRDeferredActions()
     if (
         pending_track_indices is not None
         or pending_track_seqlens is not None
@@ -300,13 +300,11 @@ def finish_dvr_verify(
                 pending_track_indices, pending_track_seqlens, strict=True
             )
         ]
-        deferred_actions = DVRDeferredActions(
-            pending_mamba_checkpoints=checkpoints or None,
-            output=(
-                DVRDeferredOutput(final_logprob_repairs=final_logprob_repairs)
-                if final_logprob_repairs is not None
-                else None
-            ),
+        deferred_actions.pending_mamba_checkpoints = checkpoints or None
+        deferred_actions.output = (
+            DVRDeferredOutput(final_logprob_repairs=final_logprob_repairs)
+            if final_logprob_repairs is not None
+            else None
         )
 
     return DVRVerifyResult(
