@@ -22,7 +22,7 @@ from sglang.srt.speculative.dvr_info import (
     should_hold_dvr_non_streaming_logprob_output,
     try_claim_dvr_final_logprob_repair,
 )
-from sglang.srt.speculative.dvr_scheduler import (
+from sglang.srt.speculative.dvr_state_flow import (
     maybe_filter_running_batch_with_dvr_state,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

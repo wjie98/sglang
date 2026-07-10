@@ -14,7 +14,7 @@ from sglang.srt.speculative.dvr_info import (
     defer_dvr_non_streaming_logprob_output,
     try_claim_dvr_final_logprob_repair,
 )
-from sglang.srt.speculative.dvr_replay import (
+from sglang.srt.speculative.dvr_state_flow import (
     replay_dvr_accepted_suffix_for_live_state,
 )
 

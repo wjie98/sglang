@@ -32,12 +32,10 @@ from sglang.srt.speculative.dvr_info import (
     dvr_compact_output_indices,
 )
 from sglang.srt.speculative.dvr_core import finish_dvr_verify
-from sglang.srt.speculative.dvr_linear_state import (
+from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
-)
-from sglang.srt.speculative.dvr_replay import (
-    run_dvr_suffix_replay_oracle,
     dvr_suffix_replay_context,
+    run_dvr_suffix_replay_oracle,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,

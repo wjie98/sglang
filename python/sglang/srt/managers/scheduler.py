@@ -244,7 +244,7 @@ from sglang.srt.speculative.dflash_utils import (
     should_delay_dflash_prefill_for_batching,
     validate_dflash_request,
 )
-from sglang.srt.speculative.dvr_scheduler import (
+from sglang.srt.speculative.dvr_state_flow import (
     maybe_filter_running_batch_with_dvr_state,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
