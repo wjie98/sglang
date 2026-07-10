@@ -198,63 +198,6 @@ def _linear_state_replay_context(
         )
 
 
-def _build_suffix_draft_mrope_positions(
-    replay_batch: ScheduleBatch,
-    replay_plan: dict[str, Any],
-) -> torch.Tensor:
-    """Build flattened mrope positions matching suffix tail+draft input order."""
-
-    draft_token_num = int(replay_plan["append_token_counts_cpu"][0])
-    device = replay_batch.seq_lens.device
-    mrope_chunks = []
-    mm_inputs = replay_batch.multimodal_inputs
-    for req_i, (seq_len, boundary, tail_len) in enumerate(
-        zip(
-            replay_plan["base_seq_lens_cpu"],
-            replay_plan["boundary_lens"],
-            replay_plan["tail_lens_cpu"],
-            strict=True,
-        )
-    ):
-        mm_input = (
-            None if mm_inputs is None or req_i >= len(mm_inputs) else mm_inputs[req_i]
-        )
-        mm_positions = getattr(mm_input, "mrope_positions", None)
-        chunk_parts = []
-        if mm_positions is not None:
-            tail_positions = mm_positions[:, int(boundary) : int(seq_len)].to(
-                device=device, dtype=torch.long
-            )
-            if tail_positions.shape[1] > 0:
-                chunk_parts.append(tail_positions)
-        filled_tail = sum(part.shape[1] for part in chunk_parts)
-        if filled_tail < int(tail_len):
-            fallback_tail = (
-                torch.arange(
-                    int(boundary) + filled_tail,
-                    int(seq_len),
-                    dtype=torch.long,
-                    device=device,
-                )
-                .unsqueeze(0)
-                .repeat(3, 1)
-            )
-            chunk_parts.append(fallback_tail)
-        draft_positions = (
-            torch.arange(
-                int(seq_len),
-                int(seq_len) + draft_token_num,
-                dtype=torch.long,
-                device=device,
-            )
-            .unsqueeze(0)
-            .repeat(3, 1)
-        )
-        chunk_parts.append(draft_positions)
-        mrope_chunks.append(torch.cat(chunk_parts, dim=1))
-    return torch.cat(mrope_chunks, dim=1)
-
-
 def build_dvr_private_extend_batch(
     batch,
     *,
@@ -620,9 +563,55 @@ def run_dvr_suffix_replay_oracle(
     if use_forward_batch:
         forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
         if model_runner.model_is_mrope:
-            forward_batch.mrope_positions = _build_suffix_draft_mrope_positions(
-                replay_batch, replay_plan
-            )
+            draft_token_num = int(replay_plan["append_token_counts_cpu"][0])
+            device = replay_batch.seq_lens.device
+            mrope_chunks = []
+            mm_inputs = replay_batch.multimodal_inputs
+            for req_i, (seq_len, boundary, tail_len) in enumerate(
+                zip(
+                    replay_plan["base_seq_lens_cpu"],
+                    replay_plan["boundary_lens"],
+                    replay_plan["tail_lens_cpu"],
+                    strict=True,
+                )
+            ):
+                mm_input = (
+                    None
+                    if mm_inputs is None or req_i >= len(mm_inputs)
+                    else mm_inputs[req_i]
+                )
+                mm_positions = getattr(mm_input, "mrope_positions", None)
+                chunk_parts = []
+                if mm_positions is not None:
+                    tail_positions = mm_positions[:, int(boundary) : int(seq_len)].to(
+                        device=device, dtype=torch.long
+                    )
+                    if tail_positions.shape[1] > 0:
+                        chunk_parts.append(tail_positions)
+                filled_tail = sum(part.shape[1] for part in chunk_parts)
+                if filled_tail < int(tail_len):
+                    chunk_parts.append(
+                        torch.arange(
+                            int(boundary) + filled_tail,
+                            int(seq_len),
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        .unsqueeze(0)
+                        .repeat(3, 1)
+                    )
+                chunk_parts.append(
+                    torch.arange(
+                        int(seq_len),
+                        int(seq_len) + draft_token_num,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    .unsqueeze(0)
+                    .repeat(3, 1)
+                )
+                mrope_chunks.append(torch.cat(chunk_parts, dim=1))
+            forward_batch.mrope_positions = torch.cat(mrope_chunks, dim=1)
         oracle_output = target_worker.forward_batch_generation(
             batch=None,
             forward_batch=forward_batch,
