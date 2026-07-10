@@ -337,12 +337,13 @@ def chain_speculative_sampling(
         BLOCK_V=4096,
     )
 
-class _DVRSelfDraftCore:
-    """Core self-DVR implementation shared by sync and overlap scheduling.
 
-    User-visible "spec v1" now means synchronous consumption of the v2 result
-    schema.  The old standalone v1 worker is intentionally gone; this class owns
-    only common self-draft, target-verify, replay, and GDN state helpers.
+class DecodeVerifyRollbackWorkerV2:
+    """Self-decode draft worker with DVR target verify/rollback semantics.
+
+    User-visible "spec v1" is a synchronous compatibility mode over this same
+    worker.  Keep the implementation in one class so self-draft, target verify,
+    GDN state, and v1/v2 glue are visible in a single execution flow.
     """
 
     def __init__(
@@ -400,6 +401,10 @@ class _DVRSelfDraftCore:
             self.num_draft_steps,
             self.num_draft_tokens,
         )
+        self.speculative_num_steps = self.num_draft_steps
+        self.speculative_num_draft_tokens = self.num_draft_tokens
+        self.draft_runner = self.model_runner
+        self.dvr_output_replay_prefix = DVRPendingOutputPrefix()
 
     def _dummy_hidden_states(self, num_tokens: int, device=None) -> torch.Tensor:
         """Keep EAGLE indexing contracts without storing real DVR hidden states.
@@ -444,9 +449,6 @@ class _DVRSelfDraftCore:
             and not self.server_args.disable_draft_cuda_graph
         ):
             self.cuda_graph_runner_for_draft_decode = DVRDraftDecodeCudaGraphRunner(self)
-
-    def clear_cache_pool(self):
-        self.linear_state.clear_cache_state()
 
     def alloc_memory_pool(
         self,
@@ -848,27 +850,12 @@ class _DVRSelfDraftCore:
             return [int(x) for x in batch.seq_lens_cpu.tolist()]
         return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
-class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
-    """Overlap-scheduler DVR worker.
-
-    DVR has no standalone draft model.  The scheduler still expects a spec-v2
-    worker to expose a draft-worker-like object, so this class presents itself
-    as that object while routing draft work through the target model runner.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.speculative_num_steps = self.num_draft_steps
-        self.speculative_num_draft_tokens = self.num_draft_tokens
-        self.draft_runner = self.model_runner
-        self.dvr_output_replay_prefix = DVRPendingOutputPrefix()
-
     @property
     def draft_worker(self):
         return self
 
     def clear_cache_pool(self):
-        super().clear_cache_pool()
+        self.linear_state.clear_cache_state()
         self.dvr_output_replay_prefix.clear()
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):

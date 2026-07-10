@@ -9,7 +9,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.speculative.dvr_core import (
     _final_output_len_if_repair_needed,
 )
-from sglang.srt.speculative.dvr_worker import _DVRSelfDraftCore
+from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
     DVRFinalLogprobRepair,
@@ -163,7 +163,7 @@ def test_dvr_self_draft_graph_runner_only_skips_known_short_boundary():
 
 
 def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
-    worker = object.__new__(_DVRSelfDraftCore)
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
     worker.cuda_graph_runner_for_draft_decode = None
     worker.model_runner = SimpleNamespace(hybrid_gdn_config=object())
 
