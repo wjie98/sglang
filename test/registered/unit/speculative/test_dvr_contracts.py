@@ -19,11 +19,9 @@ from sglang.srt.speculative.dvr_info import (
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
+    maybe_filter_running_batch_with_dvr_state,
     should_hold_dvr_non_streaming_logprob_output,
     try_claim_dvr_final_logprob_repair,
-)
-from sglang.srt.speculative.dvr_state_flow import (
-    maybe_filter_running_batch_with_dvr_state,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
