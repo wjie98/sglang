@@ -193,20 +193,6 @@ def dvr_self_draft_graph_skip_reason(forward_batch: ForwardBatch) -> str | None:
     return None
 
 
-def _patch_draft_determinism_flags(
-    model_runner,
-    global_server_args,
-    patch_attr,
-    *,
-    disable_model_runner_graph: bool,
-):
-    patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
-    patch_attr(global_server_args, "enable_deterministic_inference", False)
-    if disable_model_runner_graph:
-        patch_attr(model_runner, "decode_cuda_graph_runner", None)
-        patch_attr(model_runner, "graph_runner", None)
-
-
 def _patch_draft_decode_backend_tree(model_runner, extra_attn_backends, patch_attr):
     seen_backend_roots = set()
     for backend_root in (model_runner.attn_backend, *(extra_attn_backends or ())):
@@ -238,13 +224,6 @@ def _patch_graph_capture_extras(
             "init_cuda_graph_state",
             _skip_init_cuda_graph_state,
         )
-
-
-def _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr):
-    # Provisional draft tokens must not update mamba prefix-cache tracking
-    # slots. DVR commits verified recurrent state after target verify.
-    patch_attr(model_runner.server_args, "mamba_radix_cache_strategy", "no_buffer")
-    patch_attr(global_server_args, "mamba_radix_cache_strategy", "no_buffer")
 
 
 def _assert_draft_decode_performance_state(model_runner, extra_attn_backends):
@@ -317,12 +296,12 @@ def _dvr_draft_decode_context(
             if clear_kernel_config_caches:
                 _clear_determinism_sensitive_kernel_caches()
 
-            _patch_draft_determinism_flags(
-                model_runner,
-                global_server_args,
-                patch_attr,
-                disable_model_runner_graph=disable_model_runner_graph,
-            )
+            patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
+            patch_attr(global_server_args, "enable_deterministic_inference", False)
+            if disable_model_runner_graph:
+                patch_attr(model_runner, "decode_cuda_graph_runner", None)
+                patch_attr(model_runner, "graph_runner", None)
+
             _patch_draft_decode_backend_tree(
                 model_runner, extra_attn_backends, patch_attr
             )
@@ -334,7 +313,13 @@ def _dvr_draft_decode_context(
                     self_draft_graph=self_draft_graph_capture,
                 )
 
-            _patch_draft_mamba_tracking(model_runner, global_server_args, patch_attr)
+            # Provisional draft tokens must not update mamba prefix-cache
+            # tracking slots. DVR commits verified recurrent state after target
+            # verify.
+            patch_attr(
+                model_runner.server_args, "mamba_radix_cache_strategy", "no_buffer"
+            )
+            patch_attr(global_server_args, "mamba_radix_cache_strategy", "no_buffer")
 
             _assert_draft_decode_performance_state(model_runner, extra_attn_backends)
 
