@@ -443,8 +443,9 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             verify_input, batch, logits_output, vocab_mask
         )
         new_seq_lens = batch.seq_lens + accept_lens
+        has_verify_tokens = not batch.forward_mode.is_idle()
 
-        if not batch.forward_mode.is_idle():
+        if has_verify_tokens:
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             fill_bonus_tokens[(bs,)](
@@ -456,15 +457,14 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
-        if not batch.forward_mode.is_idle():
-            if batch.return_logprob:
-                compute_spec_v2_logprobs(
-                    batch,
-                    logits_output,
-                    predict,
-                    accept_index,
-                    self.speculative_num_steps,
-                )
+        if has_verify_tokens and batch.return_logprob:
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                predict,
+                accept_index,
+                self.speculative_num_steps,
+            )
 
         partial_suffix_replay_kwargs = None
         if linear_state_ctx is not None:
@@ -483,14 +483,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             accept_lens=accept_lens,
             accept_lens_cpu=None,
             num_draft_tokens=self.speculative_num_draft_tokens,
-            replay_prefix=(
-                self.dvr_output_prefix if not batch.forward_mode.is_idle() else None
-            ),
-            output_tokens=predict if not batch.forward_mode.is_idle() else None,
+            replay_prefix=self.dvr_output_prefix if has_verify_tokens else None,
+            output_tokens=predict if has_verify_tokens else None,
             token_logprobs=logits_output.next_token_logprobs,
-            tokens_per_req=(
-                verify_input.draft_token_num if not batch.forward_mode.is_idle() else None
-            ),
+            tokens_per_req=verify_input.draft_token_num if has_verify_tokens else None,
             base_seq_lens_cpu=base_seq_lens_cpu,
             error_prefix="DVR EAGLE",
             predict=predict if partial_suffix_replay_kwargs is not None else None,

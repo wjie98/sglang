@@ -32,14 +32,8 @@ class DVRFinalLogprobRepair:
     output_logprobs: list[float]
 
 
-@dataclass
-class DVRDeferredOutput:
-    """Client-visible output work that must wait for scheduler materialization."""
-
-    final_logprob_repairs: Optional[
-        list[Optional[DVRFinalLogprobRepair]]
-    ] = None
-    final_logprob_repair_claimed: bool = False
+_DVR_LOGPROB_DEFERRED = 1
+_DVR_LOGPROB_REPAIR_CLAIMED = 2
 
 
 @dataclass
@@ -47,7 +41,9 @@ class DVRDeferredActions:
     """DVR postprocess work carried by GenerationBatchResult.dvr_aux."""
 
     pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
-    output: Optional[DVRDeferredOutput] = None
+    final_logprob_repairs: Optional[
+        list[Optional[DVRFinalLogprobRepair]]
+    ] = None
 
     def cache_unfinished_prefill_req(
         self,
@@ -88,7 +84,7 @@ class DVRDeferredActions:
     def apply_output_after_materialize(self, *, batch: Any) -> None:
         """Apply DVR-owned output work after scheduler materializes tokens."""
 
-        repairs = None if self.output is None else self.output.final_logprob_repairs
+        repairs = self.final_logprob_repairs
         if repairs is None:
             return
 
@@ -392,7 +388,7 @@ def defer_dvr_non_streaming_logprob_output(req: Any) -> None:
     """Hold DVR non-streaming logprob output until final repair overwrites it."""
 
     if getattr(req, "dvr_deferred_output", None) is None:
-        req.dvr_deferred_output = DVRDeferredOutput()
+        req.dvr_deferred_output = _DVR_LOGPROB_DEFERRED
 
 
 def allow_dvr_non_streaming_logprob_output(req: Any) -> None:
@@ -407,10 +403,10 @@ def try_claim_dvr_final_logprob_repair(req: Any) -> bool:
     deferred_output = getattr(req, "dvr_deferred_output", None)
     if deferred_output is None:
         return False
-    if deferred_output.final_logprob_repair_claimed:
+    if deferred_output == _DVR_LOGPROB_REPAIR_CLAIMED:
         return False
 
-    deferred_output.final_logprob_repair_claimed = True
+    req.dvr_deferred_output = _DVR_LOGPROB_REPAIR_CLAIMED
     return True
 
 
@@ -427,7 +423,7 @@ def should_hold_dvr_non_streaming_logprob_output(
     should_hold = should_hold and deferred_output is not None
     if not should_hold:
         return False
-    return not require_final_repair or deferred_output.final_logprob_repair_claimed
+    return not require_final_repair or deferred_output == _DVR_LOGPROB_REPAIR_CLAIMED
 
 
 def compact_dvr_output_rows(

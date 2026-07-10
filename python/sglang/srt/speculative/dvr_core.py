@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
-    DVRDeferredOutput,
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
@@ -247,8 +246,6 @@ def finish_dvr_verify(
             seq_lens_cpu=base_seq_lens_cpu or linear_state.batch_seq_lens_cpu(batch),
             live_state_already_replayed=live_state_already_replayed,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
-            publish_boundary_checkpoint=False,
-            return_pending_boundary=True,
         )
 
     deferred_actions = DVRDeferredActions()
@@ -274,10 +271,6 @@ def finish_dvr_verify(
             )
         ]
         deferred_actions.pending_mamba_checkpoints = checkpoints or None
-        deferred_actions.output = (
-            DVRDeferredOutput(final_logprob_repairs=final_logprob_repairs)
-            if final_logprob_repairs is not None
-            else None
-        )
+        deferred_actions.final_logprob_repairs = final_logprob_repairs
 
     return deferred_actions

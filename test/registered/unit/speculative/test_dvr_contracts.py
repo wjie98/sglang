@@ -12,7 +12,6 @@ from sglang.srt.speculative.dvr_core import (
 from sglang.srt.speculative.dvr_worker import _DVRSelfDraftCore
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
-    DVRDeferredOutput,
     DVRFinalLogprobRepair,
     DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
@@ -258,14 +257,12 @@ def test_dvr_final_logprob_repair_applies_after_materialization():
     )
     result = SimpleNamespace(
         dvr_aux=DVRDeferredActions(
-            output=DVRDeferredOutput(
-                final_logprob_repairs=[
-                    DVRFinalLogprobRepair(
-                        output_ids=[10, 11, 12],
-                        output_logprobs=[-0.1, -0.2, -0.3],
-                    )
-                ]
-            )
+            final_logprob_repairs=[
+                DVRFinalLogprobRepair(
+                    output_ids=[10, 11, 12],
+                    output_logprobs=[-0.1, -0.2, -0.3],
+                )
+            ]
         )
     )
 
@@ -292,14 +289,12 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
     )
     result = SimpleNamespace(
         dvr_aux=DVRDeferredActions(
-            output=DVRDeferredOutput(
-                final_logprob_repairs=[
-                    DVRFinalLogprobRepair(
-                        output_ids=[10, 11],
-                        output_logprobs=[-0.1, -0.2],
-                    )
-                ]
-            )
+            final_logprob_repairs=[
+                DVRFinalLogprobRepair(
+                    output_ids=[10, 11],
+                    output_logprobs=[-0.1, -0.2],
+                )
+            ]
         )
     )
 
@@ -324,14 +319,12 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
     )
     result = SimpleNamespace(
         dvr_aux=DVRDeferredActions(
-            output=DVRDeferredOutput(
-                final_logprob_repairs=[
-                    DVRFinalLogprobRepair(
-                        output_ids=[10, 11],
-                        output_logprobs=[-0.1],
-                    )
-                ]
-            )
+            final_logprob_repairs=[
+                DVRFinalLogprobRepair(
+                    output_ids=[10, 11],
+                    output_logprobs=[-0.1],
+                )
+            ]
         )
     )
 

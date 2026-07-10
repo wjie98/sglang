@@ -299,25 +299,15 @@ class DVRLinearStateLifecycle:
         seq_lens_cpu: Optional[List[int]] = None,
         live_state_already_replayed: Optional[torch.Tensor] = None,
         use_fast_self_draft_commit: bool = False,
-        publish_boundary_checkpoint: bool = True,
-        return_pending_boundary: bool = False,
     ):
         pending_track_indices = [None] * len(batch.reqs)
         pending_track_seqlens = [None] * len(batch.reqs)
         ctx = ctx or self.state_context(batch, require_boundary=True)
         if ctx is None:
-            return (
-                (pending_track_indices, pending_track_seqlens)
-                if return_pending_boundary
-                else None
-            )
+            return pending_track_indices, pending_track_seqlens
         assert ctx.boundary_indices is not None
         if accepted_token_counts.numel() == 0:
-            return (
-                (pending_track_indices, pending_track_seqlens)
-                if return_pending_boundary
-                else None
-            )
+            return pending_track_indices, pending_track_seqlens
 
         if use_fast_self_draft_commit and seq_lens_cpu is None:
             # Self-DVR follows the original v5 lifecycle: verify has already
@@ -384,28 +374,16 @@ class DVRLinearStateLifecycle:
                 new_boundary_seqlen = self.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
                 self.boundary_seqlen[req.rid] = new_boundary_seqlen
                 track_idx = self.boundary_track_idx[req.rid]
-                if publish_boundary_checkpoint:
-                    self.publish_request_boundary_checkpoint(
-                        batch=batch,
-                        req=req,
-                        track_idx=track_idx,
-                        boundary_seqlen=new_boundary_seqlen,
-                    )
-                if return_pending_boundary:
-                    # Overlap materializes accepted tokens after the worker
-                    # returns. Keep the checkpoint pending until scheduler output
-                    # processing has committed those tokens to Req.output_ids.
-                    pending_track_indices[i] = track_idx
-                    pending_track_seqlens[i] = new_boundary_seqlen
+                # Scheduler materializes accepted tokens after the worker
+                # returns. Keep the checkpoint pending until result processing
+                # has committed those tokens to Req.output_ids.
+                pending_track_indices[i] = track_idx
+                pending_track_seqlens[i] = new_boundary_seqlen
         self.boundary_backup = None
         self.boundary_backup_keys = None
         self.live_backup = None
         self.suffix_replay_boundary_track_mask = None
-        return (
-            (pending_track_indices, pending_track_seqlens)
-            if return_pending_boundary
-            else None
-        )
+        return pending_track_indices, pending_track_seqlens
 
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
