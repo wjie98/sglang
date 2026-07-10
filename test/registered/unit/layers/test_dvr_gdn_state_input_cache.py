@@ -131,7 +131,8 @@ def test_dvr_gdn_adapter_lazily_adds_state_input_cache_view():
         layer_id=7,
     )
 
-    assert wrapped.base is layer_state_cache
+    assert wrapped is layer_state_cache
+    assert wrapped.linear_state_input_cache is not None
     assert req_to_token_pool._dvr_linear_state_input_cache is not None
     window = DVRStateInputWindow.from_cache(wrapped)
     assert window.enabled

@@ -24,17 +24,6 @@ from sglang.srt.layers.attention.linear.dvr_state import (
 __all__ = ["DVRGatedStateAdapter"]
 
 
-@dataclass(frozen=True)
-class DVRSpeculativeStateCacheView:
-    """DVR-only view that adds state-input windows to SGLang's Mamba cache."""
-
-    base: Any
-    linear_state_input_cache: Any
-
-    def __getattr__(self, name):
-        return getattr(self.base, name)
-
-
 @dataclass
 class DVRGatedStateAdapter:
     """Adapter for DVR state replay in gated linear-state layers.
@@ -119,10 +108,11 @@ class DVRGatedStateAdapter:
             )
         if layer_idx is not None:
             state_input_cache = state_input_cache[layer_idx]
-        return DVRSpeculativeStateCacheView(
-            base=state_cache,
-            linear_state_input_cache=state_input_cache,
-        )
+        # The speculative Mamba cache is a frozen dataclass in production.
+        # DVR adds one side-channel window without changing its normal fields or
+        # wrapping the object, so existing backend code sees the original cache.
+        object.__setattr__(state_cache, "linear_state_input_cache", state_input_cache)
+        return state_cache
 
     def get_or_create_state_input_cache(
         self, *, req_to_token_pool
