@@ -55,6 +55,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     select_top_k_tokens,
 )
+from sglang.srt.speculative.spec_info import useful_spec_proposed_drafts
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.async_probe import maybe_detect_nan
@@ -1093,7 +1094,7 @@ class DecodeVerifyRollbackWorkerV2:
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
             num_proposed_drafts_per_req_cpu=[
-                req.useful_spec_proposed_drafts(self.num_draft_steps)
+                useful_spec_proposed_drafts(req, self.num_draft_steps)
                 for req in batch.reqs
             ],
             dvr_aux=dvr_aux,

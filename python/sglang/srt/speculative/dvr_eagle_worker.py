@@ -41,6 +41,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
+from sglang.srt.speculative.spec_info import useful_spec_proposed_drafts
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import is_npu
 
@@ -514,7 +515,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             num_proposed_drafts_per_req_cpu=[
-                req.useful_spec_proposed_drafts(self.speculative_num_steps)
+                useful_spec_proposed_drafts(req, self.speculative_num_steps)
                 for req in batch.reqs
             ],
             next_draft_input=next_draft_input,

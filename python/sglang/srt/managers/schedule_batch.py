@@ -1083,43 +1083,6 @@ class Req(ReqDllmMixin):
         self.kv_overallocated_freed = True
         return self._cache_commit_len(), self.kv_allocated_len
 
-    def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
-        """Update the speculative decoding acceptance histogram.
-
-        Args:
-            num_correct_drafts: Number of correct draft tokens (no bonus) in this step.
-        """
-        if len(self.spec_correct_drafts_histogram) <= num_correct_drafts:
-            self.spec_correct_drafts_histogram.extend(
-                [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
-            )
-        self.spec_correct_drafts_histogram[num_correct_drafts] += 1
-
-    def record_spec_verify_metrics(
-        self,
-        num_correct_drafts: int,
-        num_proposed_drafts: Optional[int] = None,
-        proposed_per_verify: Optional[int] = None,
-    ):
-        """Record one speculative verify step."""
-        if num_proposed_drafts is None and proposed_per_verify is not None:
-            num_proposed_drafts = self.useful_spec_proposed_drafts(
-                proposed_per_verify
-            )
-        num_correct_drafts = max(0, int(num_correct_drafts))
-        if num_proposed_drafts is not None:
-            num_correct_drafts = min(num_correct_drafts, max(0, int(num_proposed_drafts)))
-        self.spec_verify_ct += 1
-        self.spec_num_correct_drafts += num_correct_drafts
-        if num_proposed_drafts is not None:
-            self.spec_num_proposed_drafts += max(0, int(num_proposed_drafts))
-        self.update_spec_correct_drafts_histogram(num_correct_drafts)
-
-    def useful_spec_proposed_drafts(self, proposed_per_verify: int) -> int:
-        """Return draft proposals that can still affect visible output."""
-        remaining_output = self.sampling_params.max_new_tokens - len(self.output_ids)
-        return min(max(0, int(proposed_per_verify)), max(0, remaining_output - 1))
-
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs

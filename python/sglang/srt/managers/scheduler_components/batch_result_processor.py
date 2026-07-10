@@ -26,6 +26,10 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_info import (
+    record_spec_verify_metrics,
+    useful_spec_proposed_drafts,
+)
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -603,12 +607,14 @@ class SchedulerBatchResultProcessor:
                     # EAGLE prepare_for_decode pre-claimed the bonus slot.
                     req.kv_committed_len += num_accept_tokens - 1
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-                req.record_spec_verify_metrics(
+                record_spec_verify_metrics(
+                    req,
                     num_correct_drafts=num_correct_drafts,
                     num_proposed_drafts=(
                         proposed_drafts_per_req[i]
                         if proposed_drafts_per_req is not None
-                        else req.useful_spec_proposed_drafts(
+                        else useful_spec_proposed_drafts(
+                            req,
                             default_proposed_per_verify
                         )
                     ),
