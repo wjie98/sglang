@@ -1195,8 +1195,19 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
+            dvr_eagle_force_miss = is_dvr_eagle_enabled(get_global_server_args())
+            if dvr_eagle_force_miss:
+                # DVR-EAGLE keeps radix-cache infrastructure enabled for GDN
+                # extra-buffer tracking, but target radix nodes do not own the
+                # separate MTP draft KV prefix.  Force a target-prefix miss
+                # before match_prefix so Mamba COW side effects are never
+                # installed on Req and draft prefill stays complete.
+                token_ids_to_match = array("q")
+                key_limit = None
             if cow_mamba is None:
-                cow_mamba = tree_cache.supports_mamba()
+                cow_mamba = tree_cache.supports_mamba() and not dvr_eagle_force_miss
+            elif dvr_eagle_force_miss:
+                cow_mamba = False
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
@@ -1210,23 +1221,6 @@ class Req(ReqDllmMixin):
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(tree_cache, match_result)
-            elif is_dvr_eagle_enabled(get_global_server_args()):
-                # DVR-EAGLE keeps radix-cache infrastructure enabled for GDN
-                # extra-buffer tracking, but target radix nodes do not own the
-                # separate MTP draft KV prefix.  Reusing a target prefix would
-                # skip draft prefill for those tokens and lower acceptance.
-                #
-                # match_prefix may already have installed a deferred mamba COW
-                # on Req before we force the prefix miss.  Cancel that Req-side
-                # effect as well; otherwise a no-prefix prefill would still
-                # start from the cached recurrent state and drift from the
-                # full-prefill GDN oracle.
-                had_mamba_cow = self.mamba_cow_src_index is not None
-                match_result = zero_match_result(tree_cache, match_result)
-                if had_mamba_cow:
-                    self.mamba_cow_src_index = None
-                    if self.mamba_pool_idx is not None and self.already_computed == 0:
-                        self.mamba_needs_clear = True
             (
                 self.prefix_indices,
                 self.last_node,
