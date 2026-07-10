@@ -264,17 +264,11 @@ def build_dvr_private_extend_batch(
     prefix_lens: list[int],
     extend_lens: list[int],
     final_seq_lens: list[int],
-    return_logprob: bool = False,
-    top_logprobs_nums: Optional[list[int]] = None,
-    token_ids_logprobs: Optional[list[Any]] = None,
     extend_logprob_start_lens: Optional[list[int]] = None,
-    extend_input_logprob_token_ids: Optional[list[int]] = None,
-    multimodal_inputs: Optional[list[Any]] = None,
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
     is_extend_in_batch: bool = True,
     all_extend_in_batch: bool = True,
     is_prefill_only: Optional[bool] = None,
-    with_sampling_info: bool = False,
     mamba_track_indices: Optional[torch.Tensor] = None,
     mamba_track_mask: Optional[torch.Tensor] = None,
     mamba_track_seqlens: Optional[torch.Tensor] = None,
@@ -312,11 +306,6 @@ def build_dvr_private_extend_batch(
         if extend_logprob_start_lens is None
         else extend_logprob_start_lens
     )
-    multimodal_inputs = (
-        [req.multimodal_inputs for req in reqs]
-        if multimodal_inputs is None
-        else multimodal_inputs
-    )
 
     replay_batch = ScheduleBatch.init_new(
         reqs=reqs,
@@ -343,19 +332,11 @@ def build_dvr_private_extend_batch(
     replay_batch.extend_lens = extend_lens
     replay_batch.prefix_lens = prefix_lens
     replay_batch.extend_logprob_start_lens = extend_logprob_start_lens
-    replay_batch.extend_input_logprob_token_ids = (
-        None
-        if extend_input_logprob_token_ids is None
-        else torch.tensor(
-            extend_input_logprob_token_ids,
-            dtype=torch.int64,
-            device=device,
-        )
-    )
-    replay_batch.multimodal_inputs = multimodal_inputs
-    replay_batch.return_logprob = return_logprob
-    replay_batch.top_logprobs_nums = top_logprobs_nums
-    replay_batch.token_ids_logprobs = token_ids_logprobs
+    replay_batch.extend_input_logprob_token_ids = None
+    replay_batch.multimodal_inputs = [req.multimodal_inputs for req in reqs]
+    replay_batch.return_logprob = False
+    replay_batch.top_logprobs_nums = None
+    replay_batch.token_ids_logprobs = None
     replay_batch.global_num_tokens = global_num_tokens
     replay_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
     replay_batch.is_extend_in_batch = is_extend_in_batch
@@ -386,14 +367,6 @@ def build_dvr_private_extend_batch(
     replay_batch.mamba_cow_src_indices = mamba_cow_src_indices
     replay_batch.mamba_cow_dst_indices = mamba_cow_dst_indices
     replay_batch.mamba_clear_indices = mamba_clear_indices
-
-    if with_sampling_info:
-        from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-
-        replay_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            replay_batch,
-            batch.model_config.vocab_size,
-        )
     return replay_batch
 
 
