@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -19,32 +18,6 @@ from sglang.srt.speculative.dvr_info import (
 from sglang.srt.speculative.dvr_replay import (
     replay_dvr_accepted_suffix_for_live_state,
 )
-
-
-@dataclass
-class DVRDraftResult:
-    """Draft adapter output consumed by DVR target verify."""
-
-    verify_input: Any
-    # External draft models own separate draft KV.  After partial acceptance,
-    # DVR must replay the accepted suffix to repair target recurrent state.
-    needs_accepted_suffix_repair: bool
-
-    @classmethod
-    def self_draft(cls, verify_input: Any) -> "DVRDraftResult":
-        return cls(verify_input=verify_input, needs_accepted_suffix_repair=False)
-
-    @classmethod
-    def external_draft(cls, verify_input: Any) -> "DVRDraftResult":
-        return cls(verify_input=verify_input, needs_accepted_suffix_repair=True)
-
-
-@dataclass
-class DVRVerifyResult:
-    """Core DVR post-verify result shared by self draft and EAGLE/MTP."""
-
-    accept_lens_cpu: list[int]
-    deferred_actions: DVRDeferredActions
 
 
 def score_dvr_verify_outputs(
@@ -209,7 +182,7 @@ def finish_dvr_verify(
     accept_index: Optional[torch.Tensor] = None,
     partial_suffix_replay_kwargs: Optional[dict[str, Any]] = None,
     use_fast_self_draft_commit: bool = False,
-) -> DVRVerifyResult:
+) -> DVRDeferredActions:
     """Record accepted output rows and commit target recurrent state.
 
     Draft adapters stop at sampling.  Everything after that is DVR core:
@@ -307,7 +280,4 @@ def finish_dvr_verify(
             else None
         )
 
-    return DVRVerifyResult(
-        accept_lens_cpu=accept_lens_cpu,
-        deferred_actions=deferred_actions,
-    )
+    return deferred_actions

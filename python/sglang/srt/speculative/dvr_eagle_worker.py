@@ -22,7 +22,7 @@ from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
     DVRVerifyInput,
 )
-from sglang.srt.speculative.dvr_core import DVRDraftResult, finish_dvr_verify
+from sglang.srt.speculative.dvr_core import finish_dvr_verify
 from sglang.srt.speculative.dvr_replay import (
     run_dvr_suffix_replay_oracle,
     dvr_suffix_replay_context,
@@ -310,9 +310,8 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         ):
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
         assert verify_input.is_verify_input()
-        draft_result = DVRDraftResult.external_draft(verify_input)
         batch.spec_info = verify_input
-        batch_output = self.verify(batch, draft_result)
+        batch_output = self.verify(batch, verify_input)
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
         with (
@@ -329,13 +328,11 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
     def verify(
         self,
         batch: ScheduleBatch,
-        draft_result: DVRDraftResult,
+        verify_input: EagleVerifyInput,
     ):
         fwd_stream = torch.get_device_module(self.device).current_stream()
-        verify_input = draft_result.verify_input
         if not isinstance(verify_input, DVRVerifyInput):
             verify_input = DVRVerifyInput.from_eagle_verify_input(verify_input)
-        draft_result.verify_input = verify_input
         batch.spec_info = verify_input
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
@@ -470,10 +467,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 )
 
         partial_suffix_replay_kwargs = None
-        if (
-            linear_state_ctx is not None
-            and draft_result.needs_accepted_suffix_repair
-        ):
+        if linear_state_ctx is not None:
             partial_suffix_replay_kwargs = dict(
                 target_worker=self.target_worker,
                 linear_state=self.linear_state,
@@ -482,7 +476,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 request_token_ids_for_replay=self._request_token_ids_for_replay,
             )
-        verify_result = finish_dvr_verify(
+        dvr_aux = finish_dvr_verify(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
@@ -532,7 +526,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
-            dvr_aux=verify_result.deferred_actions,
+            dvr_aux=dvr_aux,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

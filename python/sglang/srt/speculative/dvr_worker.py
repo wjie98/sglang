@@ -31,7 +31,7 @@ from sglang.srt.speculative.dvr_info import (
     DVRVerifyInput,
     dvr_compact_output_indices,
 )
-from sglang.srt.speculative.dvr_core import DVRDraftResult, finish_dvr_verify
+from sglang.srt.speculative.dvr_core import finish_dvr_verify
 from sglang.srt.speculative.dvr_linear_state import (
     DVRLinearStateLifecycle,
 )
@@ -940,10 +940,9 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
-        draft_result = self.draft(batch)
-        verify_input = draft_result.verify_input
+        verify_input = self.draft(batch)
         batch.spec_info = verify_input
-        batch_result = self.verify(batch, draft_result)
+        batch_result = self.verify(batch, verify_input)
         if on_publish is not None:
             on_publish(batch_result.new_seq_lens)
         return batch_result
@@ -974,7 +973,7 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
         batch.mamba_track_seqlens = None
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
-    def draft(self, batch: ScheduleBatch) -> DVRDraftResult:
+    def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,
@@ -983,12 +982,10 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
                 topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
-            return DVRDraftResult.self_draft(
-                EagleVerifyInput.create_idle_input(
-                    self.topk,
-                    self.num_draft_steps,
-                    self.num_draft_tokens,
-                )
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.num_draft_steps,
+                self.num_draft_tokens,
             )
 
         seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
@@ -1007,22 +1004,19 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
         # on the target verify path; carrying return_logprob into draft decode
         # adds unnecessary logits metadata and can perturb the overlap GDN state
         # lifecycle before verify repairs it.
-        return DVRDraftResult.self_draft(
-            self._run_self_draft_and_build_verify_input(
-                batch,
-                spec_info,
-                seq_lens_sum=batch.seq_lens_sum,
-                seq_lens_cpu=seq_lens_cpu,
-                suppress_return_logprob=True,
-            )
+        return self._run_self_draft_and_build_verify_input(
+            batch,
+            spec_info,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=seq_lens_cpu,
+            suppress_return_logprob=True,
         )
 
     def verify(
         self,
         batch: ScheduleBatch,
-        draft_result: DVRDraftResult,
+        spec_info: EagleVerifyInput,
     ) -> GenerationBatchResult:
-        spec_info = draft_result.verify_input
         if not batch.forward_mode.is_idle():
             batch.input_ids = spec_info.draft_token
         spec_info.num_tokens_per_req = self.num_draft_tokens
@@ -1074,23 +1068,9 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
                     batch, logits_output, predict, accept_index
                 )
 
-        partial_suffix_replay_kwargs = None
-        if linear_state_ctx is not None:
-            # return_logprob is an output-scoring concern.  Keep self-DVR on the
-            # same fast state commit path as no-logprob; only non-self callers
-            # need an accepted-suffix replay before commit.
-            if has_verify_tokens and draft_result.needs_accepted_suffix_repair:
-                partial_suffix_replay_kwargs = dict(
-                    target_worker=self.target_worker,
-                    linear_state=self.linear_state,
-                    linear_state_ctx=linear_state_ctx,
-                    base_seq_lens_cpu=self._seq_lens_cpu_list_for_verify(
-                        batch, spec_info
-                    ),
-                    num_draft_tokens=self.num_draft_tokens,
-                    request_token_ids_for_replay=self._request_token_ids_for_replay,
-                )
-        verify_result = finish_dvr_verify(
+        # Self draft reuses target KV/GDN state directly, so accepted suffix
+        # repair is unnecessary; the fast commit path can copy verify state.
+        dvr_aux = finish_dvr_verify(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
@@ -1103,12 +1083,7 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
             tokens_per_req=self.num_draft_tokens if has_verify_tokens else None,
             base_seq_lens_cpu=base_seq_lens_cpu,
             error_prefix="DVR spec-v2",
-            predict=predict if partial_suffix_replay_kwargs is not None else None,
-            accept_index=(
-                accept_index if partial_suffix_replay_kwargs is not None else None
-            ),
-            partial_suffix_replay_kwargs=partial_suffix_replay_kwargs,
-            use_fast_self_draft_commit=not draft_result.needs_accepted_suffix_repair,
+            use_fast_self_draft_commit=True,
         )
 
         if has_verify_tokens:
@@ -1136,7 +1111,7 @@ class DecodeVerifyRollbackWorkerV2(_DVRSelfDraftCore):
                 req.useful_spec_proposed_drafts(self.num_draft_steps)
                 for req in batch.reqs
             ],
-            dvr_aux=verify_result.deferred_actions,
+            dvr_aux=dvr_aux,
             routed_experts_output=batch_result.routed_experts_output,
         )
 

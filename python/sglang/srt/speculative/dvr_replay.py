@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -16,29 +15,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 
 
-@dataclass
-class _DVRSuffixReplayPlan:
-    """Plan a target EXTEND replay over unclosed prefix tail plus appended rows.
-
-    The appended rows are draft rows for verifier oracles and accepted rows for
-    live-state repair.  Keeping one shape makes both paths share the same
-    suffix replay plumbing while preserving their different callers.
-    """
-
-    base_seq_lens_cpu: list[int]
-    boundary_lens: list[int]
-    tail_lens_cpu: list[int]
-    extend_lens_cpu: list[int]
-    final_seq_lens_cpu: list[int]
-    append_token_counts_cpu: list[int]
-    input_ids: list[int]
-    out_cache_locs: list[torch.Tensor]
-    append_cache_locs: torch.Tensor
-    append_rows: Optional[torch.Tensor] = None
-    append_offsets: Optional[torch.Tensor] = None
-    hidden_gather_indices: Optional[torch.Tensor] = None
-
-
 def _build_suffix_replay_plan(
     *,
     batch,
@@ -48,7 +24,7 @@ def _build_suffix_replay_plan(
     append_cache_locs_by_req: list[torch.Tensor],
     request_token_ids_for_replay,
     hidden_gather_append_count: Optional[int] = None,
-) -> Optional[_DVRSuffixReplayPlan]:
+) -> Optional[dict[str, Any]]:
     tail_lens_cpu = []
     extend_lens_cpu = []
     final_seq_lens_cpu = []
@@ -127,7 +103,7 @@ def _build_suffix_replay_plan(
             gather_indices, dtype=torch.long, device=batch.seq_lens.device
         )
 
-    return _DVRSuffixReplayPlan(
+    return dict(
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
         tail_lens_cpu=tail_lens_cpu,
@@ -218,19 +194,19 @@ def _linear_state_replay_context(
 
 def _build_suffix_draft_mrope_positions(
     replay_batch: ScheduleBatch,
-    replay_plan: _DVRSuffixReplayPlan,
+    replay_plan: dict[str, Any],
 ) -> torch.Tensor:
     """Build flattened mrope positions matching suffix tail+draft input order."""
 
-    draft_token_num = int(replay_plan.append_token_counts_cpu[0])
+    draft_token_num = int(replay_plan["append_token_counts_cpu"][0])
     device = replay_batch.seq_lens.device
     mrope_chunks = []
     mm_inputs = replay_batch.multimodal_inputs
     for req_i, (seq_len, boundary, tail_len) in enumerate(
         zip(
-            replay_plan.base_seq_lens_cpu,
-            replay_plan.boundary_lens,
-            replay_plan.tail_lens_cpu,
+            replay_plan["base_seq_lens_cpu"],
+            replay_plan["boundary_lens"],
+            replay_plan["tail_lens_cpu"],
             strict=True,
         )
     ):
@@ -478,8 +454,8 @@ def dvr_suffix_replay_context(
             [
                 int(tail_len) + int(append_count) >= chunk_size
                 for tail_len, append_count in zip(
-                    replay_plan.tail_lens_cpu,
-                    replay_plan.append_token_counts_cpu,
+                    replay_plan["tail_lens_cpu"],
+                    replay_plan["append_token_counts_cpu"],
                     strict=True,
                 )
             ],
@@ -494,19 +470,19 @@ def dvr_suffix_replay_context(
     replay_batch = build_dvr_private_extend_batch(
         batch,
         reqs=batch.reqs,
-        input_ids=replay_plan.input_ids,
-        out_cache_locs=replay_plan.out_cache_locs,
-        prefix_lens=[int(x) for x in replay_plan.boundary_lens],
-        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-        final_seq_lens=replay_plan.final_seq_lens_cpu,
-        extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        input_ids=replay_plan["input_ids"],
+        out_cache_locs=replay_plan["out_cache_locs"],
+        prefix_lens=[int(x) for x in replay_plan["boundary_lens"]],
+        extend_lens=[int(x) for x in replay_plan["extend_lens_cpu"]],
+        final_seq_lens=replay_plan["final_seq_lens_cpu"],
+        extend_logprob_start_lens=[int(x) for x in replay_plan["extend_lens_cpu"]],
         capture_hidden_mode=CaptureHiddenMode.FULL,
         is_prefill_only=batch.is_prefill_only,
         mamba_track_indices=boundary_indices if boundary_track_mask is not None else None,
         mamba_track_mask=boundary_track_mask,
         mamba_track_seqlens=(
             torch.tensor(
-                replay_plan.final_seq_lens_cpu,
+                replay_plan["final_seq_lens_cpu"],
                 dtype=torch.int64,
                 device=batch.seq_lens.device,
             )
@@ -544,11 +520,11 @@ def dvr_suffix_replay_context(
 
         # Draft KV rows must be visible at absolute positions
         # base_seq_len..base_seq_len+draft during the oracle forward.
-        assert replay_plan.append_rows is not None
-        assert replay_plan.append_offsets is not None
+        assert replay_plan["append_rows"] is not None
+        assert replay_plan["append_offsets"] is not None
         replay_batch.req_to_token_pool.write(
-            (replay_plan.append_rows, replay_plan.append_offsets),
-            replay_plan.append_cache_locs.to(torch.int32),
+            (replay_plan["append_rows"], replay_plan["append_offsets"]),
+            replay_plan["append_cache_locs"].to(torch.int32),
         )
         yield replay_batch, replay_plan
 
@@ -625,23 +601,23 @@ def replay_dvr_accepted_suffix_for_live_state(
     replay_batch = build_dvr_private_extend_batch(
         batch,
         reqs=batch.reqs,
-        input_ids=replay_plan.input_ids,
-        out_cache_locs=replay_plan.out_cache_locs,
-        prefix_lens=[int(x) for x in replay_plan.boundary_lens],
-        extend_lens=[int(x) for x in replay_plan.extend_lens_cpu],
-        final_seq_lens=replay_plan.final_seq_lens_cpu,
-        extend_logprob_start_lens=[int(x) for x in replay_plan.extend_lens_cpu],
+        input_ids=replay_plan["input_ids"],
+        out_cache_locs=replay_plan["out_cache_locs"],
+        prefix_lens=[int(x) for x in replay_plan["boundary_lens"]],
+        extend_lens=[int(x) for x in replay_plan["extend_lens_cpu"]],
+        final_seq_lens=replay_plan["final_seq_lens_cpu"],
+        extend_logprob_start_lens=[int(x) for x in replay_plan["extend_lens_cpu"]],
         capture_hidden_mode=CaptureHiddenMode.NULL,
         is_prefill_only=batch.is_prefill_only,
         mamba_cow_src_indices=boundary_indices,
         mamba_cow_dst_indices=live_indices,
     )
     with _linear_state_replay_context(linear_state_ctx, restore_live_state=False):
-        if replay_plan.append_rows is not None:
-            assert replay_plan.append_offsets is not None
+        if replay_plan["append_rows"] is not None:
+            assert replay_plan["append_offsets"] is not None
             replay_batch.req_to_token_pool.write(
-                (replay_plan.append_rows, replay_plan.append_offsets),
-                replay_plan.append_cache_locs.to(
+                (replay_plan["append_rows"], replay_plan["append_offsets"]),
+                replay_plan["append_cache_locs"].to(
                     device=replay_batch.seq_lens.device,
                     dtype=torch.int32,
                 ),
@@ -656,7 +632,7 @@ def run_dvr_suffix_replay_oracle(
     *,
     target_worker,
     replay_batch: ScheduleBatch,
-    replay_plan: _DVRSuffixReplayPlan,
+    replay_plan: dict[str, Any],
     use_forward_batch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run a suffix+draft replay oracle and return only draft-row outputs."""
@@ -680,12 +656,13 @@ def run_dvr_suffix_replay_oracle(
         )
         forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
 
-    assert replay_plan.hidden_gather_indices is not None
+    hidden_gather_indices = replay_plan["hidden_gather_indices"]
+    assert hidden_gather_indices is not None
     hidden_states = oracle_output.logits_output.hidden_states
     if hidden_states is None:
         raise RuntimeError("DVR target replay did not return hidden states.")
     draft_hidden_states = hidden_states[
-        replay_plan.hidden_gather_indices.to(
+        hidden_gather_indices.to(
             device=hidden_states.device,
             dtype=torch.long,
         )
