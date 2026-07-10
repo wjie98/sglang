@@ -266,20 +266,6 @@ class DVRGatedStateAdapter:
             state_cache.temporal.dtype, copy=False
         )
 
-    def backup_verify_recurrent_states(
-        self,
-        *,
-        state_cache,
-        boundary_indices: torch.Tensor,
-        live_indices: torch.Tensor,
-    ) -> Tuple[DVRRecurrentStateBackup, DVRRecurrentStateBackup]:
-        return (
-            self.backup_recurrent_state(
-                state_cache=state_cache, indices=boundary_indices
-            ),
-            self.backup_recurrent_state(state_cache=state_cache, indices=live_indices),
-        )
-
     def prepare_recurrent_state_for_verify(
         self,
         *,

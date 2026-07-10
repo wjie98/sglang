@@ -893,12 +893,13 @@ class DVRLinearStateLifecycle:
             and self.boundary_backup_keys == backup_keys
         ):
             return
-        self.boundary_backup, self.live_backup = (
-            ctx.state_adapter.backup_verify_recurrent_states(
-                state_cache=ctx.state_cache,
-                boundary_indices=ctx.boundary_indices,
-                live_indices=ctx.live_indices,
-            )
+        self.boundary_backup = ctx.state_adapter.backup_recurrent_state(
+            state_cache=ctx.state_cache,
+            indices=ctx.boundary_indices,
+        )
+        self.live_backup = ctx.state_adapter.backup_recurrent_state(
+            state_cache=ctx.state_cache,
+            indices=ctx.live_indices,
         )
         self.boundary_backup_keys = backup_keys
 
@@ -1088,13 +1089,6 @@ class DVRLinearStateLifecycle:
     ):
         self.boundary_track_idx[req.rid] = track_idx
         self.boundary_seqlen[req.rid] = boundary_seqlen
-        self.publish_request_boundary_checkpoint(
-            batch=batch, req=req, track_idx=track_idx, boundary_seqlen=boundary_seqlen
-        )
-
-    def publish_request_boundary_checkpoint(
-        self, *, batch: ScheduleBatch, req, track_idx: int, boundary_seqlen: int
-    ):
         req.mamba_last_track_seqlen = boundary_seqlen
         req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
             track_idx
