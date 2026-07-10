@@ -109,7 +109,10 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.speculative.dvr_server_args import is_dvr_eagle_enabled
+from sglang.srt.speculative.dvr_server_args import (
+    is_dvr_eagle_enabled,
+    should_force_dvr_eagle_target_prefix_miss,
+)
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
@@ -1158,13 +1161,10 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
-            dvr_eagle_force_miss = is_dvr_eagle_enabled(get_global_server_args())
+            dvr_eagle_force_miss = should_force_dvr_eagle_target_prefix_miss(
+                get_global_server_args()
+            )
             if dvr_eagle_force_miss:
-                # DVR-EAGLE keeps radix-cache infrastructure enabled for GDN
-                # extra-buffer tracking, but target radix nodes do not own the
-                # separate MTP draft KV prefix.  Force a target-prefix miss
-                # before match_prefix so Mamba COW side effects are never
-                # installed on Req and draft prefill stays complete.
                 token_ids_to_match = array("q")
                 key_limit = None
             if cow_mamba is None:

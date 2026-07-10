@@ -29,6 +29,19 @@ def is_dvr_eagle_enabled(server_args) -> bool:
     return server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
 
 
+def should_force_dvr_eagle_target_prefix_miss(server_args) -> bool:
+    """Return whether target radix prefix matching must stay disabled.
+
+    DVR-EAGLE/MTP uses the standard EAGLE/MTP draft KV pool, while the regular
+    radix tree owns only target KV and GDN checkpoints.  Until draft-prefix KV
+    ownership is represented in the cache, a target prefix hit can leave draft
+    KV unavailable or stale and reduce acceptance.  Keep this policy DVR-local
+    so scheduler prefix matching stays a plain cache lookup.
+    """
+
+    return is_dvr_eagle_enabled(server_args)
+
+
 def handle_dvr_defaults(server_args):
     if not is_dvr_enabled(server_args):
         return
