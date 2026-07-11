@@ -427,33 +427,36 @@ def dvr_compact_output_indices(
     return base + offsets
 
 
-def compact_dvr_accepted_tokens_and_cache_locs(
+def compact_dvr_accepted_input_tokens_and_cache_locs(
     *,
     batch: Any,
-    predict: torch.Tensor,
-    accept_index: torch.Tensor,
+    verify_input_tokens: torch.Tensor,
     accept_lens: torch.Tensor,
     num_draft_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return accepted tokens/cache slots in scheduler output order.
+    """Return model-committed verify-input tokens/cache slots.
 
-    DVR replay must follow the same compact per-request output slices that
-    result processing materializes, while ``accept_index`` still names the
-    verifier KV/cache rows for the accepted path.
+    EAGLE/MTP emits client-visible tokens from verifier logits, so the output
+    stream is shifted by one token from the target sequence.  DVR state rollback
+    must replay the verify-input path that advances target KV/GDN state, not the
+    sampled output tokens recorded for the client.
     """
 
-    max_accept = accept_index.shape[1]
+    max_accept = int(num_draft_tokens)
     valid_accept = torch.arange(
-        max_accept, dtype=torch.long, device=accept_index.device
+        max_accept, dtype=torch.long, device=accept_lens.device
     ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
-    compact_predict_indices = dvr_compact_output_indices(
-        accept_index=accept_index,
-        num_draft_tokens=num_draft_tokens,
-        max_accept=max_accept,
+    bs = accept_lens.shape[0]
+    compact_input_indices = (
+        torch.arange(bs, dtype=torch.long, device=accept_lens.device).unsqueeze(1)
+        * int(num_draft_tokens)
+        + torch.arange(max_accept, dtype=torch.long, device=accept_lens.device)
+        .unsqueeze(0)
     )
+    verify_input_tokens = verify_input_tokens.reshape(-1)
     return (
-        predict[compact_predict_indices[valid_accept]],
-        batch.out_cache_loc[accept_index.clamp_min(0).long()[valid_accept]],
+        verify_input_tokens[compact_input_indices[valid_accept]],
+        batch.out_cache_loc[compact_input_indices[valid_accept]],
     )
 
 

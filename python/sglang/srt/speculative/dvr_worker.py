@@ -889,7 +889,6 @@ class DecodeVerifyRollbackWorkerV2:
             draft_cache_locs=batch.out_cache_loc,
             request_token_ids_for_replay=self._request_token_ids_for_replay,
             restore_boundary_state=True,
-            track_replay_boundary_checkpoint=True,
         ) as replay:
             if replay is None:
                 return None
@@ -995,6 +994,7 @@ class DecodeVerifyRollbackWorkerV2:
         tokens_per_req: int,
         next_draft_input: EagleDraftInput,
         error_prefix: str,
+        accepted_input_tokens: Optional[torch.Tensor] = None,
         routed_experts_output=None,
         indexer_topk_output=None,
         extra_keep_alive_refs=None,
@@ -1022,10 +1022,7 @@ class DecodeVerifyRollbackWorkerV2:
                 if has_verify_tokens
                 else None
             ),
-            predict=predict if rollback_replay_kwargs is not None else None,
-            accept_index=(
-                accept_index if rollback_replay_kwargs is not None else None
-            ),
+            accepted_input_tokens=accepted_input_tokens,
             rollback_replay_kwargs=rollback_replay_kwargs,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
@@ -1209,6 +1206,9 @@ class DecodeVerifyRollbackWorkerV2:
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
             tokens_per_req=spec_info.draft_token_num,
+            accepted_input_tokens=(
+                spec_info.draft_token if rollback_replay_kwargs is not None else None
+            ),
             next_draft_input=EagleDraftInput(bonus_tokens=bonus_tokens),
             error_prefix="DVR EAGLE",
             routed_experts_output=forward_batch_output.routed_experts_output,

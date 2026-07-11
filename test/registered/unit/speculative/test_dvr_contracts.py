@@ -12,7 +12,7 @@ from sglang.srt.speculative.dvr_core import (
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
     DVRRollbackActions,
-    compact_dvr_accepted_tokens_and_cache_locs,
+    compact_dvr_accepted_input_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
     maybe_filter_running_batch_after_dvr_rollback,
@@ -544,25 +544,26 @@ def test_dvr_eagle_compacts_accepted_output_rows():
     assert token_ids_per_req == [[10, 11], [20, 21, 22]]
 
 
-def test_dvr_eagle_replay_tokens_follow_spec_v2_output_order():
+def test_dvr_eagle_state_replay_uses_verify_input_path():
     batch = SimpleNamespace(
         out_cache_loc=torch.tensor(
             [100, 101, 102, 103, 200, 201, 202, 203], dtype=torch.int64
         )
     )
-    predict = torch.tensor([10, 11, 12, 13, 20, 21, 22, 23], dtype=torch.int32)
-    accept_index = torch.tensor([[0, 2, -1], [4, 7, 6]], dtype=torch.int32)
+    verify_input_tokens = torch.tensor(
+        [271, 2523, 0, 0, 248068, 271, 0, 0], dtype=torch.int32
+    )
     accept_lens = torch.tensor([2, 3], dtype=torch.int32)
 
-    tokens, cache_locs = compact_dvr_accepted_tokens_and_cache_locs(
+    tokens, cache_locs = compact_dvr_accepted_input_tokens_and_cache_locs(
         batch=batch,
-        predict=predict,
-        accept_index=accept_index,
+        verify_input_tokens=verify_input_tokens,
         accept_lens=accept_lens,
         num_draft_tokens=4,
     )
 
-    # Spec-v2 output processing emits compact per-request predict slices.
-    # Tree accept_index still owns the KV/cache rows for the accepted path.
-    assert tokens.tolist() == [10, 11, 20, 21, 22]
-    assert cache_locs.tolist() == [100, 102, 200, 203, 202]
+    # EAGLE output tokens are sampled from verifier logits and are one row ahead
+    # of the target sequence.  DVR state replay must advance the target-owned
+    # verify-input path instead of replaying the client-visible bonus tokens.
+    assert tokens.tolist() == [271, 2523, 248068, 271, 0]
+    assert cache_locs.tolist() == [100, 101, 200, 201, 202]

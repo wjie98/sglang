@@ -8,7 +8,7 @@ import torch
 from sglang.srt.speculative.dvr_info import (
     DVRFinalLogprobRepair,
     DVRRollbackActions,
-    compact_dvr_accepted_tokens_and_cache_locs,
+    compact_dvr_accepted_input_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
     try_claim_dvr_final_logprob_repair,
@@ -175,8 +175,7 @@ def rollback_dvr_verify(
     accept_lens_cpu: Optional[list[int]],
     num_draft_tokens: int,
     output: Optional[DVRVerifyOutput] = None,
-    predict: Optional[torch.Tensor] = None,
-    accept_index: Optional[torch.Tensor] = None,
+    accepted_input_tokens: Optional[torch.Tensor] = None,
     rollback_replay_kwargs: Optional[dict[str, Any]] = None,
     use_fast_self_draft_commit: bool = False,
 ) -> DVRRollbackActions:
@@ -201,32 +200,29 @@ def rollback_dvr_verify(
     pending_track_indices = None
     pending_track_seqlens = None
     if linear_state_ctx is not None:
-        live_state_already_replayed = None
+        accepted_suffix_replay = None
         if rollback_replay_kwargs is not None and torch.any(
             accept_lens < num_draft_tokens
         ).item():
-            if predict is None or accept_index is None:
+            if accepted_input_tokens is None:
                 raise RuntimeError(
-                    "DVR rollback replay requires sampled verifier rows."
+                    "DVR rollback replay requires accepted verify-input tokens."
                 )
             accepted_ids, accepted_cache_locs = (
-                compact_dvr_accepted_tokens_and_cache_locs(
+                compact_dvr_accepted_input_tokens_and_cache_locs(
                     batch=batch,
-                    predict=predict,
-                    accept_index=accept_index,
+                    verify_input_tokens=accepted_input_tokens,
                     accept_lens=accept_lens,
                     num_draft_tokens=num_draft_tokens,
                 )
             )
             if accepted_ids.numel() > 0:
-                live_state_already_replayed = (
-                    linear_state.rollback_live_state_with_accepted_suffix(
-                        batch=batch,
-                        accepted_token_counts_cpu=accept_lens_cpu,
-                        accepted_ids=accepted_ids,
-                        accepted_cache_locs=accepted_cache_locs,
-                        **rollback_replay_kwargs,
-                    )
+                accepted_suffix_replay = linear_state.rollback_live_state_with_accepted_suffix(
+                    batch=batch,
+                    accepted_token_counts_cpu=accept_lens_cpu,
+                    accepted_ids=accepted_ids,
+                    accepted_cache_locs=accepted_cache_locs,
+                    **rollback_replay_kwargs,
                 )
 
         pending_track_indices, pending_track_seqlens = linear_state.commit_after_verify(
@@ -236,7 +232,12 @@ def rollback_dvr_verify(
             accepted_token_counts_cpu=accept_lens_cpu,
             ctx=linear_state_ctx,
             seq_lens_cpu=base_seq_lens_cpu or linear_state.batch_seq_lens_cpu(batch),
-            live_state_already_replayed=live_state_already_replayed,
+            live_state_already_replayed=(
+                None
+                if accepted_suffix_replay is None
+                else accepted_suffix_replay.live_state_mask
+            ),
+            accepted_suffix_replay=accepted_suffix_replay,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
 
