@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
+    dvr_self_draft_graph_block_reason,
 )
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
@@ -127,13 +128,13 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_next_track_idx == 1
 
 
-def test_dvr_self_draft_graph_runner_only_skips_known_short_boundary():
+def test_dvr_self_draft_graph_runner_rejects_short_boundary():
     graph_runner = object.__new__(DVRDraftDecodeCudaGraphRunner)
     graph_runner.runner = SimpleNamespace(can_run_graph=lambda forward_batch: True)
 
-    assert not graph_runner.can_run(
-        SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
-    )
+    short_batch = SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
+    assert dvr_self_draft_graph_block_reason(short_batch) is not None
+    assert not graph_runner.can_run(short_batch)
     assert graph_runner.can_run(
         SimpleNamespace(
             dvr_disable_draft_cuda_graph=True,
@@ -144,6 +145,16 @@ def test_dvr_self_draft_graph_runner_only_skips_known_short_boundary():
     assert graph_runner.can_run(
         SimpleNamespace(seq_lens_cpu=torch.tensor([3]), batch_size=1)
     )
+
+
+def test_dvr_self_draft_rejects_short_boundary_without_eager_fallback():
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.cuda_graph_runner_for_draft_decode = None
+
+    with pytest.raises(RuntimeError, match="no eager fallback"):
+        worker._draft_decode_forward(
+            SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
+        )
 
 
 def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():

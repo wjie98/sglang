@@ -29,8 +29,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     DVRTargetVerifyCudaGraphRunner,
-    dvr_self_draft_eager_context,
-    dvr_self_draft_graph_skip_reason,
+    dvr_self_draft_graph_block_reason,
     iter_dvr_attention_backends,
     _min_seq_len_cpu,
 )
@@ -97,10 +96,17 @@ def _get_dvr_plan_stream(device: str):
     return None, nullcontext()
 
 
-def dvr_has_graph_unsafe_short_prompt(batch) -> bool:
-    """Return whether DVR/GDN graph replay should skip the one-token edge."""
+def raise_for_dvr_graph_unsafe_short_prompt(batch) -> None:
+    """Reject the synthetic one-token prompt edge instead of running a slow path."""
 
-    return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
+    for req in batch.reqs:
+        if len(req.origin_input_ids) <= 1:
+            raise RuntimeError(
+                "DVR does not support one-token synthetic prompts on gated "
+                "linear-state models because the first draft/verify graph step "
+                "hits the seq_len<=2 state-input boundary. Use a normal "
+                "chat-template prompt or disable DVR for this tiny prompt test."
+            )
 
 
 class _DVRSelfDraftBackend:
@@ -314,7 +320,6 @@ class DecodeVerifyRollbackWorkerV2:
         )
         self.cuda_graph_runner_for_draft_decode = None
         self.cuda_graph_runner_for_target_verify = None
-        self._logged_dvr_draft_graph_skip_reasons = set()
         if self.is_dvr_eagle:
             server_args.context_length = (
                 target_worker.model_runner.model_config.context_len
@@ -491,12 +496,6 @@ class DecodeVerifyRollbackWorkerV2:
     # Self-draft path. DVR uses the target model's decode path as a draft model,
     # but keeps EAGLE-compatible tree/retrieve metadata for verification.
 
-    def _log_dvr_draft_graph_skip_once(self, reason: str) -> None:
-        if reason in self._logged_dvr_draft_graph_skip_reasons:
-            return
-        self._logged_dvr_draft_graph_skip_reasons.add(reason)
-        logger.warning("DVR self-draft CUDA graph skipped: %s", reason)
-
     def _forward_target_verify_for_dvr(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
@@ -505,21 +504,12 @@ class DecodeVerifyRollbackWorkerV2:
         # accept/reject and GDN state commit, so keep its logprob metadata path
         # disabled.
         need_return_logprob = batch.return_logprob
-        disable_verify_graph = dvr_has_graph_unsafe_short_prompt(batch)
-        saved_graph_runner = None
+        raise_for_dvr_graph_unsafe_short_prompt(batch)
         batch.return_logprob = False
-        if disable_verify_graph:
-            # The same page-padded one-token prompt edge can crash TARGET_VERIFY
-            # graph replay on GDN models. Keep the fallback local to DVR; normal
-            # prompts and all non-DVR target paths still use the captured graph.
-            saved_graph_runner = self.model_runner.decode_cuda_graph_runner
-            self.model_runner.decode_cuda_graph_runner = None
         try:
             return self.target_worker.forward_batch_generation(batch, is_verify=True)
         finally:
             batch.return_logprob = need_return_logprob
-            if disable_verify_graph:
-                self.model_runner.decode_cuda_graph_runner = saved_graph_runner
 
     def _build_self_draft_verify_input(
         self,
@@ -725,37 +715,34 @@ class DecodeVerifyRollbackWorkerV2:
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def _draft_decode_forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        graph_skip_reason = dvr_self_draft_graph_skip_reason(forward_batch)
+        graph_block_reason = dvr_self_draft_graph_block_reason(forward_batch)
         can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_decode is not None
+            graph_block_reason is None
+            and self.cuda_graph_runner_for_draft_decode is not None
             and self.cuda_graph_runner_for_draft_decode.can_run(forward_batch)
         )
         if can_cuda_graph:
             return self.cuda_graph_runner_for_draft_decode.replay(forward_batch)
 
         min_seq_len = _min_seq_len_cpu(forward_batch)
-        if (
-            getattr(self.model_runner, "hybrid_gdn_config", None) is not None
-            and graph_skip_reason is None
-        ):
-            capture_bs = []
-            if self.cuda_graph_runner_for_draft_decode is not None:
-                capture_bs = self.cuda_graph_runner_for_draft_decode.capture_bs
-            raise RuntimeError(
-                "DVR self-draft decode requires the dedicated CUDA graph for "
-                "gated linear-state models. The current batch cannot run it: "
-                f"batch_size={forward_batch.batch_size}, "
-                f"min_seq_len={min_seq_len}, capture_bs={capture_bs}. "
-                "Use the default CUDA graph batch sizes or include the running "
-                "batch size in --cuda-graph-bs/--cuda-graph-max-bs."
-            )
-
-        if graph_skip_reason is not None:
-            self._log_dvr_draft_graph_skip_once(graph_skip_reason)
-
-        with dvr_self_draft_eager_context(self.model_runner):
-            forward_batch.can_run_dp_cuda_graph = False
-            return self.model_runner.forward(forward_batch).logits_output
+        capture_bs = []
+        if self.cuda_graph_runner_for_draft_decode is not None:
+            capture_bs = self.cuda_graph_runner_for_draft_decode.capture_bs
+        reason = (
+            f" reason={graph_block_reason}."
+            if graph_block_reason is not None
+            else ""
+        )
+        raise RuntimeError(
+            "DVR self-draft decode requires the dedicated CUDA graph; no eager "
+            "fallback is used. The current batch cannot run it: "
+            f"batch_size={forward_batch.batch_size}, min_seq_len={min_seq_len}, "
+            f"capture_bs={capture_bs}.{reason} "
+            "For seq_len<=2, use a normal chat-template prompt or disable DVR "
+            "for tiny synthetic prompt tests. For batch-size misses, use the "
+            "default CUDA graph batch sizes or include the running batch size "
+            "in --cuda-graph-bs/--cuda-graph-max-bs."
+        )
 
     def get_draft_sampling_probs(
         self, forward_batch: ForwardBatch, sampling_probs: torch.Tensor
@@ -823,17 +810,13 @@ class DecodeVerifyRollbackWorkerV2:
             return draft_logits
 
     @contextmanager
-    def _target_verify_context(
-        self, *, disable_cuda_graph: bool = False, prepare: bool = False
-    ):
-        runner = None if disable_cuda_graph else self.cuda_graph_runner_for_target_verify
+    def _target_verify_context(self, *, prepare: bool = False):
+        runner = self.cuda_graph_runner_for_target_verify
         use_plan_stream = prepare and self.plan_stream is not None and runner is None
         stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
 
         target_runner = self.target_worker.model_runner
-        patch_graph_runner = (
-            runner is not None or self.plan_stream is not None or disable_cuda_graph
-        )
+        patch_graph_runner = runner is not None or self.plan_stream is not None
         if not patch_graph_runner:
             with stream_ctx:
                 yield use_plan_stream
@@ -1041,12 +1024,9 @@ class DecodeVerifyRollbackWorkerV2:
 
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
+        raise_for_dvr_graph_unsafe_short_prompt(batch)
 
-        disable_verify_graph = dvr_has_graph_unsafe_short_prompt(batch)
-        with self._target_verify_context(
-            disable_cuda_graph=disable_verify_graph,
-            prepare=True,
-        ) as prepared_on_plan_stream:
+        with self._target_verify_context(prepare=True) as prepared_on_plan_stream:
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 spec_info,
                 self.req_to_token_pool,
@@ -1101,7 +1081,7 @@ class DecodeVerifyRollbackWorkerV2:
             seq_lens_cpu=base_seq_lens_cpu,
         )
 
-        with self._target_verify_context(disable_cuda_graph=disable_verify_graph):
+        with self._target_verify_context():
             forward_batch_output = self.target_worker.forward_batch_generation(
                 batch=None,
                 forward_batch=verify_forward_batch,

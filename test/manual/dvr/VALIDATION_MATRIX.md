@@ -81,7 +81,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
   test/manual/dvr/test_dvr_batch_kl.py \
   --base-url http://127.0.0.1:30124 \
   --request-modes concurrent,batch \
-  --prompt-token-lengths 1,2,63,64,65 \
+  --prompt-token-lengths 2,63,64,65 \
   --max-new 1,8,16,17,63,64,65 \
   --limit-cases 12 \
   --concurrent-workers 4 \
@@ -90,6 +90,12 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
 
 For a long-sequence check, remove `--limit-cases` and include
 `--max-new 512,513`.
+
+One-token synthetic prompts are intentionally not part of the positive DVR
+smoke matrix. The first self-draft graph step reaches the internal
+`seq_len<=2` GDN state-input boundary for that case, so DVR now rejects it
+explicitly instead of running a slow eager path. Normal chat-template prompts
+are much longer and do not hit this edge.
 
 ## 35B self-DVR and DVR-EAGLE
 

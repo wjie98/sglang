@@ -73,7 +73,7 @@ def _maybe_disable_batch_invariant_ops(disable: bool):
 def _clear_determinism_sensitive_kernel_caches():
     # These caches read global deterministic or batch-invariant state, but their
     # cache keys do not include that state. Clear them around self-draft graph
-    # capture/fallback so target-verify deterministic choices cannot leak into
+    # capture/replay so target-verify deterministic choices cannot leak into
     # the non-deterministic draft path, and vice versa.
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
         get_moe_configs,
@@ -180,14 +180,13 @@ def _min_seq_len_cpu(forward_batch: ForwardBatch) -> int:
     return int(forward_batch.seq_lens.min().item())
 
 
-def dvr_self_draft_graph_skip_reason(forward_batch: ForwardBatch) -> str | None:
-    """Return the local reason a self-draft decode step cannot use its graph."""
+def dvr_self_draft_graph_block_reason(forward_batch: ForwardBatch) -> str | None:
+    """Return why a self-draft decode step is unsupported for graph replay."""
 
     # The first self-draft decode after a one-token prompt reaches the graph as
-    # seq_len=2 (prompt token + anchor token). On GDN models that graph replay
-    # can hit an illegal access in the packed decode state-input window; eager
-    # decode handles the same boundary and the next draft step can return to the
-    # graph.
+    # seq_len=2 (prompt token + anchor token).  Normal chat-template prompts are
+    # much longer, so keep this synthetic edge out of the DVR serving path
+    # instead of hiding it behind a slow eager branch.
     if _min_seq_len_cpu(forward_batch) <= 2:
         return "seq_len<=2 initial GDN state-input graph boundary"
     return None
@@ -271,7 +270,6 @@ def _dvr_draft_decode_context(
     *,
     graph_capture: bool = False,
     self_draft_graph_capture: bool = False,
-    disable_model_runner_graph: bool = False,
     disable_batch_invariant_ops: bool = False,
     clear_kernel_config_caches: bool = False,
     extra_attn_backends=(),
@@ -298,9 +296,6 @@ def _dvr_draft_decode_context(
 
             patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
             patch_attr(global_server_args, "enable_deterministic_inference", False)
-            if disable_model_runner_graph:
-                patch_attr(model_runner, "decode_cuda_graph_runner", None)
-                patch_attr(model_runner, "graph_runner", None)
 
             _patch_draft_decode_backend_tree(
                 model_runner, extra_attn_backends, patch_attr
@@ -348,17 +343,6 @@ def dvr_self_draft_graph_replay_context(model_runner):
     """Replay the DVR self-draft graph without mamba tracking side effects."""
 
     return _dvr_draft_decode_context(model_runner)
-
-
-def dvr_self_draft_eager_context(model_runner):
-    """Run the explicit DVR self-draft eager fallback for graph-unsafe edges."""
-
-    return _dvr_draft_decode_context(
-        model_runner,
-        disable_model_runner_graph=True,
-        disable_batch_invariant_ops=True,
-        clear_kernel_config_caches=True,
-    )
 
 
 class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
@@ -447,7 +431,7 @@ class DVRDraftDecodeCudaGraphRunner:
         return self.runner.capture_bs
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
-        if dvr_self_draft_graph_skip_reason(forward_batch) is not None:
+        if dvr_self_draft_graph_block_reason(forward_batch) is not None:
             return False
         return self.runner.can_run_graph(forward_batch)
 

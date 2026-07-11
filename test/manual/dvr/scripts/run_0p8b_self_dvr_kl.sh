@@ -59,7 +59,7 @@ run_one_mode() {
   conda_python test/manual/dvr/test_dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \
-    --prompt-token-lengths 1,2,63,64,65 \
+    --prompt-token-lengths 2,63,64,65 \
     --max-new 1,8,16,17,63,64,65 \
     --limit-cases 12 \
     --concurrent-workers 4 \
