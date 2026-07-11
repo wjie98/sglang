@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import math
+from pathlib import Path
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -99,6 +100,75 @@ def make_boundary_inputs(base_url: str, lengths: Sequence[int]) -> dict[int, lis
         text += text
         ids = prompt_token_ids(base_url, text)
     return {length: ids[:length] for length in lengths}
+
+
+def _dataset_rows(path: str) -> Iterable[Any]:
+    dataset_path = Path(path)
+    if dataset_path.suffix == ".jsonl":
+        with dataset_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+        return
+
+    with dataset_path.open() as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = data.get("data", data.get("rows", data.get("examples", [])))
+    yield from data
+
+
+def _extract_prompt_text(row: Any) -> str | None:
+    if isinstance(row, str):
+        return row
+    if not isinstance(row, dict):
+        return None
+
+    for key in ("prompt", "input", "question", "text"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+
+    conversations = row.get("conversations") or row.get("conversation") or []
+    if isinstance(conversations, list):
+        for turn in conversations:
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get("from", turn.get("role"))
+            if role in ("human", "user"):
+                value = turn.get("value", turn.get("content"))
+                if isinstance(value, str) and value.strip():
+                    return value
+    return None
+
+
+def make_dataset_inputs(
+    base_url: str,
+    dataset_path: str,
+    *,
+    num_prompts: int,
+    min_prompt_tokens: int,
+    max_prompt_tokens: int,
+) -> list[list[int]]:
+    prompt_ids = []
+    for row in _dataset_rows(dataset_path):
+        text = _extract_prompt_text(row)
+        if not text:
+            continue
+        ids = prompt_token_ids(base_url, text)
+        if min_prompt_tokens <= len(ids) <= max_prompt_tokens:
+            prompt_ids.append(ids)
+            if len(prompt_ids) >= num_prompts:
+                break
+
+    if len(prompt_ids) < num_prompts:
+        raise RuntimeError(
+            f"Only found {len(prompt_ids)} usable prompts in {dataset_path}; "
+            f"need {num_prompts} prompts with token length in "
+            f"[{min_prompt_tokens}, {max_prompt_tokens}]"
+        )
+    return prompt_ids
 
 
 def warm_cache(base_url: str, prompt_ids: Iterable[list[int]]) -> None:
@@ -199,6 +269,14 @@ def main() -> None:
     parser.add_argument("--base-url", default=DEFAULT_BASE)
     parser.add_argument("--prompt-token-lengths", default="63,64,65")
     parser.add_argument("--max-new", default="4,16,65,256")
+    parser.add_argument(
+        "--dataset-path",
+        default=None,
+        help="Optional real-data prompt source. Supports ShareGPT-style JSON and JSONL prompt/input/question/text rows.",
+    )
+    parser.add_argument("--num-prompts", type=int, default=8)
+    parser.add_argument("--min-prompt-tokens", type=int, default=1)
+    parser.add_argument("--max-prompt-tokens", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
@@ -226,26 +304,35 @@ def main() -> None:
 
     prompt_lengths = parse_int_list(args.prompt_token_lengths)
     max_new_values = parse_int_list(args.max_new)
-    prompt_ids_by_len = make_boundary_inputs(args.base_url, prompt_lengths)
+    if args.dataset_path:
+        prompt_cases = make_dataset_inputs(
+            args.base_url,
+            args.dataset_path,
+            num_prompts=args.num_prompts,
+            min_prompt_tokens=args.min_prompt_tokens,
+            max_prompt_tokens=args.max_prompt_tokens,
+        )
+    else:
+        prompt_ids_by_len = make_boundary_inputs(args.base_url, prompt_lengths)
+        prompt_cases = list(prompt_ids_by_len.values())
 
     if args.cache_mode != "flush-each":
         flush_cache(args.base_url)
     if args.cache_mode == "warm-all":
-        warm_cache(args.base_url, prompt_ids_by_len.values())
+        warm_cache(args.base_url, prompt_cases)
 
     rows = []
     case_id = 0
     for max_new in max_new_values:
-        for prompt_len in prompt_lengths:
+        for prompt_ids in prompt_cases:
             if args.cache_mode == "flush-each":
                 flush_cache(args.base_url)
             case = Case(
-                prompt_len=prompt_len,
+                prompt_len=len(prompt_ids),
                 max_new=max_new,
                 seed=args.seed + case_id,
             )
             params = sampling_params(args, case.max_new, case.seed)
-            prompt_ids = prompt_ids_by_len[case.prompt_len]
             resp = run_generate(
                 args.base_url,
                 prompt_ids,

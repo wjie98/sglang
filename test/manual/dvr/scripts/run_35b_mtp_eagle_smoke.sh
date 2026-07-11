@@ -7,12 +7,16 @@ source "${SCRIPT_DIR}/common.sh"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/data/hwj/Qwen3.5-35B-A3B}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-${MODEL_PATH}}"
+SHAREGPT_DATASET="${SHAREGPT_DATASET:-/mnt/data/hwj/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json}"
 PORT="${PORT:-30135}"
 SPEC_DRAFT_TOKENS="${SPEC_DRAFT_TOKENS:-2}"
 SPEC_STEPS="${SPEC_STEPS:-1}"
 ACCEPT_TEMPERATURE="${ACCEPT_TEMPERATURE:-0.0}"
 ACCEPT_TOP_P="${ACCEPT_TOP_P:-1.0}"
 MTP_MIN_ACCEPT_RATE="${MTP_MIN_ACCEPT_RATE:-0.96}"
+MTP_REALDATA_MIN_ACCEPT_RATE="${MTP_REALDATA_MIN_ACCEPT_RATE:-0.0}"
+MTP_REALDATA_NUM_PROMPTS="${MTP_REALDATA_NUM_PROMPTS:-8}"
+MTP_REALDATA_MAX_NEW="${MTP_REALDATA_MAX_NEW:-64}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/35b-mtp-eagle-smoke}"
 SERVER_PID=""
@@ -32,6 +36,8 @@ run_one_mode() {
   local no_logprob_log="${RESULT_ROOT}/results/${label}_return_logprob_false.log"
   local prefix_cache_kl_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_true.log"
   local prefix_cache_no_logprob_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_false.log"
+  local realdata_kl_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_true.log"
+  local realdata_no_logprob_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_false.log"
   local overlap_args=()
   if [[ "${spec_v2}" == "0" ]]; then
     overlap_args=(--disable-overlap-schedule)
@@ -135,6 +141,41 @@ run_one_mode() {
     --seed 3032 \
     2>&1 | tee "${prefix_cache_no_logprob_log}"
   grep -q '"accept_failed": 0' "${prefix_cache_no_logprob_log}"
+
+  echo "==> Running ${label} ShareGPT real-data returned-logprob acceptance/KL smoke"
+  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+    --base-url "${BASE_URL}" \
+    --dataset-path "${SHAREGPT_DATASET}" \
+    --num-prompts "${MTP_REALDATA_NUM_PROMPTS}" \
+    --max-prompt-tokens 1536 \
+    --max-new "${MTP_REALDATA_MAX_NEW}" \
+    --cache-mode flush-each \
+    --check-kl \
+    --min-accept-rate "${MTP_REALDATA_MIN_ACCEPT_RATE}" \
+    --temperature "${ACCEPT_TEMPERATURE}" \
+    --top-p "${ACCEPT_TOP_P}" \
+    --ignore-eos \
+    --seed 4032 \
+    2>&1 | tee "${realdata_kl_log}"
+  grep -q '"kl_failed": 0' "${realdata_kl_log}"
+  grep -q '"accept_failed": 0' "${realdata_kl_log}"
+
+  echo "==> Running ${label} ShareGPT real-data no-return-logprob acceptance smoke"
+  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+    --base-url "${BASE_URL}" \
+    --dataset-path "${SHAREGPT_DATASET}" \
+    --num-prompts "${MTP_REALDATA_NUM_PROMPTS}" \
+    --max-prompt-tokens 1536 \
+    --max-new "${MTP_REALDATA_MAX_NEW}" \
+    --cache-mode flush-each \
+    --no-return-logprob \
+    --min-accept-rate "${MTP_REALDATA_MIN_ACCEPT_RATE}" \
+    --temperature "${ACCEPT_TEMPERATURE}" \
+    --top-p "${ACCEPT_TOP_P}" \
+    --ignore-eos \
+    --seed 4032 \
+    2>&1 | tee "${realdata_no_logprob_log}"
+  grep -q '"accept_failed": 0' "${realdata_no_logprob_log}"
 
   stop_process_group "${SERVER_PID}"
   SERVER_PID=""
