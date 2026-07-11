@@ -10,32 +10,19 @@ import torch
 DVRMambaCheckpoint = tuple[int, int]
 """Request-local Mamba checkpoint as ``(track_idx, seqlen)``."""
 
-DVRFinalLogprobRepair = tuple[list[int], list[float]]
-"""Exact final output ids/logprobs carried until Req.output_ids is materialized."""
-
-
-_DVR_LOGPROB_DEFERRED = 1
-_DVR_LOGPROB_REPAIR_CLAIMED = 2
-
-
 @dataclass
 class DVRRollbackActions:
     """DVR rollback work carried to scheduler result processing.
 
     ``GenerationBatchResult.dvr_rollback_actions`` carries per-step checkpoint
-    commits and final logprob repairs.  The worker also keeps one instance as
-    the overlap output journal so replay and final repair use the same
-    DVR-owned rollback object.
+    commits.  The worker also keeps one instance as the overlap output journal
+    so DVR replay can rebuild target-owned prefixes from client-visible tokens.
     """
 
     pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
-    final_logprob_repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = None
     _tokens_by_req: weakref.WeakKeyDictionary[Any, list[int]] = field(
         default_factory=weakref.WeakKeyDictionary
     )
-    _logprobs_by_req: weakref.WeakKeyDictionary[
-        Any, list[Optional[float]]
-    ] = field(default_factory=weakref.WeakKeyDictionary)
 
     def cache_prefill_after_rollback(
         self,
@@ -72,49 +59,6 @@ class DVRRollbackActions:
         if enable_hisparse:
             hisparse_coordinator.admit_request_into_staging(req)
         return True
-
-    def repair_output_after_materialize(self, *, batch: Any) -> None:
-        """Repair DVR-owned output data after scheduler materializes tokens."""
-
-        repairs = self.final_logprob_repairs
-        if repairs is None:
-            return
-
-        for req_i, req in enumerate(batch.reqs):
-            if req_i >= len(repairs):
-                break
-            repair = repairs[req_i]
-            if repair is None or not req.return_logprob:
-                continue
-
-            output_ids, output_logprobs = repair
-            output_len = len(output_ids)
-            if output_len != len(output_logprobs):
-                raise RuntimeError(
-                    "DVR final logprob repair has inconsistent ids/logprobs "
-                    f"length: rid={req.rid}, output_len={output_len}, "
-                    f"logprob_len={len(output_logprobs)}."
-                )
-
-            # Spec-v2 applies accepted tokens after the worker returns.  Repair
-            # only the exact materialized prefix; a mismatch here means worker
-            # replay and scheduler-owned output have diverged.
-            materialized_output_ids = list(req.output_ids[:output_len])
-            if materialized_output_ids != output_ids:
-                raise RuntimeError(
-                    "DVR final logprob repair no longer matches materialized "
-                    f"output ids: rid={req.rid}, "
-                    f"materialized_tail={materialized_output_ids[-8:]}, "
-                    f"repair_tail={output_ids[-8:]}, "
-                    f"repair_len={output_len}, req_output_len={len(req.output_ids)}."
-                )
-
-            if req.logprob.output_token_logprobs_val is not None:
-                req.logprob.output_token_logprobs_val[:] = output_logprobs
-                req.logprob.output_token_logprobs_idx[:] = output_ids
-            # The exact final logprobs are now materialized; release the
-            # non-streaming response held by the output streamer.
-            req.dvr_deferred_output = None
 
     def commit_checkpoint_after_decode(
         self,
@@ -175,19 +119,16 @@ class DVRRollbackActions:
 
     def clear(self) -> None:
         self._tokens_by_req.clear()
-        self._logprobs_by_req.clear()
 
     def prune_to_batch(self, batch: Any) -> None:
         if batch.reqs is None:
             self._tokens_by_req.clear()
-            self._logprobs_by_req.clear()
             return
 
         active_reqs = set(batch.reqs)
         for req in list(self._tokens_by_req):
             if req not in active_reqs:
                 self._tokens_by_req.pop(req, None)
-                self._logprobs_by_req.pop(req, None)
 
     def _stream_for_req(
         self, req: Any, *, error_prefix: Optional[str] = None
@@ -207,27 +148,6 @@ class DVRRollbackActions:
             if len(output_ids) > len(stream):
                 stream.extend(int(token_id) for token_id in output_ids[len(stream) :])
         return stream
-
-    def _logprob_stream_for_req(self, req: Any) -> list[Optional[float]]:
-        logprob_stream = self._logprobs_by_req.setdefault(req, [])
-        req_logprobs = getattr(
-            getattr(req, "logprob", None), "output_token_logprobs_val", None
-        )
-        if not req_logprobs:
-            return logprob_stream
-
-        for i, value in enumerate(req_logprobs):
-            if i < len(logprob_stream):
-                if logprob_stream[i] is None:
-                    logprob_stream[i] = float(value)
-            else:
-                logprob_stream.append(float(value))
-        return logprob_stream
-
-    def observed_output_len(self, req: Any) -> int:
-        """Return the best known client-visible output length for final repair."""
-
-        return len(self._stream_for_req(req))
 
     def request_output_prefix_token_ids(
         self,
@@ -259,7 +179,6 @@ class DVRRollbackActions:
         batch: Any,
         tokens_per_req,
         *,
-        token_logprobs_per_req: Optional[list[Optional[list[float]]]] = None,
         base_seq_lens_cpu: Optional[list[int]] = None,
         error_prefix: str = "DVR output prefix",
     ) -> None:
@@ -275,24 +194,13 @@ class DVRRollbackActions:
 
         if base_seq_lens_cpu is None:
             base_seq_lens_cpu = [None] * len(batch.reqs)
-        if token_logprobs_per_req is None:
-            token_logprobs_per_req = [None] * len(batch.reqs)
-
-        for req, base_seq_len, token_ids, token_logprobs in zip(
+        for req, base_seq_len, token_ids in zip(
             batch.reqs,
             base_seq_lens_cpu,
             tokens_per_req,
-            token_logprobs_per_req,
             strict=True,
         ):
             stream = self._stream_for_req(req, error_prefix=error_prefix)
-            logprob_stream = self._logprob_stream_for_req(req)
-            if len(logprob_stream) < len(stream):
-                # Tokens can be learned from Req.output_ids before their
-                # logprobs are visible to the worker.  Keep positional
-                # alignment and fill the holes once result processing exposes
-                # them through Req.logprob or the next verify journal append.
-                logprob_stream.extend([None] * (len(stream) - len(logprob_stream)))
             if base_seq_len is not None:
                 required_len = max(0, int(base_seq_len) - len(req.origin_input_ids))
                 if len(stream) < required_len:
@@ -302,79 +210,6 @@ class DVRRollbackActions:
                         f"required={required_len}."
                     )
             stream.extend(int(token_id) for token_id in token_ids)
-            if token_logprobs is not None:
-                if len(token_logprobs) != len(token_ids):
-                    raise RuntimeError(
-                        f"{error_prefix} has inconsistent token/logprob counts: "
-                        f"rid={req.rid}, token_count={len(token_ids)}, "
-                        f"logprob_count={len(token_logprobs)}."
-                    )
-                logprob_stream.extend(float(value) for value in token_logprobs)
-            else:
-                logprob_stream.extend([None] * len(token_ids))
-
-    def final_logprob_repair(
-        self,
-        req: Any,
-        output_len: int,
-        *,
-        error_prefix: str,
-    ) -> DVRFinalLogprobRepair:
-        """Build final repair rows from the verify-step output journal."""
-
-        token_stream = self._stream_for_req(req, error_prefix=error_prefix)
-        logprob_stream = self._logprob_stream_for_req(req)
-        if len(token_stream) < output_len or len(logprob_stream) < output_len:
-            raise RuntimeError(
-                f"{error_prefix} is incomplete: rid={req.rid}, "
-                f"output_len={output_len}, tracked_tokens={len(token_stream)}, "
-                f"tracked_logprobs={len(logprob_stream)}."
-            )
-
-        repair_logprobs = logprob_stream[:output_len]
-        if any(value is None for value in repair_logprobs):
-            missing = [i for i, value in enumerate(repair_logprobs) if value is None]
-            raise RuntimeError(
-                f"{error_prefix} is missing verify logprobs: rid={req.rid}, "
-                f"missing_positions={missing[:8]}, output_len={output_len}."
-            )
-        return token_stream[:output_len], [float(value) for value in repair_logprobs]
-
-
-def defer_dvr_non_streaming_logprob_output(req: Any) -> None:
-    """Hold DVR non-streaming logprob output until final repair overwrites it."""
-
-    if getattr(req, "dvr_deferred_output", None) is None:
-        req.dvr_deferred_output = _DVR_LOGPROB_DEFERRED
-
-
-def try_claim_dvr_final_logprob_repair(req: Any) -> bool:
-    """Claim the request's DVR final logprob repair exactly once."""
-
-    deferred_output = getattr(req, "dvr_deferred_output", None)
-    if deferred_output is None:
-        return False
-    if deferred_output == _DVR_LOGPROB_REPAIR_CLAIMED:
-        return False
-
-    req.dvr_deferred_output = _DVR_LOGPROB_REPAIR_CLAIMED
-    return True
-
-
-def should_hold_dvr_non_streaming_logprob_output(
-    *,
-    req: Any,
-    return_logprob: bool,
-    require_final_repair: bool = False,
-) -> bool:
-    """Return whether DVR still owns this non-streaming logprob chunk."""
-
-    deferred_output = getattr(req, "dvr_deferred_output", None)
-    should_hold = return_logprob and req.return_logprob and not req.stream
-    should_hold = should_hold and deferred_output is not None
-    if not should_hold:
-        return False
-    return not require_final_repair or deferred_output == _DVR_LOGPROB_REPAIR_CLAIMED
 
 
 def compact_dvr_output_rows(

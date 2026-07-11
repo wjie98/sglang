@@ -230,12 +230,12 @@ uses CUDA graph and non-deterministic decode performance knobs.
 not an optional slow path that can be ignored for throughput.  It must not change
 the DVR state lifecycle or the draft input state used by the next iteration.
 
-For self-DVR, exact logprob repair must stay side-effect-free: keep live GDN
-state commit on the same fast self-draft path as `return_logprob=False`, and
-repair final output logprobs with an external scoring replay only.  Do not use
-accepted-suffix replay as the self-DVR commit path just because returned
-logprobs are requested; that changes the next draft state, lowers the
-acceptance rate, and cuts long-output throughput.
+For self-DVR, returned logprobs must stay side-effect-free: keep live GDN state
+commit on the same fast self-draft path as `return_logprob=False`, and populate
+`next_token_logprobs` from the verifier logits before normal result processing.
+Do not use output-layer final repair or accepted-suffix replay as the self-DVR
+commit path just because returned logprobs are requested; that changes the next
+draft state, lowers the acceptance rate, and cuts long-output throughput.
 
 The fixed 80B ShareGPT 16x1024 reference results are:
 

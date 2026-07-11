@@ -33,26 +33,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 
-def _should_hold_dvr_non_streaming_logprob_output_if_set(
-    *,
-    req: Req,
-    return_logprob: bool,
-    require_final_repair: bool = False,
-) -> bool:
-    if getattr(req, "dvr_deferred_output", None) is None:
-        return False
-
-    from sglang.srt.speculative.dvr_info import (
-        should_hold_dvr_non_streaming_logprob_output,
-    )
-
-    return should_hold_dvr_non_streaming_logprob_output(
-        req=req,
-        return_logprob=return_logprob,
-        require_final_repair=require_final_repair,
-    )
-
-
 @dataclass(kw_only=True, slots=True)
 class SchedulerOutputStreamer:
     send_to_detokenizer: zmq.Socket
@@ -337,16 +317,6 @@ class _GenerationStreamAccumulator:
 
     def accept(self, *, req: Req) -> None:
         if req.finished():
-            # Prompt-only/scoring requests have no output tokens to repair.
-            # For generation, keep finished non-streaming logprob responses
-            # buffered until the producing algorithm clears the defer flag.
-            if len(req.output_ids_through_stop) > 0:
-                if _should_hold_dvr_non_streaming_logprob_output_if_set(
-                    req=req,
-                    return_logprob=self.return_logprob,
-                    require_final_repair=True,
-                ):
-                    return
             assert not req.finished_output
             req.finished_output = True
             if req.finished_len is None:
@@ -369,18 +339,8 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
-                # DVR repairs exact non-streaming logprobs at the final response.
-                # The streamer only checks the DVR-owned request flag; repair
-                # state and scoring stay inside the DVR speculative path.
-                should_hold_output = (
-                    _should_hold_dvr_non_streaming_logprob_output_if_set(
-                        req=req,
-                        return_logprob=self.return_logprob,
-                    )
-                )
                 should_output = (
-                    not should_hold_output
-                    and len(req.output_ids) % self.default_force_stream_interval == 0
+                    len(req.output_ids) % self.default_force_stream_interval == 0
                 )
 
         if not should_output:

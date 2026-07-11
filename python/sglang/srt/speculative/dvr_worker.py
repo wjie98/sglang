@@ -411,21 +411,15 @@ class DecodeVerifyRollbackWorkerV2:
         self,
         *,
         batch: ScheduleBatch,
-        logits_output: LogitsProcessorOutput,
         next_token_ids: torch.Tensor,
         error_prefix: str = "DVR output prefix",
     ) -> None:
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
-        token_logprobs_per_req = None
-        if logits_output.next_token_logprobs is not None:
-            logprob_values = logits_output.next_token_logprobs.detach().cpu().tolist()
-            token_logprobs_per_req = [[float(value)] for value in logprob_values]
         self.dvr_output_journal.append_batch_output_tokens(
             batch,
             [[token_id] for token_id in next_token_ids.detach().cpu().tolist()],
-            token_logprobs_per_req=token_logprobs_per_req,
             error_prefix=error_prefix,
         )
 
@@ -792,7 +786,6 @@ class DecodeVerifyRollbackWorkerV2:
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
         linear_state_ctx,
-        full_prefix_replay: bool = False,
     ) -> Optional[torch.Tensor]:
         """Compute verifier logits by replaying only the deterministic suffix.
 
@@ -817,7 +810,6 @@ class DecodeVerifyRollbackWorkerV2:
             draft_tokens=spec_info.draft_token,
             draft_cache_locs=batch.out_cache_loc,
             request_token_ids_for_replay=self._request_token_ids_for_replay,
-            full_prefix_replay=full_prefix_replay,
             use_mamba_cow_from_boundary=True,
         ) as replay:
             if replay is None:
@@ -950,7 +942,6 @@ class DecodeVerifyRollbackWorkerV2:
             if batch_output.next_token_ids is not None:
                 self._append_output_journal_tokens(
                     batch=batch,
-                    logits_output=batch_output.logits_output,
                     next_token_ids=batch_output.next_token_ids,
                     error_prefix="DVR EAGLE prefill output prefix",
                 )
@@ -1014,7 +1005,6 @@ class DecodeVerifyRollbackWorkerV2:
                 DVRVerifyOutput(
                     replay_prefix=self.dvr_output_journal,
                     tokens=predict,
-                    token_logprobs=logits_output.next_token_logprobs,
                     tokens_per_req=tokens_per_req,
                     base_seq_lens_cpu=base_seq_lens_cpu,
                     error_prefix=error_prefix,
@@ -1266,7 +1256,6 @@ class DecodeVerifyRollbackWorkerV2:
             )
             self._append_output_journal_tokens(
                 batch=batch,
-                logits_output=logits_output,
                 next_token_ids=next_token_ids,
             )
             batch_result = GenerationBatchResult(
@@ -1346,14 +1335,13 @@ class DecodeVerifyRollbackWorkerV2:
             req.return_logprob and req.stream for req in batch.reqs
         )
         if batch.return_logprob and streaming_return_logprob:
-            # Streaming logprob chunks cannot be repaired after the final response
-            # is materialized. Non-streaming requests use final-response repair
-            # below; streaming keeps the conservative per-step oracle.
+            # Streaming logprob chunks are emitted immediately, so they need the
+            # same prefill-equivalent suffix oracle that DVR-EAGLE uses for
+            # verify hidden states.
             oracle_logits = self._target_suffix_extend_verify_logits(
                 batch=batch,
                 spec_info=spec_info,
                 linear_state_ctx=linear_state_ctx,
-                full_prefix_replay=True,
             )
         if oracle_logits is not None:
             logits_output.next_token_logits = oracle_logits

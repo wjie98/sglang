@@ -760,10 +760,6 @@ class SchedulerBatchResultProcessor:
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
-        # DVR output repairs become valid only after accepted tokens are
-        # materialized into Req.output_ids.
-        if result.dvr_rollback_actions is not None:
-            result.dvr_rollback_actions.repair_output_after_materialize(batch=batch)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 

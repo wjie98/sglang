@@ -272,7 +272,6 @@ def dvr_verify_replay_context(
     draft_tokens: torch.Tensor,
     draft_cache_locs: torch.Tensor,
     request_token_ids_for_replay,
-    full_prefix_replay: bool = False,
     restore_boundary_state: bool = False,
     use_mamba_cow_from_boundary: bool = False,
 ):
@@ -294,8 +293,6 @@ def dvr_verify_replay_context(
         return
 
     boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
-    if full_prefix_replay:
-        boundary_lens = [0 for _ in boundary_lens]
     bs = len(batch.seq_lens)
     draft_token_num = draft_tokens.numel() // max(bs, 1)
     draft_tokens = draft_tokens.reshape(bs, draft_token_num)
@@ -325,22 +322,18 @@ def dvr_verify_replay_context(
         capture_hidden_mode=CaptureHiddenMode.FULL,
         is_prefill_only=batch.is_prefill_only,
         mamba_cow_src_indices=(
-            boundary_indices
-            if use_mamba_cow_from_boundary and not full_prefix_replay
-            else None
+            boundary_indices if use_mamba_cow_from_boundary else None
         ),
         mamba_cow_dst_indices=(
-            live_indices if use_mamba_cow_from_boundary and not full_prefix_replay else None
+            live_indices if use_mamba_cow_from_boundary else None
         ),
-        mamba_clear_indices=live_indices if full_prefix_replay else None,
     )
 
     with linear_state.replay_state_context(
         linear_state_ctx,
-        clear_state_input_window=full_prefix_replay,
         restore_live_state=True,
     ):
-        if restore_boundary_state and not full_prefix_replay:
+        if restore_boundary_state:
             boundary_backup = linear_state.boundary_backup
             if boundary_backup is None:
                 boundary_backup = linear_state_ctx.state_adapter.backup_recurrent_state(

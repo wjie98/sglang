@@ -6,18 +6,12 @@ import torch
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
 )
-from sglang.srt.speculative.dvr_core import (
-    _final_output_len_if_repair_needed,
-)
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
     DVRRollbackActions,
     compact_dvr_accepted_input_tokens_and_cache_locs,
     compact_dvr_output_rows,
-    defer_dvr_non_streaming_logprob_output,
     maybe_filter_running_batch_after_dvr_rollback,
-    should_hold_dvr_non_streaming_logprob_output,
-    try_claim_dvr_final_logprob_repair,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -163,161 +157,6 @@ def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
         )
 
 
-def test_dvr_request_flags_defer_non_streaming_logprob():
-    req = SimpleNamespace(
-        return_logprob=True,
-        stream=False,
-        output_ids=[1, 2],
-    )
-
-    assert not should_hold_dvr_non_streaming_logprob_output(
-        req=req,
-        return_logprob=True,
-    )
-
-    defer_dvr_non_streaming_logprob_output(req)
-    assert should_hold_dvr_non_streaming_logprob_output(
-        req=req,
-        return_logprob=True,
-    )
-
-
-def test_dvr_request_flags_do_not_defer_streaming_or_non_logprob_output():
-    streaming_req = SimpleNamespace(
-        return_logprob=True,
-        stream=True,
-        output_ids=[1, 2],
-    )
-    defer_dvr_non_streaming_logprob_output(streaming_req)
-    assert not should_hold_dvr_non_streaming_logprob_output(
-        req=streaming_req,
-        return_logprob=True,
-    )
-
-    no_logprob_req = SimpleNamespace(
-        return_logprob=False,
-        stream=False,
-        output_ids=[1, 2],
-    )
-    defer_dvr_non_streaming_logprob_output(no_logprob_req)
-    assert not should_hold_dvr_non_streaming_logprob_output(
-        req=no_logprob_req,
-        return_logprob=True,
-    )
-    assert not should_hold_dvr_non_streaming_logprob_output(
-        req=no_logprob_req,
-        return_logprob=False,
-    )
-
-
-def test_dvr_request_flags_final_logprob_repair_claim_is_once_only():
-    req = SimpleNamespace(
-        return_logprob=True,
-        stream=False,
-        output_ids=[1, 2],
-    )
-
-    defer_dvr_non_streaming_logprob_output(req)
-    assert try_claim_dvr_final_logprob_repair(req)
-    assert not try_claim_dvr_final_logprob_repair(req)
-    assert should_hold_dvr_non_streaming_logprob_output(
-        req=req,
-        return_logprob=True,
-        require_final_repair=True,
-    )
-
-    req.dvr_deferred_output = None
-    assert not should_hold_dvr_non_streaming_logprob_output(
-        req=req,
-        return_logprob=True,
-        require_final_repair=True,
-    )
-    assert not try_claim_dvr_final_logprob_repair(req)
-
-
-def test_dvr_final_logprob_repair_applies_after_materialization():
-    req = SimpleNamespace(
-        rid="r0",
-        return_logprob=True,
-        output_ids=[10, 11, 12],
-        logprob=SimpleNamespace(
-            output_token_logprobs_val=[-1.0],
-            output_token_logprobs_idx=[10],
-        ),
-    )
-    result = SimpleNamespace(
-        dvr_rollback_actions=DVRRollbackActions(
-            final_logprob_repairs=[
-                ([10, 11, 12], [-0.1, -0.2, -0.3])
-            ]
-        )
-    )
-
-    result.dvr_rollback_actions.repair_output_after_materialize(
-        batch=SimpleNamespace(
-            reqs=[req],
-            spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-        )
-    )
-
-    assert req.logprob.output_token_logprobs_val == [-0.1, -0.2, -0.3]
-    assert req.logprob.output_token_logprobs_idx == [10, 11, 12]
-
-
-def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
-    req = SimpleNamespace(
-        rid="r0",
-        return_logprob=True,
-        output_ids=[10, 99],
-        logprob=SimpleNamespace(
-            output_token_logprobs_val=[],
-            output_token_logprobs_idx=[],
-        ),
-    )
-    result = SimpleNamespace(
-        dvr_rollback_actions=DVRRollbackActions(
-            final_logprob_repairs=[
-                ([10, 11], [-0.1, -0.2])
-            ]
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="materialized output ids"):
-        result.dvr_rollback_actions.repair_output_after_materialize(
-            batch=SimpleNamespace(
-                reqs=[req],
-                spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-            )
-        )
-
-
-def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
-    req = SimpleNamespace(
-        rid="r0",
-        return_logprob=True,
-        output_ids=[10, 11],
-        logprob=SimpleNamespace(
-            output_token_logprobs_val=[],
-            output_token_logprobs_idx=[],
-        ),
-    )
-    result = SimpleNamespace(
-        dvr_rollback_actions=DVRRollbackActions(
-            final_logprob_repairs=[
-                ([10, 11], [-0.1])
-            ]
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="inconsistent ids/logprobs length"):
-        result.dvr_rollback_actions.repair_output_after_materialize(
-            batch=SimpleNamespace(
-                reqs=[req],
-                spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-            )
-        )
-
-
 def test_dvr_replay_prefix_records_only_visible_output_tokens():
     req = _MockReq(
         rid="r0",
@@ -397,59 +236,6 @@ def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
     ) == [101, 102, 201, 202, 203]
 
 
-def test_dvr_output_journal_builds_final_logprob_repair():
-    req = _MockReq(
-        rid="r0",
-        origin_input_ids=[101, 102],
-        output_ids=[201],
-        logprob=SimpleNamespace(output_token_logprobs_val=[-0.1]),
-    )
-    batch = SimpleNamespace(reqs=[req])
-    prefix = DVRRollbackActions()
-
-    prefix.append_batch_output_tokens(
-        batch,
-        [[202, 203]],
-        token_logprobs_per_req=[[-0.2, -0.3]],
-        base_seq_lens_cpu=[3],
-        error_prefix="DVR spec-v2",
-    )
-
-    repair = prefix.final_logprob_repair(
-        req,
-        3,
-        error_prefix="DVR spec-v2 final logprob",
-    )
-    output_ids, output_logprobs = repair
-    assert output_ids == [201, 202, 203]
-    assert output_logprobs == [-0.1, -0.2, -0.3]
-
-
-def test_dvr_output_journal_requires_exact_logprobs():
-    req = _MockReq(
-        rid="r0",
-        origin_input_ids=[101, 102],
-        output_ids=[201],
-        logprob=SimpleNamespace(output_token_logprobs_val=[]),
-    )
-    batch = SimpleNamespace(reqs=[req])
-    prefix = DVRRollbackActions()
-
-    prefix.append_batch_output_tokens(
-        batch,
-        [[202]],
-        base_seq_lens_cpu=[3],
-        error_prefix="DVR spec-v2",
-    )
-
-    with pytest.raises(RuntimeError, match="missing verify logprobs"):
-        prefix.final_logprob_repair(
-            req,
-            2,
-            error_prefix="DVR spec-v2 final logprob",
-        )
-
-
 def test_dvr_output_replay_prefix_is_req_lifecycle_scoped():
     old_req = _MockReq(
         rid="reused",
@@ -474,55 +260,6 @@ def test_dvr_output_replay_prefix_is_req_lifecycle_scoped():
         3,
         error_prefix="DVR spec-v2",
     ) == [101, 102, 301]
-
-
-def test_dvr_final_logprob_overlap_bonus_can_finish_request():
-    req = SimpleNamespace(
-        return_logprob=True,
-        stream=False,
-        origin_input_ids=[1, 2, 3, 4],
-        sampling_params=SimpleNamespace(max_new_tokens=17),
-    )
-
-    # Spec-v2 overlap can have model-side seq_len one token behind the
-    # scheduler-visible output because the verifier preclaims the bonus slot.
-    # If that bonus slot exactly reaches max_new_tokens, final logprob repair
-    # must replay the completed output instead of waiting for another step.
-    assert (
-        _final_output_len_if_repair_needed(
-            req=req,
-            req_i=0,
-            seq_len=len(req.origin_input_ids),
-            accept_len=16,
-            observed_output_len=0,
-            compact_output_token_ids_per_req=None,
-        )
-        == 17
-    )
-
-    assert (
-        _final_output_len_if_repair_needed(
-            req=req,
-            req_i=0,
-            seq_len=len(req.origin_input_ids) + 16,
-            accept_len=0,
-            observed_output_len=0,
-            compact_output_token_ids_per_req=None,
-        )
-        is None
-    )
-
-    assert (
-        _final_output_len_if_repair_needed(
-            req=req,
-            req_i=0,
-            seq_len=len(req.origin_input_ids),
-            accept_len=0,
-            observed_output_len=17,
-            compact_output_token_ids_per_req=None,
-        )
-        == 17
-    )
 
 
 def test_dvr_eagle_compacts_accepted_output_rows():
