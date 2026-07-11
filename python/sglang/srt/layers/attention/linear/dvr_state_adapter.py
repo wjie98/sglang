@@ -48,12 +48,14 @@ class DVRGatedStateAdapter:
         model_runner: Any,
         is_draft_worker: bool = False,
     ) -> "DVRGatedStateAdapter":
-        from sglang.srt.layers.attention.linear.dvr_gdn_state import DVRGDNStateOps
+        from sglang.srt.layers.attention.linear.dvr_gdn_state import (
+            create_dvr_gdn_state_ops,
+        )
 
         mamba_cache_params = model_runner.mambaish_config.mamba2_cache_params
 
         return cls(
-            DVRGDNStateOps.create(kernel_dispatcher),
+            create_dvr_gdn_state_ops(kernel_dispatcher),
             is_draft_worker=is_draft_worker,
             state_shape=mamba_cache_params.shape,
             conv_dtype=mamba_cache_params.dtype.conv,

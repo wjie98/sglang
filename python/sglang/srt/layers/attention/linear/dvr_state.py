@@ -8,7 +8,7 @@ This module intentionally knows only the DVR lifecycle:
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 
@@ -319,16 +319,23 @@ class DVRStateInputCache:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class DVRStateOps:
-    """Base operator interface used by DVR state adapters.
+    """Callable bundle used by DVR state adapters.
 
-    Concrete subclasses bind model-family kernels. The adapter depends on this
-    interface rather than on FLA/GDN-specific function names.
+    Model-family code supplies these callables at adapter construction time.
+    Keeping the DVR core on this small bundle preserves the future KDA/GDN
+    extension point without a subclass per model family.
     """
 
+    scan_chunkwise_fn: Callable[..., tuple]
+    rebuild_recurrent_state_fn: Callable[..., torch.Tensor]
+    run_verify_conv_fn: Callable
+    scatter_state_fn: Callable
+    rebuild_recurrent_state_chunkwise_fn: Optional[Callable[..., torch.Tensor]] = None
+
     def scan_chunkwise(self, *, state_inputs: DVRStateInputs, **kwargs) -> tuple:
-        raise NotImplementedError
+        return self.scan_chunkwise_fn(state_inputs=state_inputs, **kwargs)
 
     def rebuild_recurrent_state(
         self,
@@ -337,13 +344,34 @@ class DVRStateOps:
         initial_state: torch.Tensor,
         token_count: Optional[Union[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        return self.rebuild_recurrent_state_fn(
+            state_inputs,
+            initial_state=initial_state,
+            token_count=token_count,
+        )
+
+    def rebuild_recurrent_state_chunkwise(
+        self,
+        state_inputs: DVRStateInputs,
+        *,
+        initial_state: torch.Tensor,
+        token_count: Optional[Union[int, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        rebuild_fn = (
+            self.rebuild_recurrent_state_chunkwise_fn
+            or self.rebuild_recurrent_state_fn
+        )
+        return rebuild_fn(
+            state_inputs,
+            initial_state=initial_state,
+            token_count=token_count,
+        )
 
     def run_verify_conv(self, *args, **kwargs):
-        raise NotImplementedError
+        return self.run_verify_conv_fn(*args, **kwargs)
 
     def scatter_state(self, *args, **kwargs):
-        raise NotImplementedError
+        return self.scatter_state_fn(*args, **kwargs)
 
 
 def write_dvr_conv_windows(
@@ -482,11 +510,11 @@ def rebuild_dvr_live_state_grouped(
         token_count.unsqueeze(0).expand(num_layers, -1).reshape(-1).contiguous()
     )
 
-    rebuild_fn = state_ops.rebuild_recurrent_state
-    if use_chunkwise_rebuild:
-        rebuild_fn = getattr(
-            state_ops, "rebuild_recurrent_state_chunkwise", rebuild_fn
-        )
+    rebuild_fn = (
+        state_ops.rebuild_recurrent_state_chunkwise
+        if use_chunkwise_rebuild
+        else state_ops.rebuild_recurrent_state
+    )
 
     rebuilt_state = rebuild_fn(
         window_inputs,

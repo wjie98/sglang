@@ -1,7 +1,7 @@
 """GDN-specific DVR state-input cache allocation and operators."""
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -19,7 +19,7 @@ from sglang.srt.utils import is_cpu
 __all__ = [
     "DVRGDNStateInputs",
     "DVRGDNStateInputCache",
-    "DVRGDNStateOps",
+    "create_dvr_gdn_state_ops",
 ]
 
 if not is_cpu():
@@ -394,33 +394,17 @@ class DVRGDNStateInputCache(DVRStateInputCache):
         return DVRGDNStateInputs.from_tensors(self.tensors)
 
 
-@dataclass
-class DVRGDNStateOps(DVRStateOps):
-    """GDN concrete operator bundle for DVR state replay."""
+def create_dvr_gdn_state_ops(kernel_dispatcher) -> DVRStateOps:
+    """Build DVR's GDN operator bundle from the model's existing kernels."""
 
-    chunkwise_scan_fn: Optional[Callable] = None
-    rebuild_recurrent_state_fn: Optional[Callable] = None
-    verify_conv_fn: Optional[Callable] = None
-    state_scatter_fn: Optional[Callable] = None
-
-    @classmethod
-    def create(cls, kernel_dispatcher) -> "DVRGDNStateOps":
-        from sglang.srt.layers.attention.mamba.causal_conv1d import (
-            causal_conv1d_fn,
-        )
-        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-            fused_mamba_state_scatter_with_mask,
-        )
-
-        return cls(
-            chunkwise_scan_fn=kernel_dispatcher.extend,
-            rebuild_recurrent_state_fn=_rebuild_gdn_state_from_qkvg_beta_triton,
-            verify_conv_fn=causal_conv1d_fn,
-            state_scatter_fn=fused_mamba_state_scatter_with_mask,
-        )
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_fn,
+    )
+    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+        fused_mamba_state_scatter_with_mask,
+    )
 
     def scan_chunkwise(
-        self,
         *,
         state_inputs: DVRStateInputs,
         ssm_states: torch.Tensor,
@@ -428,9 +412,8 @@ class DVRGDNStateOps(DVRStateOps):
         query_start_loc: Optional[torch.Tensor],
         **kwargs,
     ) -> tuple:
-        assert self.chunkwise_scan_fn is not None
         state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
-        return self.chunkwise_scan_fn(
+        return kernel_dispatcher.extend(
             q=state_inputs.q,
             k=state_inputs.k,
             v=state_inputs.v,
@@ -443,15 +426,13 @@ class DVRGDNStateOps(DVRStateOps):
         )
 
     def rebuild_recurrent_state(
-        self,
         state_inputs: DVRStateInputs,
         *,
         initial_state: torch.Tensor,
         token_count: Optional[Union[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        assert self.rebuild_recurrent_state_fn is not None
         state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
-        return self.rebuild_recurrent_state_fn(
+        return _rebuild_gdn_state_from_qkvg_beta_triton(
             state_inputs.q,
             state_inputs.k,
             state_inputs.v,
@@ -462,7 +443,6 @@ class DVRGDNStateOps(DVRStateOps):
         )
 
     def rebuild_recurrent_state_chunkwise(
-        self,
         state_inputs: DVRStateInputs,
         *,
         initial_state: torch.Tensor,
@@ -479,10 +459,10 @@ class DVRGDNStateOps(DVRStateOps):
             token_count=token_count,
         )
 
-    def run_verify_conv(self, *args, **kwargs):
-        assert self.verify_conv_fn is not None
-        return self.verify_conv_fn(*args, **kwargs)
-
-    def scatter_state(self, *args, **kwargs):
-        assert self.state_scatter_fn is not None
-        return self.state_scatter_fn(*args, **kwargs)
+    return DVRStateOps(
+        scan_chunkwise_fn=scan_chunkwise,
+        rebuild_recurrent_state_fn=rebuild_recurrent_state,
+        run_verify_conv_fn=causal_conv1d_fn,
+        scatter_state_fn=fused_mamba_state_scatter_with_mask,
+        rebuild_recurrent_state_chunkwise_fn=rebuild_recurrent_state_chunkwise,
+    )
