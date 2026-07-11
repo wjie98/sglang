@@ -130,31 +130,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             finally:
                 target_runner.decode_cuda_graph_runner = saved_graph_runner
 
-    def _target_verify_graph_runner_bs(self, can_run_cuda_graph: bool):
-        if not can_run_cuda_graph:
-            return None
-        runner = (
-            self.cuda_graph_runner_for_target_verify
-            or self.target_worker.model_runner.decode_cuda_graph_runner
-        )
-        return None if runner is None else runner.bs
-
-    def _update_verify_buffers_to_fill_after_draft(
-        self, verify_input: DVRVerifyInput, can_run_cuda_graph: bool
-    ):
-        cuda_graph_bs = self._target_verify_graph_runner_bs(can_run_cuda_graph)
-        for backend in iter_dvr_attention_backends(
-            self.target_worker.model_runner.attn_backend
-        ):
-            try:
-                backend.update_verify_buffers_to_fill_after_draft(
-                    verify_input, cuda_graph_bs
-                )
-            except NotImplementedError:
-                # Hybrid wrappers only route metadata calls to their children;
-                # the real full-attention backend owns this EAGLE overlap hook.
-                continue
-
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
         return self.dvr_output_prefix.request_output_prefix_token_ids(
             req,
@@ -367,9 +342,24 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
                     self.target_worker.model_runner, batch
                 )
 
-            self._update_verify_buffers_to_fill_after_draft(
-                verify_input, can_run_cuda_graph
+            runner = (
+                self.cuda_graph_runner_for_target_verify
+                or self.target_worker.model_runner.decode_cuda_graph_runner
             )
+            cuda_graph_bs = (
+                None if not can_run_cuda_graph or runner is None else runner.bs
+            )
+            for backend in iter_dvr_attention_backends(
+                self.target_worker.model_runner.attn_backend
+            ):
+                try:
+                    backend.update_verify_buffers_to_fill_after_draft(
+                        verify_input, cuda_graph_bs
+                    )
+                except NotImplementedError:
+                    # Hybrid wrappers only route metadata calls to their children;
+                    # the real full-attention backend owns this EAGLE overlap hook.
+                    continue
 
         if batch.has_grammar:
             retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()

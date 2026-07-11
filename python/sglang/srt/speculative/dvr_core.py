@@ -7,7 +7,6 @@ import torch
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
     DVRFinalLogprobRepair,
-    DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
@@ -262,7 +261,7 @@ def finish_dvr_verify(
             pending_track_seqlens = [None] * len(pending_track_indices)
         checkpoints = [
             (
-                DVRMambaCheckpoint(track_idx=track_idx, seqlen=seqlen)
+                (int(track_idx), int(seqlen))
                 if track_idx is not None and seqlen is not None
                 else None
             )

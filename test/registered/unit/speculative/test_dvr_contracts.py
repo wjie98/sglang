@@ -12,8 +12,6 @@ from sglang.srt.speculative.dvr_core import (
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
-    DVRFinalLogprobRepair,
-    DVRMambaCheckpoint,
     DVRPendingOutputPrefix,
     allow_dvr_non_streaming_logprob_output,
     compact_dvr_accepted_tokens_and_cache_locs,
@@ -104,7 +102,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
 
     dvr_aux = DVRDeferredActions(
         pending_mamba_checkpoints=[
-            DVRMambaCheckpoint(track_idx=0, seqlen=128),
+            (0, 128),
         ],
     )
     assert dvr_aux.commit_mamba_checkpoint_after_decode(
@@ -116,9 +114,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    dvr_aux.pending_mamba_checkpoints = [
-        DVRMambaCheckpoint(track_idx=1, seqlen=128)
-    ]
+    dvr_aux.pending_mamba_checkpoints = [(1, 128)]
     assert dvr_aux.commit_mamba_checkpoint_after_decode(
         req=req,
         batch=batch,
@@ -128,9 +124,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    dvr_aux.pending_mamba_checkpoints = [
-        DVRMambaCheckpoint(track_idx=2, seqlen=192)
-    ]
+    dvr_aux.pending_mamba_checkpoints = [(2, 192)]
     assert dvr_aux.commit_mamba_checkpoint_after_decode(
         req=req,
         batch=batch,
@@ -256,10 +250,7 @@ def test_dvr_final_logprob_repair_applies_after_materialization():
     result = SimpleNamespace(
         dvr_aux=DVRDeferredActions(
             final_logprob_repairs=[
-                DVRFinalLogprobRepair(
-                    output_ids=[10, 11, 12],
-                    output_logprobs=[-0.1, -0.2, -0.3],
-                )
+                ([10, 11, 12], [-0.1, -0.2, -0.3])
             ]
         )
     )
@@ -288,10 +279,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
     result = SimpleNamespace(
         dvr_aux=DVRDeferredActions(
             final_logprob_repairs=[
-                DVRFinalLogprobRepair(
-                    output_ids=[10, 11],
-                    output_logprobs=[-0.1, -0.2],
-                )
+                ([10, 11], [-0.1, -0.2])
             ]
         )
     )
@@ -318,10 +306,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
     result = SimpleNamespace(
         dvr_aux=DVRDeferredActions(
             final_logprob_repairs=[
-                DVRFinalLogprobRepair(
-                    output_ids=[10, 11],
-                    output_logprobs=[-0.1],
-                )
+                ([10, 11], [-0.1])
             ]
         )
     )
@@ -437,8 +422,9 @@ def test_dvr_output_journal_builds_final_logprob_repair():
         3,
         error_prefix="DVR spec-v2 final logprob",
     )
-    assert repair.output_ids == [201, 202, 203]
-    assert repair.output_logprobs == [-0.1, -0.2, -0.3]
+    output_ids, output_logprobs = repair
+    assert output_ids == [201, 202, 203]
+    assert output_logprobs == [-0.1, -0.2, -0.3]
 
 
 def test_dvr_output_journal_requires_exact_logprobs():

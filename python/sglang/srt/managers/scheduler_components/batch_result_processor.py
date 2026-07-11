@@ -28,7 +28,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import (
     record_spec_verify_metrics,
-    useful_spec_proposed_drafts,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -613,11 +612,9 @@ class SchedulerBatchResultProcessor:
                     num_proposed_drafts=(
                         proposed_drafts_per_req[i]
                         if proposed_drafts_per_req is not None
-                        else useful_spec_proposed_drafts(
-                            req,
-                            default_proposed_per_verify
-                        )
+                        else None
                     ),
+                    proposed_per_verify=default_proposed_per_verify,
                 )
 
             predict_tokens.append(accept_tokens)

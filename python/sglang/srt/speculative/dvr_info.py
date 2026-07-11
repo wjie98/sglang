@@ -9,27 +9,11 @@ import torch
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
-@dataclass
-class DVRMambaCheckpoint:
-    track_idx: Optional[int] = None
-    seqlen: Optional[int] = None
+DVRMambaCheckpoint = tuple[int, int]
+"""Request-local Mamba checkpoint as ``(track_idx, seqlen)``."""
 
-    @property
-    def valid(self) -> bool:
-        return self.track_idx is not None and self.seqlen is not None
-
-
-@dataclass
-class DVRFinalLogprobRepair:
-    """Exact final output logprobs produced by a DVR worker.
-
-    Spec-v2 overlap materializes accepted tokens into ``Req.output_ids`` after
-    the worker returns.  DVR carries the final rows here and applies them only
-    after scheduler result processing owns the final output token list.
-    """
-
-    output_ids: list[int]
-    output_logprobs: list[float]
+DVRFinalLogprobRepair = tuple[list[int], list[float]]
+"""Exact final output ids/logprobs carried until Req.output_ids is materialized."""
 
 
 _DVR_LOGPROB_DEFERRED = 1
@@ -41,9 +25,7 @@ class DVRDeferredActions:
     """DVR postprocess work carried by GenerationBatchResult.dvr_aux."""
 
     pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
-    final_logprob_repairs: Optional[
-        list[Optional[DVRFinalLogprobRepair]]
-    ] = None
+    final_logprob_repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = None
 
     def cache_unfinished_prefill_req(
         self,
@@ -95,30 +77,31 @@ class DVRDeferredActions:
             if repair is None or not req.return_logprob:
                 continue
 
-            output_len = len(repair.output_ids)
-            if output_len != len(repair.output_logprobs):
+            output_ids, output_logprobs = repair
+            output_len = len(output_ids)
+            if output_len != len(output_logprobs):
                 raise RuntimeError(
                     "DVR final logprob repair has inconsistent ids/logprobs "
                     f"length: rid={req.rid}, output_len={output_len}, "
-                    f"logprob_len={len(repair.output_logprobs)}."
+                    f"logprob_len={len(output_logprobs)}."
                 )
 
             # Spec-v2 applies accepted tokens after the worker returns.  Repair
             # only the exact materialized prefix; a mismatch here means worker
             # replay and scheduler-owned output have diverged.
             materialized_output_ids = list(req.output_ids[:output_len])
-            if materialized_output_ids != repair.output_ids:
+            if materialized_output_ids != output_ids:
                 raise RuntimeError(
                     "DVR final logprob repair no longer matches materialized "
                     f"output ids: rid={req.rid}, "
                     f"materialized_tail={materialized_output_ids[-8:]}, "
-                    f"repair_tail={repair.output_ids[-8:]}, "
+                    f"repair_tail={output_ids[-8:]}, "
                     f"repair_len={output_len}, req_output_len={len(req.output_ids)}."
                 )
 
             if req.logprob.output_token_logprobs_val is not None:
-                req.logprob.output_token_logprobs_val[:] = repair.output_logprobs
-                req.logprob.output_token_logprobs_idx[:] = repair.output_ids
+                req.logprob.output_token_logprobs_val[:] = output_logprobs
+                req.logprob.output_token_logprobs_idx[:] = output_ids
             allow_dvr_non_streaming_logprob_output(req)
 
     def commit_mamba_checkpoint_after_decode(
@@ -137,42 +120,44 @@ class DVRDeferredActions:
         ):
             return False
 
-        checkpoint = (
-            self.pending_mamba_checkpoints[req_index]
-            if self.pending_mamba_checkpoints is not None
+        checkpoint = None
+        if (
+            self.pending_mamba_checkpoints is not None
             and req_index < len(self.pending_mamba_checkpoints)
-            and self.pending_mamba_checkpoints[req_index] is not None
-            else DVRMambaCheckpoint()
-        )
-        if not checkpoint.valid or checkpoint.seqlen <= 0:
+        ):
+            checkpoint = self.pending_mamba_checkpoints[req_index]
+        if checkpoint is None:
+            return True
+        track_idx, seqlen = checkpoint
+        if seqlen <= 0:
             return True
 
         last_track_seqlen = getattr(req, "mamba_last_track_seqlen", None)
-        if last_track_seqlen is not None and checkpoint.seqlen <= last_track_seqlen:
+        if last_track_seqlen is not None and seqlen <= last_track_seqlen:
             return True
 
         materialized_len = len(req.origin_input_ids) + len(req.output_ids)
-        if checkpoint.seqlen > materialized_len:
+        if seqlen > materialized_len:
             return True
 
         buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
         if buffer is None:
             return True
-        if checkpoint.track_idx < 0 or checkpoint.track_idx >= buffer.numel():
+        if track_idx < 0 or track_idx >= buffer.numel():
             return True
         # A pending DVR boundary names the request-local ping-pong slot that
         # holds the just-verified GDN state.  A freed lazy slot is marked as -1
         # and must never become the scheduler-owned checkpoint for radix insert.
-        if buffer[checkpoint.track_idx].item() == -1:
+        if buffer[track_idx].item() == -1:
             return True
 
         page_size = getattr(tree_cache, "page_size", 1)
-        if page_size != 1 and checkpoint.seqlen % page_size != 0:
+        if page_size != 1 and seqlen % page_size != 0:
             return True
 
-        req.mamba_last_track_seqlen = checkpoint.seqlen
+        req.mamba_last_track_seqlen = seqlen
         req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-            checkpoint.track_idx
+            track_idx
         )
         return True
 
@@ -378,10 +363,7 @@ class DVRPendingOutputPrefix:
                 f"{error_prefix} is missing verify logprobs: rid={req.rid}, "
                 f"missing_positions={missing[:8]}, output_len={output_len}."
             )
-        return DVRFinalLogprobRepair(
-            output_ids=token_stream[:output_len],
-            output_logprobs=[float(value) for value in repair_logprobs],
-        )
+        return token_stream[:output_len], [float(value) for value in repair_logprobs]
 
 
 def defer_dvr_non_streaming_logprob_output(req: Any) -> None:

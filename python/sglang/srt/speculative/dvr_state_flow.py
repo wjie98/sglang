@@ -6,7 +6,6 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.linear.dvr_state import DVRRecurrentStateBackup
 from sglang.srt.layers.logits_processor import LogitsMetadata
@@ -394,10 +393,10 @@ def dvr_suffix_replay_context(
         reqs=batch.reqs,
         input_ids=replay_plan["input_ids"],
         out_cache_locs=replay_plan["out_cache_locs"],
-        prefix_lens=[int(x) for x in replay_plan["boundary_lens"]],
-        extend_lens=[int(x) for x in replay_plan["extend_lens_cpu"]],
+        prefix_lens=replay_plan["boundary_lens"],
+        extend_lens=replay_plan["extend_lens_cpu"],
         final_seq_lens=replay_plan["final_seq_lens_cpu"],
-        extend_logprob_start_lens=[int(x) for x in replay_plan["extend_lens_cpu"]],
+        extend_logprob_start_lens=replay_plan["extend_lens_cpu"],
         capture_hidden_mode=CaptureHiddenMode.FULL,
         is_prefill_only=batch.is_prefill_only,
         mamba_track_indices=boundary_indices if boundary_track_mask is not None else None,
@@ -525,10 +524,10 @@ def replay_dvr_accepted_suffix_for_live_state(
         reqs=batch.reqs,
         input_ids=replay_plan["input_ids"],
         out_cache_locs=replay_plan["out_cache_locs"],
-        prefix_lens=[int(x) for x in replay_plan["boundary_lens"]],
-        extend_lens=[int(x) for x in replay_plan["extend_lens_cpu"]],
+        prefix_lens=replay_plan["boundary_lens"],
+        extend_lens=replay_plan["extend_lens_cpu"],
         final_seq_lens=replay_plan["final_seq_lens_cpu"],
-        extend_logprob_start_lens=[int(x) for x in replay_plan["extend_lens_cpu"]],
+        extend_logprob_start_lens=replay_plan["extend_lens_cpu"],
         capture_hidden_mode=CaptureHiddenMode.NULL,
         is_prefill_only=batch.is_prefill_only,
         mamba_cow_src_indices=boundary_indices,

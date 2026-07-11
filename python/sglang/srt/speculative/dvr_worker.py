@@ -83,36 +83,6 @@ def dvr_has_graph_unsafe_short_prompt(batch) -> bool:
     return any(len(req.origin_input_ids) <= 1 for req in batch.reqs)
 
 
-def dvr_chain_uniform_samples(
-    candidates: torch.Tensor,
-    batch,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return accept/reject uniforms for DVR chain sampling."""
-
-    sampling_seed = getattr(batch.sampling_info, "sampling_seed", None)
-    if sampling_seed is None:
-        return (
-            torch.rand_like(candidates, dtype=torch.float32),
-            torch.rand((candidates.shape[0],), dtype=torch.float32, device=batch.device),
-        )
-
-    bs, num_slots = candidates.shape
-    device = candidates.device
-    seed = sampling_seed.to(device=device).repeat_interleave(num_slots + 1)
-    slot_offsets = torch.arange(num_slots + 1, dtype=torch.int64, device=device)
-    positions = (
-        batch.seq_lens.to(device=device, dtype=torch.int64).unsqueeze(1) + slot_offsets
-    ).reshape(-1)
-    cols = torch.zeros((1,), dtype=torch.int32, device=device)
-    uniforms = (
-        murmur_hash32(seed, positions, cols)
-        .reshape(bs, num_slots + 1)
-        .to(torch.float32)
-        / 4294967296.0
-    )
-    return uniforms[:, :num_slots], uniforms[:, num_slots].contiguous()
-
-
 if triton is not None:
 
     @triton.jit
@@ -775,29 +745,6 @@ class DecodeVerifyRollbackWorkerV2:
             sampling_probs = top_p_renorm_prob(sampling_probs, sampling_info.top_ps)
         return sampling_probs
 
-    # Accepted-token and verify-output helpers. These intentionally stay close
-    # to EAGLE's postprocess contract so scheduler/radix-cache ownership remains
-    # compatible with normal speculative decoding.
-
-    def _next_self_draft_input_from_bonus_tokens(
-        self, bonus_tokens: torch.Tensor
-    ) -> EagleDraftInput:
-        return EagleDraftInput(
-            hidden_states=self._dummy_hidden_states(
-                bonus_tokens.shape[0], device=bonus_tokens.device
-            ),
-            bonus_tokens=bonus_tokens,
-            topk_p=torch.ones(
-                (bonus_tokens.shape[0], self.topk),
-                dtype=torch.float32,
-                device=bonus_tokens.device,
-            ),
-            topk_index=bonus_tokens.to(torch.long).unsqueeze(-1),
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
-        )
-
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
 
@@ -818,7 +765,12 @@ class DecodeVerifyRollbackWorkerV2:
         to target prefill without replaying the full prefix on every step.
         """
 
-        base_seq_lens_cpu = self._seq_lens_cpu_list_for_verify(batch, spec_info)
+        if getattr(spec_info, "seq_lens_cpu", None) is not None:
+            base_seq_lens_cpu = [int(x) for x in spec_info.seq_lens_cpu.tolist()]
+        elif batch.seq_lens_cpu is not None:
+            base_seq_lens_cpu = [int(x) for x in batch.seq_lens_cpu.tolist()]
+        else:
+            base_seq_lens_cpu = [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
         with dvr_suffix_replay_context(
             batch=batch,
             linear_state=self.linear_state,
@@ -839,17 +791,6 @@ class DecodeVerifyRollbackWorkerV2:
                 replay_plan=replay_plan,
             )
             return draft_logits
-
-    @staticmethod
-    def _seq_lens_cpu_list_for_verify(
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-    ) -> list[int]:
-        if getattr(spec_info, "seq_lens_cpu", None) is not None:
-            return [int(x) for x in spec_info.seq_lens_cpu.tolist()]
-        if batch.seq_lens_cpu is not None:
-            return [int(x) for x in batch.seq_lens_cpu.tolist()]
-        return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
     @property
     def draft_worker(self):
@@ -1083,7 +1024,21 @@ class DecodeVerifyRollbackWorkerV2:
         else:
             verified_id = torch.empty((0,), dtype=torch.int32, device=self.device)
 
-        next_draft_input = self._next_self_draft_input_from_bonus_tokens(verified_id)
+        next_draft_input = EagleDraftInput(
+            hidden_states=self._dummy_hidden_states(
+                verified_id.shape[0], device=verified_id.device
+            ),
+            bonus_tokens=verified_id,
+            topk_p=torch.ones(
+                (verified_id.shape[0], self.topk),
+                dtype=torch.float32,
+                device=verified_id.device,
+            ),
+            topk_index=verified_id.to(torch.long).unsqueeze(-1),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -1212,14 +1167,42 @@ class DecodeVerifyRollbackWorkerV2:
                 if spec_info.draft_probs is not None
                 else tree_speculative_sampling_target_only
             )
-            uniform_samples, uniform_samples_for_final_sampling = (
-                dvr_chain_uniform_samples(candidates, batch)
-                if spec_info.draft_probs is not None
-                else (
-                    torch.rand_like(candidates, dtype=torch.float32),
-                    torch.rand((bs,), dtype=torch.float32, device=self.device),
+            if spec_info.draft_probs is not None:
+                sampling_seed = getattr(sampling_info, "sampling_seed", None)
+                if sampling_seed is None:
+                    uniform_samples = torch.rand_like(candidates, dtype=torch.float32)
+                    uniform_samples_for_final_sampling = torch.rand(
+                        (bs,), dtype=torch.float32, device=self.device
+                    )
+                else:
+                    num_slots = candidates.shape[1]
+                    seed = sampling_seed.to(device=self.device).repeat_interleave(
+                        num_slots + 1
+                    )
+                    slot_offsets = torch.arange(
+                        num_slots + 1, dtype=torch.int64, device=self.device
+                    )
+                    positions = (
+                        batch.seq_lens.to(device=self.device, dtype=torch.int64)
+                        .unsqueeze(1)
+                        + slot_offsets
+                    ).reshape(-1)
+                    cols = torch.zeros((1,), dtype=torch.int32, device=self.device)
+                    uniforms = (
+                        murmur_hash32(seed, positions, cols)
+                        .reshape(bs, num_slots + 1)
+                        .to(torch.float32)
+                        / 4294967296.0
+                    )
+                    uniform_samples = uniforms[:, :num_slots]
+                    uniform_samples_for_final_sampling = uniforms[
+                        :, num_slots
+                    ].contiguous()
+            else:
+                uniform_samples = torch.rand_like(candidates, dtype=torch.float32)
+                uniform_samples_for_final_sampling = torch.rand(
+                    (bs,), dtype=torch.float32, device=self.device
                 )
-            )
             sampling_fn(
                 predicts=predict,
                 accept_index=accept_index,
