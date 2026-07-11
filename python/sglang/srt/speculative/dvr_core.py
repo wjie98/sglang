@@ -65,17 +65,19 @@ class DVRRollbackActions:
         ):
             return False
 
-        checkpoint = None
-        if (
-            self.pending_mamba_checkpoints is not None
-            and req_index < len(self.pending_mamba_checkpoints)
-        ):
-            checkpoint = self.pending_mamba_checkpoints[req_index]
+        if self.pending_mamba_checkpoints is None:
+            raise RuntimeError("DVR decode result is missing Mamba checkpoint actions.")
+        if req_index >= len(self.pending_mamba_checkpoints):
+            raise RuntimeError(
+                "DVR Mamba checkpoint actions do not match the request batch: "
+                f"req_index={req_index}, actions={len(self.pending_mamba_checkpoints)}."
+            )
+        checkpoint = self.pending_mamba_checkpoints[req_index]
         if checkpoint is None:
             return True
         track_idx, seqlen = checkpoint
         if seqlen <= 0:
-            return True
+            raise RuntimeError(f"DVR produced invalid Mamba checkpoint length {seqlen}.")
 
         last_track_seqlen = getattr(req, "mamba_last_track_seqlen", None)
         if last_track_seqlen is not None and seqlen <= last_track_seqlen:
@@ -83,17 +85,28 @@ class DVRRollbackActions:
 
         materialized_len = len(req.origin_input_ids) + len(req.output_ids)
         if seqlen > materialized_len:
-            return True
+            raise RuntimeError(
+                "DVR Mamba checkpoint precedes output materialization: "
+                f"checkpoint={seqlen}, materialized={materialized_len}."
+            )
 
         buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
         if buffer is None or track_idx < 0 or track_idx >= buffer.numel():
-            return True
+            raise RuntimeError(
+                "DVR Mamba checkpoint references an invalid tracking slot: "
+                f"track_idx={track_idx}, slots={0 if buffer is None else buffer.numel()}."
+            )
         if buffer[track_idx].item() == -1:
-            return True
+            raise RuntimeError(
+                f"DVR Mamba checkpoint tracking slot {track_idx} is unallocated."
+            )
 
         page_size = getattr(tree_cache, "page_size", 1)
         if page_size != 1 and seqlen % page_size != 0:
-            return True
+            raise RuntimeError(
+                "DVR Mamba checkpoint is not page aligned: "
+                f"checkpoint={seqlen}, page_size={page_size}."
+            )
 
         req.mamba_last_track_seqlen = seqlen
         req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(

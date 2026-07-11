@@ -292,8 +292,7 @@ def dvr_suffix_replay_context(
     live_indices = linear_state_ctx.live_indices
     boundary_indices = linear_state_ctx.boundary_indices
     if boundary_indices is None:
-        yield None
-        return
+        raise RuntimeError("DVR suffix replay requires a chunk-boundary state slot.")
 
     boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
     replay_plan = _build_suffix_replay_plan(
@@ -306,8 +305,7 @@ def dvr_suffix_replay_context(
         hidden_gather_append_count=hidden_gather_append_count,
     )
     if replay_plan is None:
-        yield None
-        return
+        raise RuntimeError("DVR suffix replay received no tail or append tokens.")
 
     replay_batch = build_dvr_private_extend_batch(
         batch,
@@ -335,9 +333,8 @@ def dvr_suffix_replay_context(
         if restore_boundary_state:
             boundary_backup = linear_state.boundary_backup
             if boundary_backup is None:
-                boundary_backup = linear_state_ctx.state_adapter.backup_recurrent_state(
-                    state_cache=linear_state_ctx.state_cache,
-                    indices=boundary_indices,
+                raise RuntimeError(
+                    "DVR target replay requires the preserved boundary state."
                 )
             linear_state_ctx.state_adapter.restore_recurrent_state(
                 state_cache=linear_state_ctx.state_cache,
@@ -915,10 +912,12 @@ class DVRLinearStateLifecycle:
     ):
         """Replay the actual accepted suffix after a partial verify acceptance."""
 
-        if batch.forward_mode.is_idle() or linear_state_ctx is None:
+        if batch.forward_mode.is_idle():
             return None
-        if accepted_ids is None or accepted_ids.numel() == 0:
-            return None
+        if linear_state_ctx is None:
+            raise RuntimeError("DVR accepted-suffix replay requires linear state.")
+        if accepted_ids.numel() == 0:
+            raise RuntimeError("DVR accepted-suffix replay requires accepted tokens.")
 
         live_indices = linear_state_ctx.live_indices
         boundary_indices = linear_state_ctx.boundary_indices
@@ -929,12 +928,18 @@ class DVRLinearStateLifecycle:
             accepted_ids.numel() != total_accepted
             or accepted_cache_locs.numel() != total_accepted
         ):
-            return None
+            raise RuntimeError(
+                "DVR accepted-suffix token/cache shape mismatch: "
+                f"accepted={total_accepted}, tokens={accepted_ids.numel()}, "
+                f"cache_locs={accepted_cache_locs.numel()}."
+            )
         if all(
             int(accepted) >= num_draft_tokens
             for accepted in accepted_token_counts_cpu
         ):
-            return None
+            raise RuntimeError(
+                "DVR accepted-suffix replay was requested without a rejection."
+            )
 
         accepted_cache_locs = accepted_cache_locs.to(torch.long)
         accepted_tokens_cpu = accepted_ids.detach().cpu().tolist()
@@ -968,7 +973,7 @@ class DVRLinearStateLifecycle:
             restore_live_state=False,
         ) as replay:
             if replay is None:
-                return None
+                raise RuntimeError("Active DVR accepted-suffix replay was skipped.")
             replay_batch, _ = replay
             target_worker.forward_batch_generation(batch=replay_batch, is_verify=True)
             accepted_tail_lens = linear_state_ctx.state_adapter.state_input_tail_lens(

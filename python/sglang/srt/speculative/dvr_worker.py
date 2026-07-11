@@ -828,9 +828,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         verify_input: EagleVerifyInput,
         linear_state_ctx,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if self.topk != 1 or self.linear_state.boundary_backup is None:
-            return None
-
         base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         batch_size = len(batch.reqs)
         draft_token_num = verify_input.draft_token.numel() // max(batch_size, 1)

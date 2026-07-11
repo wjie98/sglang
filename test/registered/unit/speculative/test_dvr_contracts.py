@@ -139,13 +139,33 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_next_track_idx == 1
 
     dvr_rollback_actions.pending_mamba_checkpoints = [(2, 192)]
-    assert dvr_rollback_actions.commit_checkpoint_after_decode(
-        req=req,
-        batch=batch,
-        req_index=0,
-        tree_cache=tree_cache,
-    )
-    assert req.mamba_last_track_seqlen == 128
+    with pytest.raises(RuntimeError, match="precedes output materialization"):
+        dvr_rollback_actions.commit_checkpoint_after_decode(
+            req=req,
+            batch=batch,
+            req_index=0,
+            tree_cache=tree_cache,
+        )
+
+    dvr_rollback_actions.pending_mamba_checkpoints = None
+    with pytest.raises(RuntimeError, match="missing Mamba checkpoint actions"):
+        dvr_rollback_actions.commit_checkpoint_after_decode(
+            req=req,
+            batch=batch,
+            req_index=0,
+            tree_cache=tree_cache,
+        )
+
+    dvr_rollback_actions.pending_mamba_checkpoints = [(2, 128)]
+    req.mamba_last_track_seqlen = 64
+    with pytest.raises(RuntimeError, match="invalid tracking slot"):
+        dvr_rollback_actions.commit_checkpoint_after_decode(
+            req=req,
+            batch=batch,
+            req_index=0,
+            tree_cache=tree_cache,
+        )
+    assert req.mamba_last_track_seqlen == 64
     assert req.mamba_next_track_idx == 1
 
 

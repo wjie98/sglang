@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
+import torch
+
 from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -127,13 +130,10 @@ def _ensure_decode_custom_all_reduce_comm(group):
             dispatch_custom_allreduce,
         )
 
-        try:
-            ca_comm = dispatch_custom_allreduce()(
-                group=group.cpu_group,
-                device=group.device,
-            )
-        except Exception:
-            ca_comm = None
+        ca_comm = dispatch_custom_allreduce()(
+            group=group.cpu_group,
+            device=group.device,
+        )
         group.ca_comm = ca_comm
 
     if ca_comm is None or not _custom_all_reduce_is_ready(ca_comm):
@@ -376,14 +376,42 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
             else:
                 delattr(model_runner, "enable_dvr_target_verify_cuda_graph")
 
-    def _fill_replay_side_buffers(
-        self, forward_batch: ForwardBatch, raw_num_token: int
-    ) -> None:
-        if not self.capture_forward_mode.is_target_verify():
-            return
+    def get_spec_info(self, num_tokens: int):
+        capture_hidden_mode = (
+            CaptureHiddenMode.FULL
+            if self.model_runner.spec_algorithm.is_dvr_eagle()
+            else CaptureHiddenMode.NULL
+        )
+        spec_info = EagleVerifyInput(
+            draft_token=None,
+            custom_mask=self.buffers.custom_mask,
+            positions=None,
+            retrieve_index=None,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            retrieve_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.model_runner.server_args.speculative_eagle_topk,
+            draft_token_num=self.speculative_num_draft_tokens,
+            capture_hidden_mode=capture_hidden_mode,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+        )
+        if self.model_runner.spec_algorithm.is_dvr_eagle():
+            spec_info.hidden_states = torch.zeros(
+                (num_tokens, self.model_runner.model_config.hidden_size),
+                dtype=self.model_runner.dtype,
+                device=self.model_runner.device,
+            )
+        return spec_info
+
+    def load_batch(self, forward_batch, pp_proxy_tensors=None):
         # The generic num_token_non_padded slot is enabled only for EP. GDN DVR
         # verify also needs the raw token count to mask padded graph rows.
-        self.buffers.num_token_non_padded.fill_(raw_num_token)
+        self.buffers.num_token_non_padded.fill_(
+            forward_batch.batch_size * self.num_tokens_per_bs
+        )
+        return super().load_batch(forward_batch, pp_proxy_tensors)
 
     @contextmanager
     def _forward_metadata_out_graph_context(
@@ -392,9 +420,7 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
         forward_batch: ForwardBatch,
         attn_backend,
         forward_mode,
-        fallback_custom_mask=None,
     ):
-        del fallback_custom_mask
         spec_info = getattr(forward_batch, "spec_info", None)
         old_custom_mask = getattr(spec_info, "custom_mask", None)
         should_clear_custom_mask = (

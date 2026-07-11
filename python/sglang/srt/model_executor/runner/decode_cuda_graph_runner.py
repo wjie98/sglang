@@ -754,18 +754,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
-    def _fill_replay_side_buffers(
-        self, forward_batch: ForwardBatch, raw_num_token: int
-    ) -> None:
-        """Let specialized graph runners fill buffers absent from ForwardBatch."""
-
     def _forward_metadata_out_graph_context(
         self,
         *,
         forward_batch: ForwardBatch,
         attn_backend,
         forward_mode: ForwardMode,
-        fallback_custom_mask=None,
     ):
         """Scoped fixups around init_forward_metadata_out_graph."""
 
@@ -804,7 +798,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
                 forward_mode=forward_batch.forward_mode,
-                fallback_custom_mask=self.buffers.custom_mask,
             )
             with metadata_context:
                 attn_backend.init_forward_metadata_out_graph(
@@ -957,7 +950,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        self._fill_replay_side_buffers(forward_batch, raw_num_token)
         if (
             self.model_runner.spec_algorithm.is_dflash()
             and self.model_runner.is_draft_worker
@@ -993,7 +985,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch=forward_batch,
             attn_backend=attn_backend,
             forward_mode=self.capture_forward_mode,
-            fallback_custom_mask=buffers.custom_mask,
         )
         with metadata_context:
             attn_backend.init_forward_metadata_out_graph(fb_view)
@@ -1074,38 +1065,34 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
-            or self.model_runner.spec_algorithm.is_dvr()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
+            else:
 
-            capture_mode = CaptureHiddenMode.FULL
-            if (
-                self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dvr_self_draft()
-            ):
-                capture_mode = CaptureHiddenMode.NULL
-            spec_info = EagleVerifyInput(
-                draft_token=None,
-                custom_mask=self.buffers.custom_mask,
-                positions=None,
-                retrieve_index=None,
-                retrieve_next_token=None,
-                retrieve_next_sibling=None,
-                retrieve_cum_len=None,
-                spec_steps=self.speculative_num_steps,
-                topk=self.model_runner.server_args.speculative_eagle_topk,
-                draft_token_num=self.speculative_num_draft_tokens,
-                capture_hidden_mode=capture_mode,
-                seq_lens_sum=None,
-                seq_lens_cpu=None,
-            )
-            # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states.
-            if self.model_runner.spec_algorithm.is_eagle() or (
-                self.model_runner.spec_algorithm.is_dvr_eagle()
-            ):
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.spec_algorithm.is_standalone()
+                    else CaptureHiddenMode.FULL
+                )
+                spec_info = EagleVerifyInput(
+                    draft_token=None,
+                    custom_mask=self.buffers.custom_mask,
+                    positions=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
+                    spec_steps=self.speculative_num_steps,
+                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    draft_token_num=self.speculative_num_draft_tokens,
+                    capture_hidden_mode=capture_mode,
+                    seq_lens_sum=None,
+                    seq_lens_cpu=None,
+                )
+                # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
                 spec_info.hidden_states = torch.zeros(
                     (num_tokens, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
