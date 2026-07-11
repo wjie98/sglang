@@ -29,7 +29,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
-    DVRTargetVerifyCudaGraphRunner,
+    dvr_draft_graph_capture_context,
+    dvr_draft_graph_replay_context,
     dvr_self_draft_graph_block_reason,
     iter_dvr_attention_backends,
     _min_seq_len_cpu,
@@ -259,7 +260,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             model_runner=self.model_runner,
         )
         self.cuda_graph_runner_for_draft_decode = None
-        self.cuda_graph_runner_for_target_verify = None
         if self.is_dvr_eagle:
             server_args.context_length = (
                 target_worker.model_runner.model_config.context_len
@@ -374,13 +374,23 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     @contextmanager
     def _draft_context(self):
         if not self.is_dvr_eagle:
-            yield
+            with dvr_draft_graph_replay_context(self.model_runner):
+                yield
             return
         draft_worker = self._draft_worker
+        extra_attn_backends = (
+            draft_worker.draft_attn_backend,
+            draft_worker.draft_extend_attn_backend
+            or draft_worker.draft_runner.attn_backend,
+        )
         with (
             draft_worker.draft_tp_context(draft_worker.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
+            dvr_draft_graph_replay_context(
+                draft_worker.draft_runner,
+                extra_attn_backends=extra_attn_backends,
+            ),
         ):
             yield
 
@@ -420,18 +430,17 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         if self.is_dvr_eagle:
-            self._draft_worker.init_cuda_graphs()
-            if (
-                self.cuda_graph_runner_for_target_verify is None
-                and not self.server_args.disable_cuda_graph
-                and self.server_args.model_impl != "mindspore"
+            draft_worker = self._draft_worker
+            extra_attn_backends = (
+                draft_worker.draft_attn_backend,
+                draft_worker.draft_extend_attn_backend
+                or draft_worker.draft_runner.attn_backend,
+            )
+            with dvr_draft_graph_capture_context(
+                draft_worker.draft_runner,
+                extra_attn_backends=extra_attn_backends,
             ):
-                self.cuda_graph_runner_for_target_verify = (
-                    DVRTargetVerifyCudaGraphRunner(
-                        self.target_worker.model_runner,
-                        dvr_target_verify_cuda_graph=True,
-                    )
-                )
+                draft_worker.init_cuda_graphs()
             return
 
         # Capture the dedicated self-draft decode graph after target attention
@@ -788,24 +797,11 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
     @contextmanager
     def _target_verify_context(self, *, prepare: bool = False):
-        runner = self.cuda_graph_runner_for_target_verify
+        runner = self.target_worker.model_runner.decode_cuda_graph_runner
         use_plan_stream = prepare and self.plan_stream is not None and runner is None
         stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
-
-        target_runner = self.target_worker.model_runner
-        patch_graph_runner = runner is not None or self.plan_stream is not None
-        if not patch_graph_runner:
-            with stream_ctx:
-                yield use_plan_stream
-            return
-
-        saved_graph_runner = target_runner.decode_cuda_graph_runner
         with stream_ctx:
-            target_runner.decode_cuda_graph_runner = runner
-            try:
-                yield use_plan_stream
-            finally:
-                target_runner.decode_cuda_graph_runner = saved_graph_runner
+            yield use_plan_stream
 
     def _prepare_dvr_boundary_for_verify(self, batch: ScheduleBatch) -> None:
         if batch.forward_mode.is_idle():
@@ -1061,10 +1057,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     self.target_worker.model_runner, batch
                 )
 
-            runner = (
-                self.cuda_graph_runner_for_target_verify
-                or self.target_worker.model_runner.decode_cuda_graph_runner
-            )
+            runner = self.target_worker.model_runner.decode_cuda_graph_runner
             cuda_graph_bs = (
                 None if not can_run_cuda_graph or runner is None else runner.bs
             )

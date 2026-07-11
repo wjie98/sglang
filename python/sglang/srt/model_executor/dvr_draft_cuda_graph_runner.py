@@ -343,10 +343,25 @@ def dvr_self_draft_graph_capture_context(model_runner):
     )
 
 
-def dvr_self_draft_graph_replay_context(model_runner):
-    """Replay the DVR self-draft graph without mamba tracking side effects."""
+def dvr_draft_graph_capture_context(model_runner, *, extra_attn_backends=()):
+    """Capture a DVR draft-model graph with performance-first decode settings."""
 
-    return _dvr_draft_decode_context(model_runner)
+    return _dvr_draft_decode_context(
+        model_runner,
+        graph_capture=True,
+        disable_batch_invariant_ops=True,
+        clear_kernel_config_caches=True,
+        extra_attn_backends=extra_attn_backends,
+    )
+
+
+def dvr_draft_graph_replay_context(model_runner, *, extra_attn_backends=()):
+    """Run one complete DVR draft phase without target determinism settings."""
+
+    return _dvr_draft_decode_context(
+        model_runner,
+        extra_attn_backends=extra_attn_backends,
+    )
 
 
 class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
@@ -474,5 +489,4 @@ class DVRDraftDecodeCudaGraphRunner:
         return self.runner.can_run_graph(forward_batch)
 
     def replay(self, forward_batch: ForwardBatch):
-        with dvr_self_draft_graph_replay_context(self.dvr_worker.model_runner):
-            return self.runner.execute(forward_batch)
+        return self.runner.execute(forward_batch)
