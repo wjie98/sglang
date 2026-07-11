@@ -410,13 +410,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         dvr_state_adapter = self.dvr_state_adapter
         if dvr_state_adapter is not None:
-            mamba_cache_params = dvr_state_adapter.get_layer_state_cache(
-                req_to_token_pool=self.req_to_token_pool,
-                state_cache=mamba_cache_params,
-                layer_id=layer.layer_id,
+            layer_idx = self.req_to_token_pool.mamba_map[layer.layer_id]
+            dvr_state_adapter.get_or_create_state_input_cache(
+                req_to_token_pool=self.req_to_token_pool
             )
             if dvr_state_adapter.is_dvr_target_verify(
-                state_cache=mamba_cache_params, is_target_verify=is_target_verify
+                is_target_verify=is_target_verify
             ):
                 # DVR target verify replays GDN state with prefill-equivalent inputs.
                 return dvr_state_adapter.forward_gdn_target_verify(
@@ -428,6 +427,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     state_cache=mamba_cache_params,
                     cache_indices=cache_indices,
                     query_start_loc=query_start_loc,
+                    layer_idx=layer_idx,
                 )
 
         conv_states = mamba_cache_params.conv[0]
@@ -551,6 +551,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         g=g,
                         beta=beta,
                     ),
+                    layer_idx=layer_idx,
                 )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:

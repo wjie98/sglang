@@ -8,7 +8,6 @@ from sglang.srt.layers.attention.linear.dvr_gdn_state import (
     DVRGDNStateInputCache,
     DVRGDNStateInputs,
 )
-from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputWindow
 from sglang.srt.layers.attention.linear.dvr_state_adapter import (
     DVRGatedStateAdapter,
 )
@@ -50,7 +49,7 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
 
     layer_cache = cache[0]
     state_inputs.write_extend_tail(
-        layer_cache.window(),
+        layer_cache,
         indices=torch.tensor([1]),
         extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
         extend_seq_lens_cpu=[2],
@@ -65,7 +64,7 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
     assert torch.equal(layer_inputs.beta[1, :2], beta)
 
 
-def test_gdn_state_input_cache_uses_generic_linear_state_field():
+def test_gdn_state_input_cache_is_its_own_window():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
         intermediate_size=32 * 128,
@@ -84,14 +83,10 @@ def test_gdn_state_input_cache_uses_generic_linear_state_field():
         device="cpu",
     )[0]
 
-    state_cache = SimpleNamespace(linear_state_input_cache=cache)
-    window = DVRStateInputWindow.from_cache(state_cache)
-
-    assert window.enabled
-    assert window.capacity == FLA_CHUNK_SIZE + 16
+    assert cache.capacity == FLA_CHUNK_SIZE + 16
 
 
-def test_dvr_gdn_adapter_lazily_adds_state_input_cache_view():
+def test_dvr_gdn_adapter_owns_state_input_cache():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
         intermediate_size=32 * 128,
@@ -116,28 +111,26 @@ def test_dvr_gdn_adapter_lazily_adds_state_input_cache_view():
         reqs=[SimpleNamespace(mamba_ping_pong_track_buffer=torch.tensor([0]))],
     )
     adapter = DVRGatedStateAdapter(
-        ops=None,
+        kernel_dispatcher=None,
         state_shape=state_shape,
         conv_dtype=torch.float32,
         device="cpu",
     )
 
-    layer_state_cache = SimpleNamespace(
-        intermediate_ssm=all_layers_state_cache.intermediate_ssm[0],
-    )
-    wrapped = adapter.get_layer_state_cache(
-        req_to_token_pool=batch.req_to_token_pool,
-        state_cache=layer_state_cache,
-        layer_id=7,
-    )
+    returned_state_cache = adapter.get_state_cache(batch=batch)
 
-    assert wrapped is layer_state_cache
-    assert wrapped.linear_state_input_cache is not None
-    assert req_to_token_pool._dvr_linear_state_input_cache is not None
-    window = DVRStateInputWindow.from_cache(wrapped)
-    assert window.enabled
+    assert returned_state_cache is all_layers_state_cache
+    assert adapter.state_input_cache is not None
+    window = adapter.state_input_window(layer_idx=0)
     assert window.capacity == FLA_CHUNK_SIZE + 4
-    assert window.tensors()[0].shape == (4, FLA_CHUNK_SIZE + 4, 8, 128)
+    assert window.tensors[0].shape == (4, FLA_CHUNK_SIZE + 4, 8, 128)
+
+    # The adapter owns the side cache without mutating upstream pool/cache objects.
+    assert not hasattr(req_to_token_pool, "_dvr_linear_state_input_cache")
+    assert not hasattr(
+        all_layers_state_cache,
+        "linear_state_input_cache",
+    )
 
 
 def test_gdn_extend_tail_cache_skips_draft_workers():
@@ -157,10 +150,14 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         state_shape=state_shape,
         dtype=torch.float32,
         device="cpu",
-    )[0]
-    state_cache = SimpleNamespace(linear_state_input_cache=cache)
-    draft_adapter = DVRGatedStateAdapter(ops=None, is_draft_worker=True)
-    target_adapter = DVRGatedStateAdapter(ops=None, is_draft_worker=False)
+    )
+    state_cache = SimpleNamespace()
+    draft_adapter = DVRGatedStateAdapter(
+        kernel_dispatcher=None, is_draft_worker=True, state_input_cache=cache
+    )
+    target_adapter = DVRGatedStateAdapter(
+        kernel_dispatcher=None, is_draft_worker=False, state_input_cache=cache
+    )
 
     q = torch.randn(1, 2, 8, 128)
     k = torch.randn(1, 2, 8, 128)
@@ -185,8 +182,9 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         forward_batch=draft_batch,
         state_cache=state_cache,
         state_inputs=state_inputs,
+        layer_idx=0,
     )
-    assert torch.equal(cache.tail_lens[1], torch.tensor(0, dtype=torch.int32))
+    assert torch.equal(cache.tail_lens[0, 1], torch.tensor(0, dtype=torch.int32))
 
     target_batch = SimpleNamespace(
         extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
@@ -197,9 +195,11 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         forward_batch=target_batch,
         state_cache=state_cache,
         state_inputs=state_inputs,
+        layer_idx=0,
     )
-    assert torch.equal(cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
-    layer_inputs = cache.state_inputs()
+    layer_cache = cache[0]
+    assert torch.equal(layer_cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
+    layer_inputs = layer_cache.state_inputs()
     assert torch.equal(layer_inputs.q[1, :2], q.reshape(2, 8, 128))
     assert torch.equal(layer_inputs.k[1, :2], k.reshape(2, 8, 128))
     assert torch.equal(layer_inputs.v[1, :2], v.reshape(2, 16, 128))

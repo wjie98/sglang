@@ -12,14 +12,12 @@ from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (
     DVRStateInputCache,
     DVRStateInputs,
-    DVRStateOps,
 )
 from sglang.srt.utils import is_cpu
 
 __all__ = [
     "DVRGDNStateInputs",
     "DVRGDNStateInputCache",
-    "create_dvr_gdn_state_ops",
 ]
 
 if not is_cpu():
@@ -392,77 +390,3 @@ class DVRGDNStateInputCache(DVRStateInputCache):
 
     def state_inputs(self) -> DVRGDNStateInputs:
         return DVRGDNStateInputs.from_tensors(self.tensors)
-
-
-def create_dvr_gdn_state_ops(kernel_dispatcher) -> DVRStateOps:
-    """Build DVR's GDN operator bundle from the model's existing kernels."""
-
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn,
-    )
-    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-        fused_mamba_state_scatter_with_mask,
-    )
-
-    def scan_chunkwise(
-        *,
-        state_inputs: DVRStateInputs,
-        ssm_states: torch.Tensor,
-        cache_indices: torch.Tensor,
-        query_start_loc: Optional[torch.Tensor],
-        **kwargs,
-    ) -> tuple:
-        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
-        return kernel_dispatcher.extend(
-            q=state_inputs.q,
-            k=state_inputs.k,
-            v=state_inputs.v,
-            g=state_inputs.g,
-            beta=state_inputs.beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            **kwargs,
-        )
-
-    def rebuild_recurrent_state(
-        state_inputs: DVRStateInputs,
-        *,
-        initial_state: torch.Tensor,
-        token_count: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
-        return _rebuild_gdn_state_from_qkvg_beta_triton(
-            state_inputs.q,
-            state_inputs.k,
-            state_inputs.v,
-            state_inputs.g,
-            state_inputs.beta,
-            initial_state=initial_state,
-            token_count=token_count,
-        )
-
-    def rebuild_recurrent_state_chunkwise(
-        state_inputs: DVRStateInputs,
-        *,
-        initial_state: torch.Tensor,
-        token_count: Optional[Union[int, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
-        return _rebuild_gdn_state_from_qkvg_beta_chunkwise(
-            state_inputs.q,
-            state_inputs.k,
-            state_inputs.v,
-            state_inputs.g,
-            state_inputs.beta,
-            initial_state=initial_state,
-            token_count=token_count,
-        )
-
-    return DVRStateOps(
-        scan_chunkwise_fn=scan_chunkwise,
-        rebuild_recurrent_state_fn=rebuild_recurrent_state,
-        run_verify_conv_fn=causal_conv1d_fn,
-        scatter_state_fn=fused_mamba_state_scatter_with_mask,
-        rebuild_recurrent_state_chunkwise_fn=rebuild_recurrent_state_chunkwise,
-    )

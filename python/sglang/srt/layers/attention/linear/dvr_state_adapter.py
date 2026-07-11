@@ -10,12 +10,13 @@ from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.linear.dvr_gdn_state import (
     DVRGDNStateInputCache,
     DVRGDNStateInputs,
+    _rebuild_gdn_state_from_qkvg_beta_chunkwise,
+    _rebuild_gdn_state_from_qkvg_beta_triton,
 )
 from sglang.srt.layers.attention.linear.dvr_state import (
     DVRRecurrentStateBackup,
+    DVRStateInputCache,
     DVRStateInputs,
-    DVRStateInputWindow,
-    DVRStateOps,
     rebuild_dvr_live_state_grouped,
     run_dvr_chunkwise_verify,
     write_dvr_conv_windows,
@@ -33,12 +34,13 @@ class DVRGatedStateAdapter:
     to know the verify/post-verify lifecycle details.
     """
 
-    ops: DVRStateOps
+    kernel_dispatcher: Any
     chunk_size: int = FLA_CHUNK_SIZE
     is_draft_worker: bool = False
     state_shape: Any = None
     conv_dtype: Optional[torch.dtype] = None
     device: Optional[str] = None
+    state_input_cache: Optional[DVRGDNStateInputCache] = None
 
     @classmethod
     def for_gdn(
@@ -48,14 +50,10 @@ class DVRGatedStateAdapter:
         model_runner: Any,
         is_draft_worker: bool = False,
     ) -> "DVRGatedStateAdapter":
-        from sglang.srt.layers.attention.linear.dvr_gdn_state import (
-            create_dvr_gdn_state_ops,
-        )
-
         mamba_cache_params = model_runner.mambaish_config.mamba2_cache_params
 
         return cls(
-            create_dvr_gdn_state_ops(kernel_dispatcher),
+            kernel_dispatcher,
             is_draft_worker=is_draft_worker,
             state_shape=mamba_cache_params.shape,
             conv_dtype=mamba_cache_params.dtype.conv,
@@ -83,43 +81,13 @@ class DVRGatedStateAdapter:
         )
 
     def get_state_cache(self, *, batch):
-        return self.maybe_wrap_state_cache(
-            req_to_token_pool=batch.req_to_token_pool,
-            state_cache=batch.req_to_token_pool.get_speculative_mamba2_params_all_layers(),
-        )
-
-    def get_layer_state_cache(self, *, req_to_token_pool, state_cache, layer_id: int):
-        layer_idx = req_to_token_pool.mamba_map[layer_id]
-        return self.maybe_wrap_state_cache(
-            req_to_token_pool=req_to_token_pool,
-            state_cache=state_cache,
-            layer_idx=layer_idx,
-        )
-
-    def maybe_wrap_state_cache(
-        self, *, req_to_token_pool, state_cache, layer_idx: Optional[int] = None
-    ):
-        if not hasattr(state_cache, "intermediate_ssm"):
-            return state_cache
-        state_input_cache = getattr(
-            req_to_token_pool, "_dvr_linear_state_input_cache", None
-        )
-        if state_input_cache is None:
-            state_input_cache = self.get_or_create_state_input_cache(
-                req_to_token_pool=req_to_token_pool
-            )
-        if layer_idx is not None:
-            state_input_cache = state_input_cache[layer_idx]
-        # The speculative Mamba cache is a frozen dataclass in production.
-        # DVR adds one side-channel window without changing its normal fields or
-        # wrapping the object, so existing backend code sees the original cache.
-        object.__setattr__(state_cache, "linear_state_input_cache", state_input_cache)
-        return state_cache
+        self.get_or_create_state_input_cache(req_to_token_pool=batch.req_to_token_pool)
+        return batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
 
     def get_or_create_state_input_cache(
         self, *, req_to_token_pool
     ) -> DVRGDNStateInputCache:
-        cache = getattr(req_to_token_pool, "_dvr_linear_state_input_cache", None)
+        cache = self.state_input_cache
         if cache is not None:
             return cache
         if self.state_shape is None or self.conv_dtype is None or self.device is None:
@@ -139,7 +107,17 @@ class DVRGatedStateAdapter:
             dtype=self.conv_dtype,
             device=self.device,
         )
-        req_to_token_pool._dvr_linear_state_input_cache = cache
+        self.state_input_cache = cache
+        return cache
+
+    def state_input_window(
+        self, *, layer_idx: Optional[int] = None
+    ) -> DVRStateInputCache:
+        cache = self.state_input_cache
+        if cache is None:
+            raise RuntimeError("DVR linear state-input cache is not initialized.")
+        if layer_idx is not None:
+            cache = cache[layer_idx]
         return cache
 
     def get_live_indices(self, *, batch) -> torch.Tensor:
@@ -164,23 +142,74 @@ class DVRGatedStateAdapter:
         # speculative Mamba cache, so normalize layout at the DVR commit edge.
         if not src.is_contiguous():
             src = src.contiguous()
-        self.ops.scatter_state(dst, src, dst_indices, step_indices)
+        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+            fused_mamba_state_scatter_with_mask,
+        )
 
-    def is_dvr_target_verify(self, *, state_cache, is_target_verify: bool) -> bool:
-        return is_target_verify and DVRStateInputWindow.from_cache(state_cache).enabled
+        fused_mamba_state_scatter_with_mask(
+            dst, src, dst_indices, step_indices
+        )
+
+    def scan_chunkwise(self, *, state_inputs: DVRStateInputs, **kwargs) -> tuple:
+        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
+        return self.kernel_dispatcher.extend(
+            q=state_inputs.q,
+            k=state_inputs.k,
+            v=state_inputs.v,
+            g=state_inputs.g,
+            beta=state_inputs.beta,
+            **kwargs,
+        )
+
+    def rebuild_recurrent_state(
+        self,
+        state_inputs: DVRStateInputs,
+        *,
+        initial_state: torch.Tensor,
+        token_count=None,
+    ) -> torch.Tensor:
+        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
+        return _rebuild_gdn_state_from_qkvg_beta_triton(
+            state_inputs.q,
+            state_inputs.k,
+            state_inputs.v,
+            state_inputs.g,
+            state_inputs.beta,
+            initial_state=initial_state,
+            token_count=token_count,
+        )
+
+    def rebuild_recurrent_state_chunkwise(
+        self,
+        state_inputs: DVRStateInputs,
+        *,
+        initial_state: torch.Tensor,
+        token_count=None,
+    ) -> torch.Tensor:
+        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
+        return _rebuild_gdn_state_from_qkvg_beta_chunkwise(
+            state_inputs.q,
+            state_inputs.k,
+            state_inputs.v,
+            state_inputs.g,
+            state_inputs.beta,
+            initial_state=initial_state,
+            token_count=token_count,
+        )
+
+    def is_dvr_target_verify(self, *, is_target_verify: bool) -> bool:
+        return is_target_verify and self.state_input_cache is not None
 
     def state_input_tail_lens(
         self, *, state_cache, state_input_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        state_window = DVRStateInputWindow.from_cache(state_cache)
-        if not state_window.enabled:
-            return None
-        return state_window.tail_lens(indices=state_input_indices)
+        state_window = self.state_input_window()
+        return state_window.get_tail_lens(indices=state_input_indices)
 
     def backup_state_input_window(
         self, *, state_cache, state_input_indices: torch.Tensor
     ) -> Optional[Tuple[torch.Tensor, ...]]:
-        state_window = DVRStateInputWindow.from_cache(state_cache)
+        state_window = self.state_input_window()
         return state_window.backup_rows(indices=state_input_indices)
 
     def restore_state_input_window(
@@ -190,7 +219,7 @@ class DVRGatedStateAdapter:
         state_input_indices: torch.Tensor,
         backup: Optional[Tuple[torch.Tensor, ...]],
     ):
-        state_window = DVRStateInputWindow.from_cache(state_cache)
+        state_window = self.state_input_window()
         state_window.restore_rows(indices=state_input_indices, backup=backup)
 
     def set_state_input_tail_lens(
@@ -200,9 +229,7 @@ class DVRGatedStateAdapter:
         state_input_indices: torch.Tensor,
         tail_lens: torch.Tensor,
     ):
-        state_window = DVRStateInputWindow.from_cache(state_cache)
-        if not state_window.enabled:
-            return
+        state_window = self.state_input_window()
         state_window.set_tail_lens(indices=state_input_indices, value=tail_lens)
 
     def zero_state_input_after_lens(
@@ -212,9 +239,7 @@ class DVRGatedStateAdapter:
         state_input_indices: torch.Tensor,
         keep_lens: torch.Tensor,
     ):
-        state_window = DVRStateInputWindow.from_cache(state_cache)
-        if not state_window.enabled:
-            return
+        state_window = self.state_input_window()
         state_window.zero_after_lens(indices=state_input_indices, keep_lens=keep_lens)
 
     def validate_state_cache(self, *, state_cache):
@@ -294,15 +319,14 @@ class DVRGatedStateAdapter:
         forward_batch,
         state_cache,
         state_inputs: DVRStateInputs,
+        layer_idx: int,
     ):
         if self.is_draft_worker:
             # DVR state-input windows are target-model prefill oracles.  EAGLE
             # and MTP draft workers may share request slots with the target
             # worker, so draft-model state inputs must never overwrite them.
             return
-        state_window = DVRStateInputWindow.from_cache(state_cache)
-        if not state_window.enabled:
-            return
+        state_window = self.state_input_window(layer_idx=layer_idx)
         if (
             forward_batch.extend_prefix_lens_cpu is None
             or forward_batch.extend_seq_lens_cpu is None
@@ -331,11 +355,11 @@ class DVRGatedStateAdapter:
         state_cache,
         cache_indices: torch.Tensor,
         query_start_loc: Optional[torch.Tensor],
+        layer_idx: int,
     ) -> torch.Tensor:
         """Run GDN target verify using DVR's prefill-equivalent state replay."""
 
         assert self.is_dvr_target_verify(
-            state_cache=state_cache,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
         )
         draft_token_num = forward_batch.spec_info.draft_token_num
@@ -375,7 +399,9 @@ class DVRGatedStateAdapter:
             batch_size, draft_token_num, -1
         ).transpose(1, 2)
         initial_conv_windows = state_cache.conv[0][dvr_indices].clone()
-        conv_output = self.ops.run_verify_conv(
+        from sglang.srt.layers.attention.mamba.causal_conv1d import causal_conv1d_fn
+
+        conv_output = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -425,16 +451,18 @@ class DVRGatedStateAdapter:
             num_v_heads=layer.num_v_heads,
             head_v_dim=layer.head_v_dim,
         )
-        state_window = DVRStateInputWindow.from_cache(state_cache)
-        tail_lens = state_window.tail_lens(indices=state_input_indices).to(torch.long)
+        state_window = self.state_input_window(layer_idx=layer_idx)
+        tail_lens = state_window.get_tail_lens(indices=state_input_indices).to(
+            torch.long
+        )
         tail_lens = torch.where(
             valid_mask,
             tail_lens.clamp(min=0, max=self.chunk_size),
             torch.zeros_like(tail_lens),
         )
         return run_dvr_chunkwise_verify(
-            state_ops=self.ops,
-            state_window=state_window,
+            state_ops=self,
+            state_input_cache=state_window,
             draft_state_inputs=draft_state_inputs,
             ssm_states=state_cache.temporal,
             cache_indices=dvr_indices,
@@ -465,7 +493,7 @@ class DVRGatedStateAdapter:
         live_state_already_replayed: Optional[torch.Tensor] = None,
         use_fast_self_draft_commit: bool = False,
     ) -> torch.Tensor:
-        state_window = DVRStateInputWindow.from_cache(state_cache)
+        state_window = self.state_input_window()
         tail_lens_before = verified_tail_lens.to(
             device=live_indices.device, dtype=torch.long
         )
@@ -525,8 +553,8 @@ class DVRGatedStateAdapter:
                 chunk_size=self.chunk_size,
             )
             rebuild_dvr_live_state_grouped(
-                state_ops=self.ops,
-                state_window=state_window,
+                state_ops=self,
+                state_input_cache=state_window,
                 temporal_state=state_cache.temporal,
                 state_input_indices=state_input_indices,
                 live_indices=live_indices,
@@ -575,8 +603,8 @@ class DVRGatedStateAdapter:
             # row-indexed for accepted draft steps; rebuilding from the rolling
             # window keeps boundary checkpoints aligned with full prefill.
             rebuild_dvr_live_state_grouped(
-                state_ops=self.ops,
-                state_window=state_window,
+                state_ops=self,
+                state_input_cache=state_window,
                 temporal_state=state_cache.temporal,
                 state_input_indices=state_input_indices,
                 live_indices=boundary_indices,
@@ -628,8 +656,8 @@ class DVRGatedStateAdapter:
         ]
         if full_accept_crossing_req_indices.numel() > 0:
             rebuild_dvr_live_state_grouped(
-                state_ops=self.ops,
-                state_window=state_window,
+                state_ops=self,
+                state_input_cache=state_window,
                 temporal_state=state_cache.temporal,
                 state_input_indices=state_input_indices,
                 live_indices=live_indices,
@@ -643,8 +671,8 @@ class DVRGatedStateAdapter:
         ]
         if full_accept_fast_req_indices.numel() > 0:
             rebuild_dvr_live_state_grouped(
-                state_ops=self.ops,
-                state_window=state_window,
+                state_ops=self,
+                state_input_cache=state_window,
                 temporal_state=state_cache.temporal,
                 state_input_indices=state_input_indices,
                 live_indices=live_indices,
@@ -658,8 +686,8 @@ class DVRGatedStateAdapter:
             # a shortened suffix.  Use the same chunkwise GDN math as prefill
             # here; the all-accepted hot path keeps the faster recurrent rebuild.
             rebuild_dvr_live_state_grouped(
-                state_ops=self.ops,
-                state_window=state_window,
+                state_ops=self,
+                state_input_cache=state_window,
                 temporal_state=state_cache.temporal,
                 state_input_indices=state_input_indices,
                 live_indices=live_indices,
