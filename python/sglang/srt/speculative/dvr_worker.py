@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -45,7 +45,6 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
     organize_draft_results,
-    eagle_sample,
     verify_tree_greedy_func,
 )
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
@@ -115,15 +114,8 @@ class DecodeVerifyRollbackWorkerV2:
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.model_config = target_worker.model_config
-        self.tp_rank = tp_rank
         self.device = server_args.device
-        self.page_size = server_args.page_size
         self.topk = 1
-        self.max_batch_size = (
-            getattr(target_worker, "max_running_requests", None)
-            or getattr(target_worker.model_runner, "max_running_requests", None)
-            or server_args.max_running_requests
-        )
         self.num_draft_steps = server_args.speculative_num_steps
         self.num_draft_tokens = server_args.speculative_num_draft_tokens
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -211,22 +203,6 @@ class DecodeVerifyRollbackWorkerV2:
 
     # Self-draft path. DVR uses the target model's decode path as a draft model,
     # but keeps EAGLE-compatible tree/retrieve metadata for verification.
-
-    @staticmethod
-    def _request_token_ids_for_replay(req, boundary_seqlen: int):
-        token_ids = list(req.origin_input_ids) + list(req.output_ids)
-        if len(token_ids) >= boundary_seqlen:
-            return token_ids
-
-        fill_ids = getattr(req, "fill_ids", None)
-        if fill_ids is not None and len(fill_ids) >= boundary_seqlen:
-            return fill_ids
-
-        raise RuntimeError(
-            "DVR boundary fallback replay cannot reconstruct the verified prefix: "
-            f"rid={req.rid}, available_tokens={len(token_ids)}, "
-            f"boundary_seqlen={boundary_seqlen}."
-        )
 
     def _log_dvr_draft_graph_skip_once(self, reason: str) -> None:
         if reason in self._logged_dvr_draft_graph_skip_reasons:

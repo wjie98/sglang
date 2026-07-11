@@ -16,7 +16,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
 )
 from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
