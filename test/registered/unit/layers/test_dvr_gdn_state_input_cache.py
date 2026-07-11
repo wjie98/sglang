@@ -180,7 +180,6 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
 
     draft_adapter.cache_extend_tail(
         forward_batch=draft_batch,
-        state_cache=state_cache,
         state_inputs=state_inputs,
         layer_idx=0,
     )
@@ -193,7 +192,6 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
     )
     target_adapter.cache_extend_tail(
         forward_batch=target_batch,
-        state_cache=state_cache,
         state_inputs=state_inputs,
         layer_idx=0,
     )

@@ -400,6 +400,7 @@ def run_target_verify_replay(
 class DVRLinearStateContext:
     state_cache: Any
     state_adapter: Any
+    state_input_cache: Any
     state_input_indices: torch.Tensor
     live_indices: torch.Tensor
     boundary_indices: Optional[torch.Tensor] = None
@@ -471,35 +472,19 @@ class DVRLinearStateLifecycle:
         self,
         linear_state_ctx: DVRLinearStateContext,
         *,
-        clear_state_input_window: bool = False,
         restore_live_state: bool = True,
     ):
         """Save/restore linear-state side effects around a replay oracle."""
 
         state_adapter = linear_state_ctx.state_adapter
         state_cache = linear_state_ctx.state_cache
-        saved_tail_lens = state_adapter.state_input_tail_lens(
-            state_cache=state_cache,
-            state_input_indices=linear_state_ctx.state_input_indices,
+        state_input_cache = linear_state_ctx.state_input_cache
+        saved_tail_lens = state_input_cache.get_tail_lens(
+            indices=linear_state_ctx.state_input_indices
+        ).clone()
+        saved_state_input_window = state_input_cache.backup_rows(
+            indices=linear_state_ctx.state_input_indices
         )
-        if saved_tail_lens is not None:
-            saved_tail_lens = saved_tail_lens.clone()
-        saved_state_input_window = state_adapter.backup_state_input_window(
-            state_cache=state_cache,
-            state_input_indices=linear_state_ctx.state_input_indices,
-        )
-        if clear_state_input_window and saved_tail_lens is not None:
-            zero_tail_lens = torch.zeros_like(saved_tail_lens)
-            state_adapter.set_state_input_tail_lens(
-                state_cache=state_cache,
-                state_input_indices=linear_state_ctx.state_input_indices,
-                tail_lens=zero_tail_lens,
-            )
-            state_adapter.zero_state_input_after_lens(
-                state_cache=state_cache,
-                state_input_indices=linear_state_ctx.state_input_indices,
-                keep_lens=zero_tail_lens,
-            )
 
         live_backup = None
         if restore_live_state:
@@ -517,15 +502,12 @@ class DVRLinearStateLifecycle:
                     backup=live_backup,
                     indices=linear_state_ctx.live_indices,
                 )
-            if saved_tail_lens is not None:
-                state_adapter.set_state_input_tail_lens(
-                    state_cache=state_cache,
-                    state_input_indices=linear_state_ctx.state_input_indices,
-                    tail_lens=saved_tail_lens,
-                )
-            state_adapter.restore_state_input_window(
-                state_cache=state_cache,
-                state_input_indices=linear_state_ctx.state_input_indices,
+            state_input_cache.set_tail_lens(
+                indices=linear_state_ctx.state_input_indices,
+                value=saved_tail_lens,
+            )
+            state_input_cache.restore_rows(
+                indices=linear_state_ctx.state_input_indices,
                 backup=saved_state_input_window,
             )
 
@@ -686,10 +668,9 @@ class DVRLinearStateLifecycle:
             state_input_indices.append(ctx.state_input_indices[i])
             tail_lens.append(seq_len - boundary)
         if state_input_indices:
-            ctx.state_adapter.set_state_input_tail_lens(
-                state_cache=ctx.state_cache,
-                state_input_indices=torch.stack(state_input_indices),
-                tail_lens=torch.tensor(tail_lens, device=ctx.live_indices.device),
+            ctx.state_input_cache.set_tail_lens(
+                indices=torch.stack(state_input_indices),
+                value=torch.tensor(tail_lens, device=ctx.live_indices.device),
             )
 
     def backup_boundary_state(
@@ -790,16 +771,9 @@ class DVRLinearStateLifecycle:
                 int(seq_len) - self.boundary_seqlen[req.rid]
                 for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
             ]
-        verified_tail_lens = ctx.state_adapter.state_input_tail_lens(
-            state_cache=ctx.state_cache,
-            state_input_indices=ctx.state_input_indices,
+        verified_tail_lens = ctx.state_input_cache.get_tail_lens(
+            indices=ctx.state_input_indices
         )
-        if verified_tail_lens is None:
-            verified_tail_lens = torch.tensor(
-                verified_tail_lens_cpu,
-                dtype=torch.long,
-                device=batch.seq_lens.device,
-            )
         verified_tail_lens = verified_tail_lens.to(
             device=ctx.live_indices.device, dtype=torch.long
         )
@@ -816,15 +790,12 @@ class DVRLinearStateLifecycle:
         )
         if accepted_suffix_replay is not None:
             _, replay_tail_lens, replay_state_input_window = accepted_suffix_replay
-            if replay_tail_lens is not None:
-                ctx.state_adapter.set_state_input_tail_lens(
-                    state_cache=ctx.state_cache,
-                    state_input_indices=ctx.state_input_indices,
-                    tail_lens=replay_tail_lens,
-                )
-            ctx.state_adapter.restore_state_input_window(
-                state_cache=ctx.state_cache,
-                state_input_indices=ctx.state_input_indices,
+            ctx.state_input_cache.set_tail_lens(
+                indices=ctx.state_input_indices,
+                value=replay_tail_lens,
+            )
+            ctx.state_input_cache.restore_rows(
+                indices=ctx.state_input_indices,
                 backup=replay_state_input_window,
             )
 
@@ -929,17 +900,11 @@ class DVRLinearStateLifecycle:
                 raise RuntimeError("Active DVR accepted-suffix replay was skipped.")
             replay_batch, _ = replay
             target_worker.forward_batch_generation(batch=replay_batch, is_verify=True)
-            accepted_tail_lens = linear_state_ctx.state_adapter.state_input_tail_lens(
-                state_cache=linear_state_ctx.state_cache,
-                state_input_indices=linear_state_ctx.state_input_indices,
-            )
-            if accepted_tail_lens is not None:
-                accepted_tail_lens = accepted_tail_lens.clone()
-            accepted_state_input_window = (
-                linear_state_ctx.state_adapter.backup_state_input_window(
-                    state_cache=linear_state_ctx.state_cache,
-                    state_input_indices=linear_state_ctx.state_input_indices,
-                )
+            accepted_tail_lens = linear_state_ctx.state_input_cache.get_tail_lens(
+                indices=linear_state_ctx.state_input_indices
+            ).clone()
+            accepted_state_input_window = linear_state_ctx.state_input_cache.backup_rows(
+                indices=linear_state_ctx.state_input_indices
             )
         return (
             torch.ones(
@@ -978,6 +943,7 @@ class DVRLinearStateLifecycle:
         return DVRLinearStateContext(
             state_cache=state_cache,
             state_adapter=state_adapter,
+            state_input_cache=state_adapter.state_input_window(),
             state_input_indices=state_input_indices,
             live_indices=live_indices,
             boundary_indices=boundary_indices,
@@ -1186,10 +1152,9 @@ class DVRLinearStateLifecycle:
                 state_cache=ctx.state_cache, indices=boundary_indices_to_zero
             )
         if reset_pos_indices:
-            ctx.state_adapter.set_state_input_tail_lens(
-                state_cache=ctx.state_cache,
-                state_input_indices=torch.stack(reset_pos_indices),
-                tail_lens=torch.tensor(reset_pos_values, device=ctx.live_indices.device),
+            ctx.state_input_cache.set_tail_lens(
+                indices=torch.stack(reset_pos_indices),
+                value=torch.tensor(reset_pos_values, device=ctx.live_indices.device),
             )
         return replay_tasks
 

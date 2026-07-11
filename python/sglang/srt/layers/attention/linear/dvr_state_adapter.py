@@ -1,7 +1,7 @@
 """Adapter boundary between model backends and DVR linear-state lifecycle."""
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import torch
 
@@ -197,51 +197,6 @@ class DVRGatedStateAdapter:
             token_count=token_count,
         )
 
-    def is_dvr_target_verify(self, *, is_target_verify: bool) -> bool:
-        return is_target_verify and self.state_input_cache is not None
-
-    def state_input_tail_lens(
-        self, *, state_cache, state_input_indices: torch.Tensor
-    ) -> Optional[torch.Tensor]:
-        state_window = self.state_input_window()
-        return state_window.get_tail_lens(indices=state_input_indices)
-
-    def backup_state_input_window(
-        self, *, state_cache, state_input_indices: torch.Tensor
-    ) -> Optional[Tuple[torch.Tensor, ...]]:
-        state_window = self.state_input_window()
-        return state_window.backup_rows(indices=state_input_indices)
-
-    def restore_state_input_window(
-        self,
-        *,
-        state_cache,
-        state_input_indices: torch.Tensor,
-        backup: Optional[Tuple[torch.Tensor, ...]],
-    ):
-        state_window = self.state_input_window()
-        state_window.restore_rows(indices=state_input_indices, backup=backup)
-
-    def set_state_input_tail_lens(
-        self,
-        *,
-        state_cache,
-        state_input_indices: torch.Tensor,
-        tail_lens: torch.Tensor,
-    ):
-        state_window = self.state_input_window()
-        state_window.set_tail_lens(indices=state_input_indices, value=tail_lens)
-
-    def zero_state_input_after_lens(
-        self,
-        *,
-        state_cache,
-        state_input_indices: torch.Tensor,
-        keep_lens: torch.Tensor,
-    ):
-        state_window = self.state_input_window()
-        state_window.zero_after_lens(indices=state_input_indices, keep_lens=keep_lens)
-
     def validate_state_cache(self, *, state_cache):
         assert state_cache.temporal.dtype == torch.float32, (
             "DVR linear-state verify requires fp32 temporal state checkpoints. "
@@ -317,7 +272,6 @@ class DVRGatedStateAdapter:
         self,
         *,
         forward_batch,
-        state_cache,
         state_inputs: DVRStateInputs,
         layer_idx: int,
     ):
@@ -359,9 +313,8 @@ class DVRGatedStateAdapter:
     ) -> torch.Tensor:
         """Run GDN target verify using DVR's prefill-equivalent state replay."""
 
-        assert self.is_dvr_target_verify(
-            is_target_verify=forward_batch.forward_mode.is_target_verify(),
-        )
+        assert forward_batch.forward_mode.is_target_verify()
+        assert self.state_input_cache is not None
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = mixed_qkv.shape[0] // draft_token_num
         rows = torch.arange(batch_size, dtype=torch.long, device=cache_indices.device)
@@ -489,7 +442,6 @@ class DVRGatedStateAdapter:
         verified_tail_lens: torch.Tensor,
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
-        boundary_already_tracked: Optional[torch.Tensor] = None,
         live_state_already_replayed: Optional[torch.Tensor] = None,
         use_fast_self_draft_commit: bool = False,
     ) -> torch.Tensor:
@@ -568,23 +520,13 @@ class DVRGatedStateAdapter:
             )
             return crosses_chunk_boundary
 
-        if boundary_already_tracked is None:
-            boundary_already_tracked = torch.zeros_like(crosses_chunk_boundary)
-        else:
-            boundary_already_tracked = boundary_already_tracked.to(
-                device=live_indices.device, dtype=torch.bool
-            )
         if live_state_already_replayed is None:
             live_state_already_replayed = torch.zeros_like(crosses_chunk_boundary)
         else:
             live_state_already_replayed = live_state_already_replayed.to(
                 device=live_indices.device, dtype=torch.bool
             )
-        # Suffix replay can pre-materialize the next boundary through the
-        # backend's normal EXTEND tracking path.  Do not rebuild or scatter that
-        # same boundary from TARGET_VERIFY intermediates, whose rows are indexed
-        # by accepted draft steps rather than prefill positions.
-        boundary_needs_rebuild = crosses_chunk_boundary & ~boundary_already_tracked
+        boundary_needs_rebuild = crosses_chunk_boundary
 
         has_live_conv_commit = (accepted_token_counts > 0) & ~live_state_already_replayed
         live_conv_req_indices = torch.nonzero(has_live_conv_commit).flatten()

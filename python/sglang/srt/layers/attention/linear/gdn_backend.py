@@ -414,9 +414,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             dvr_state_adapter.get_or_create_state_input_cache(
                 req_to_token_pool=self.req_to_token_pool
             )
-            if dvr_state_adapter.is_dvr_target_verify(
-                is_target_verify=is_target_verify
-            ):
+            if is_target_verify:
                 # DVR target verify replays GDN state with prefill-equivalent inputs.
                 return dvr_state_adapter.forward_gdn_target_verify(
                     layer=layer,
@@ -543,7 +541,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 dvr_state_adapter.cache_extend_tail(
                     forward_batch=forward_batch,
-                    state_cache=mamba_cache_params,
                     state_inputs=DVRGDNStateInputs.from_extend_forward(
                         q=query,
                         k=key,
