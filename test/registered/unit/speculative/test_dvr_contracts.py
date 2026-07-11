@@ -15,7 +15,6 @@ from sglang.srt.speculative.dvr_core import (
     append_dvr_batch_output_tokens,
     compact_dvr_accepted_input_tokens_and_cache_locs,
     compact_dvr_output_rows,
-    maybe_filter_running_batch_after_dvr_rollback,
     request_dvr_output_prefix_token_ids,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -55,44 +54,6 @@ def test_dvr_self_draft_weight_update_does_not_reload_target():
         "Succeeded to update model weights.",
     )
 
-
-def test_dvr_published_seq_len_filter_hook():
-    req = SimpleNamespace(
-        origin_input_ids=[1, 2, 3],
-        finished=lambda: False,
-        sampling_params=SimpleNamespace(max_new_tokens=4),
-    )
-    batch = SimpleNamespace(
-        enable_overlap=True,
-        seq_lens_cpu=torch.tensor([6]),
-        seq_lens=None,
-        reqs=[req],
-        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
-        filter_batch=lambda keep_indices: setattr(
-            batch, "filtered_keep_indices", keep_indices
-        ),
-    )
-    future_map = SimpleNamespace(
-        resolve_seq_lens_cpu=lambda resolved_batch: setattr(
-            resolved_batch, "seq_lens_resolved", True
-        )
-    )
-
-    assert maybe_filter_running_batch_after_dvr_rollback(
-        batch=batch,
-        future_map=future_map,
-        enable_overlap=True,
-    )
-    assert batch.seq_lens_resolved
-    assert batch.filtered_keep_indices == []
-
-    batch.seq_lens_cpu = torch.tensor([5])
-    assert maybe_filter_running_batch_after_dvr_rollback(
-        batch=batch,
-        future_map=future_map,
-        enable_overlap=True,
-    )
-    assert batch.filtered_keep_indices == [0]
 
 def test_dvr_pending_mamba_checkpoint_commit_guards():
     class Pool:

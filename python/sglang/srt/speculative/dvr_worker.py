@@ -17,7 +17,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -40,7 +39,6 @@ from sglang.srt.speculative.dvr_core import (
     DVRRollbackActions,
     append_dvr_batch_output_tokens,
     compact_dvr_output_rows,
-    dvr_compact_output_indices,
     request_dvr_output_prefix_token_ids,
     rollback_dvr_verify,
 )
@@ -1343,8 +1341,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         if has_verify_tokens:
             if batch.return_logprob:
-                self._compute_compact_logprobs(
-                    batch, logits_output, predict, accept_index
+                compute_spec_v2_logprobs(
+                    batch,
+                    logits_output,
+                    predict,
+                    accept_index,
+                    self.num_draft_steps,
                 )
 
         next_draft_input = self.draft_backend.next_draft_input(
@@ -1549,73 +1551,3 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
         accept_lens.add_(1)
         return predict, accept_lens, accept_index
-
-    def _compute_compact_logprobs(
-        self,
-        batch: ScheduleBatch,
-        logits_output: LogitsProcessorOutput,
-        predict: torch.Tensor,
-        accept_index: torch.Tensor,
-    ):
-        bs = len(batch.seq_lens)
-        max_accept = self.num_draft_steps + 1
-        device = predict.device
-
-        compact_output_idx = dvr_compact_output_indices(
-            accept_index=accept_index,
-            num_draft_tokens=self.num_draft_tokens,
-            max_accept=max_accept,
-        ).reshape(-1)
-        flat_accept_idx = accept_index.clamp_min(0).long().reshape(-1)
-        gathered_logits = logits_output.next_token_logits[flat_accept_idx]
-
-        if (
-            batch.sampling_info.is_all_greedy
-            or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get()
-        ):
-            gathered_logprobs = torch.nn.functional.log_softmax(
-                gathered_logits, dim=-1
-            )
-        else:
-            temperatures = batch.sampling_info.temperatures[
-                flat_accept_idx // self.num_draft_tokens
-            ]
-            gathered_logprobs = torch.nn.functional.log_softmax(
-                gathered_logits / temperatures, dim=-1
-            )
-        gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
-
-        # DVR result processing emits tokens from the compact per-request
-        # prefix of `predict`, while the correct target-model logprob row is
-        # identified by `accept_index`. These differ as soon as a chain rejects
-        # and samples the bonus token from the residual distribution.
-        accepted_token_ids = predict[compact_output_idx]
-        token_logprobs = gathered_logprobs[
-            torch.arange(bs * max_accept, device=device),
-            accepted_token_ids.long(),
-        ]
-        logits_output.next_token_logprobs = token_logprobs.reshape(bs, max_accept)
-
-        if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
-            top_logprobs_nums_expanded = [
-                num for num in batch.top_logprobs_nums for _ in range(max_accept)
-            ]
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(
-                gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
-            )
-
-        if batch.token_ids_logprobs and any(
-            x is not None for x in batch.token_ids_logprobs
-        ):
-            token_ids_logprobs_expanded = [
-                ids for ids in batch.token_ids_logprobs for _ in range(max_accept)
-            ]
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
-                gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
-            )

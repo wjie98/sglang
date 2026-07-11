@@ -3014,19 +3014,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        dvr_filtered = False
-        if batch.spec_algorithm.is_dvr():
-            from sglang.srt.speculative.dvr_core import (
-                maybe_filter_running_batch_after_dvr_rollback,
-            )
-
-            dvr_filtered = maybe_filter_running_batch_after_dvr_rollback(
-                batch=batch,
-                future_map=self.future_map,
-                enable_overlap=self.enable_overlap,
-            )
-        if not dvr_filtered:
-            batch.filter_batch()
+        batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
             return batch

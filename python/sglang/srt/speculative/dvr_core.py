@@ -233,24 +233,6 @@ def compact_dvr_output_rows(
     return accept_lens_cpu, token_ids_per_req
 
 
-def dvr_compact_output_indices(
-    *,
-    accept_index: torch.Tensor,
-    num_draft_tokens: int,
-    max_accept: Optional[int] = None,
-) -> torch.Tensor:
-    if max_accept is None:
-        max_accept = accept_index.shape[1]
-    bs = accept_index.shape[0]
-    device = accept_index.device
-    base = (
-        torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
-        * int(num_draft_tokens)
-    )
-    offsets = torch.arange(max_accept, dtype=torch.long, device=device).unsqueeze(0)
-    return base + offsets
-
-
 def compact_dvr_accepted_input_tokens_and_cache_locs(
     *,
     batch: Any,
@@ -276,45 +258,6 @@ def compact_dvr_accepted_input_tokens_and_cache_locs(
         verify_input_tokens[compact_input_indices[valid_accept]],
         batch.out_cache_loc[compact_input_indices[valid_accept]],
     )
-
-
-def maybe_filter_running_batch_after_dvr_rollback(
-    *,
-    batch: Any,
-    future_map: Any,
-    enable_overlap: bool,
-) -> bool:
-    """Filter a DVR batch using spec-v2's published logical lengths."""
-
-    if not enable_overlap:
-        return False
-    if batch.spec_algorithm.is_dvr_self_draft() and not batch.enable_overlap:
-        return False
-
-    future_map.resolve_seq_lens_cpu(batch)
-    keep_indices = []
-    for i, req in enumerate(batch.reqs):
-        if req.finished():
-            continue
-        max_new_tokens = req.sampling_params.max_new_tokens
-        dvr_finished = False
-        if max_new_tokens is not None:
-            max_new_tokens = int(max_new_tokens)
-            if batch.seq_lens_cpu is not None:
-                seq_len = int(batch.seq_lens_cpu[i].item())
-            elif batch.seq_lens is not None:
-                seq_len = int(batch.seq_lens[i].item())
-            else:
-                seq_len = None
-            if max_new_tokens > 0 and seq_len is not None:
-                # The newest bonus token is materialized one result step later.
-                dvr_finished = (
-                    seq_len - len(req.origin_input_ids) >= max_new_tokens - 1
-                )
-        if not dvr_finished:
-            keep_indices.append(i)
-    batch.filter_batch(keep_indices=keep_indices)
-    return True
 
 
 def rollback_dvr_verify(
