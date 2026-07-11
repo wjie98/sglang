@@ -362,7 +362,7 @@ def rollback_dvr_verify(
             live_state_already_replayed=(
                 None
                 if accepted_suffix_replay is None
-                else accepted_suffix_replay.live_state_mask
+                else accepted_suffix_replay[0]
             ),
             accepted_suffix_replay=accepted_suffix_replay,
             use_fast_self_draft_commit=use_fast_self_draft_commit,

@@ -45,7 +45,7 @@ from sglang.srt.speculative.dvr_core import (
 )
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
-    dvr_verify_replay_context,
+    dvr_suffix_replay_context,
     run_target_verify_replay,
 )
 from sglang.srt.speculative.eagle_info import (
@@ -760,14 +760,20 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             base_seq_lens_cpu = [int(x) for x in batch.seq_lens_cpu.tolist()]
         else:
             base_seq_lens_cpu = [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
-        with dvr_verify_replay_context(
+        batch_size = len(batch.reqs)
+        draft_token_num = spec_info.draft_token.numel() // max(batch_size, 1)
+        draft_tokens = spec_info.draft_token.reshape(batch_size, draft_token_num)
+        draft_cache_locs = batch.out_cache_loc.reshape(batch_size, draft_token_num)
+        with dvr_suffix_replay_context(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
-            draft_tokens=spec_info.draft_token,
-            draft_cache_locs=batch.out_cache_loc,
+            append_tokens_cpu_by_req=draft_tokens.detach().cpu().tolist(),
+            append_cache_locs_by_req=[draft_cache_locs[i] for i in range(batch_size)],
             request_token_ids_for_replay=self._request_token_ids_for_replay,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            hidden_gather_append_count=draft_token_num,
             use_mamba_cow_from_boundary=True,
         ) as replay:
             if replay is None:
@@ -826,14 +832,20 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             return None
 
         base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        with dvr_verify_replay_context(
+        batch_size = len(batch.reqs)
+        draft_token_num = verify_input.draft_token.numel() // max(batch_size, 1)
+        draft_tokens = verify_input.draft_token.reshape(batch_size, draft_token_num)
+        draft_cache_locs = batch.out_cache_loc.reshape(batch_size, draft_token_num)
+        with dvr_suffix_replay_context(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
-            draft_tokens=verify_input.draft_token,
-            draft_cache_locs=batch.out_cache_loc,
+            append_tokens_cpu_by_req=draft_tokens.detach().cpu().tolist(),
+            append_cache_locs_by_req=[draft_cache_locs[i] for i in range(batch_size)],
             request_token_ids_for_replay=self._request_token_ids_for_replay,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            hidden_gather_append_count=draft_token_num,
             restore_boundary_state=True,
         ) as replay:
             if replay is None:
