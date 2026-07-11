@@ -153,11 +153,6 @@ class DecodeVerifyRollbackWorkerV2:
             device=device or self.device,
         )
 
-    def _draft_anchor_tokens(self, draft_input: EagleDraftInput) -> torch.Tensor:
-        """Return per-request token ids that seed the next DVR self-draft step."""
-
-        return draft_input.bonus_tokens
-
     def __getattr__(self, name):
         if name == "target_worker":
             raise AttributeError(name)
@@ -254,7 +249,7 @@ class DecodeVerifyRollbackWorkerV2:
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            self._draft_anchor_tokens(spec_info),
+            spec_info.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens.to(torch.long),
@@ -360,7 +355,7 @@ class DecodeVerifyRollbackWorkerV2:
         draft_probs_list: List[torch.Tensor] = []
         scores = None
         topk_p = None
-        topk_index = self._draft_anchor_tokens(spec_info)
+        topk_index = spec_info.bonus_tokens
         empty_hidden_states = torch.empty(
             (0, 0), dtype=torch.float32, device=topk_index.device
         )
@@ -627,7 +622,7 @@ class DecodeVerifyRollbackWorkerV2:
         penalizer_orchestrator = batch.sampling_info.penalizer_orchestrator
         if penalizer_orchestrator is not None and penalizer_orchestrator.is_required:
             penalizer_orchestrator.cumulate_output_tokens(
-                self._draft_anchor_tokens(spec_info).to(torch.int64)
+                spec_info.bonus_tokens.to(torch.int64)
             )
 
         # ScheduleBatch.prepare_for_decode already reserved the speculative
