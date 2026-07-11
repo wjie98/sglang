@@ -6,19 +6,20 @@ from typing import Any, Optional
 import torch
 
 from sglang.srt.speculative.dvr_info import (
-    DVRDeferredActions,
     DVRFinalLogprobRepair,
+    DVRRollbackActions,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
     try_claim_dvr_final_logprob_repair,
 )
 
+
 @dataclass
 class DVRVerifyOutput:
     """Client-visible DVR tokens produced by one target verify step."""
 
-    replay_prefix: DVRDeferredActions
+    replay_prefix: DVRRollbackActions
     tokens: torch.Tensor
     token_logprobs: Optional[torch.Tensor]
     tokens_per_req: int
@@ -178,7 +179,7 @@ def finish_dvr_verify(
     accept_index: Optional[torch.Tensor] = None,
     partial_suffix_replay_kwargs: Optional[dict[str, Any]] = None,
     use_fast_self_draft_commit: bool = False,
-) -> DVRDeferredActions:
+) -> DVRRollbackActions:
     """Record accepted output rows and commit target recurrent state.
 
     Draft adapters stop at sampling.  Everything after that is DVR core:
@@ -237,7 +238,7 @@ def finish_dvr_verify(
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
 
-    deferred_actions = DVRDeferredActions()
+    rollback_actions = DVRRollbackActions()
     if (
         pending_track_indices is not None
         or pending_track_seqlens is not None
@@ -259,7 +260,7 @@ def finish_dvr_verify(
                 pending_track_indices, pending_track_seqlens, strict=True
             )
         ]
-        deferred_actions.pending_mamba_checkpoints = checkpoints or None
-        deferred_actions.final_logprob_repairs = final_logprob_repairs
+        rollback_actions.pending_mamba_checkpoints = checkpoints or None
+        rollback_actions.final_logprob_repairs = final_logprob_repairs
 
-    return deferred_actions
+    return rollback_actions

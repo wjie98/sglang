@@ -245,7 +245,7 @@ from sglang.srt.speculative.dflash_utils import (
     validate_dflash_request,
 )
 from sglang.srt.speculative.dvr_info import (
-    maybe_filter_running_batch_with_dvr_state,
+    maybe_filter_running_batch_after_dvr_rollback,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -3019,7 +3019,7 @@ class Scheduler(
 
         dvr_filtered = (
             batch.spec_algorithm.is_dvr()
-            and maybe_filter_running_batch_with_dvr_state(
+            and maybe_filter_running_batch_after_dvr_rollback(
                 batch=batch,
                 future_map=self.future_map,
                 enable_overlap=self.enable_overlap,

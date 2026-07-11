@@ -35,7 +35,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.dvr_info import (
-    DVRDeferredActions,
+    DVRRollbackActions,
     dvr_compact_output_indices,
 )
 from sglang.srt.speculative.dvr_core import DVRVerifyOutput, finish_dvr_verify
@@ -355,7 +355,7 @@ class DecodeVerifyRollbackWorkerV2:
         )
         self.speculative_num_steps = self.num_draft_steps
         self.speculative_num_draft_tokens = self.num_draft_tokens
-        self.dvr_output_journal = DVRDeferredActions()
+        self.dvr_output_journal = DVRRollbackActions()
 
     def _dummy_hidden_states(self, num_tokens: int, device=None) -> torch.Tensor:
         """Keep EAGLE indexing contracts without storing real DVR hidden states.
@@ -1005,7 +1005,7 @@ class DecodeVerifyRollbackWorkerV2:
         partial_suffix_replay_kwargs=None,
         use_fast_self_draft_commit: bool = False,
     ) -> GenerationBatchResult:
-        dvr_aux = finish_dvr_verify(
+        dvr_rollback_actions = finish_dvr_verify(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
@@ -1039,7 +1039,7 @@ class DecodeVerifyRollbackWorkerV2:
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
-            dvr_aux=dvr_aux,
+            dvr_rollback_actions=dvr_rollback_actions,
             routed_experts_output=routed_experts_output,
             indexer_topk_output=indexer_topk_output,
             extra_keep_alive_refs=extra_keep_alive_refs,

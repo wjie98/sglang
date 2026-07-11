@@ -11,11 +11,11 @@ from sglang.srt.speculative.dvr_core import (
 )
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
-    DVRDeferredActions,
+    DVRRollbackActions,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
-    maybe_filter_running_batch_with_dvr_state,
+    maybe_filter_running_batch_after_dvr_rollback,
     should_hold_dvr_non_streaming_logprob_output,
     try_claim_dvr_final_logprob_repair,
 )
@@ -61,7 +61,7 @@ def test_dvr_published_seq_len_filter_hook():
         )
     )
 
-    assert maybe_filter_running_batch_with_dvr_state(
+    assert maybe_filter_running_batch_after_dvr_rollback(
         batch=batch,
         future_map=future_map,
         enable_overlap=True,
@@ -70,7 +70,7 @@ def test_dvr_published_seq_len_filter_hook():
     assert batch.filtered_keep_indices == []
 
     batch.seq_lens_cpu = torch.tensor([5])
-    assert maybe_filter_running_batch_with_dvr_state(
+    assert maybe_filter_running_batch_after_dvr_rollback(
         batch=batch,
         future_map=future_map,
         enable_overlap=True,
@@ -98,12 +98,12 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     )
     tree_cache = SimpleNamespace(page_size=64)
 
-    dvr_aux = DVRDeferredActions(
+    dvr_rollback_actions = DVRRollbackActions(
         pending_mamba_checkpoints=[
             (0, 128),
         ],
     )
-    assert dvr_aux.commit_mamba_checkpoint_after_decode(
+    assert dvr_rollback_actions.commit_checkpoint_after_decode(
         req=req,
         batch=batch,
         req_index=0,
@@ -112,8 +112,8 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    dvr_aux.pending_mamba_checkpoints = [(1, 128)]
-    assert dvr_aux.commit_mamba_checkpoint_after_decode(
+    dvr_rollback_actions.pending_mamba_checkpoints = [(1, 128)]
+    assert dvr_rollback_actions.commit_checkpoint_after_decode(
         req=req,
         batch=batch,
         req_index=0,
@@ -122,8 +122,8 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    dvr_aux.pending_mamba_checkpoints = [(2, 192)]
-    assert dvr_aux.commit_mamba_checkpoint_after_decode(
+    dvr_rollback_actions.pending_mamba_checkpoints = [(2, 192)]
+    assert dvr_rollback_actions.commit_checkpoint_after_decode(
         req=req,
         batch=batch,
         req_index=0,
@@ -246,14 +246,14 @@ def test_dvr_final_logprob_repair_applies_after_materialization():
         ),
     )
     result = SimpleNamespace(
-        dvr_aux=DVRDeferredActions(
+        dvr_rollback_actions=DVRRollbackActions(
             final_logprob_repairs=[
                 ([10, 11, 12], [-0.1, -0.2, -0.3])
             ]
         )
     )
 
-    result.dvr_aux.apply_output_after_materialize(
+    result.dvr_rollback_actions.repair_output_after_materialize(
         batch=SimpleNamespace(
             reqs=[req],
             spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
@@ -275,7 +275,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
         ),
     )
     result = SimpleNamespace(
-        dvr_aux=DVRDeferredActions(
+        dvr_rollback_actions=DVRRollbackActions(
             final_logprob_repairs=[
                 ([10, 11], [-0.1, -0.2])
             ]
@@ -283,7 +283,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_output_ids():
     )
 
     with pytest.raises(RuntimeError, match="materialized output ids"):
-        result.dvr_aux.apply_output_after_materialize(
+        result.dvr_rollback_actions.repair_output_after_materialize(
             batch=SimpleNamespace(
                 reqs=[req],
                 spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
@@ -302,7 +302,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
         ),
     )
     result = SimpleNamespace(
-        dvr_aux=DVRDeferredActions(
+        dvr_rollback_actions=DVRRollbackActions(
             final_logprob_repairs=[
                 ([10, 11], [-0.1])
             ]
@@ -310,7 +310,7 @@ def test_dvr_final_logprob_repair_rejects_mismatched_lengths():
     )
 
     with pytest.raises(RuntimeError, match="inconsistent ids/logprobs length"):
-        result.dvr_aux.apply_output_after_materialize(
+        result.dvr_rollback_actions.repair_output_after_materialize(
             batch=SimpleNamespace(
                 reqs=[req],
                 spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
@@ -325,7 +325,7 @@ def test_dvr_replay_prefix_records_only_visible_output_tokens():
         output_ids=[],
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRDeferredActions()
+    prefix = DVRRollbackActions()
 
     # Target EXTEND publishes the first client-visible token before overlap
     # scheduling has necessarily materialized it into Req.output_ids.
@@ -377,7 +377,7 @@ def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
         output_ids=[201],
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRDeferredActions()
+    prefix = DVRRollbackActions()
 
     assert prefix.request_output_prefix_token_ids(
         req,
@@ -405,7 +405,7 @@ def test_dvr_output_journal_builds_final_logprob_repair():
         logprob=SimpleNamespace(output_token_logprobs_val=[-0.1]),
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRDeferredActions()
+    prefix = DVRRollbackActions()
 
     prefix.append_batch_output_tokens(
         batch,
@@ -433,7 +433,7 @@ def test_dvr_output_journal_requires_exact_logprobs():
         logprob=SimpleNamespace(output_token_logprobs_val=[]),
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRDeferredActions()
+    prefix = DVRRollbackActions()
 
     prefix.append_batch_output_tokens(
         batch,
@@ -461,7 +461,7 @@ def test_dvr_output_replay_prefix_is_req_lifecycle_scoped():
         origin_input_ids=[101, 102],
         output_ids=[301],
     )
-    prefix = DVRDeferredActions()
+    prefix = DVRRollbackActions()
 
     prefix.append_batch_output_tokens(SimpleNamespace(reqs=[old_req]), [[201, 202]])
     prefix.prune_to_batch(SimpleNamespace(reqs=[new_req]))

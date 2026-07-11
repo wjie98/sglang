@@ -247,9 +247,9 @@ class SchedulerBatchResultProcessor:
                         # normally see.  If it does not handle this request,
                         # keep the original unfinished-prefill cache path.
                         dvr_cached = False
-                        dvr_aux = result.dvr_aux
-                        if dvr_aux is not None:
-                            dvr_cached = dvr_aux.cache_unfinished_prefill_req(
+                        dvr_rollback_actions = result.dvr_rollback_actions
+                        if dvr_rollback_actions is not None:
+                            dvr_cached = dvr_rollback_actions.cache_prefill_after_rollback(
                                 req=req,
                                 batch=batch,
                                 req_index=i,
@@ -762,8 +762,8 @@ class SchedulerBatchResultProcessor:
 
         # DVR output repairs become valid only after accepted tokens are
         # materialized into Req.output_ids.
-        if result.dvr_aux is not None:
-            result.dvr_aux.apply_output_after_materialize(batch=batch)
+        if result.dvr_rollback_actions is not None:
+            result.dvr_rollback_actions.repair_output_after_materialize(batch=batch)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -923,8 +923,8 @@ class SchedulerBatchResultProcessor:
             return
 
         dvr_checkpoint_committed = (
-            result.dvr_aux is not None
-            and result.dvr_aux.commit_mamba_checkpoint_after_decode(
+            result.dvr_rollback_actions is not None
+            and result.dvr_rollback_actions.commit_checkpoint_after_decode(
                 req=req,
                 batch=batch,
                 req_index=i,

@@ -19,12 +19,13 @@ _DVR_LOGPROB_REPAIR_CLAIMED = 2
 
 
 @dataclass
-class DVRDeferredActions:
-    """DVR postprocess work and overlap output journal.
+class DVRRollbackActions:
+    """DVR rollback work carried to scheduler result processing.
 
-    ``GenerationBatchResult.dvr_aux`` carries the per-step actions below.  The
-    worker also keeps one instance as the overlap output journal so replay and
-    final logprob repair use the same DVR-owned postprocess object.
+    ``GenerationBatchResult.dvr_rollback_actions`` carries per-step checkpoint
+    commits and final logprob repairs.  The worker also keeps one instance as
+    the overlap output journal so replay and final repair use the same
+    DVR-owned rollback object.
     """
 
     pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
@@ -36,7 +37,7 @@ class DVRDeferredActions:
         Any, list[Optional[float]]
     ] = field(default_factory=weakref.WeakKeyDictionary)
 
-    def cache_unfinished_prefill_req(
+    def cache_prefill_after_rollback(
         self,
         *,
         req: Any,
@@ -46,7 +47,7 @@ class DVRDeferredActions:
         enable_hisparse: bool,
         hisparse_coordinator: Any,
     ) -> bool:
-        """Cache unfinished prefill reqs that DVR spec-v2 materialized."""
+        """Cache unfinished prefill reqs whose prefix changed during rollback."""
 
         should_cache_unfinished = (
             not batch.decoding_reqs or req not in batch.decoding_reqs
@@ -72,8 +73,8 @@ class DVRDeferredActions:
             hisparse_coordinator.admit_request_into_staging(req)
         return True
 
-    def apply_output_after_materialize(self, *, batch: Any) -> None:
-        """Apply DVR-owned output work after scheduler materializes tokens."""
+    def repair_output_after_materialize(self, *, batch: Any) -> None:
+        """Repair DVR-owned output data after scheduler materializes tokens."""
 
         repairs = self.final_logprob_repairs
         if repairs is None:
@@ -115,7 +116,7 @@ class DVRDeferredActions:
             # non-streaming response held by the output streamer.
             req.dvr_deferred_output = None
 
-    def commit_mamba_checkpoint_after_decode(
+    def commit_checkpoint_after_decode(
         self,
         *,
         req: Any,
@@ -456,7 +457,7 @@ def compact_dvr_accepted_tokens_and_cache_locs(
     )
 
 
-def maybe_filter_running_batch_with_dvr_state(
+def maybe_filter_running_batch_after_dvr_rollback(
     *,
     batch: Any,
     future_map: Any,

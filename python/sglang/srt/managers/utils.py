@@ -62,7 +62,7 @@ class GenerationBatchResult:
     extra_keep_alive_refs: Optional[List[Any]] = None
 
     # DVR-owned metadata consumed after result processing materializes outputs.
-    dvr_aux: Optional[Any] = None
+    dvr_rollback_actions: Optional[Any] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
