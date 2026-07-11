@@ -31,12 +31,10 @@ def score_dvr_verify_outputs(
 ) -> tuple[list[int], Optional[list[Optional[DVRFinalLogprobRepair]]]]:
     """Record accepted DVR tokens and carry exact final non-streaming logprobs."""
 
-    _, accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
-        batch=batch,
+    accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
         output_tokens=output_tokens,
         accept_lens=accept_lens,
         tokens_per_req=tokens_per_req,
-        base_seq_lens_cpu=base_seq_lens_cpu,
     )
     token_logprobs_per_req = None
     if token_logprobs is not None:

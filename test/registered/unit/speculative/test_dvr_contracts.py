@@ -537,8 +537,7 @@ def test_dvr_eagle_compacts_accepted_output_rows():
     )
     accept_lens = torch.tensor([2, 3], dtype=torch.int32)
 
-    _, accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
-        batch=SimpleNamespace(seq_lens=None),
+    accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
         output_tokens=accept_tokens,
         accept_lens=accept_lens,
         tokens_per_req=4,

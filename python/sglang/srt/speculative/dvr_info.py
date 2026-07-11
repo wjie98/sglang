@@ -393,22 +393,11 @@ def should_hold_dvr_non_streaming_logprob_output(
 
 def compact_dvr_output_rows(
     *,
-    batch: Any,
     output_tokens: torch.Tensor,
     accept_lens,
     tokens_per_req: Optional[int] = None,
-    base_seq_lens_cpu: Optional[list[int]] = None,
-) -> tuple[Optional[list[int]], list[int], list[list[int]]]:
+) -> tuple[list[int], list[list[int]]]:
     """Return accepted output rows in the same order scheduler materializes."""
-
-    if base_seq_lens_cpu is None and getattr(batch, "seq_lens", None) is not None:
-        base_seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if getattr(batch, "seq_lens_cpu", None) is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
-    if base_seq_lens_cpu is not None:
-        base_seq_lens_cpu = [int(seq_len) for seq_len in base_seq_lens_cpu]
 
     if torch.is_tensor(accept_lens):
         accept_lens_cpu = [int(x) for x in accept_lens.detach().cpu().tolist()]
@@ -429,7 +418,7 @@ def compact_dvr_output_rows(
             end = start + accept_len
             token_ids_per_req.append([int(x) for x in token_ids[start:end]])
 
-    return base_seq_lens_cpu, accept_lens_cpu, token_ids_per_req
+    return accept_lens_cpu, token_ids_per_req
 
 
 def dvr_compact_output_indices(
