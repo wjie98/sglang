@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -20,10 +20,21 @@ _DVR_LOGPROB_REPAIR_CLAIMED = 2
 
 @dataclass
 class DVRDeferredActions:
-    """DVR postprocess work carried by GenerationBatchResult.dvr_aux."""
+    """DVR postprocess work and overlap output journal.
+
+    ``GenerationBatchResult.dvr_aux`` carries the per-step actions below.  The
+    worker also keeps one instance as the overlap output journal so replay and
+    final logprob repair use the same DVR-owned postprocess object.
+    """
 
     pending_mamba_checkpoints: Optional[list[Optional[DVRMambaCheckpoint]]] = None
     final_logprob_repairs: Optional[list[Optional[DVRFinalLogprobRepair]]] = None
+    _tokens_by_req: weakref.WeakKeyDictionary[Any, list[int]] = field(
+        default_factory=weakref.WeakKeyDictionary
+    )
+    _logprobs_by_req: weakref.WeakKeyDictionary[
+        Any, list[Optional[float]]
+    ] = field(default_factory=weakref.WeakKeyDictionary)
 
     def cache_unfinished_prefill_req(
         self,
@@ -160,26 +171,6 @@ class DVRDeferredActions:
             track_idx
         )
         return True
-
-
-class DVRPendingOutputPrefix:
-    """Worker-owned output prefix journal for DVR overlap paths.
-
-    Spec-v2 can start the next replay before result processing appends accepted
-    tokens into ``Req.output_ids``.  DVR therefore records the real
-    client-visible accepted tokens produced by each verify step.  Replay
-    prefixes are built only from ``origin_input_ids`` + materialized
-    ``Req.output_ids`` + this pending output journal; draft-token streams and
-    broad fallback reconstruction are deliberately excluded.
-    """
-
-    def __init__(self) -> None:
-        self._tokens_by_req: weakref.WeakKeyDictionary[Any, list[int]] = (
-            weakref.WeakKeyDictionary()
-        )
-        self._logprobs_by_req: weakref.WeakKeyDictionary[
-            Any, list[Optional[float]]
-        ] = weakref.WeakKeyDictionary()
 
     def clear(self) -> None:
         self._tokens_by_req.clear()

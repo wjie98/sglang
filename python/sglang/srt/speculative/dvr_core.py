@@ -8,22 +8,17 @@ import torch
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
     DVRFinalLogprobRepair,
-    DVRPendingOutputPrefix,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
     try_claim_dvr_final_logprob_repair,
 )
-from sglang.srt.speculative.dvr_state_flow import (
-    replay_dvr_accepted_suffix_for_live_state,
-)
-
 
 @dataclass
 class DVRVerifyOutput:
     """Client-visible DVR tokens produced by one target verify step."""
 
-    replay_prefix: DVRPendingOutputPrefix
+    replay_prefix: DVRDeferredActions
     tokens: torch.Tensor
     token_logprobs: Optional[torch.Tensor]
     tokens_per_req: int
@@ -221,12 +216,14 @@ def finish_dvr_verify(
                 )
             )
             if accepted_ids.numel() > 0:
-                live_state_already_replayed = replay_dvr_accepted_suffix_for_live_state(
-                    batch=batch,
-                    accepted_token_counts_cpu=accept_lens_cpu,
-                    accepted_ids=accepted_ids,
-                    accepted_cache_locs=accepted_cache_locs,
-                    **partial_suffix_replay_kwargs,
+                live_state_already_replayed = (
+                    linear_state.replay_accepted_suffix_for_live_state(
+                        batch=batch,
+                        accepted_token_counts_cpu=accept_lens_cpu,
+                        accepted_ids=accepted_ids,
+                        accepted_cache_locs=accepted_cache_locs,
+                        **partial_suffix_replay_kwargs,
+                    )
                 )
 
         pending_track_indices, pending_track_seqlens = linear_state.commit_after_verify(

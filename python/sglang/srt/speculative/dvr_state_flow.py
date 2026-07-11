@@ -128,93 +128,6 @@ def _build_suffix_replay_plan(
     )
 
 
-def _write_replay_append_cache_locs(
-    replay_batch: ScheduleBatch,
-    replay_plan: dict[str, Any],
-) -> None:
-    append_rows = replay_plan["append_rows"]
-    append_offsets = replay_plan["append_offsets"]
-    if append_rows is None:
-        return
-    assert append_offsets is not None
-    replay_batch.req_to_token_pool.write(
-        (append_rows, append_offsets),
-        replay_plan["append_cache_locs"].to(
-            device=replay_batch.seq_lens.device,
-            dtype=torch.int32,
-        ),
-    )
-
-
-@contextmanager
-def _linear_state_replay_context(
-    linear_state_ctx,
-    *,
-    clear_state_input_window: bool = False,
-    restore_live_state: bool = True,
-):
-    """Save/restore linear-state side effects around a replay oracle.
-
-    Suffix replay temporarily reuses the live request slots.  The oracle may
-    clear state-input windows or mutate recurrent state through the normal
-    EXTEND path; callers opt out of live-state restore only when the replay
-    itself is intended to refresh committed live state.
-    """
-
-    state_adapter = linear_state_ctx.state_adapter
-    state_cache = linear_state_ctx.state_cache
-    saved_tail_lens = state_adapter.state_input_tail_lens(
-        state_cache=state_cache,
-        state_input_indices=linear_state_ctx.state_input_indices,
-    )
-    if saved_tail_lens is not None:
-        saved_tail_lens = saved_tail_lens.clone()
-    saved_state_input_window = state_adapter.backup_state_input_window(
-        state_cache=state_cache,
-        state_input_indices=linear_state_ctx.state_input_indices,
-    )
-    if clear_state_input_window and saved_tail_lens is not None:
-        zero_tail_lens = torch.zeros_like(saved_tail_lens)
-        state_adapter.set_state_input_tail_lens(
-            state_cache=state_cache,
-            state_input_indices=linear_state_ctx.state_input_indices,
-            tail_lens=zero_tail_lens,
-        )
-        state_adapter.zero_state_input_after_lens(
-            state_cache=state_cache,
-            state_input_indices=linear_state_ctx.state_input_indices,
-            keep_lens=zero_tail_lens,
-        )
-
-    live_backup = None
-    if restore_live_state:
-        live_backup = state_adapter.backup_recurrent_state(
-            state_cache=state_cache,
-            indices=linear_state_ctx.live_indices,
-        )
-
-    try:
-        yield
-    finally:
-        if live_backup is not None:
-            state_adapter.restore_recurrent_state(
-                state_cache=state_cache,
-                backup=live_backup,
-                indices=linear_state_ctx.live_indices,
-            )
-        if saved_tail_lens is not None:
-            state_adapter.set_state_input_tail_lens(
-                state_cache=state_cache,
-                state_input_indices=linear_state_ctx.state_input_indices,
-                tail_lens=saved_tail_lens,
-            )
-        state_adapter.restore_state_input_window(
-            state_cache=state_cache,
-            state_input_indices=linear_state_ctx.state_input_indices,
-            backup=saved_state_input_window,
-        )
-
-
 def build_dvr_private_extend_batch(
     batch,
     *,
@@ -439,7 +352,7 @@ def dvr_suffix_replay_context(
         mamba_clear_indices=live_indices if full_prefix_replay else None,
     )
 
-    with _linear_state_replay_context(
+    with linear_state.replay_state_context(
         linear_state_ctx,
         clear_state_input_window=full_prefix_replay,
         restore_live_state=True,
@@ -459,99 +372,8 @@ def dvr_suffix_replay_context(
 
         # Draft KV rows must be visible at absolute positions
         # base_seq_len..base_seq_len+draft during the oracle forward.
-        _write_replay_append_cache_locs(replay_batch, replay_plan)
+        linear_state.write_replay_append_cache_locs(replay_batch, replay_plan)
         yield replay_batch, replay_plan
-
-
-def replay_dvr_accepted_suffix_for_live_state(
-    *,
-    batch: ScheduleBatch,
-    target_worker,
-    linear_state,
-    linear_state_ctx,
-    base_seq_lens_cpu: list[int],
-    accepted_token_counts_cpu: list[int],
-    accepted_ids: torch.Tensor,
-    accepted_cache_locs: torch.Tensor,
-    num_draft_tokens: int,
-    request_token_ids_for_replay,
-) -> Optional[torch.Tensor]:
-    """Refresh live recurrent state after a partial verify acceptance.
-
-    The TARGET_VERIFY hot path forwards every proposed draft token.  When a row
-    is rejected, however, the committed suffix is shorter and may include a
-    target-predicted token.  Replaying only "unclosed chunk tail + accepted
-    tokens" updates the live recurrent slot to the exact committed sequence
-    without replaying the full prefix.
-    """
-
-    if batch.forward_mode.is_idle() or linear_state_ctx is None:
-        return None
-    if accepted_ids is None or accepted_ids.numel() == 0:
-        return None
-
-    live_indices = linear_state_ctx.live_indices
-    boundary_indices = linear_state_ctx.boundary_indices
-    assert boundary_indices is not None
-
-    total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
-    if (
-        accepted_ids.numel() != total_accepted
-        or accepted_cache_locs.numel() != total_accepted
-    ):
-        return None
-    if all(int(accepted) >= num_draft_tokens for accepted in accepted_token_counts_cpu):
-        return None
-
-    boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
-    accepted_cache_locs = accepted_cache_locs.to(torch.long)
-    accepted_tokens_cpu = accepted_ids.detach().cpu().tolist()
-    accepted_tokens_by_req = []
-    accepted_cache_locs_by_req = []
-    token_offset = 0
-    for accepted_count in accepted_token_counts_cpu:
-        accepted_count = int(accepted_count)
-        accepted_tokens_by_req.append(
-            accepted_tokens_cpu[token_offset : token_offset + accepted_count]
-        )
-        accepted_cache_locs_by_req.append(
-            accepted_cache_locs[token_offset : token_offset + accepted_count]
-        )
-        token_offset += accepted_count
-    replay_plan = _build_suffix_replay_plan(
-        batch=batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        append_tokens_cpu_by_req=accepted_tokens_by_req,
-        append_cache_locs_by_req=accepted_cache_locs_by_req,
-        request_token_ids_for_replay=request_token_ids_for_replay,
-    )
-    if replay_plan is None:
-        return None
-
-    # Commit repair, not checkpoint publication: leave the live recurrent slot
-    # updated by the replay so the normal commit path can copy it directly.
-    linear_state.suffix_replay_boundary_track_mask = None
-    replay_batch = build_dvr_private_extend_batch(
-        batch,
-        reqs=batch.reqs,
-        input_ids=replay_plan["input_ids"],
-        out_cache_locs=replay_plan["out_cache_locs"],
-        prefix_lens=replay_plan["boundary_lens"],
-        extend_lens=replay_plan["extend_lens_cpu"],
-        final_seq_lens=replay_plan["final_seq_lens_cpu"],
-        extend_logprob_start_lens=replay_plan["extend_lens_cpu"],
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-        is_prefill_only=batch.is_prefill_only,
-        mamba_cow_src_indices=boundary_indices,
-        mamba_cow_dst_indices=live_indices,
-    )
-    with _linear_state_replay_context(linear_state_ctx, restore_live_state=False):
-        _write_replay_append_cache_locs(replay_batch, replay_plan)
-        target_worker.forward_batch_generation(batch=replay_batch, is_verify=True)
-        return torch.ones(
-            len(batch.reqs), dtype=torch.bool, device=live_indices.device
-        )
 
 
 def run_dvr_suffix_replay_oracle(
@@ -702,6 +524,87 @@ class DVRLinearStateLifecycle:
         self.boundary_backup_keys = None
         self.live_backup = None
         self.suffix_replay_boundary_track_mask = None
+
+    @staticmethod
+    def write_replay_append_cache_locs(
+        replay_batch: ScheduleBatch,
+        replay_plan: dict[str, Any],
+    ) -> None:
+        append_rows = replay_plan["append_rows"]
+        append_offsets = replay_plan["append_offsets"]
+        if append_rows is None:
+            return
+        assert append_offsets is not None
+        replay_batch.req_to_token_pool.write(
+            (append_rows, append_offsets),
+            replay_plan["append_cache_locs"].to(
+                device=replay_batch.seq_lens.device,
+                dtype=torch.int32,
+            ),
+        )
+
+    @contextmanager
+    def replay_state_context(
+        self,
+        linear_state_ctx: DVRLinearStateContext,
+        *,
+        clear_state_input_window: bool = False,
+        restore_live_state: bool = True,
+    ):
+        """Save/restore linear-state side effects around a replay oracle."""
+
+        state_adapter = linear_state_ctx.state_adapter
+        state_cache = linear_state_ctx.state_cache
+        saved_tail_lens = state_adapter.state_input_tail_lens(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+        if saved_tail_lens is not None:
+            saved_tail_lens = saved_tail_lens.clone()
+        saved_state_input_window = state_adapter.backup_state_input_window(
+            state_cache=state_cache,
+            state_input_indices=linear_state_ctx.state_input_indices,
+        )
+        if clear_state_input_window and saved_tail_lens is not None:
+            zero_tail_lens = torch.zeros_like(saved_tail_lens)
+            state_adapter.set_state_input_tail_lens(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                tail_lens=zero_tail_lens,
+            )
+            state_adapter.zero_state_input_after_lens(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                keep_lens=zero_tail_lens,
+            )
+
+        live_backup = None
+        if restore_live_state:
+            live_backup = state_adapter.backup_recurrent_state(
+                state_cache=state_cache,
+                indices=linear_state_ctx.live_indices,
+            )
+
+        try:
+            yield
+        finally:
+            if live_backup is not None:
+                state_adapter.restore_recurrent_state(
+                    state_cache=state_cache,
+                    backup=live_backup,
+                    indices=linear_state_ctx.live_indices,
+                )
+            if saved_tail_lens is not None:
+                state_adapter.set_state_input_tail_lens(
+                    state_cache=state_cache,
+                    state_input_indices=linear_state_ctx.state_input_indices,
+                    tail_lens=saved_tail_lens,
+                )
+            state_adapter.restore_state_input_window(
+                state_cache=state_cache,
+                state_input_indices=linear_state_ctx.state_input_indices,
+                backup=saved_state_input_window,
+            )
 
     def prepare_for_draft(
         self,
@@ -1016,6 +919,92 @@ class DVRLinearStateLifecycle:
         self.live_backup = None
         self.suffix_replay_boundary_track_mask = None
         return pending_track_indices, pending_track_seqlens
+
+    def replay_accepted_suffix_for_live_state(
+        self,
+        *,
+        batch: ScheduleBatch,
+        target_worker,
+        linear_state_ctx: DVRLinearStateContext,
+        base_seq_lens_cpu: list[int],
+        accepted_token_counts_cpu: list[int],
+        accepted_ids: torch.Tensor,
+        accepted_cache_locs: torch.Tensor,
+        num_draft_tokens: int,
+        request_token_ids_for_replay,
+    ) -> Optional[torch.Tensor]:
+        """Refresh live recurrent state after a partial verify acceptance."""
+
+        if batch.forward_mode.is_idle() or linear_state_ctx is None:
+            return None
+        if accepted_ids is None or accepted_ids.numel() == 0:
+            return None
+
+        live_indices = linear_state_ctx.live_indices
+        boundary_indices = linear_state_ctx.boundary_indices
+        assert boundary_indices is not None
+
+        total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
+        if (
+            accepted_ids.numel() != total_accepted
+            or accepted_cache_locs.numel() != total_accepted
+        ):
+            return None
+        if all(
+            int(accepted) >= num_draft_tokens
+            for accepted in accepted_token_counts_cpu
+        ):
+            return None
+
+        boundary_lens = self.boundary_lens_for_replay(batch, base_seq_lens_cpu)
+        accepted_cache_locs = accepted_cache_locs.to(torch.long)
+        accepted_tokens_cpu = accepted_ids.detach().cpu().tolist()
+        accepted_tokens_by_req = []
+        accepted_cache_locs_by_req = []
+        token_offset = 0
+        for accepted_count in accepted_token_counts_cpu:
+            accepted_count = int(accepted_count)
+            accepted_tokens_by_req.append(
+                accepted_tokens_cpu[token_offset : token_offset + accepted_count]
+            )
+            accepted_cache_locs_by_req.append(
+                accepted_cache_locs[token_offset : token_offset + accepted_count]
+            )
+            token_offset += accepted_count
+        replay_plan = _build_suffix_replay_plan(
+            batch=batch,
+            base_seq_lens_cpu=base_seq_lens_cpu,
+            boundary_lens=boundary_lens,
+            append_tokens_cpu_by_req=accepted_tokens_by_req,
+            append_cache_locs_by_req=accepted_cache_locs_by_req,
+            request_token_ids_for_replay=request_token_ids_for_replay,
+        )
+        if replay_plan is None:
+            return None
+
+        # Commit repair, not checkpoint publication: leave the live recurrent
+        # slot updated by the replay so the normal commit path can copy it.
+        self.suffix_replay_boundary_track_mask = None
+        replay_batch = build_dvr_private_extend_batch(
+            batch,
+            reqs=batch.reqs,
+            input_ids=replay_plan["input_ids"],
+            out_cache_locs=replay_plan["out_cache_locs"],
+            prefix_lens=replay_plan["boundary_lens"],
+            extend_lens=replay_plan["extend_lens_cpu"],
+            final_seq_lens=replay_plan["final_seq_lens_cpu"],
+            extend_logprob_start_lens=replay_plan["extend_lens_cpu"],
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            is_prefill_only=batch.is_prefill_only,
+            mamba_cow_src_indices=boundary_indices,
+            mamba_cow_dst_indices=live_indices,
+        )
+        with self.replay_state_context(linear_state_ctx, restore_live_state=False):
+            self.write_replay_append_cache_locs(replay_batch, replay_plan)
+            target_worker.forward_batch_generation(batch=replay_batch, is_verify=True)
+            return torch.ones(
+                len(batch.reqs), dtype=torch.bool, device=live_indices.device
+            )
 
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False

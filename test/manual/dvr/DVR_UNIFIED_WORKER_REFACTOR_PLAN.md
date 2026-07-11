@@ -73,16 +73,16 @@ server arguments and must not leak into scheduler code.
 
 3. EAGLE backend introduction.
    Add `_DVREagleDraftBackend` by wrapping the upstream EAGLE draft-side worker.
-   At this stage the old `DecodeVerifyRollbackEagleWorkerV2` can remain as a
-   reference, but no new target-verify logic should be added there.
+   The old `DecodeVerifyRollbackEagleWorkerV2` reference path has been removed;
+   no target-verify logic should be reintroduced outside the unified worker.
 
 4. EAGLE dispatch through the unified worker.
    Route `DECODE_VERIFY_ROLLBACK_EAGLE` to `DecodeVerifyRollbackWorkerV2` and
    run EAGLE/MTP through the same DVR target pipeline.
 
 5. Remove the old DVR-EAGLE worker main flow.
-   Delete `dvr_eagle_worker.py` or reduce it to a temporary compatibility alias
-   if needed during review.
+   The temporary `dvr_eagle_worker.py` compatibility alias has been removed;
+   both DVR algorithms now dispatch directly to the unified worker.
 
 6. Shrink DVR core parameters.
    Once self and EAGLE share the same caller, replace broad

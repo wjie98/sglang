@@ -12,7 +12,6 @@ from sglang.srt.speculative.dvr_core import (
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
-    DVRPendingOutputPrefix,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
@@ -326,7 +325,7 @@ def test_dvr_replay_prefix_records_only_visible_output_tokens():
         output_ids=[],
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRPendingOutputPrefix()
+    prefix = DVRDeferredActions()
 
     # Target EXTEND publishes the first client-visible token before overlap
     # scheduling has necessarily materialized it into Req.output_ids.
@@ -378,7 +377,7 @@ def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
         output_ids=[201],
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRPendingOutputPrefix()
+    prefix = DVRDeferredActions()
 
     assert prefix.request_output_prefix_token_ids(
         req,
@@ -406,7 +405,7 @@ def test_dvr_output_journal_builds_final_logprob_repair():
         logprob=SimpleNamespace(output_token_logprobs_val=[-0.1]),
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRPendingOutputPrefix()
+    prefix = DVRDeferredActions()
 
     prefix.append_batch_output_tokens(
         batch,
@@ -434,7 +433,7 @@ def test_dvr_output_journal_requires_exact_logprobs():
         logprob=SimpleNamespace(output_token_logprobs_val=[]),
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRPendingOutputPrefix()
+    prefix = DVRDeferredActions()
 
     prefix.append_batch_output_tokens(
         batch,
@@ -462,7 +461,7 @@ def test_dvr_output_replay_prefix_is_req_lifecycle_scoped():
         origin_input_ids=[101, 102],
         output_ids=[301],
     )
-    prefix = DVRPendingOutputPrefix()
+    prefix = DVRDeferredActions()
 
     prefix.append_batch_output_tokens(SimpleNamespace(reqs=[old_req]), [[201, 202]])
     prefix.prune_to_batch(SimpleNamespace(reqs=[new_req]))
