@@ -13,7 +13,6 @@ from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
     DVRDeferredActions,
     DVRPendingOutputPrefix,
-    allow_dvr_non_streaming_logprob_output,
     compact_dvr_accepted_tokens_and_cache_locs,
     compact_dvr_output_rows,
     defer_dvr_non_streaming_logprob_output,
@@ -228,7 +227,7 @@ def test_dvr_request_flags_final_logprob_repair_claim_is_once_only():
         require_final_repair=True,
     )
 
-    allow_dvr_non_streaming_logprob_output(req)
+    req.dvr_deferred_output = None
     assert not should_hold_dvr_non_streaming_logprob_output(
         req=req,
         return_logprob=True,

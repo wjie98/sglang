@@ -100,7 +100,9 @@ class DVRDeferredActions:
             if req.logprob.output_token_logprobs_val is not None:
                 req.logprob.output_token_logprobs_val[:] = output_logprobs
                 req.logprob.output_token_logprobs_idx[:] = output_ids
-            allow_dvr_non_streaming_logprob_output(req)
+            # The exact final logprobs are now materialized; release the
+            # non-streaming response held by the output streamer.
+            req.dvr_deferred_output = None
 
     def commit_mamba_checkpoint_after_decode(
         self,
@@ -352,12 +354,6 @@ def defer_dvr_non_streaming_logprob_output(req: Any) -> None:
 
     if getattr(req, "dvr_deferred_output", None) is None:
         req.dvr_deferred_output = _DVR_LOGPROB_DEFERRED
-
-
-def allow_dvr_non_streaming_logprob_output(req: Any) -> None:
-    """Release a DVR non-streaming logprob response after final repair."""
-
-    req.dvr_deferred_output = None
 
 
 def try_claim_dvr_final_logprob_repair(req: Any) -> bool:
