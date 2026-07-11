@@ -1194,7 +1194,6 @@ class DecodeVerifyRollbackWorkerV2:
                 if has_verify_tokens
                 else None
             ),
-            base_seq_lens_cpu=base_seq_lens_cpu,
             predict=predict if partial_suffix_replay_kwargs is not None else None,
             accept_index=(
                 accept_index if partial_suffix_replay_kwargs is not None else None
@@ -1389,7 +1388,6 @@ class DecodeVerifyRollbackWorkerV2:
                 if has_verify_tokens
                 else None
             ),
-            base_seq_lens_cpu=base_seq_lens_cpu,
             use_fast_self_draft_commit=True,
         )
 

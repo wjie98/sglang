@@ -179,7 +179,6 @@ def finish_dvr_verify(
     accept_lens_cpu: Optional[list[int]],
     num_draft_tokens: int,
     output: Optional[DVRVerifyOutput] = None,
-    base_seq_lens_cpu: Optional[list[int]] = None,
     predict: Optional[torch.Tensor] = None,
     accept_index: Optional[torch.Tensor] = None,
     partial_suffix_replay_kwargs: Optional[dict[str, Any]] = None,
@@ -193,6 +192,7 @@ def finish_dvr_verify(
     """
 
     final_logprob_repairs = None
+    base_seq_lens_cpu = output.base_seq_lens_cpu if output is not None else None
     if output is not None and not batch.forward_mode.is_idle():
         accept_lens_cpu, final_logprob_repairs = score_dvr_verify_outputs(
             batch=batch,
