@@ -28,7 +28,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 )
 from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
-    DVRVerifyInput,
     dvr_compact_output_indices,
 )
 from sglang.srt.speculative.dvr_core import finish_dvr_verify
@@ -240,7 +239,7 @@ class DecodeVerifyRollbackWorkerV2:
         draft_probs: Optional[torch.Tensor],
         seq_lens_sum,
         seq_lens_cpu,
-    ) -> DVRVerifyInput:
+    ) -> EagleVerifyInput:
         (
             _tree_mask,
             positions,
@@ -261,7 +260,7 @@ class DecodeVerifyRollbackWorkerV2:
             tree_mask_mode=TreeMaskMode.QLEN_ONLY,
         )
 
-        return DVRVerifyInput(
+        return EagleVerifyInput(
             draft_token=draft_tokens.to(torch.long),
             # DVR uses topk=1 chain verify. The tree builder is still reused
             # for token order/retrieve metadata, but attention itself should
@@ -280,7 +279,6 @@ class DecodeVerifyRollbackWorkerV2:
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             draft_probs=draft_probs,
-            is_self_draft=True,
         )
 
     def _run_self_draft_and_build_verify_input(

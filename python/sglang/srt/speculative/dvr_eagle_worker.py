@@ -19,7 +19,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
-    DVRVerifyInput,
 )
 from sglang.srt.speculative.dvr_core import finish_dvr_verify
 from sglang.srt.speculative.dvr_state_flow import (
@@ -161,7 +160,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         self,
         *,
         batch: ScheduleBatch,
-        verify_input: DVRVerifyInput,
+        verify_input: EagleVerifyInput,
         linear_state_ctx,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Compute verifier outputs by replaying the deterministic suffix prefill.
@@ -304,8 +303,6 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
         verify_input: EagleVerifyInput,
     ):
         fwd_stream = torch.get_device_module(self.device).current_stream()
-        if not isinstance(verify_input, DVRVerifyInput):
-            verify_input = DVRVerifyInput.from_eagle_verify_input(verify_input)
         batch.spec_info = verify_input
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 

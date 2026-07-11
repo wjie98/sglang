@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import weakref
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
-
-from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
 DVRMambaCheckpoint = tuple[int, int]
@@ -513,29 +511,3 @@ def maybe_filter_running_batch_with_dvr_state(
             keep_indices.append(i)
     batch.filter_batch(keep_indices=keep_indices)
     return True
-
-
-@dataclass
-class DVRVerifyInput(EagleVerifyInput):
-    """DVR target verify input for both self-draft and EAGLE/MTP draft.
-
-    The verifier shape is EAGLE-compatible in both modes.  ``is_self_draft``
-    selects the chain accept/reject sampler and fast self-draft state commit;
-    EAGLE/MTP leaves it false and uses target-only sampling.
-    """
-
-    is_self_draft: bool = False
-
-    @classmethod
-    def from_eagle_verify_input(
-        cls, verify_input: EagleVerifyInput, *, is_self_draft: bool = False
-    ):
-        """Preserve EAGLE draft metadata while adding DVR mode selection."""
-
-        return cls(
-            **{
-                field.name: getattr(verify_input, field.name)
-                for field in fields(EagleVerifyInput)
-            },
-            is_self_draft=is_self_draft,
-        )

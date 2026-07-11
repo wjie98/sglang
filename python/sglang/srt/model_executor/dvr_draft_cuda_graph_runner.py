@@ -384,22 +384,6 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
         )
         super().__init__(model_runner, **kwargs)
 
-    def get_spec_info(self, num_tokens: int):
-        spec_info = super().get_spec_info(num_tokens)
-        if spec_info is None:
-            return None
-        if self.model_runner.spec_algorithm.is_dvr_self_draft():
-            from sglang.srt.speculative.dvr_info import DVRVerifyInput
-
-            return DVRVerifyInput.from_eagle_verify_input(
-                spec_info, is_self_draft=True
-            )
-        if self.model_runner.spec_algorithm.is_dvr_eagle():
-            from sglang.srt.speculative.dvr_info import DVRVerifyInput
-
-            return DVRVerifyInput.from_eagle_verify_input(spec_info)
-        return spec_info
-
     def _fill_replay_side_buffers(
         self, forward_batch: ForwardBatch, raw_num_token: int
     ) -> None:
