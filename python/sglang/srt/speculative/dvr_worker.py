@@ -33,6 +33,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     iter_dvr_attention_backends,
     _min_seq_len_cpu,
 )
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_info import (
     DVRRollbackActions,
     dvr_compact_output_indices,
@@ -265,7 +266,7 @@ class _DVREagleDraftBackend:
         return eagle_sample(spec_info, batch, logits_output, vocab_mask)
 
 
-class DecodeVerifyRollbackWorkerV2:
+class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     """Self-decode draft worker with DVR target verify/rollback semantics.
 
     User-visible "spec v1" is a synchronous compatibility mode over this same
@@ -296,7 +297,6 @@ class DecodeVerifyRollbackWorkerV2:
                 "aligned to FLA_CHUNK_SIZE."
             )
         self.server_args = server_args
-        self.target_worker = target_worker
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.model_config = target_worker.model_config
@@ -428,24 +428,15 @@ class DecodeVerifyRollbackWorkerV2:
             error_prefix=error_prefix,
         )
 
-    def __getattr__(self, name):
-        if name == "target_worker":
-            raise AttributeError(name)
-        return getattr(self.target_worker, name)
+    @property
+    def target_worker(self):
+        return self._target_worker
 
     def init_attention_backends(self):
         if self.is_dvr_eagle:
             self._draft_worker.init_attention_backends()
         # Self-DVR target worker owns the model and attention backend. Scheduler
         # already initializes it before calling this self-draft worker hook.
-
-    def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
-    ) -> None:
-        pass
-
-    def activate_step_by_batch(self, batch_size: int) -> None:
-        pass
 
     def init_cuda_graphs(self):
         if self.is_dvr_eagle:
@@ -901,6 +892,30 @@ class DecodeVerifyRollbackWorkerV2:
         if self.is_dvr_eagle:
             return [("draft", self._draft_worker.draft_runner)]
         return []
+
+    def update_weights_from_disk(self, recv_req):
+        if not self.is_dvr_eagle:
+            # The scheduler has already updated the target model. Self-draft
+            # shares those weights and must not load them a second time.
+            return True, "Succeeded to update model weights."
+        success, message = self._draft_worker.draft_runner.update_weights_from_disk(
+            recv_req.model_path,
+            recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
+        )
+        if not success:
+            return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_ipc(self, recv_req):
+        if not self.is_dvr_eagle:
+            return True, "Succeeded to update model weights."
+        success, message = self._draft_worker.draft_runner.update_weights_from_ipc(
+            recv_req
+        )
+        if not success:
+            return success, message
+        return True, "Succeeded to update model weights."
 
     def clear_cache_pool(self):
         self.linear_state.clear_cache_state()

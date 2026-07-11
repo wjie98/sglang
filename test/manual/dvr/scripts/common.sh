@@ -7,7 +7,9 @@ DVR_REPO_ROOT="$(cd "${DVR_SCRIPT_DIR}/../../../.." && pwd)"
 cd "${DVR_REPO_ROOT}"
 
 CONDA_ENV="${CONDA_ENV:-dvr_dev}"
-export PYTHONPATH="${PYTHONPATH:-python}"
+# Put this worktree first even when the conda environment contains an editable
+# SGLang install from another worktree.
+export PYTHONPATH="${DVR_REPO_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 export SGLANG_RETURN_ORIGINAL_LOGPROB="${SGLANG_RETURN_ORIGINAL_LOGPROB:-True}"
 
 if [[ -z "${CUDAHOSTCXX:-}" ]]; then

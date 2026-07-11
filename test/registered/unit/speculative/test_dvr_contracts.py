@@ -7,6 +7,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     dvr_self_draft_graph_block_reason,
 )
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_info import (
     DVRRollbackActions,
@@ -32,6 +33,24 @@ def test_dvr_spec_algorithm_contracts():
     assert eagle_draft.is_dvr()
     assert eagle_draft.is_dvr_eagle()
     assert not eagle_draft.is_eagle()
+
+
+def test_dvr_worker_uses_base_spec_worker_contract():
+    assert issubclass(DecodeVerifyRollbackWorkerV2, BaseSpecWorker)
+    assert not DecodeVerifyRollbackWorkerV2.__abstractmethods__
+
+
+def test_dvr_self_draft_weight_update_does_not_reload_target():
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.is_dvr_eagle = False
+    assert worker.update_weights_from_disk(SimpleNamespace()) == (
+        True,
+        "Succeeded to update model weights.",
+    )
+    assert worker.update_weights_from_ipc(SimpleNamespace()) == (
+        True,
+        "Succeeded to update model weights.",
+    )
 
 
 def test_dvr_published_seq_len_filter_hook():
