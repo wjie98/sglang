@@ -283,7 +283,7 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
             verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
         assert verify_input.is_verify_input()
         batch.spec_info = verify_input
-        batch_output = self.verify(batch, verify_input)
+        batch_output = self.verify(batch)
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
         with (
@@ -297,13 +297,10 @@ class DecodeVerifyRollbackEagleWorkerV2(EAGLEWorkerV2):
 
         return batch_output
 
-    def verify(
-        self,
-        batch: ScheduleBatch,
-        verify_input: EagleVerifyInput,
-    ):
+    def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
-        batch.spec_info = verify_input
+        verify_input: EagleVerifyInput = batch.spec_info
+        assert verify_input.is_verify_input()
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
