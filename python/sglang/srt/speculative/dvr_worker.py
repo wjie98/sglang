@@ -38,7 +38,7 @@ from sglang.srt.speculative.dvr_info import (
     DVRPendingOutputPrefix,
     dvr_compact_output_indices,
 )
-from sglang.srt.speculative.dvr_core import finish_dvr_verify
+from sglang.srt.speculative.dvr_core import DVRVerifyOutput, finish_dvr_verify
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
     dvr_suffix_replay_context,
@@ -1182,12 +1182,19 @@ class DecodeVerifyRollbackWorkerV2:
             accept_lens=accept_lens,
             accept_lens_cpu=None,
             num_draft_tokens=self.speculative_num_draft_tokens,
-            replay_prefix=self.dvr_output_replay_prefix if has_verify_tokens else None,
-            output_tokens=predict if has_verify_tokens else None,
-            token_logprobs=logits_output.next_token_logprobs,
-            tokens_per_req=spec_info.draft_token_num if has_verify_tokens else None,
+            output=(
+                DVRVerifyOutput(
+                    replay_prefix=self.dvr_output_replay_prefix,
+                    tokens=predict,
+                    token_logprobs=logits_output.next_token_logprobs,
+                    tokens_per_req=spec_info.draft_token_num,
+                    base_seq_lens_cpu=base_seq_lens_cpu,
+                    error_prefix="DVR EAGLE",
+                )
+                if has_verify_tokens
+                else None
+            ),
             base_seq_lens_cpu=base_seq_lens_cpu,
-            error_prefix="DVR EAGLE",
             predict=predict if partial_suffix_replay_kwargs is not None else None,
             accept_index=(
                 accept_index if partial_suffix_replay_kwargs is not None else None
@@ -1370,12 +1377,19 @@ class DecodeVerifyRollbackWorkerV2:
             accept_lens=accept_lens,
             accept_lens_cpu=None,
             num_draft_tokens=self.num_draft_tokens,
-            replay_prefix=self.dvr_output_replay_prefix if has_verify_tokens else None,
-            output_tokens=predict if has_verify_tokens else None,
-            token_logprobs=logits_output.next_token_logprobs,
-            tokens_per_req=self.num_draft_tokens if has_verify_tokens else None,
+            output=(
+                DVRVerifyOutput(
+                    replay_prefix=self.dvr_output_replay_prefix,
+                    tokens=predict,
+                    token_logprobs=logits_output.next_token_logprobs,
+                    tokens_per_req=self.num_draft_tokens,
+                    base_seq_lens_cpu=base_seq_lens_cpu,
+                    error_prefix="DVR spec-v2",
+                )
+                if has_verify_tokens
+                else None
+            ),
             base_seq_lens_cpu=base_seq_lens_cpu,
-            error_prefix="DVR spec-v2",
             use_fast_self_draft_commit=True,
         )
 

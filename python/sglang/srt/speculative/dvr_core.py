@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -18,37 +19,44 @@ from sglang.srt.speculative.dvr_state_flow import (
 )
 
 
+@dataclass
+class DVRVerifyOutput:
+    """Client-visible DVR tokens produced by one target verify step."""
+
+    replay_prefix: DVRPendingOutputPrefix
+    tokens: torch.Tensor
+    token_logprobs: Optional[torch.Tensor]
+    tokens_per_req: int
+    base_seq_lens_cpu: list[int]
+    error_prefix: str
+
+
 def score_dvr_verify_outputs(
     *,
     batch: Any,
-    replay_prefix: DVRPendingOutputPrefix,
-    output_tokens: torch.Tensor,
+    output: DVRVerifyOutput,
     accept_lens: torch.Tensor,
-    token_logprobs: Optional[torch.Tensor],
-    tokens_per_req: int,
-    base_seq_lens_cpu: list[int],
-    error_prefix: str,
 ) -> tuple[list[int], Optional[list[Optional[DVRFinalLogprobRepair]]]]:
     """Record accepted DVR tokens and carry exact final non-streaming logprobs."""
 
     accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
-        output_tokens=output_tokens,
+        output_tokens=output.tokens,
         accept_lens=accept_lens,
-        tokens_per_req=tokens_per_req,
+        tokens_per_req=output.tokens_per_req,
     )
     token_logprobs_per_req = None
-    if token_logprobs is not None:
-        logprob_rows = token_logprobs.detach().cpu().tolist()
+    if output.token_logprobs is not None:
+        logprob_rows = output.token_logprobs.detach().cpu().tolist()
         token_logprobs_per_req = [
             [float(value) for value in row[:accept_len]]
             for row, accept_len in zip(logprob_rows, accept_lens_cpu, strict=True)
         ]
-    replay_prefix.append_batch_output_tokens(
+    output.replay_prefix.append_batch_output_tokens(
         batch,
         token_ids_per_req,
         token_logprobs_per_req=token_logprobs_per_req,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        error_prefix=f"{error_prefix} output prefix",
+        base_seq_lens_cpu=output.base_seq_lens_cpu,
+        error_prefix=f"{output.error_prefix} output prefix",
     )
     if not batch.return_logprob:
         return accept_lens_cpu, None
@@ -58,7 +66,9 @@ def score_dvr_verify_outputs(
         max_new_tokens = req.sampling_params.max_new_tokens
         if max_new_tokens is not None:
             prompt_len = len(req.origin_input_ids)
-            prefix_output_len = max(0, int(base_seq_lens_cpu[req_i]) - prompt_len)
+            prefix_output_len = max(
+                0, int(output.base_seq_lens_cpu[req_i]) - prompt_len
+            )
             if prefix_output_len >= int(max_new_tokens):
                 continue
         defer_dvr_non_streaming_logprob_output(req)
@@ -70,9 +80,9 @@ def score_dvr_verify_outputs(
     ]
     has_repair = False
     for req_i, (req, seq_len, accept_len) in enumerate(
-        zip(batch.reqs, base_seq_lens_cpu, accept_lens_cpu, strict=True)
+        zip(batch.reqs, output.base_seq_lens_cpu, accept_lens_cpu, strict=True)
     ):
-        observed_output_len = replay_prefix.observed_output_len(req)
+        observed_output_len = output.replay_prefix.observed_output_len(req)
         final_output_len = _final_output_len_if_repair_needed(
             req=req,
             req_i=req_i,
@@ -86,10 +96,10 @@ def score_dvr_verify_outputs(
 
         if not try_claim_dvr_final_logprob_repair(req):
             continue
-        repairs[req_i] = replay_prefix.final_logprob_repair(
+        repairs[req_i] = output.replay_prefix.final_logprob_repair(
             req=req,
             output_len=final_output_len,
-            error_prefix=f"{error_prefix} final logprob",
+            error_prefix=f"{output.error_prefix} final logprob",
         )
         has_repair = True
     return accept_lens_cpu, repairs if has_repair else None
@@ -168,12 +178,8 @@ def finish_dvr_verify(
     accept_lens: torch.Tensor,
     accept_lens_cpu: Optional[list[int]],
     num_draft_tokens: int,
-    replay_prefix: Optional[DVRPendingOutputPrefix] = None,
-    output_tokens: Optional[torch.Tensor] = None,
-    token_logprobs: Optional[torch.Tensor] = None,
-    tokens_per_req: Optional[int] = None,
+    output: Optional[DVRVerifyOutput] = None,
     base_seq_lens_cpu: Optional[list[int]] = None,
-    error_prefix: str = "DVR",
     predict: Optional[torch.Tensor] = None,
     accept_index: Optional[torch.Tensor] = None,
     partial_suffix_replay_kwargs: Optional[dict[str, Any]] = None,
@@ -187,22 +193,11 @@ def finish_dvr_verify(
     """
 
     final_logprob_repairs = None
-    if (
-        replay_prefix is not None
-        and output_tokens is not None
-        and tokens_per_req is not None
-        and base_seq_lens_cpu is not None
-        and not batch.forward_mode.is_idle()
-    ):
+    if output is not None and not batch.forward_mode.is_idle():
         accept_lens_cpu, final_logprob_repairs = score_dvr_verify_outputs(
             batch=batch,
-            replay_prefix=replay_prefix,
-            output_tokens=output_tokens,
+            output=output,
             accept_lens=accept_lens,
-            token_logprobs=token_logprobs,
-            tokens_per_req=tokens_per_req,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            error_prefix=error_prefix,
         )
     elif accept_lens_cpu is None:
         accept_lens_cpu = accept_lens.detach().cpu().tolist()
