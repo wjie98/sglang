@@ -841,7 +841,10 @@ class TritonAttnBackend(AttentionBackend):
             # Allocate the same upper bound used by _update_target_verify_buffers
             # so graph replay remains valid at context-length boundaries.
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * (self.max_context_len + self.num_draft_tokens)),
+                (
+                    max_num_tokens
+                    * (self.max_context_len + (self.num_draft_tokens or 0))
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )
