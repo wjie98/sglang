@@ -1,8 +1,8 @@
 """Manual unit check for DVR chain speculative sampling.
 
 DVR self draft runs topk=1, so EAGLE's tree sampling reduces to a single
-chain. The production path intentionally keeps only the Triton CUDA kernel; this
-test owns a small Python reference so serving code does not carry a slow fallback.
+chain. DVR reuses SGLang's shared Triton rejection-sampling kernel; this test
+owns a small Python reference so serving code does not carry a slow fallback.
 
 The reference mirrors the EAGLE verify contract used by DVR:
 
@@ -167,11 +167,6 @@ def make_probs(
         draft_probs = draft_probs / draft_probs.sum(dim=-1, keepdim=True)
         target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
         coins.fill_(0.99)
-    elif mode == "zero_residual":
-        draft_probs = target_probs.clone()
-        candidates[:, 1] = vocab_size
-        coins.fill_(0.99)
-
     return candidates, target_probs.contiguous(), draft_probs.contiguous(), coins
 
 
@@ -295,7 +290,7 @@ def main():
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA is required for the DVR chain sampling test.")
 
-    modes = ("random", "all_accept", "early_reject", "zero_residual")
+    modes = ("random", "all_accept", "early_reject")
     for batch_i, batch in enumerate(parse_int_list(args.batch_sizes)):
         for mode_i, mode in enumerate(modes):
             run_case(
