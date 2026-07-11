@@ -280,7 +280,6 @@ def main() -> None:
                 "accept_ok": accept_ok,
                 "accept_length": meta.get("spec_accept_length"),
                 "correct_drafts": meta.get("spec_num_correct_drafts"),
-                "proposed_drafts": meta.get("spec_num_proposed_drafts"),
                 "verify_ct": meta.get("spec_verify_ct"),
                 "histogram": meta.get("spec_correct_drafts_histogram"),
                 "hash": digest(output_ids),

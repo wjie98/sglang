@@ -577,9 +577,6 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
-        proposed_drafts_per_req = result.num_proposed_drafts_per_req_cpu
-        default_proposed_per_verify = max(0, int(stride) - 1)
-
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
@@ -609,12 +606,6 @@ class SchedulerBatchResultProcessor:
                 record_spec_verify_metrics(
                     req,
                     num_correct_drafts=num_correct_drafts,
-                    num_proposed_drafts=(
-                        proposed_drafts_per_req[i]
-                        if proposed_drafts_per_req is not None
-                        else None
-                    ),
-                    proposed_per_verify=default_proposed_per_verify,
                 )
 
             predict_tokens.append(accept_tokens)

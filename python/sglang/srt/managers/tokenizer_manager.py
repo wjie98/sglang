@@ -2318,17 +2318,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
-            if (
-                hasattr(recv_obj, "spec_num_proposed_drafts")
-                and len(recv_obj.spec_num_proposed_drafts) > i
-                and recv_obj.spec_num_proposed_drafts[i] > 0
-            ):
-                num_proposed_drafts = recv_obj.spec_num_proposed_drafts[i]
-            else:
-                proposed_per_verify = max(
-                    0, int(self.server_args.speculative_num_draft_tokens) - 1
-                )
-                num_proposed_drafts = recv_obj.spec_verify_ct[i] * proposed_per_verify
+            proposed_per_verify = max(
+                0, int(self.server_args.speculative_num_draft_tokens) - 1
+            )
+            num_proposed_drafts = recv_obj.spec_verify_ct[i] * proposed_per_verify
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
@@ -2341,12 +2334,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
                 meta_info["spec_num_correct_drafts"] = num_correct_drafts
-                meta_info["spec_num_proposed_drafts"] = num_proposed_drafts
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
                 # FIXME: backward-compat aliases, remove in next release.
                 meta_info["spec_accepted_drafts"] = num_correct_drafts
-                meta_info["spec_proposed_drafts"] = num_proposed_drafts
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (

@@ -72,7 +72,6 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.speculative.reject_sampling import (
     chain_speculative_sampling_triton as chain_speculative_sampling,
 )
-from sglang.srt.speculative.spec_info import useful_spec_proposed_drafts
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
@@ -1076,10 +1075,6 @@ class DecodeVerifyRollbackWorkerV2:
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
-            num_proposed_drafts_per_req_cpu=[
-                useful_spec_proposed_drafts(req, self.num_draft_steps)
-                for req in batch.reqs
-            ],
             dvr_aux=dvr_aux,
             routed_experts_output=routed_experts_output,
             indexer_topk_output=indexer_topk_output,
