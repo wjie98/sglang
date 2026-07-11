@@ -2710,7 +2710,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 self.decode_cuda_graph_runner = DVRTargetVerifyCudaGraphRunner(
                     self,
-                    skip_prefill_only_deterministic_for_capture=(
+                    dvr_target_verify_cuda_graph=(
                         self.spec_algorithm.is_dvr_eagle()
                     ),
                 )

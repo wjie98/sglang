@@ -458,7 +458,7 @@ class DecodeVerifyRollbackWorkerV2:
                 self.cuda_graph_runner_for_target_verify = (
                     DVRTargetVerifyCudaGraphRunner(
                         self.target_worker.model_runner,
-                        skip_prefill_only_deterministic_for_capture=True,
+                        dvr_target_verify_cuda_graph=True,
                     )
                 )
             return

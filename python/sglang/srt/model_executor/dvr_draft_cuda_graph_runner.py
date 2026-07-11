@@ -354,19 +354,27 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     spec_info data object.
     """
 
-    skip_prefill_only_deterministic_for_capture = False
-
     def __init__(
         self,
         model_runner,
         *,
-        skip_prefill_only_deterministic_for_capture: bool = False,
+        dvr_target_verify_cuda_graph: bool = False,
         **kwargs,
     ):
-        self.skip_prefill_only_deterministic_for_capture = (
-            skip_prefill_only_deterministic_for_capture
+        had_override = hasattr(model_runner, "enable_dvr_target_verify_cuda_graph")
+        old_override = getattr(
+            model_runner, "enable_dvr_target_verify_cuda_graph", False
         )
-        super().__init__(model_runner, **kwargs)
+        model_runner.enable_dvr_target_verify_cuda_graph = (
+            dvr_target_verify_cuda_graph
+        )
+        try:
+            super().__init__(model_runner, **kwargs)
+        finally:
+            if had_override:
+                model_runner.enable_dvr_target_verify_cuda_graph = old_override
+            else:
+                delattr(model_runner, "enable_dvr_target_verify_cuda_graph")
 
     def _fill_replay_side_buffers(
         self, forward_batch: ForwardBatch, raw_num_token: int

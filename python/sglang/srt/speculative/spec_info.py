@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
@@ -269,24 +269,6 @@ class SpeculativeAlgorithm(Enum):
             return NGRAMWorker
 
         raise ValueError("Unreachable code path in create_worker.")
-
-
-def record_spec_verify_metrics(
-    req: Any,
-    *,
-    num_correct_drafts: int,
-) -> None:
-    """Record one speculative verify step on a request."""
-
-    num_correct_drafts = max(0, int(num_correct_drafts))
-
-    req.spec_verify_ct += 1
-    req.spec_num_correct_drafts += num_correct_drafts
-
-    histogram = req.spec_correct_drafts_histogram
-    if len(histogram) <= num_correct_drafts:
-        histogram.extend([0] * (num_correct_drafts - len(histogram) + 1))
-    histogram[num_correct_drafts] += 1
 
 
 class SpecInputType(IntEnum):
