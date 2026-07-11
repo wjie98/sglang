@@ -16,8 +16,10 @@ from sglang.srt.layers.attention.fla.index import (
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
 from sglang.srt.layers.attention.fla.utils import (
     autotune_cache_kwargs,
+    is_nvidia_hopper,
 )
 
+NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
@@ -319,6 +321,8 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
+    # Boundary states must keep the recurrent-state dtype; DVR compares and
+    # reuses them as prefill-equivalent checkpoints.
     h_dtype = initial_state.dtype if initial_state is not None else k.dtype
     h = torch.empty(B, NT, H, V, K, dtype=h_dtype, device=k.device)
 

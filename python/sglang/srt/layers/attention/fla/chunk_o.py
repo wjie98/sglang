@@ -10,8 +10,22 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
+from sglang.srt.layers.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+
+BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
+NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
+# @triton.autotune(
+#     configs=[
+#         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+#         for BK in BKV_LIST
+#         for BV in BKV_LIST
+#         for num_warps in NUM_WARPS
+#         for num_stages in [2, 3, 4]
+#     ],
+#     key=["H", "K", "V", "BT"],
+# )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
@@ -80,6 +94,8 @@ def chunk_fwd_kernel_o(
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
+        # h may be stored in fp32 for deterministic recurrent checkpoints; dot
+        # still follows q/k's math dtype for prefill-equivalent output.
         b_o += tl.dot(b_q, tl.trans(b_h.to(b_q.dtype)))
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)
