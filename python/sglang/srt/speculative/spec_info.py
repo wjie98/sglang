@@ -231,11 +231,11 @@ class SpeculativeAlgorithm(Enum):
             return FrozenKVMTPWorkerV2
 
         if self.is_dvr_eagle():
-            from sglang.srt.speculative.dvr_eagle_worker import (
-                DecodeVerifyRollbackEagleWorkerV2,
+            from sglang.srt.speculative.dvr_worker import (
+                DecodeVerifyRollbackWorkerV2,
             )
 
-            return DecodeVerifyRollbackEagleWorkerV2
+            return DecodeVerifyRollbackWorkerV2
 
         if self.is_dvr_self_draft():
             from sglang.srt.speculative.dvr_worker import (
