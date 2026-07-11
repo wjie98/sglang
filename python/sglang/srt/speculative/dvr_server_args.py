@@ -29,19 +29,6 @@ def is_dvr_eagle_enabled(server_args) -> bool:
     return server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
 
 
-def should_force_dvr_eagle_target_prefix_miss(server_args) -> bool:
-    """Return whether target radix prefix matching must stay disabled.
-
-    DVR-EAGLE/MTP uses the standard EAGLE/MTP draft KV pool, while the regular
-    radix tree owns only target KV and GDN checkpoints.  Until draft-prefix KV
-    ownership is represented in the cache, a target prefix hit can leave draft
-    KV unavailable or stale and reduce acceptance.  Keep this policy DVR-local
-    so scheduler prefix matching stays a plain cache lookup.
-    """
-
-    return is_dvr_eagle_enabled(server_args)
-
-
 def handle_dvr_defaults(server_args):
     if not is_dvr_enabled(server_args):
         return
@@ -129,22 +116,6 @@ def handle_dvr_speculative_decoding(server_args):
         raise ValueError(
             "DVR EAGLE requires setting --speculative-draft-model-path."
         )
-    if (
-        is_dvr_eagle_enabled(server_args)
-        and not server_args.disable_radix_cache
-        and not _is_dvr_gated_linear_state_model_safe(server_args)
-    ):
-        # DVR-EAGLE/MTP owns an independent draft KV pool.  The regular radix
-        # tree only tracks target KV slots, so a target prefix hit can leave
-        # the MTP draft prefix KV unavailable or stale and sharply reduce the
-        # accept rate.  Keep correctness/acceptance stable until draft-prefix
-        # KV ownership is represented in the cache.
-        logger.warning(
-            "Radix cache is disabled for DVR EAGLE because independent MTP "
-            "draft KV prefixes are not tracked by the target radix cache."
-        )
-        server_args.disable_radix_cache = True
-
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = 16
         logger.warning(

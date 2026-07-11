@@ -1027,19 +1027,10 @@ class Req(ReqDllmMixin):
     @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
-        server_args = get_global_server_args()
-        spec_alg = server_args.speculative_algorithm
-        # Most speculative algorithms keep prefill-only optimizations disabled
-        # so their draft-side state can stay warm.  DVR-EAGLE's draft KV is
-        # request-local and not represented in target radix cache nodes, so a
-        # max_new=0 cache-warm/scoring request should remain target prefill only.
-        if self.sampling_params.max_new_tokens != 0:
-            return False
-        if spec_alg is None:
-            return True
-        from sglang.srt.speculative.dvr_server_args import is_dvr_eagle_enabled
+        # NOTE: when spec is enabled, prefill_only optimizations are disabled
 
-        return is_dvr_eagle_enabled(server_args)
+        spec_alg = get_global_server_args().speculative_algorithm
+        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
     def output_ids_through_stop(self) -> array[int]:
@@ -1170,20 +1161,8 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
-            from sglang.srt.speculative.dvr_server_args import (
-                should_force_dvr_eagle_target_prefix_miss,
-            )
-
-            dvr_eagle_force_miss = should_force_dvr_eagle_target_prefix_miss(
-                get_global_server_args()
-            )
-            if dvr_eagle_force_miss:
-                token_ids_to_match = array("q")
-                key_limit = None
             if cow_mamba is None:
-                cow_mamba = tree_cache.supports_mamba() and not dvr_eagle_force_miss
-            elif dvr_eagle_force_miss:
-                cow_mamba = False
+                cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(

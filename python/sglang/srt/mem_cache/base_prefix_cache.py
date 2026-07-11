@@ -204,7 +204,6 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
-        mamba_branching_seqlen=None,
     )
 
 

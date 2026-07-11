@@ -92,14 +92,14 @@ class TestDVRServerArgs(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
                 handle_dvr_speculative_decoding(args)
 
-    def test_dvr_eagle_disables_radix_cache(self):
+    def test_dvr_eagle_keeps_radix_cache(self):
         args = _Args()
         args.speculative_algorithm = DVR_EAGLE_SPECULATIVE_ALGORITHM
         args.speculative_draft_model_path = "draft"
 
         handle_dvr_speculative_decoding(args)
 
-        self.assertTrue(args.disable_radix_cache)
+        self.assertFalse(args.disable_radix_cache)
 
 
 if __name__ == "__main__":
