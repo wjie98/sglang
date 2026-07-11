@@ -38,7 +38,7 @@ from sglang.srt.speculative.dvr_info import (
     DVRRollbackActions,
     dvr_compact_output_indices,
 )
-from sglang.srt.speculative.dvr_core import DVRVerifyOutput, finish_dvr_verify
+from sglang.srt.speculative.dvr_core import DVRVerifyOutput, rollback_dvr_verify
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
     dvr_suffix_replay_context,
@@ -969,21 +969,17 @@ class DecodeVerifyRollbackWorkerV2:
             return batch_output
 
         self.activate_step_by_batch(batch.seq_lens.shape[0])
-        if batch.spec_info is None:
-            batch.spec_info = self.draft_backend.idle_draft_input()
-
-        self._prepare_dvr_boundary_for_verify(batch)
-        verify_input: EagleVerifyInput = self.draft_backend.draft(batch)
-        assert verify_input.is_verify_input()
-        batch.spec_info = verify_input
-        batch_output = self.verify(batch, verify_input)
+        batch_output = self._run_decode_draft_verify_rollback(
+            batch,
+            prepare_boundary_for_verify=True,
+        )
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
         with self.draft_backend.draft_context():
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
         return batch_output
 
-    def _finish_verify_result(
+    def _rollback_after_verify(
         self,
         *,
         batch: ScheduleBatch,
@@ -1005,7 +1001,9 @@ class DecodeVerifyRollbackWorkerV2:
         partial_suffix_replay_kwargs=None,
         use_fast_self_draft_commit: bool = False,
     ) -> GenerationBatchResult:
-        dvr_rollback_actions = finish_dvr_verify(
+        """Apply DVR rollback and package the scheduler-visible batch result."""
+
+        dvr_rollback_actions = rollback_dvr_verify(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
@@ -1199,7 +1197,7 @@ class DecodeVerifyRollbackWorkerV2:
                 num_draft_tokens=self.speculative_num_draft_tokens,
                 request_token_ids_for_replay=self._request_token_ids_for_replay,
             )
-        batch_result = self._finish_verify_result(
+        batch_result = self._rollback_after_verify(
             batch=batch,
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -1229,6 +1227,24 @@ class DecodeVerifyRollbackWorkerV2:
                 self.speculative_num_draft_tokens,
             )
         return batch_result
+
+    def _run_decode_draft_verify_rollback(
+        self,
+        batch: ScheduleBatch,
+        *,
+        prepare_boundary_for_verify: bool = False,
+    ) -> GenerationBatchResult:
+        """Run one decode step through DVR's core draft -> verify -> rollback path."""
+
+        if batch.spec_info is None:
+            batch.spec_info = self.draft_backend.idle_draft_input()
+        if prepare_boundary_for_verify:
+            self._prepare_dvr_boundary_for_verify(batch)
+
+        verify_input = self.draft(batch)
+        assert verify_input.is_verify_input()
+        batch.spec_info = verify_input
+        return self.verify(batch, verify_input)
 
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
@@ -1264,12 +1280,7 @@ class DecodeVerifyRollbackWorkerV2:
                 on_publish(batch_result.new_seq_lens)
             return batch_result
 
-        if batch.spec_info is None:
-            batch.spec_info = self.draft_backend.idle_draft_input()
-
-        verify_input = self.draft_backend.draft(batch)
-        batch.spec_info = verify_input
-        batch_result = self.verify(batch, verify_input)
+        batch_result = self._run_decode_draft_verify_rollback(batch)
         if on_publish is not None:
             on_publish(batch_result.new_seq_lens)
         return batch_result
@@ -1373,7 +1384,7 @@ class DecodeVerifyRollbackWorkerV2:
 
         # Self draft reuses target KV/GDN state directly, so accepted suffix
         # repair is unnecessary; the fast commit path can copy verify state.
-        return self._finish_verify_result(
+        return self._rollback_after_verify(
             batch=batch,
             logits_output=logits_output,
             can_run_cuda_graph=batch_result.can_run_cuda_graph,

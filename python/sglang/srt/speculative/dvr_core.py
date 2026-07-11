@@ -166,7 +166,7 @@ def _final_output_len_if_repair_needed(
     return None
 
 
-def finish_dvr_verify(
+def rollback_dvr_verify(
     *,
     batch: Any,
     linear_state: Any,
@@ -180,11 +180,11 @@ def finish_dvr_verify(
     partial_suffix_replay_kwargs: Optional[dict[str, Any]] = None,
     use_fast_self_draft_commit: bool = False,
 ) -> DVRRollbackActions:
-    """Record accepted output rows and commit target recurrent state.
+    """Rollback target state and output metadata after a DVR verify step.
 
-    Draft adapters stop at sampling.  Everything after that is DVR core:
-    scheduler-visible output prefix, optional exact logprob repair, accepted
-    suffix state repair, and delayed checkpoint publication for spec-v2.
+    Draft adapters stop at sampling.  Everything after that is rollback:
+    scheduler-visible output prefix, exact logprob repair, accepted suffix state
+    repair, and delayed checkpoint publication for spec-v2.
     """
 
     final_logprob_repairs = None
