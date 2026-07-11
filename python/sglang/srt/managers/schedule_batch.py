@@ -109,10 +109,6 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.speculative.dvr_server_args import (
-    is_dvr_eagle_enabled,
-    should_force_dvr_eagle_target_prefix_miss,
-)
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
@@ -1032,15 +1028,19 @@ class Req(ReqDllmMixin):
     @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
-        spec_alg = get_global_server_args().speculative_algorithm
+        server_args = get_global_server_args()
+        spec_alg = server_args.speculative_algorithm
         # Most speculative algorithms keep prefill-only optimizations disabled
         # so their draft-side state can stay warm.  DVR-EAGLE's draft KV is
         # request-local and not represented in target radix cache nodes, so a
         # max_new=0 cache-warm/scoring request should remain target prefill only.
-        return self.sampling_params.max_new_tokens == 0 and (
-            spec_alg is None
-            or is_dvr_eagle_enabled(get_global_server_args())
-        )
+        if self.sampling_params.max_new_tokens != 0:
+            return False
+        if spec_alg is None:
+            return True
+        from sglang.srt.speculative.dvr_server_args import is_dvr_eagle_enabled
+
+        return is_dvr_eagle_enabled(server_args)
 
     @property
     def output_ids_through_stop(self) -> array[int]:
@@ -1159,6 +1159,10 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
+            from sglang.srt.speculative.dvr_server_args import (
+                should_force_dvr_eagle_target_prefix_miss,
+            )
+
             dvr_eagle_force_miss = should_force_dvr_eagle_target_prefix_miss(
                 get_global_server_args()
             )

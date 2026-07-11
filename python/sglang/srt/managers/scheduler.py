@@ -244,9 +244,6 @@ from sglang.srt.speculative.dflash_utils import (
     should_delay_dflash_prefill_for_batching,
     validate_dflash_request,
 )
-from sglang.srt.speculative.dvr_info import (
-    maybe_filter_running_batch_after_dvr_rollback,
-)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -3017,14 +3014,17 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        dvr_filtered = (
-            batch.spec_algorithm.is_dvr()
-            and maybe_filter_running_batch_after_dvr_rollback(
+        dvr_filtered = False
+        if batch.spec_algorithm.is_dvr():
+            from sglang.srt.speculative.dvr_info import (
+                maybe_filter_running_batch_after_dvr_rollback,
+            )
+
+            dvr_filtered = maybe_filter_running_batch_after_dvr_rollback(
                 batch=batch,
                 future_map=self.future_map,
                 enable_overlap=self.enable_overlap,
             )
-        )
         if not dvr_filtered:
             batch.filter_batch()
         if batch.is_empty():
