@@ -130,7 +130,11 @@ def _ensure_decode_custom_all_reduce_comm(group):
             dispatch_custom_allreduce,
         )
 
-        ca_comm = dispatch_custom_allreduce()(
+        custom_allreduce_cls = dispatch_custom_allreduce(
+            group=group.cpu_group,
+            device=group.device,
+        )
+        ca_comm = custom_allreduce_cls(
             group=group.cpu_group,
             device=group.device,
         )

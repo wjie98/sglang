@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
+    _ensure_decode_custom_all_reduce_comm,
     dvr_self_draft_graph_block_reason,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -167,6 +168,43 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
         )
     assert req.mamba_last_track_seqlen == 64
     assert req.mamba_next_track_idx == 1
+
+
+def test_dvr_custom_all_reduce_uses_current_dispatch_contract(monkeypatch):
+    calls = []
+
+    class FakeCustomAllReduce:
+        def __init__(self, *, group, device):
+            calls.append(("init", group, device))
+            self.world_size = 2
+            self._ptr = 1
+            self.full_nvlink = True
+            self.disabled = False
+            self.original_disabled = False
+
+    def fake_dispatch(*, group, device):
+        calls.append(("dispatch", group, device))
+        return FakeCustomAllReduce
+
+    from sglang.srt.distributed.device_communicators import custom_all_reduce
+
+    monkeypatch.setattr(custom_all_reduce, "dispatch_custom_allreduce", fake_dispatch)
+    group = SimpleNamespace(
+        ca_comm=None,
+        world_size=2,
+        cpu_group="cpu-group",
+        device="cuda:0",
+    )
+
+    ca_comm = _ensure_decode_custom_all_reduce_comm(group)
+
+    assert calls == [
+        ("dispatch", "cpu-group", "cuda:0"),
+        ("init", "cpu-group", "cuda:0"),
+    ]
+    assert group.ca_comm is ca_comm
+    assert ca_comm.disabled
+    assert ca_comm.original_disabled
 
 
 def test_dvr_self_draft_graph_runner_rejects_short_boundary():
