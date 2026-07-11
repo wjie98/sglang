@@ -20,7 +20,7 @@ from sglang.srt.speculative.dvr_server_args import is_dvr_eagle_enabled
 _BoundaryReplayTask = tuple[Any, int, int, Optional[torch.Tensor], int, torch.Tensor]
 
 
-def _build_suffix_replay_plan(
+def _build_verify_replay_plan(
     *,
     batch,
     base_seq_lens_cpu: list[int],
@@ -30,6 +30,8 @@ def _build_suffix_replay_plan(
     request_token_ids_for_replay,
     hidden_gather_append_count: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
+    """Plan target verify replay over the open chunk tail plus draft tokens."""
+
     tail_lens_cpu = []
     extend_lens_cpu = []
     final_seq_lens_cpu = []
@@ -149,10 +151,10 @@ def build_dvr_private_extend_batch(
     mamba_cow_dst_indices: Optional[torch.Tensor] = None,
     mamba_clear_indices: Optional[torch.Tensor] = None,
 ) -> ScheduleBatch:
-    """Create a DVR-owned EXTEND batch for suffix replay.
+    """Create a DVR-owned EXTEND batch for target verify replay.
 
-    DVR replay runs target-model EXTEND on a private token span: the unclosed
-    GDN chunk tail plus draft tokens.  SGLang does not expose a smaller replay
+    Target verify replay runs EXTEND on a private token span: the unclosed GDN
+    chunk tail plus draft tokens.  SGLang does not expose a smaller replay
     object, so this constructor mirrors only the ScheduleBatch fields consumed
     by ForwardBatch/EXTEND/GDN tracking and leaves sampling/output state off.
     Keep this explicit and close to ScheduleBatch when upstream fields change.
@@ -262,7 +264,7 @@ def build_dvr_private_extend_batch(
 
 
 @contextmanager
-def dvr_suffix_replay_context(
+def dvr_verify_replay_context(
     *,
     batch,
     linear_state,
@@ -276,7 +278,7 @@ def dvr_suffix_replay_context(
     use_mamba_cow_from_boundary: bool = False,
     track_replay_boundary_checkpoint: bool = False,
 ):
-    """Prepare a suffix+draft replay batch and protect live DVR state.
+    """Prepare target verify replay and protect live DVR state.
 
     Callers still own the actual forward path: self-DVR uses the normal target
     worker batch entrypoint, while DVR-EAGLE may need a prebuilt ForwardBatch to
@@ -300,7 +302,7 @@ def dvr_suffix_replay_context(
     draft_token_num = draft_tokens.numel() // max(bs, 1)
     draft_tokens = draft_tokens.reshape(bs, draft_token_num)
     draft_cache_locs = draft_cache_locs.reshape(bs, draft_token_num)
-    replay_plan = _build_suffix_replay_plan(
+    replay_plan = _build_verify_replay_plan(
         batch=batch,
         base_seq_lens_cpu=base_seq_lens_cpu,
         boundary_lens=boundary_lens,
@@ -313,8 +315,8 @@ def dvr_suffix_replay_context(
         yield None
         return
 
-    # Suffix replay is an oracle for verifier rows.  When it crosses the next
-    # chunk boundary, let the normal EXTEND tracking path materialize that
+    # Target verify replay is an oracle for verifier rows.  When it crosses the
+    # next chunk boundary, let the normal EXTEND tracking path materialize that
     # boundary checkpoint; DVR commit will decide after sampling whether the
     # checkpoint is actually accepted.
     boundary_track_mask = None
@@ -334,7 +336,7 @@ def dvr_suffix_replay_context(
         )
         if not bool(boundary_track_mask.any().item()):
             boundary_track_mask = None
-    linear_state.suffix_replay_boundary_track_mask = (
+    linear_state.verify_replay_boundary_track_mask = (
         None if boundary_track_mask is None else boundary_track_mask.detach()
     )
     replay_batch = build_dvr_private_extend_batch(
@@ -394,14 +396,14 @@ def dvr_suffix_replay_context(
         yield replay_batch, replay_plan
 
 
-def run_dvr_suffix_replay_oracle(
+def run_target_verify_replay(
     *,
     target_worker,
     replay_batch: ScheduleBatch,
     replay_plan: dict[str, Any],
     use_forward_batch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run a suffix+draft replay oracle and return only draft-row outputs."""
+    """Run target verify replay and return only draft-row outputs."""
 
     model_runner = target_worker.model_runner
     if use_forward_batch:
@@ -518,7 +520,7 @@ class DVRLinearStateLifecycle:
         # request and chunk boundary are unchanged.
         self.boundary_backup_keys = None
         self.live_backup = None
-        self.suffix_replay_boundary_track_mask = None
+        self.verify_replay_boundary_track_mask = None
         if self.state_adapter() is None:
             return
         if self.server_args.mamba_track_interval != FLA_CHUNK_SIZE:
@@ -541,7 +543,7 @@ class DVRLinearStateLifecycle:
         self.boundary_backup = None
         self.boundary_backup_keys = None
         self.live_backup = None
-        self.suffix_replay_boundary_track_mask = None
+        self.verify_replay_boundary_track_mask = None
 
     @staticmethod
     def write_replay_append_cache_locs(
@@ -897,7 +899,7 @@ class DVRLinearStateLifecycle:
         verified_tail_lens = verified_tail_lens.to(
             device=ctx.live_indices.device, dtype=torch.long
         )
-        boundary_already_tracked = self.prepare_suffix_replay_boundary_commit(
+        boundary_already_tracked = self.prepare_verify_replay_boundary_commit(
             ctx=ctx,
             verified_tail_lens_cpu=verified_tail_lens_cpu,
             accepted_token_counts_cpu=accepted_token_counts_cpu,
@@ -935,10 +937,10 @@ class DVRLinearStateLifecycle:
         self.boundary_backup = None
         self.boundary_backup_keys = None
         self.live_backup = None
-        self.suffix_replay_boundary_track_mask = None
+        self.verify_replay_boundary_track_mask = None
         return pending_track_indices, pending_track_seqlens
 
-    def replay_accepted_suffix_for_live_state(
+    def rollback_live_state_with_accepted_suffix(
         self,
         *,
         batch: ScheduleBatch,
@@ -951,7 +953,7 @@ class DVRLinearStateLifecycle:
         num_draft_tokens: int,
         request_token_ids_for_replay,
     ) -> Optional[torch.Tensor]:
-        """Refresh live recurrent state after a partial verify acceptance."""
+        """Rollback live recurrent state after a partial verify acceptance."""
 
         if batch.forward_mode.is_idle() or linear_state_ctx is None:
             return None
@@ -989,7 +991,7 @@ class DVRLinearStateLifecycle:
                 accepted_cache_locs[token_offset : token_offset + accepted_count]
             )
             token_offset += accepted_count
-        replay_plan = _build_suffix_replay_plan(
+        replay_plan = _build_verify_replay_plan(
             batch=batch,
             base_seq_lens_cpu=base_seq_lens_cpu,
             boundary_lens=boundary_lens,
@@ -1002,7 +1004,7 @@ class DVRLinearStateLifecycle:
 
         # Commit repair, not checkpoint publication: leave the live recurrent
         # slot updated by the replay so the normal commit path can copy it.
-        self.suffix_replay_boundary_track_mask = None
+        self.verify_replay_boundary_track_mask = None
         replay_batch = build_dvr_private_extend_batch(
             batch,
             reqs=batch.reqs,
@@ -1285,14 +1287,14 @@ class DVRLinearStateLifecycle:
             boundary_lens.append(int(boundary))
         return boundary_lens
 
-    def prepare_suffix_replay_boundary_commit(
+    def prepare_verify_replay_boundary_commit(
         self,
         *,
         ctx: DVRLinearStateContext,
         verified_tail_lens_cpu,
         accepted_token_counts_cpu,
     ) -> Optional[torch.Tensor]:
-        tracked = self.suffix_replay_boundary_track_mask
+        tracked = self.verify_replay_boundary_track_mask
         if tracked is None:
             return None
         tracked = tracked.to(device=ctx.live_indices.device, dtype=torch.bool)

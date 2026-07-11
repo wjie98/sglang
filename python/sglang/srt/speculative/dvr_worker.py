@@ -41,8 +41,8 @@ from sglang.srt.speculative.dvr_info import (
 from sglang.srt.speculative.dvr_core import DVRVerifyOutput, rollback_dvr_verify
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
-    dvr_suffix_replay_context,
-    run_dvr_suffix_replay_oracle,
+    dvr_verify_replay_context,
+    run_target_verify_replay,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
@@ -809,7 +809,7 @@ class DecodeVerifyRollbackWorkerV2:
             base_seq_lens_cpu = [int(x) for x in batch.seq_lens_cpu.tolist()]
         else:
             base_seq_lens_cpu = [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
-        with dvr_suffix_replay_context(
+        with dvr_verify_replay_context(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
@@ -823,7 +823,7 @@ class DecodeVerifyRollbackWorkerV2:
             if replay is None:
                 return None
             replay_batch, replay_plan = replay
-            draft_logits, _ = run_dvr_suffix_replay_oracle(
+            draft_logits, _ = run_target_verify_replay(
                 target_worker=self.target_worker,
                 replay_batch=replay_batch,
                 replay_plan=replay_plan,
@@ -880,7 +880,7 @@ class DecodeVerifyRollbackWorkerV2:
             return None
 
         base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        with dvr_suffix_replay_context(
+        with dvr_verify_replay_context(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
@@ -894,7 +894,7 @@ class DecodeVerifyRollbackWorkerV2:
             if replay is None:
                 return None
             replay_batch, replay_plan = replay
-            draft_logits, draft_hidden_states = run_dvr_suffix_replay_oracle(
+            draft_logits, draft_hidden_states = run_target_verify_replay(
                 target_worker=self.target_worker,
                 replay_batch=replay_batch,
                 replay_plan=replay_plan,
@@ -998,7 +998,7 @@ class DecodeVerifyRollbackWorkerV2:
         routed_experts_output=None,
         indexer_topk_output=None,
         extra_keep_alive_refs=None,
-        partial_suffix_replay_kwargs=None,
+        rollback_replay_kwargs=None,
         use_fast_self_draft_commit: bool = False,
     ) -> GenerationBatchResult:
         """Apply DVR rollback and package the scheduler-visible batch result."""
@@ -1022,11 +1022,11 @@ class DecodeVerifyRollbackWorkerV2:
                 if has_verify_tokens
                 else None
             ),
-            predict=predict if partial_suffix_replay_kwargs is not None else None,
+            predict=predict if rollback_replay_kwargs is not None else None,
             accept_index=(
-                accept_index if partial_suffix_replay_kwargs is not None else None
+                accept_index if rollback_replay_kwargs is not None else None
             ),
-            partial_suffix_replay_kwargs=partial_suffix_replay_kwargs,
+            rollback_replay_kwargs=rollback_replay_kwargs,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
         return GenerationBatchResult(
@@ -1188,9 +1188,9 @@ class DecodeVerifyRollbackWorkerV2:
                 self.speculative_num_steps,
             )
 
-        partial_suffix_replay_kwargs = None
+        rollback_replay_kwargs = None
         if linear_state_ctx is not None:
-            partial_suffix_replay_kwargs = dict(
+            rollback_replay_kwargs = dict(
                 target_worker=self.target_worker,
                 linear_state_ctx=linear_state_ctx,
                 base_seq_lens_cpu=base_seq_lens_cpu,
@@ -1214,7 +1214,7 @@ class DecodeVerifyRollbackWorkerV2:
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
-            partial_suffix_replay_kwargs=partial_suffix_replay_kwargs,
+            rollback_replay_kwargs=rollback_replay_kwargs,
         )
         if linear_state_ctx is not None:
             self.linear_state.backup_boundary_state(batch, preserve_existing=False)
@@ -1382,8 +1382,8 @@ class DecodeVerifyRollbackWorkerV2:
             has_verify_tokens=has_verify_tokens,
         )
 
-        # Self draft reuses target KV/GDN state directly, so accepted suffix
-        # repair is unnecessary; the fast commit path can copy verify state.
+        # Self draft reuses target KV/GDN state directly, so rollback does not
+        # need a target replay of accepted rows; the fast path copies verify state.
         return self._rollback_after_verify(
             batch=batch,
             logits_output=logits_output,
