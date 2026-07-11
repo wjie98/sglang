@@ -128,6 +128,24 @@ def _build_suffix_replay_plan(
     )
 
 
+def _write_replay_append_cache_locs(
+    replay_batch: ScheduleBatch,
+    replay_plan: dict[str, Any],
+) -> None:
+    append_rows = replay_plan["append_rows"]
+    append_offsets = replay_plan["append_offsets"]
+    if append_rows is None:
+        return
+    assert append_offsets is not None
+    replay_batch.req_to_token_pool.write(
+        (append_rows, append_offsets),
+        replay_plan["append_cache_locs"].to(
+            device=replay_batch.seq_lens.device,
+            dtype=torch.int32,
+        ),
+    )
+
+
 @contextmanager
 def _linear_state_replay_context(
     linear_state_ctx,
@@ -441,12 +459,7 @@ def dvr_suffix_replay_context(
 
         # Draft KV rows must be visible at absolute positions
         # base_seq_len..base_seq_len+draft during the oracle forward.
-        assert replay_plan["append_rows"] is not None
-        assert replay_plan["append_offsets"] is not None
-        replay_batch.req_to_token_pool.write(
-            (replay_plan["append_rows"], replay_plan["append_offsets"]),
-            replay_plan["append_cache_locs"].to(torch.int32),
-        )
+        _write_replay_append_cache_locs(replay_batch, replay_plan)
         yield replay_batch, replay_plan
 
 
@@ -534,15 +547,7 @@ def replay_dvr_accepted_suffix_for_live_state(
         mamba_cow_dst_indices=live_indices,
     )
     with _linear_state_replay_context(linear_state_ctx, restore_live_state=False):
-        if replay_plan["append_rows"] is not None:
-            assert replay_plan["append_offsets"] is not None
-            replay_batch.req_to_token_pool.write(
-                (replay_plan["append_rows"], replay_plan["append_offsets"]),
-                replay_plan["append_cache_locs"].to(
-                    device=replay_batch.seq_lens.device,
-                    dtype=torch.int32,
-                ),
-            )
+        _write_replay_append_cache_locs(replay_batch, replay_plan)
         target_worker.forward_batch_generation(batch=replay_batch, is_verify=True)
         return torch.ones(
             len(batch.reqs), dtype=torch.bool, device=live_indices.device
