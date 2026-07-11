@@ -9,11 +9,13 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
-from sglang.srt.speculative.dvr_info import (
+from sglang.srt.speculative.dvr_core import (
     DVRRollbackActions,
+    append_dvr_batch_output_tokens,
     compact_dvr_accepted_input_tokens_and_cache_locs,
     compact_dvr_output_rows,
     maybe_filter_running_batch_after_dvr_rollback,
+    request_dvr_output_prefix_token_ids,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -194,21 +196,24 @@ def test_dvr_replay_prefix_records_only_visible_output_tokens():
         output_ids=[],
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRRollbackActions()
+    journal = {}
 
     # Target EXTEND publishes the first client-visible token before overlap
     # scheduling has necessarily materialized it into Req.output_ids.
-    prefix.append_batch_output_tokens(
+    append_dvr_batch_output_tokens(
+        journal,
         batch,
         [[748]],
     )
-    assert prefix.request_output_prefix_token_ids(
+    assert request_dvr_output_prefix_token_ids(
+        journal,
         req,
         4,
         error_prefix="DVR EAGLE output replay prefix",
     ) == [101, 102, 103, 748]
     with pytest.raises(RuntimeError, match="not yet owned"):
-        prefix.request_output_prefix_token_ids(
+        request_dvr_output_prefix_token_ids(
+            journal,
             req,
             5,
             error_prefix="DVR EAGLE output replay prefix",
@@ -217,14 +222,16 @@ def test_dvr_replay_prefix_records_only_visible_output_tokens():
     # A rejected EAGLE draft must append the target-predicted output tokens,
     # not the rejected draft candidates.
     req.output_ids = [748]
-    prefix.append_batch_output_tokens(
+    append_dvr_batch_output_tokens(
+        journal,
         batch,
         [[749, 750]],
         base_seq_lens_cpu=[4],
         error_prefix="DVR EAGLE output replay prefix",
     )
 
-    assert prefix.request_output_prefix_token_ids(
+    assert request_dvr_output_prefix_token_ids(
+        journal,
         req,
         6,
         error_prefix="DVR EAGLE final logprob",
@@ -232,7 +239,8 @@ def test_dvr_replay_prefix_records_only_visible_output_tokens():
 
     req.output_ids = [748, 999]
     with pytest.raises(RuntimeError, match="diverged"):
-        prefix.request_output_prefix_token_ids(
+        request_dvr_output_prefix_token_ids(
+            journal,
             req,
             5,
             error_prefix="DVR EAGLE output replay prefix",
@@ -246,20 +254,23 @@ def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
         output_ids=[201],
     )
     batch = SimpleNamespace(reqs=[req])
-    prefix = DVRRollbackActions()
+    journal = {}
 
-    assert prefix.request_output_prefix_token_ids(
+    assert request_dvr_output_prefix_token_ids(
+        journal,
         req,
         3,
         error_prefix="DVR spec-v2",
     ) == [101, 102, 201]
 
-    prefix.append_batch_output_tokens(
+    append_dvr_batch_output_tokens(
+        journal,
         batch,
         [[202, 203]],
     )
 
-    assert prefix.request_output_prefix_token_ids(
+    assert request_dvr_output_prefix_token_ids(
+        journal,
         req,
         5,
         error_prefix="DVR spec-v2",
@@ -277,15 +288,18 @@ def test_dvr_output_replay_prefix_is_req_lifecycle_scoped():
         origin_input_ids=[101, 102],
         output_ids=[301],
     )
-    prefix = DVRRollbackActions()
+    journal = {}
 
-    prefix.append_batch_output_tokens(SimpleNamespace(reqs=[old_req]), [[201, 202]])
-    prefix.prune_to_batch(SimpleNamespace(reqs=[new_req]))
+    append_dvr_batch_output_tokens(
+        journal, SimpleNamespace(reqs=[old_req]), [[201, 202]]
+    )
+    append_dvr_batch_output_tokens(journal, SimpleNamespace(reqs=[new_req]), [[]])
 
     # rid is client/protocol state and can be reused.  The pending output
     # journal must be scoped to the live Req object, otherwise a new request can
     # inherit stale overlap output tokens from a completed request.
-    assert prefix.request_output_prefix_token_ids(
+    assert request_dvr_output_prefix_token_ids(
+        journal,
         new_req,
         3,
         error_prefix="DVR spec-v2",

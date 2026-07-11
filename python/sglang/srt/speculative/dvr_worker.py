@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import weakref
 from contextlib import contextmanager, nullcontext
 from typing import List, Optional
 
@@ -34,11 +35,14 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dvr_info import (
+from sglang.srt.speculative.dvr_core import (
     DVRRollbackActions,
+    append_dvr_batch_output_tokens,
+    compact_dvr_output_rows,
     dvr_compact_output_indices,
+    request_dvr_output_prefix_token_ids,
+    rollback_dvr_verify,
 )
-from sglang.srt.speculative.dvr_core import DVRVerifyOutput, rollback_dvr_verify
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
     dvr_verify_replay_context,
@@ -298,7 +302,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         )
         self.speculative_num_steps = self.num_draft_steps
         self.speculative_num_draft_tokens = self.num_draft_tokens
-        self.dvr_output_journal = DVRRollbackActions()
+        self.dvr_output_journal = weakref.WeakKeyDictionary()
 
     def _dummy_hidden_states(self, num_tokens: int, device=None) -> torch.Tensor:
         """Keep EAGLE indexing contracts without storing real DVR hidden states.
@@ -360,7 +364,8 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle() or batch.reqs is None:
             return
 
-        self.dvr_output_journal.append_batch_output_tokens(
+        append_dvr_batch_output_tokens(
+            self.dvr_output_journal,
             batch,
             [[token_id] for token_id in next_token_ids.detach().cpu().tolist()],
             error_prefix=error_prefix,
@@ -898,7 +903,8 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
         error_prefix = "DVR EAGLE" if self.is_dvr_eagle else "DVR spec-v2"
-        return self.dvr_output_journal.request_output_prefix_token_ids(
+        return request_dvr_output_prefix_token_ids(
+            self.dvr_output_journal,
             req,
             boundary_seqlen,
             error_prefix=error_prefix,
@@ -967,24 +973,29 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         """Apply DVR rollback and package the scheduler-visible batch result."""
 
+        accept_lens_cpu = None
+        if has_verify_tokens:
+            accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
+                output_tokens=predict,
+                accept_lens=accept_lens,
+                tokens_per_req=tokens_per_req,
+            )
+            append_dvr_batch_output_tokens(
+                self.dvr_output_journal,
+                batch,
+                token_ids_per_req,
+                base_seq_lens_cpu=base_seq_lens_cpu,
+                error_prefix=f"{error_prefix} output prefix",
+            )
+
         dvr_rollback_actions = rollback_dvr_verify(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
             accept_lens=accept_lens,
-            accept_lens_cpu=None,
+            accept_lens_cpu=accept_lens_cpu,
+            base_seq_lens_cpu=base_seq_lens_cpu,
             num_draft_tokens=self.num_draft_tokens,
-            output=(
-                DVRVerifyOutput(
-                    replay_prefix=self.dvr_output_journal,
-                    tokens=predict,
-                    tokens_per_req=tokens_per_req,
-                    base_seq_lens_cpu=base_seq_lens_cpu,
-                    error_prefix=error_prefix,
-                )
-                if has_verify_tokens
-                else None
-            ),
             accepted_input_tokens=accepted_input_tokens,
             rollback_replay_kwargs=rollback_replay_kwargs,
             use_fast_self_draft_commit=use_fast_self_draft_commit,

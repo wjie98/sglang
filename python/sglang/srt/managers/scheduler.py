@@ -3016,7 +3016,7 @@ class Scheduler(
 
         dvr_filtered = False
         if batch.spec_algorithm.is_dvr():
-            from sglang.srt.speculative.dvr_info import (
+            from sglang.srt.speculative.dvr_core import (
                 maybe_filter_running_batch_after_dvr_rollback,
             )
 
