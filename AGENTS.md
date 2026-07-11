@@ -21,7 +21,7 @@ Use these entry points:
   - includes the seeded `prompt_len=65`, `max_new=65` boundary acceptance
     regression and fails if reported accept rate drops below `0.99`
 - `test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh`
-  - Qwen3-Next 80B self-DVR spec v1/v2 long-output throughput
+  - Qwen3-Next 80B no-DVR baseline and self-DVR spec v1/v2 long-output throughput
   - covers ShareGPT and fixed LongBench custom-cache inputs
   - covers `return_logprob=True/False`
 
@@ -42,4 +42,6 @@ script or clearly mark it as a new baseline and keep the fixed scripts intact.
 
 The 80B throughput script intentionally pins `--max-mamba-cache-size 16`.
 Omitting it can lower effective request concurrency and produce misleadingly
-low self-DVR throughput.
+low self-DVR throughput.  Its default run includes baseline, v1, and v2;
+`RUN_BASELINE=0` or `RUN_DVR=0` may be used only to resume an interrupted
+matrix in the same `RESULT_ROOT`.

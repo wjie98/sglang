@@ -11,6 +11,8 @@ LONGBENCH_CUSTOM_DATASET="${LONGBENCH_CUSTOM_DATASET:-${DVR_REPO_ROOT}/../dvr-v6
 PORT="${PORT:-30180}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/80b-self-dvr-throughput}"
+RUN_BASELINE="${RUN_BASELINE:-1}"
+RUN_DVR="${RUN_DVR:-1}"
 SERVER_PID=""
 
 mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
@@ -61,6 +63,47 @@ run_bench() {
     2>&1 | tee "${output_log}"
 }
 
+run_benchmark_matrix() {
+  local label="$1"
+  run_bench "80b_${label}_sharegpt_logprob_false" "${SHAREGPT_DATASET}" "sharegpt" 3 false
+  run_bench "80b_${label}_sharegpt_logprob_true" "${SHAREGPT_DATASET}" "sharegpt" 3 true
+  run_bench "80b_${label}_longbench_logprob_false" "${LONGBENCH_CUSTOM_DATASET}" "custom" 2 false
+  run_bench "80b_${label}_longbench_logprob_true" "${LONGBENCH_CUSTOM_DATASET}" "custom" 2 true
+}
+
+run_baseline() {
+  local server_log="${RESULT_ROOT}/logs/80b_baseline_server.log"
+
+  echo "==> Starting 80B no-DVR baseline server on ${BASE_URL}"
+  setsid env \
+    PYTHONPATH="${PYTHONPATH}" \
+    conda run --no-capture-output -n "${CONDA_ENV}" python -m sglang.launch_server \
+      --model-path "${MODEL_PATH}" \
+      --host 127.0.0.1 \
+      --port "${PORT}" \
+      --tp-size 4 \
+      --context-length 8192 \
+      --max-total-tokens 6144 \
+      --mem-fraction-static 0.9 \
+      --max-running-requests 4 \
+      --max-mamba-cache-size 16 \
+      --page-size 1 \
+      --attention-backend triton \
+      --linear-attn-backend triton \
+      --sampling-backend pytorch \
+      --cuda-graph-bs 1 2 3 4 \
+      --cuda-graph-max-bs 4 \
+      --disable-overlap-schedule \
+      --skip-server-warmup \
+      >"${server_log}" 2>&1 &
+  SERVER_PID="$!"
+
+  wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
+  run_benchmark_matrix "baseline"
+  stop_process_group "${SERVER_PID}"
+  SERVER_PID=""
+}
+
 run_one_mode() {
   local label="$1"
   local spec_v2="$2"
@@ -103,10 +146,7 @@ run_one_mode() {
 
   wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
 
-  run_bench "80b_${label}_sharegpt_logprob_false" "${SHAREGPT_DATASET}" "sharegpt" 3 false
-  run_bench "80b_${label}_sharegpt_logprob_true" "${SHAREGPT_DATASET}" "sharegpt" 3 true
-  run_bench "80b_${label}_longbench_logprob_false" "${LONGBENCH_CUSTOM_DATASET}" "custom" 2 false
-  run_bench "80b_${label}_longbench_logprob_true" "${LONGBENCH_CUSTOM_DATASET}" "custom" 2 true
+  run_benchmark_matrix "${label}"
 
   stop_process_group "${SERVER_PID}"
   SERVER_PID=""
@@ -125,11 +165,13 @@ for path in sorted(glob.glob(os.path.join(base, "results", "80b_*.jsonl"))):
     if not rows:
         continue
     row = json.loads(rows[-1])
+    accept_length = row.get("accept_length")
+    accept_text = "n/a" if accept_length is None else f"{accept_length:.2f}"
     print(
-        "{} out={:.2f} accept={:.2f} completed={} duration={:.2f}".format(
+        "{} out={:.2f} accept={} completed={} duration={:.2f}".format(
             os.path.basename(path),
             row.get("output_throughput"),
-            row.get("accept_length"),
+            accept_text,
             row.get("completed"),
             row.get("duration"),
         )
@@ -142,9 +184,15 @@ require_file "${SHAREGPT_DATASET}"
 require_file "${LONGBENCH_CUSTOM_DATASET}"
 
 # Fixed reproduced口径:
+# - baseline: normal no-DVR decode, overlap disabled.
 # - v1: compatibility scheduler, overlap disabled.
 # - v2: spec-v2 worker with overlap enabled.
 # - max_mamba_cache_size must stay 16; omitting it lowers effective concurrency.
-run_one_mode "v1" "0"
-run_one_mode "v2" "1"
+if [[ "${RUN_BASELINE}" == "1" ]]; then
+  run_baseline
+fi
+if [[ "${RUN_DVR}" == "1" ]]; then
+  run_one_mode "v1" "0"
+  run_one_mode "v2" "1"
+fi
 summarize_results

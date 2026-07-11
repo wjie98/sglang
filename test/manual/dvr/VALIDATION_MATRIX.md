@@ -216,7 +216,8 @@ test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh
 The reproduced口径 is 16 requests, 1024 generated tokens, ShareGPT
 `max_concurrency=3`, and fixed LongBench custom-cache input with
 `max_concurrency=2`.  The server command pins `--max-mamba-cache-size 16`; do
-not omit it when comparing against the reference numbers.
+not omit it when comparing against the reference numbers.  The default script
+run includes the matching normal no-DVR baseline before DVR v1 and v2.
 
 Compare every DVR run with a no-DVR baseline launched with the same backend, TP
 size, context length, request rate, request count, and output length.  Report:
