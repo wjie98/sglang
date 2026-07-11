@@ -149,7 +149,14 @@ def build_dvr_private_extend_batch(
     mamba_cow_dst_indices: Optional[torch.Tensor] = None,
     mamba_clear_indices: Optional[torch.Tensor] = None,
 ) -> ScheduleBatch:
-    """Create a DVR-owned EXTEND batch with upstream ScheduleBatch plumbing."""
+    """Create a DVR-owned EXTEND batch for suffix replay.
+
+    DVR replay runs target-model EXTEND on a private token span: the unclosed
+    GDN chunk tail plus draft tokens.  SGLang does not expose a smaller replay
+    object, so this constructor mirrors only the ScheduleBatch fields consumed
+    by ForwardBatch/EXTEND/GDN tracking and leaves sampling/output state off.
+    Keep this explicit and close to ScheduleBatch when upstream fields change.
+    """
 
     device = batch.seq_lens.device
     global_num_tokens = None
@@ -190,6 +197,9 @@ def build_dvr_private_extend_batch(
         spec_algorithm=batch.spec_algorithm,
         dllm_config=batch.dllm_config,
     )
+
+    # Request and token layout: ForwardBatch consumes these fields to build the
+    # physical EXTEND positions and write replay KV rows back to the live pool.
     replay_batch.forward_mode = ForwardMode.EXTEND
     replay_batch.input_ids = torch.tensor(
         input_ids, dtype=torch.int64, device=device
@@ -204,6 +214,9 @@ def build_dvr_private_extend_batch(
     replay_batch.extend_num_tokens = len(input_ids)
     replay_batch.extend_lens = extend_lens
     replay_batch.prefix_lens = prefix_lens
+
+    # Replay is an internal verifier oracle.  It may request hidden states, but
+    # it must not emit sampled tokens or user-visible logprobs by itself.
     replay_batch.extend_logprob_start_lens = extend_logprob_start_lens
     replay_batch.extend_input_logprob_token_ids = None
     replay_batch.multimodal_inputs = [req.multimodal_inputs for req in reqs]
@@ -212,6 +225,9 @@ def build_dvr_private_extend_batch(
     replay_batch.token_ids_logprobs = None
     replay_batch.global_num_tokens = global_num_tokens
     replay_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
+
+    # Private replay batches are short-lived and should not enter DP graph or
+    # split-output paths whose ownership belongs to the scheduler batch.
     replay_batch.is_extend_in_batch = is_extend_in_batch
     replay_batch.all_extend_in_batch = all_extend_in_batch
     replay_batch.can_run_dp_cuda_graph = False
@@ -227,6 +243,8 @@ def build_dvr_private_extend_batch(
     replay_batch.ne_token_table = None
     replay_batch.spec_info = None
     replay_batch.capture_hidden_mode = capture_hidden_mode
+
+    # Preserve only the side channels needed by GDN checkpoint/replay tracking.
     replay_batch.hicache_consumer_index = -1
     replay_batch.is_prefill_only = (
         batch.is_prefill_only if is_prefill_only is None else is_prefill_only
