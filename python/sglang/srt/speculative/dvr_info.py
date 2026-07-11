@@ -237,14 +237,14 @@ class DVRPendingOutputPrefix:
 
         return len(self._stream_for_req(req))
 
-    def _prefix_token_ids(
+    def request_output_prefix_token_ids(
         self,
         req: Any,
         seq_len: int,
         *,
-        error_prefix: Optional[str] = None,
-    ) -> Optional[list[int]]:
-        """Return an explicitly owned DVR replay prefix."""
+        error_prefix: str,
+    ) -> list[int]:
+        """Return a client-visible output prefix for DVR replay."""
 
         origin_input_ids = list(req.origin_input_ids)
         output_len = seq_len - len(origin_input_ids)
@@ -255,28 +255,11 @@ class DVRPendingOutputPrefix:
         if len(stream) >= output_len:
             return origin_input_ids + stream[:output_len]
 
-        if error_prefix is not None:
-            raise RuntimeError(
-                f"{error_prefix} replay prefix is not yet owned by DVR: "
-                f"rid={req.rid}, origin_tokens={len(req.origin_input_ids)}, "
-                f"req_output_tokens={len(req.output_ids)}, "
-                f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
-            )
-        return None
-
-    def request_output_prefix_token_ids(
-        self,
-        req: Any,
-        seq_len: int,
-        *,
-        error_prefix: str,
-    ) -> list[int]:
-        """Return a client-visible output prefix for DVR replay."""
-
-        return self._prefix_token_ids(
-            req,
-            seq_len,
-            error_prefix=error_prefix,
+        raise RuntimeError(
+            f"{error_prefix} replay prefix is not yet owned by DVR: "
+            f"rid={req.rid}, origin_tokens={len(req.origin_input_ids)}, "
+            f"req_output_tokens={len(req.output_ids)}, "
+            f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
         )
 
     def append_batch_output_tokens(
