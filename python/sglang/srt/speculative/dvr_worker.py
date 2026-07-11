@@ -745,28 +745,26 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
 
-    def _target_suffix_extend_verify_logits(
+    def _replay_target_verify_suffix(
         self,
         *,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
         linear_state_ctx,
-    ) -> Optional[torch.Tensor]:
-        """Compute verifier logits by replaying only the deterministic suffix.
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Replay the open GDN tail and draft rows from the target boundary.
 
-        The ordinary TARGET_VERIFY forward still runs first so DVR can commit
-        accepted recurrent states.  The oracle restores the live recurrent slot
-        to the chunk-boundary checkpoint, then runs an ordinary EXTEND over the
-        unclosed tail plus draft tokens.  This keeps verifier logits equivalent
-        to target prefill without replaying the full prefix on every step.
+        Self draft and EAGLE consume the same target oracle. EAGLE restores the
+        target snapshot because its draft model owns independent state; self
+        draft can copy the boundary state directly into the shared live slot.
         """
 
-        if getattr(spec_info, "seq_lens_cpu", None) is not None:
-            base_seq_lens_cpu = [int(x) for x in spec_info.seq_lens_cpu.tolist()]
-        elif batch.seq_lens_cpu is not None:
-            base_seq_lens_cpu = [int(x) for x in batch.seq_lens_cpu.tolist()]
-        else:
-            base_seq_lens_cpu = [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
+        seq_lens_cpu = getattr(spec_info, "seq_lens_cpu", None)
+        base_seq_lens_cpu = (
+            [int(x) for x in seq_lens_cpu.tolist()]
+            if seq_lens_cpu is not None
+            else self.linear_state.batch_seq_lens_cpu(batch)
+        )
         batch_size = len(batch.reqs)
         draft_token_num = spec_info.draft_token.numel() // max(batch_size, 1)
         draft_tokens = spec_info.draft_token.reshape(batch_size, draft_token_num)
@@ -781,17 +779,18 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             request_token_ids_for_replay=self._request_token_ids_for_replay,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             hidden_gather_append_count=draft_token_num,
-            use_mamba_cow_from_boundary=True,
+            restore_boundary_state=self.is_dvr_eagle,
+            use_mamba_cow_from_boundary=not self.is_dvr_eagle,
         ) as replay:
             if replay is None:
                 return None
             replay_batch, replay_plan = replay
-            draft_logits, _ = run_target_verify_replay(
+            return run_target_verify_replay(
                 target_worker=self.target_worker,
                 replay_batch=replay_batch,
                 replay_plan=replay_plan,
+                use_forward_batch=self.is_dvr_eagle,
             )
-            return draft_logits
 
     @contextmanager
     def _target_verify_context(self, *, prepare: bool = False):
@@ -814,41 +813,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # EAGLE/MTP draft can run before the next target verify in overlap mode.
         # Preserve the target checkpoint authority across draft-side mutations.
         self.linear_state.backup_boundary_state(batch, preserve_existing=True)
-
-    def _target_suffix_extend_verify_output(
-        self,
-        *,
-        batch: ScheduleBatch,
-        verify_input: EagleVerifyInput,
-        linear_state_ctx,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        batch_size = len(batch.reqs)
-        draft_token_num = verify_input.draft_token.numel() // max(batch_size, 1)
-        draft_tokens = verify_input.draft_token.reshape(batch_size, draft_token_num)
-        draft_cache_locs = batch.out_cache_loc.reshape(batch_size, draft_token_num)
-        with dvr_suffix_replay_context(
-            batch=batch,
-            linear_state=self.linear_state,
-            linear_state_ctx=linear_state_ctx,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            append_tokens_cpu_by_req=draft_tokens.detach().cpu().tolist(),
-            append_cache_locs_by_req=[draft_cache_locs[i] for i in range(batch_size)],
-            request_token_ids_for_replay=self._request_token_ids_for_replay,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            hidden_gather_append_count=draft_token_num,
-            restore_boundary_state=True,
-        ) as replay:
-            if replay is None:
-                return None
-            replay_batch, replay_plan = replay
-            draft_logits, draft_hidden_states = run_target_verify_replay(
-                target_worker=self.target_worker,
-                replay_batch=replay_batch,
-                replay_plan=replay_plan,
-                use_forward_batch=True,
-            )
-            return draft_logits, draft_hidden_states
 
     @property
     def draft_worker(self):
@@ -1095,9 +1059,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             or batch.return_logprob
             or logits_output.hidden_states is None
         ):
-            oracle_output = self._target_suffix_extend_verify_output(
+            oracle_output = self._replay_target_verify_suffix(
                 batch=batch,
-                verify_input=spec_info,
+                spec_info=spec_info,
                 linear_state_ctx=linear_state_ctx,
             )
         if oracle_output is not None:
@@ -1320,11 +1284,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             # Streaming logprob chunks are emitted immediately, so they need the
             # same prefill-equivalent suffix oracle that DVR-EAGLE uses for
             # verify hidden states.
-            oracle_logits = self._target_suffix_extend_verify_logits(
+            oracle_output = self._replay_target_verify_suffix(
                 batch=batch,
                 spec_info=spec_info,
                 linear_state_ctx=linear_state_ctx,
             )
+            oracle_logits = None if oracle_output is None else oracle_output[0]
         if oracle_logits is not None:
             logits_output.next_token_logits = oracle_logits
         maybe_detect_nan(logits_output.next_token_logits, "dvr v2 target verify")

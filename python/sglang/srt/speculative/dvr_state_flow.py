@@ -138,17 +138,9 @@ def build_dvr_private_extend_batch(
     prefix_lens: list[int],
     extend_lens: list[int],
     final_seq_lens: list[int],
-    extend_logprob_start_lens: Optional[list[int]] = None,
+    extend_logprob_start_lens: list[int],
+    is_prefill_only: bool,
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
-    is_extend_in_batch: bool = True,
-    all_extend_in_batch: bool = True,
-    is_prefill_only: Optional[bool] = None,
-    mamba_track_indices: Optional[torch.Tensor] = None,
-    mamba_track_mask: Optional[torch.Tensor] = None,
-    mamba_track_seqlens: Optional[torch.Tensor] = None,
-    mamba_cow_src_indices: Optional[torch.Tensor] = None,
-    mamba_cow_dst_indices: Optional[torch.Tensor] = None,
-    mamba_clear_indices: Optional[torch.Tensor] = None,
 ) -> ScheduleBatch:
     """Create a DVR-owned EXTEND batch for target verify replay.
 
@@ -182,12 +174,6 @@ def build_dvr_private_extend_batch(
             if isinstance(out_cache_locs, list)
             else out_cache_locs
         ).to(device=device)
-    extend_logprob_start_lens = (
-        prefix_lens
-        if extend_logprob_start_lens is None
-        else extend_logprob_start_lens
-    )
-
     replay_batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=batch.req_to_token_pool,
@@ -216,49 +202,19 @@ def build_dvr_private_extend_batch(
     replay_batch.extend_lens = extend_lens
     replay_batch.prefix_lens = prefix_lens
 
-    # Replay is an internal verifier oracle.  It may request hidden states, but
-    # it must not emit sampled tokens or user-visible logprobs by itself.
+    # Replay is an internal verifier oracle. It may request hidden states, but
+    # never owns sampling or user-visible output.
     replay_batch.extend_logprob_start_lens = extend_logprob_start_lens
-    replay_batch.extend_input_logprob_token_ids = None
     replay_batch.multimodal_inputs = [req.multimodal_inputs for req in reqs]
     replay_batch.return_logprob = False
-    replay_batch.top_logprobs_nums = None
-    replay_batch.token_ids_logprobs = None
     replay_batch.global_num_tokens = global_num_tokens
     replay_batch.global_num_tokens_for_logprob = global_num_tokens_for_logprob
-
-    # Private replay batches are short-lived and should not enter DP graph or
-    # split-output paths whose ownership belongs to the scheduler batch.
-    replay_batch.is_extend_in_batch = is_extend_in_batch
-    replay_batch.all_extend_in_batch = all_extend_in_batch
-    replay_batch.can_run_dp_cuda_graph = False
-    replay_batch.can_run_dp_breakable_cuda_graph = False
-    replay_batch.tbo_split_seq_index = None
-    replay_batch.global_forward_mode = None
-    replay_batch.encoder_cached = None
-    replay_batch.encoder_lens = None
-    replay_batch.encoder_lens_cpu = None
-    replay_batch.encoder_out_cache_loc = None
-    replay_batch.sampling_info = None
-    replay_batch.input_embeds = None
-    replay_batch.ne_token_table = None
-    replay_batch.spec_info = None
+    replay_batch.is_extend_in_batch = True
+    replay_batch.all_extend_in_batch = True
     replay_batch.capture_hidden_mode = capture_hidden_mode
-
-    # Preserve only the side channels needed by GDN checkpoint/replay tracking.
-    replay_batch.hicache_consumer_index = -1
-    replay_batch.is_prefill_only = (
-        batch.is_prefill_only if is_prefill_only is None else is_prefill_only
-    )
+    replay_batch.is_prefill_only = is_prefill_only
     replay_batch.has_grammar = False
     replay_batch.return_hidden_states = False
-    replay_batch.return_hidden_states_before_norm = False
-    replay_batch.mamba_track_indices = mamba_track_indices
-    replay_batch.mamba_track_mask = mamba_track_mask
-    replay_batch.mamba_track_seqlens = mamba_track_seqlens
-    replay_batch.mamba_cow_src_indices = mamba_cow_src_indices
-    replay_batch.mamba_cow_dst_indices = mamba_cow_dst_indices
-    replay_batch.mamba_clear_indices = mamba_clear_indices
     return replay_batch
 
 
@@ -318,13 +274,10 @@ def dvr_suffix_replay_context(
         extend_logprob_start_lens=replay_plan["extend_lens_cpu"],
         capture_hidden_mode=capture_hidden_mode,
         is_prefill_only=batch.is_prefill_only,
-        mamba_cow_src_indices=(
-            boundary_indices if use_mamba_cow_from_boundary else None
-        ),
-        mamba_cow_dst_indices=(
-            live_indices if use_mamba_cow_from_boundary else None
-        ),
     )
+    if use_mamba_cow_from_boundary:
+        replay_batch.mamba_cow_src_indices = boundary_indices
+        replay_batch.mamba_cow_dst_indices = live_indices
 
     with linear_state.replay_state_context(
         linear_state_ctx,
@@ -695,21 +648,21 @@ class DVRLinearStateLifecycle:
                     extend_lens=extend_lens,
                     final_seq_lens=final_seq_lens,
                     extend_logprob_start_lens=prefix_lens,
-                    is_extend_in_batch=False,
-                    all_extend_in_batch=False,
                     is_prefill_only=True,
-                    mamba_track_indices=self.boundary_indices_for_reqs(
-                        reqs=reqs,
-                        track_indices=[task[4] for task in tasks],
-                        device=batch.device,
-                    ),
-                    mamba_track_mask=torch.ones(
-                        len(reqs), dtype=torch.bool, device=batch.device
-                    ),
-                    mamba_track_seqlens=torch.tensor(
-                        final_seq_lens, dtype=torch.int64, device=batch.device
-                    ),
                 )
+                replay_batch.mamba_track_indices = self.boundary_indices_for_reqs(
+                    reqs=reqs,
+                    track_indices=[task[4] for task in tasks],
+                    device=batch.device,
+                )
+                replay_batch.mamba_track_mask = torch.ones(
+                    len(reqs), dtype=torch.bool, device=batch.device
+                )
+                replay_batch.mamba_track_seqlens = torch.tensor(
+                    final_seq_lens, dtype=torch.int64, device=batch.device
+                )
+                replay_batch.is_extend_in_batch = False
+                replay_batch.all_extend_in_batch = False
                 forward_batch = ForwardBatch.init_new(replay_batch, self.model_runner)
                 self.model_runner.forward(forward_batch)
         finally:
