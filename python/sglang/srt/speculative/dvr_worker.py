@@ -42,11 +42,7 @@ from sglang.srt.speculative.dvr_core import (
     request_dvr_output_prefix_token_ids,
     rollback_dvr_verify,
 )
-from sglang.srt.speculative.dvr_state_flow import (
-    DVRLinearStateLifecycle,
-    dvr_suffix_replay_context,
-    run_target_verify_replay,
-)
+from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -745,55 +741,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
 
-    def _replay_target_verify_suffix(
-        self,
-        *,
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-        linear_state_ctx,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Replay the open GDN tail and draft rows from the target boundary.
-
-        Self draft and EAGLE consume the same target oracle. EAGLE restores the
-        target snapshot because its draft model owns independent state; self
-        draft can copy the boundary state directly into the shared live slot.
-        """
-
-        seq_lens_cpu = getattr(spec_info, "seq_lens_cpu", None)
-        base_seq_lens_cpu = (
-            [int(x) for x in seq_lens_cpu.tolist()]
-            if seq_lens_cpu is not None
-            else self.linear_state.batch_seq_lens_cpu(batch)
-        )
-        batch_size = len(batch.reqs)
-        draft_token_num = spec_info.draft_token.numel() // max(batch_size, 1)
-        draft_tokens = spec_info.draft_token.reshape(batch_size, draft_token_num)
-        draft_cache_locs = batch.out_cache_loc.reshape(batch_size, draft_token_num)
-        with dvr_suffix_replay_context(
-            batch=batch,
-            linear_state=self.linear_state,
-            linear_state_ctx=linear_state_ctx,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            append_tokens_cpu_by_req=draft_tokens.detach().cpu().tolist(),
-            append_cache_locs_by_req=[draft_cache_locs[i] for i in range(batch_size)],
-            request_token_ids_for_replay=self._request_token_ids_for_replay,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            hidden_gather_append_count=draft_token_num,
-            restore_boundary_state=self.is_dvr_eagle,
-            use_mamba_cow_from_boundary=not self.is_dvr_eagle,
-        ) as replay:
-            if replay is None:
-                return None
-            replay_batch, hidden_gather_indices = replay
-            assert hidden_gather_indices is not None
-            return run_target_verify_replay(
-                target_worker=self.target_worker,
-                replay_batch=replay_batch,
-                hidden_gather_indices=hidden_gather_indices,
-                append_token_count=self.num_draft_tokens,
-                use_forward_batch=self.is_dvr_eagle,
-            )
-
     @contextmanager
     def _target_verify_context(self, *, prepare: bool = False):
         runner = self.target_worker.model_runner.decode_cuda_graph_runner
@@ -933,11 +880,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         tokens_per_req: int,
         next_draft_input: EagleDraftInput,
         error_prefix: str,
-        accepted_input_tokens: Optional[torch.Tensor] = None,
         routed_experts_output=None,
         indexer_topk_output=None,
         extra_keep_alive_refs=None,
-        rollback_replay_kwargs=None,
         use_fast_self_draft_commit: bool = False,
     ) -> GenerationBatchResult:
         """Apply DVR rollback and package the scheduler-visible batch result."""
@@ -964,9 +909,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             accept_lens_cpu=accept_lens_cpu,
             base_seq_lens_cpu=base_seq_lens_cpu,
-            num_draft_tokens=self.num_draft_tokens,
-            accepted_input_tokens=accepted_input_tokens,
-            rollback_replay_kwargs=rollback_replay_kwargs,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
         return GenerationBatchResult(
@@ -1076,8 +1018,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         scheduler_seq_lens = batch.seq_lens
         vocab_mask = None
-        rollback_replay_kwargs = None
-        accepted_input_tokens = None
         extra_keep_alive_refs = None
 
         if self.is_dvr_eagle:
@@ -1159,15 +1099,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
                     batch.sampling_info.vocab_mask = None
 
-            if linear_state_ctx is not None:
-                rollback_replay_kwargs = dict(
-                    target_worker=self.target_worker,
-                    linear_state_ctx=linear_state_ctx,
-                    base_seq_lens_cpu=base_seq_lens_cpu,
-                    num_draft_tokens=self.num_draft_tokens,
-                    request_token_ids_for_replay=self._request_token_ids_for_replay,
-                )
-                accepted_input_tokens = spec_info.draft_token
             extra_keep_alive_refs = [verify_forward_batch]
             error_prefix = "DVR EAGLE"
             use_fast_self_draft_commit = False
@@ -1195,29 +1126,11 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             use_fast_self_draft_commit = True
 
         logits_output = forward_output.logits_output
-        needs_suffix_oracle = (
-            self.is_dvr_eagle
-            and (
-                linear_state_ctx is not None
-                or batch.return_logprob
-                or logits_output.hidden_states is None
+        if self.is_dvr_eagle and logits_output.hidden_states is None:
+            raise RuntimeError(
+                "DVR EAGLE target verify must return hidden states for the next "
+                "draft step."
             )
-            or (
-                not self.is_dvr_eagle
-                and batch.return_logprob
-                and any(req.return_logprob and req.stream for req in batch.reqs)
-            )
-        )
-        if needs_suffix_oracle:
-            oracle_output = self._replay_target_verify_suffix(
-                batch=batch,
-                spec_info=spec_info,
-                linear_state_ctx=linear_state_ctx,
-            )
-            if oracle_output is not None:
-                logits_output.next_token_logits = oracle_output[0]
-                if self.is_dvr_eagle:
-                    logits_output.hidden_states = oracle_output[1]
 
         maybe_detect_nan(logits_output.next_token_logits, f"{error_prefix} verify")
         maybe_detect_inf(logits_output.next_token_logits, f"{error_prefix} verify")
@@ -1276,13 +1189,11 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
             tokens_per_req=spec_info.draft_token_num,
-            accepted_input_tokens=accepted_input_tokens,
             next_draft_input=next_draft_input,
             error_prefix=error_prefix,
             routed_experts_output=forward_output.routed_experts_output,
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=extra_keep_alive_refs,
-            rollback_replay_kwargs=rollback_replay_kwargs,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
         if self.is_dvr_eagle:

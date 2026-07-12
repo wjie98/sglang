@@ -463,7 +463,6 @@ class DVRGatedStateAdapter:
         verified_tail_lens: torch.Tensor,
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
-        live_state_already_replayed: Optional[torch.Tensor] = None,
         use_fast_self_draft_commit: bool = False,
     ) -> torch.Tensor:
         state_window = self.state_input_window()
@@ -541,15 +540,9 @@ class DVRGatedStateAdapter:
             )
             return crosses_chunk_boundary
 
-        if live_state_already_replayed is None:
-            live_state_already_replayed = torch.zeros_like(crosses_chunk_boundary)
-        else:
-            live_state_already_replayed = live_state_already_replayed.to(
-                device=live_indices.device, dtype=torch.bool
-            )
         boundary_needs_rebuild = crosses_chunk_boundary
 
-        has_live_conv_commit = (accepted_token_counts > 0) & ~live_state_already_replayed
+        has_live_conv_commit = accepted_token_counts > 0
         live_conv_req_indices = torch.nonzero(has_live_conv_commit).flatten()
         if live_conv_req_indices.numel() > 0:
             self._scatter_state(
@@ -596,14 +589,9 @@ class DVRGatedStateAdapter:
         tail_lens_after = torch.where(
             crosses_chunk_boundary, new_tail_lens, tail_lens_after
         )
-        # Suffix EXTEND replay can materialize the recurrent checkpoint, but
-        # the DVR replay context restores the rolling state-input window after
-        # the oracle.  Keep shifting the target-verify window here so the next
-        # verify sees the accepted post-boundary tail at column zero.
-        shift_window_mask = crosses_chunk_boundary
         state_window.shift_after_boundary(
             indices=state_input_indices,
-            crosses_chunk_boundary=shift_window_mask,
+            crosses_chunk_boundary=crosses_chunk_boundary,
             chunk_size=self.chunk_size,
         )
         state_window.zero_after_lens(
@@ -612,8 +600,7 @@ class DVRGatedStateAdapter:
         )
         draft_token_num = state_cache.intermediate_conv_window[0].shape[2]
         partial_accept = accepted_token_counts < draft_token_num
-        needs_live_rebuild = ~live_state_already_replayed
-        full_accept_req_indices = req_indices[(~partial_accept) & needs_live_rebuild]
+        full_accept_req_indices = req_indices[~partial_accept]
         full_accept_crossing_req_indices = full_accept_req_indices[
             crosses_chunk_boundary[full_accept_req_indices]
         ]
@@ -643,7 +630,7 @@ class DVRGatedStateAdapter:
                 req_indices=full_accept_fast_req_indices,
                 token_count=tail_lens_after[full_accept_fast_req_indices],
             )
-        partial_accept_req_indices = req_indices[partial_accept & needs_live_rebuild]
+        partial_accept_req_indices = req_indices[partial_accept]
         if partial_accept_req_indices.numel() > 0:
             # Partial accept is the only time DVR must start the next draft from
             # a shortened suffix.  Use the same chunkwise GDN math as prefill

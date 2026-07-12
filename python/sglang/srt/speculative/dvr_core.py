@@ -233,33 +233,6 @@ def compact_dvr_output_rows(
     return accept_lens_cpu, token_ids_per_req
 
 
-def compact_dvr_accepted_input_tokens_and_cache_locs(
-    *,
-    batch: Any,
-    verify_input_tokens: torch.Tensor,
-    accept_lens: torch.Tensor,
-    num_draft_tokens: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return model-committed verify-input tokens and cache slots."""
-
-    valid_accept = torch.arange(
-        num_draft_tokens, dtype=torch.long, device=accept_lens.device
-    ).unsqueeze(0) < accept_lens.to(torch.long).unsqueeze(1)
-    bs = accept_lens.shape[0]
-    compact_input_indices = (
-        torch.arange(bs, dtype=torch.long, device=accept_lens.device).unsqueeze(1)
-        * int(num_draft_tokens)
-        + torch.arange(
-            num_draft_tokens, dtype=torch.long, device=accept_lens.device
-        ).unsqueeze(0)
-    )
-    verify_input_tokens = verify_input_tokens.reshape(-1)
-    return (
-        verify_input_tokens[compact_input_indices[valid_accept]],
-        batch.out_cache_loc[compact_input_indices[valid_accept]],
-    )
-
-
 def rollback_dvr_verify(
     *,
     batch: Any,
@@ -268,9 +241,6 @@ def rollback_dvr_verify(
     accept_lens: torch.Tensor,
     accept_lens_cpu: Optional[list[int]],
     base_seq_lens_cpu: list[int],
-    num_draft_tokens: int,
-    accepted_input_tokens: Optional[torch.Tensor] = None,
-    rollback_replay_kwargs: Optional[dict[str, Any]] = None,
     use_fast_self_draft_commit: bool = False,
 ) -> DVRRollbackActions:
     """Rollback target linear state after one verified speculative step."""
@@ -281,33 +251,6 @@ def rollback_dvr_verify(
     pending_track_indices = None
     pending_track_seqlens = None
     if linear_state_ctx is not None:
-        accepted_suffix_replay = None
-        if rollback_replay_kwargs is not None and torch.any(
-            accept_lens < num_draft_tokens
-        ).item():
-            if accepted_input_tokens is None:
-                raise RuntimeError(
-                    "DVR rollback replay requires accepted verify-input tokens."
-                )
-            accepted_ids, accepted_cache_locs = (
-                compact_dvr_accepted_input_tokens_and_cache_locs(
-                    batch=batch,
-                    verify_input_tokens=accepted_input_tokens,
-                    accept_lens=accept_lens,
-                    num_draft_tokens=num_draft_tokens,
-                )
-            )
-            if accepted_ids.numel() > 0:
-                accepted_suffix_replay = (
-                    linear_state.rollback_live_state_with_accepted_suffix(
-                        batch=batch,
-                        accepted_token_counts_cpu=accept_lens_cpu,
-                        accepted_ids=accepted_ids,
-                        accepted_cache_locs=accepted_cache_locs,
-                        **rollback_replay_kwargs,
-                    )
-                )
-
         pending_track_indices, pending_track_seqlens = linear_state.commit_after_verify(
             batch=batch,
             accepted_token_counts=accept_lens.to(torch.long),
@@ -315,7 +258,6 @@ def rollback_dvr_verify(
             accepted_token_counts_cpu=accept_lens_cpu,
             ctx=linear_state_ctx,
             seq_lens_cpu=base_seq_lens_cpu,
-            accepted_suffix_replay=accepted_suffix_replay,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
 

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -108,251 +106,6 @@ def build_dvr_private_extend_batch(
     return replay_batch
 
 
-@contextmanager
-def dvr_suffix_replay_context(
-    *,
-    batch,
-    linear_state,
-    linear_state_ctx,
-    base_seq_lens_cpu: list[int],
-    append_tokens_cpu_by_req: list[list[int]],
-    append_cache_locs_by_req: list[torch.Tensor],
-    request_token_ids_for_replay,
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
-    hidden_gather_append_count: Optional[int] = None,
-    restore_boundary_state: bool = False,
-    use_mamba_cow_from_boundary: bool = False,
-    restore_live_state: bool = True,
-):
-    """Prepare one boundary-tail plus appended-token replay.
-
-    Verify oracles append every draft row and gather hidden states. Partial
-    rollback appends only accepted verify-input rows and publishes the replayed
-    live state. Both use the same physical EXTEND layout and cache ownership.
-    """
-
-    if batch.forward_mode.is_idle() or linear_state_ctx is None:
-        yield None
-        return
-
-    live_indices = linear_state_ctx.live_indices
-    boundary_indices = linear_state_ctx.boundary_indices
-    if boundary_indices is None:
-        raise RuntimeError("DVR suffix replay requires a chunk-boundary state slot.")
-
-    boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
-    extend_lens = []
-    final_seq_lens = []
-    input_ids = []
-    out_cache_locs = []
-    append_locs = []
-    append_rows = []
-    append_offsets = []
-    hidden_gather_indices = []
-    token_offset = 0
-
-    for req_i, (req, seq_len, boundary, tokens, cache_locs) in enumerate(
-        zip(
-            batch.reqs,
-            base_seq_lens_cpu,
-            boundary_lens,
-            append_tokens_cpu_by_req,
-            append_cache_locs_by_req,
-            strict=True,
-        )
-    ):
-        seq_len = int(seq_len)
-        boundary = int(boundary)
-        tail_len = seq_len - boundary
-        append_count = len(tokens)
-        extend_len = tail_len + append_count
-        extend_lens.append(extend_len)
-        final_seq_lens.append(seq_len + append_count)
-
-        replay_tokens = request_token_ids_for_replay(req, seq_len)
-        input_ids.extend(replay_tokens[boundary:seq_len])
-        input_ids.extend(tokens)
-        if tail_len:
-            out_cache_locs.append(
-                batch.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, boundary:seq_len
-                ].to(torch.long)
-            )
-        if append_count:
-            cache_locs = cache_locs.to(torch.long)
-            out_cache_locs.append(cache_locs)
-            append_locs.append(cache_locs)
-            append_rows.append(
-                batch.req_pool_indices[req_i].to(torch.long).repeat(append_count)
-            )
-            append_offsets.append(
-                torch.arange(
-                    seq_len,
-                    seq_len + append_count,
-                    dtype=torch.long,
-                    device=batch.seq_lens.device,
-                )
-            )
-        if hidden_gather_append_count is not None:
-            hidden_gather_indices.extend(
-                range(
-                    token_offset + tail_len,
-                    token_offset + tail_len + hidden_gather_append_count,
-                )
-            )
-        token_offset += extend_len
-
-    if not input_ids:
-        raise RuntimeError("DVR suffix replay received no tail or append tokens.")
-    replay_batch = build_dvr_private_extend_batch(
-        batch,
-        reqs=batch.reqs,
-        input_ids=input_ids,
-        out_cache_locs=out_cache_locs,
-        prefix_lens=boundary_lens,
-        extend_lens=extend_lens,
-        final_seq_lens=final_seq_lens,
-        extend_logprob_start_lens=extend_lens,
-        capture_hidden_mode=capture_hidden_mode,
-        is_prefill_only=batch.is_prefill_only,
-    )
-    if use_mamba_cow_from_boundary:
-        replay_batch.mamba_cow_src_indices = boundary_indices
-        replay_batch.mamba_cow_dst_indices = live_indices
-
-    with linear_state.replay_state_context(
-        linear_state_ctx,
-        restore_live_state=restore_live_state,
-    ):
-        if restore_boundary_state:
-            boundary_backup = linear_state.boundary_backup
-            if boundary_backup is None:
-                raise RuntimeError(
-                    "DVR target replay requires the preserved boundary state."
-                )
-            linear_state_ctx.state_adapter.restore_recurrent_state(
-                state_cache=linear_state_ctx.state_cache,
-                backup=boundary_backup,
-                indices=live_indices,
-            )
-
-        # Draft KV rows must be visible at absolute positions
-        # base_seq_len..base_seq_len+draft during the oracle forward.
-        if append_rows:
-            replay_batch.req_to_token_pool.write(
-                (torch.cat(append_rows), torch.cat(append_offsets)),
-                torch.cat(append_locs).to(
-                    device=replay_batch.seq_lens.device,
-                    dtype=torch.int32,
-                ),
-            )
-        gather_indices = (
-            torch.tensor(
-                hidden_gather_indices,
-                dtype=torch.long,
-                device=batch.seq_lens.device,
-            )
-            if hidden_gather_append_count is not None
-            else None
-        )
-        yield replay_batch, gather_indices
-
-
-def run_target_verify_replay(
-    *,
-    target_worker,
-    replay_batch: ScheduleBatch,
-    hidden_gather_indices: torch.Tensor,
-    append_token_count: int,
-    use_forward_batch: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run target verify replay and return only draft-row outputs."""
-
-    model_runner = target_worker.model_runner
-    if use_forward_batch:
-        forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
-        if model_runner.model_is_mrope:
-            device = replay_batch.seq_lens.device
-            mrope_chunks = []
-            mm_inputs = replay_batch.multimodal_inputs
-            for req_i, (final_seq_len, boundary, extend_len) in enumerate(
-                zip(
-                    replay_batch.seq_lens_cpu.tolist(),
-                    replay_batch.prefix_lens,
-                    replay_batch.extend_lens,
-                    strict=True,
-                )
-            ):
-                seq_len = int(final_seq_len) - append_token_count
-                tail_len = int(extend_len) - append_token_count
-                mm_input = (
-                    None
-                    if mm_inputs is None or req_i >= len(mm_inputs)
-                    else mm_inputs[req_i]
-                )
-                mm_positions = getattr(mm_input, "mrope_positions", None)
-                chunk_parts = []
-                if mm_positions is not None:
-                    tail_positions = mm_positions[:, int(boundary) : int(seq_len)].to(
-                        device=device, dtype=torch.long
-                    )
-                    if tail_positions.shape[1] > 0:
-                        chunk_parts.append(tail_positions)
-                filled_tail = sum(part.shape[1] for part in chunk_parts)
-                if filled_tail < int(tail_len):
-                    chunk_parts.append(
-                        torch.arange(
-                            int(boundary) + filled_tail,
-                            int(seq_len),
-                            dtype=torch.long,
-                            device=device,
-                        )
-                        .unsqueeze(0)
-                        .repeat(3, 1)
-                    )
-                chunk_parts.append(
-                    torch.arange(
-                        int(seq_len),
-                        int(seq_len) + append_token_count,
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    .unsqueeze(0)
-                    .repeat(3, 1)
-                )
-                mrope_chunks.append(torch.cat(chunk_parts, dim=1))
-            forward_batch.mrope_positions = torch.cat(mrope_chunks, dim=1)
-        oracle_output = target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=forward_batch,
-            is_verify=True,
-        )
-    else:
-        oracle_output = target_worker.forward_batch_generation(
-            batch=replay_batch,
-            is_verify=True,
-        )
-        forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
-
-    hidden_states = oracle_output.logits_output.hidden_states
-    if hidden_states is None:
-        raise RuntimeError("DVR target replay did not return hidden states.")
-    draft_hidden_states = hidden_states[
-        hidden_gather_indices.to(
-            device=hidden_states.device,
-            dtype=torch.long,
-        )
-    ]
-    logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
-    logits_metadata.next_token_logits_buffer = None
-    draft_logits = target_worker.model_runner.model.logits_processor._get_logits(
-        draft_hidden_states,
-        target_worker.model_runner.model.lm_head,
-        logits_metadata,
-    )
-    return draft_logits, draft_hidden_states
-
-
 @dataclass
 class DVRLinearStateContext:
     state_cache: Any
@@ -405,50 +158,6 @@ class DVRLinearStateLifecycle:
         self.boundary_backup = None
         self.boundary_backup_keys = None
         self.live_backup = None
-
-    @contextmanager
-    def replay_state_context(
-        self,
-        linear_state_ctx: DVRLinearStateContext,
-        *,
-        restore_live_state: bool = True,
-    ):
-        """Save/restore linear-state side effects around a replay oracle."""
-
-        state_adapter = linear_state_ctx.state_adapter
-        state_cache = linear_state_ctx.state_cache
-        state_input_cache = linear_state_ctx.state_input_cache
-        saved_tail_lens = state_input_cache.get_tail_lens(
-            indices=linear_state_ctx.state_input_indices
-        ).clone()
-        saved_state_input_window = state_input_cache.backup_rows(
-            indices=linear_state_ctx.state_input_indices
-        )
-
-        live_backup = None
-        if restore_live_state:
-            live_backup = state_adapter.backup_recurrent_state(
-                state_cache=state_cache,
-                indices=linear_state_ctx.live_indices,
-            )
-
-        try:
-            yield
-        finally:
-            if live_backup is not None:
-                state_adapter.restore_recurrent_state(
-                    state_cache=state_cache,
-                    backup=live_backup,
-                    indices=linear_state_ctx.live_indices,
-                )
-            state_input_cache.set_tail_lens(
-                indices=linear_state_ctx.state_input_indices,
-                value=saved_tail_lens,
-            )
-            state_input_cache.restore_rows(
-                indices=linear_state_ctx.state_input_indices,
-                backup=saved_state_input_window,
-            )
 
     def prepare_for_draft(
         self,
@@ -675,7 +384,6 @@ class DVRLinearStateLifecycle:
         accepted_token_counts_cpu,
         ctx: DVRLinearStateContext,
         seq_lens_cpu: List[int],
-        accepted_suffix_replay=None,
         use_fast_self_draft_commit: bool = False,
     ):
         pending_track_indices = [None] * len(batch.reqs)
@@ -704,23 +412,8 @@ class DVRLinearStateLifecycle:
             verified_tail_lens=verified_tail_lens,
             accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
-            live_state_already_replayed=(
-                None
-                if accepted_suffix_replay is None
-                else accepted_suffix_replay[0]
-            ),
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
-        if accepted_suffix_replay is not None:
-            _, replay_tail_lens, replay_state_input_window = accepted_suffix_replay
-            ctx.state_input_cache.set_tail_lens(
-                indices=ctx.state_input_indices,
-                value=replay_tail_lens,
-            )
-            ctx.state_input_cache.restore_rows(
-                indices=ctx.state_input_indices,
-                backup=replay_state_input_window,
-            )
 
         for i, (req, verified_tail_len, accepted_token_num) in enumerate(
             zip(
@@ -743,99 +436,6 @@ class DVRLinearStateLifecycle:
         self.boundary_backup_keys = None
         self.live_backup = None
         return pending_track_indices, pending_track_seqlens
-
-    def rollback_live_state_with_accepted_suffix(
-        self,
-        *,
-        batch: ScheduleBatch,
-        target_worker,
-        linear_state_ctx: DVRLinearStateContext,
-        base_seq_lens_cpu: list[int],
-        accepted_token_counts_cpu: list[int],
-        accepted_ids: torch.Tensor,
-        accepted_cache_locs: torch.Tensor,
-        num_draft_tokens: int,
-        request_token_ids_for_replay,
-    ):
-        """Replay the actual accepted suffix after a partial verify acceptance."""
-
-        if batch.forward_mode.is_idle():
-            return None
-        if linear_state_ctx is None:
-            raise RuntimeError("DVR accepted-suffix replay requires linear state.")
-        if accepted_ids.numel() == 0:
-            raise RuntimeError("DVR accepted-suffix replay requires accepted tokens.")
-
-        live_indices = linear_state_ctx.live_indices
-        boundary_indices = linear_state_ctx.boundary_indices
-        assert boundary_indices is not None
-
-        total_accepted = sum(int(x) for x in accepted_token_counts_cpu)
-        if (
-            accepted_ids.numel() != total_accepted
-            or accepted_cache_locs.numel() != total_accepted
-        ):
-            raise RuntimeError(
-                "DVR accepted-suffix token/cache shape mismatch: "
-                f"accepted={total_accepted}, tokens={accepted_ids.numel()}, "
-                f"cache_locs={accepted_cache_locs.numel()}."
-            )
-        if all(
-            int(accepted) >= num_draft_tokens
-            for accepted in accepted_token_counts_cpu
-        ):
-            raise RuntimeError(
-                "DVR accepted-suffix replay was requested without a rejection."
-            )
-
-        accepted_cache_locs = accepted_cache_locs.to(torch.long)
-        accepted_tokens_cpu = accepted_ids.detach().cpu().tolist()
-        accepted_tokens_by_req = []
-        accepted_cache_locs_by_req = []
-        token_offset = 0
-        for accepted_count in accepted_token_counts_cpu:
-            accepted_count = int(accepted_count)
-            accepted_tokens_by_req.append(
-                accepted_tokens_cpu[token_offset : token_offset + accepted_count]
-            )
-            accepted_cache_locs_by_req.append(
-                accepted_cache_locs[token_offset : token_offset + accepted_count]
-            )
-            token_offset += accepted_count
-        # Accepted-suffix rollback advances target-owned state, not the
-        # client-visible output stream.  EAGLE/MTP output tokens are shifted by
-        # one verifier row, so callers pass the accepted verify-input path here.
-        # This replay publishes the live recurrent state and rolling
-        # state-input tail for the next verify.
-        with dvr_suffix_replay_context(
-            batch=batch,
-            linear_state=self,
-            linear_state_ctx=linear_state_ctx,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            append_tokens_cpu_by_req=accepted_tokens_by_req,
-            append_cache_locs_by_req=accepted_cache_locs_by_req,
-            request_token_ids_for_replay=request_token_ids_for_replay,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            use_mamba_cow_from_boundary=True,
-            restore_live_state=False,
-        ) as replay:
-            if replay is None:
-                raise RuntimeError("Active DVR accepted-suffix replay was skipped.")
-            replay_batch, _hidden_gather_indices = replay
-            target_worker.forward_batch_generation(batch=replay_batch, is_verify=True)
-            accepted_tail_lens = linear_state_ctx.state_input_cache.get_tail_lens(
-                indices=linear_state_ctx.state_input_indices
-            ).clone()
-            accepted_state_input_window = linear_state_ctx.state_input_cache.backup_rows(
-                indices=linear_state_ctx.state_input_indices
-            )
-        return (
-            torch.ones(
-                len(batch.reqs), dtype=torch.bool, device=live_indices.device
-            ),
-            accepted_tail_lens,
-            accepted_state_input_window,
-        )
 
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
@@ -1080,20 +680,3 @@ class DVRLinearStateLifecycle:
                 value=torch.tensor(reset_pos_values, device=ctx.live_indices.device),
             )
         return replay_tasks
-
-    def boundary_lens_for_replay(self, batch: ScheduleBatch, seq_lens_cpu) -> List[int]:
-        boundary_lens = []
-        for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True):
-            boundary = self.boundary_seqlen.get(req.rid)
-            if boundary is None:
-                raise RuntimeError(
-                    "DVR suffix replay requires a prepared chunk-boundary "
-                    f"checkpoint: rid={req.rid}, seq_len={int(seq_len)}."
-                )
-            if boundary > int(seq_len):
-                raise RuntimeError(
-                    "DVR suffix replay boundary is ahead of the batch prefix: "
-                    f"rid={req.rid}, boundary={boundary}, seq_len={int(seq_len)}."
-                )
-            boundary_lens.append(int(boundary))
-        return boundary_lens

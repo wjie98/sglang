@@ -14,7 +14,6 @@ from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
 from sglang.srt.speculative.dvr_core import (
     DVRRollbackActions,
     append_dvr_batch_output_tokens,
-    compact_dvr_accepted_input_tokens_and_cache_locs,
     compact_dvr_output_rows,
     request_dvr_output_prefix_token_ids,
 )
@@ -403,28 +402,3 @@ def test_dvr_eagle_compacts_accepted_output_rows():
     )
     assert accept_lens_cpu == [2, 3]
     assert token_ids_per_req == [[10, 11], [20, 21, 22]]
-
-
-def test_dvr_eagle_state_replay_uses_verify_input_path():
-    batch = SimpleNamespace(
-        out_cache_loc=torch.tensor(
-            [100, 101, 102, 103, 200, 201, 202, 203], dtype=torch.int64
-        )
-    )
-    verify_input_tokens = torch.tensor(
-        [271, 2523, 0, 0, 248068, 271, 0, 0], dtype=torch.int32
-    )
-    accept_lens = torch.tensor([2, 3], dtype=torch.int32)
-
-    tokens, cache_locs = compact_dvr_accepted_input_tokens_and_cache_locs(
-        batch=batch,
-        verify_input_tokens=verify_input_tokens,
-        accept_lens=accept_lens,
-        num_draft_tokens=4,
-    )
-
-    # EAGLE output tokens are sampled from verifier logits and are one row ahead
-    # of the target sequence.  DVR state replay must advance the target-owned
-    # verify-input path instead of replaying the client-visible bonus tokens.
-    assert tokens.tolist() == [271, 2523, 248068, 271, 0]
-    assert cache_locs.tolist() == [100, 101, 200, 201, 202]
