@@ -27,6 +27,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     dvr_draft_graph_capture_context,
     dvr_draft_graph_replay_context,
+    dvr_self_draft_graph_replay_context,
     dvr_self_draft_graph_block_reason,
     iter_dvr_attention_backends,
     _min_seq_len_cpu,
@@ -292,7 +293,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     @contextmanager
     def _draft_context(self):
         if not self.is_dvr_eagle:
-            with dvr_draft_graph_replay_context(self.model_runner):
+            with dvr_self_draft_graph_replay_context(self.model_runner):
                 yield
             return
         draft_worker = self._draft_worker

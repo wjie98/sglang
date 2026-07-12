@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 
@@ -265,6 +265,7 @@ def _dvr_draft_decode_context(
     self_draft_graph_capture: bool = False,
     disable_batch_invariant_ops: bool = False,
     clear_kernel_config_caches: bool = False,
+    patch_global_state: bool = True,
     extra_attn_backends=(),
 ):
     """Temporarily switch a DVR draft runner into performance-first decode mode.
@@ -282,13 +283,19 @@ def _dvr_draft_decode_context(
         patched_attrs.append((obj, attr_name, getattr(obj, attr_name)))
         setattr(obj, attr_name, value)
 
-    with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False):
+    deterministic_env = (
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False)
+        if patch_global_state
+        else nullcontext()
+    )
+    with deterministic_env:
         try:
             if clear_kernel_config_caches:
                 _clear_determinism_sensitive_kernel_caches()
 
-            patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
-            patch_attr(global_server_args, "enable_deterministic_inference", False)
+            if patch_global_state:
+                for server_args in (model_runner.server_args, global_server_args):
+                    patch_attr(server_args, "enable_deterministic_inference", False)
 
             seen_backend_roots = set()
             for backend_root in (
@@ -329,10 +336,9 @@ def _dvr_draft_decode_context(
             # Provisional draft tokens must not update mamba prefix-cache
             # tracking slots. DVR commits verified recurrent state after target
             # verify.
-            patch_attr(
-                model_runner.server_args, "mamba_radix_cache_strategy", "no_buffer"
-            )
-            patch_attr(global_server_args, "mamba_radix_cache_strategy", "no_buffer")
+            if patch_global_state:
+                for server_args in (model_runner.server_args, global_server_args):
+                    patch_attr(server_args, "mamba_radix_cache_strategy", "no_buffer")
 
             with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
                 yield
@@ -374,6 +380,12 @@ def dvr_draft_graph_replay_context(model_runner, *, extra_attn_backends=()):
         model_runner,
         extra_attn_backends=extra_attn_backends,
     )
+
+
+def dvr_self_draft_graph_replay_context(model_runner):
+    """Patch only decode metadata fields needed by the captured self-draft graph."""
+
+    return _dvr_draft_decode_context(model_runner, patch_global_state=False)
 
 
 class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
