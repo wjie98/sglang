@@ -26,7 +26,7 @@ class DVRLinearStateContext:
 class DVRRollbackActions:
     """DVR state/cache work deferred until verified tokens are materialized."""
 
-    pending_checkpoints: Optional[list[Optional[tuple[int, int]]]] = None
+    pending_checkpoints: Optional[list[tuple[int, int]]] = None
     cache_generated_prefix: Optional[list[bool]] = None
 
     def cache_prefill_after_rollback(
@@ -65,8 +65,6 @@ class DVRRollbackActions:
                 f"req_index={req_index}, actions={len(self.pending_checkpoints)}."
             )
         checkpoint = self.pending_checkpoints[req_index]
-        if checkpoint is None:
-            return True
         track_idx, seqlen = checkpoint
         if seqlen <= 0:
             raise RuntimeError(f"DVR produced invalid checkpoint length {seqlen}.")
@@ -121,6 +119,7 @@ class DVRLinearStateLifecycle:
         # request and chunk boundary are unchanged.
         self.boundary_backup_keys = None
         self.live_backup = None
+
     def bind_state_adapter(self) -> None:
         adapters = []
         for backend in iter_dvr_attention_backends(
@@ -328,7 +327,7 @@ class DVRLinearStateLifecycle:
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
     ) -> Optional[DVRLinearStateContext]:
-        state_adapter = self.state_adapter()
+        state_adapter = self._state_adapter
         if state_adapter is None or not state_adapter.has_dvr_state(batch=batch):
             return None
         assert self.server_args.mamba_track_interval == FLA_CHUNK_SIZE, (
@@ -344,13 +343,14 @@ class DVRLinearStateLifecycle:
         state_adapter.validate_state_cache(state_cache=state_cache)
         boundary_indices = None
         if require_boundary:
-            boundary_indices = self.boundary_indices_for_reqs(
-                reqs=batch.reqs,
-                track_indices=[
-                    self.boundary_track_idx[req.rid] for req in batch.reqs
-                ],
-                device=live_indices.device,
-            )
+            boundary_indices = torch.stack(
+                [
+                    req.mamba_ping_pong_track_buffer[
+                        self.boundary_track_idx[req.rid]
+                    ]
+                    for req in batch.reqs
+                ]
+            ).to(device=live_indices.device, dtype=torch.long)
         return DVRLinearStateContext(
             state_cache=state_cache,
             state_adapter=state_adapter,
@@ -371,9 +371,6 @@ class DVRLinearStateLifecycle:
         if batch.seq_lens_cpu is not None:
             return [int(x) for x in batch.seq_lens_cpu.tolist()]
         return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
-
-    def state_adapter(self):
-        return self._state_adapter
 
     def set_boundary_checkpoint(
         self,
@@ -397,23 +394,6 @@ class DVRLinearStateLifecycle:
         req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
             track_idx
         )
-
-    @staticmethod
-    def copy_state_indices(
-        *, batch: ScheduleBatch, src_indices: torch.Tensor, dst_indices: torch.Tensor
-    ):
-        batch.req_to_token_pool.mamba_pool.copy_from(
-            src_indices.reshape(-1), dst_indices.reshape(-1)
-        )
-
-    @staticmethod
-    def boundary_indices_for_reqs(*, reqs, track_indices, device) -> torch.Tensor:
-        return torch.stack(
-            [
-                req.mamba_ping_pong_track_buffer[track_idx]
-                for req, track_idx in zip(reqs, track_indices, strict=True)
-            ]
-        ).to(device=device, dtype=torch.long)
 
     def init_boundary_for_req(
         self,
@@ -446,10 +426,8 @@ class DVRLinearStateLifecycle:
             boundary_track_idx = req.mamba_next_track_idx
             dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
             src = req.mamba_ping_pong_track_buffer[checkpoint_track_idx]
-            self.copy_state_indices(
-                batch=batch,
-                src_indices=src.unsqueeze(0),
-                dst_indices=dst.unsqueeze(0),
+            batch.req_to_token_pool.mamba_pool.copy_from(
+                src.reshape(-1), dst.reshape(-1)
             )
             self.set_boundary_checkpoint(
                 batch,
