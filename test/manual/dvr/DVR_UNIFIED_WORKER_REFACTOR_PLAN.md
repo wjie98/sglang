@@ -1,118 +1,118 @@
-# DVR Unified Worker Refactor Plan
+# DVR Production Cleanup Plan
 
-This is the working plan for replacing the current split self-DVR and
-DVR-EAGLE workers with one DVR orchestration flow and two draft backends.
+This document is the implementation plan for reducing the current DVR
+integration to a production-quality draft -> verify -> rollback pipeline. It
+replaces the completed backend-unification plan and describes only work that is
+still relevant to the current tree.
 
-## Goal
+## Design Rules
 
-DVR should be implemented as one target-verify/rollback pipeline:
+1. Do not add a class, data object, helper, or module unless it owns a distinct
+   lifetime or removes a real duplicated algorithm.
+2. Preserve SGLang's existing speculative worker, scheduler, CUDA graph, and
+   linear-state contracts. DVR-specific behavior stays behind explicit DVR
+   branches or DVR-owned objects.
+3. Self draft and EAGLE/MTP may differ while proposing tokens and preparing the
+   next draft input. Target verify, sampling, rollback, logprob, and result
+   publication use one DVR pipeline wherever their data contracts are equal.
+4. Keep the model-independent rolling linear-state cache reusable by future
+   KDA-like adapters. Do not present GDN-specific q/k/v/g/beta code as a generic
+   adapter contract.
+5. Fail at initialization for unsupported hybrid linear-state configurations.
+   Do not silently continue without deterministic state rollback.
+6. Prefill and target verify remain deterministic. Provisional draft decode
+   keeps normal performance-first attention and collective settings.
 
-1. target prefill or decode entry
-2. target GDN/radix boundary preparation
-3. draft backend proposal
-4. target verify
-5. optional suffix replay oracle
-6. backend-specific accept/reject sampling
-7. target GDN state/output/logprob commit
-8. backend-specific next-draft state update
-9. `GenerationBatchResult` publication
+## Batch 1: Correctness And Semantic Boundaries
 
-Self draft and EAGLE/MTP should be sibling draft backends under this common
-pipeline.  EAGLE/MTP is the superset: it owns an independent draft KV cache,
-needs target hidden states for the next draft step, and runs draft-extend after
-prefill/verify.  Self draft disables those features and keeps only target-model
-decode as the draft proposal mechanism.
+- Make self-DVR constrained sampling build the same per-node grammar mask as
+  the EAGLE verify path.
+- Stop using `enable_overlap_schedule=True` as an alias for "allocate two
+  request checkpoint slots". Pass the required slot count explicitly inside
+  memory-pool construction without adding a server argument.
+- Bind and validate the target linear-state adapter after attention backend
+  initialization. An unsupported hybrid target must fail before serving.
+- Align gated-linear model detection with SGLang's existing model registry,
+  including models already recognized by `ModelRunner.hybrid_gdn_config`.
+- Audit target-verify plan-stream use with the dedicated DVR graph runner. Keep
+  synchronous preparation only when a concrete graph safety constraint exists.
+- Add focused coverage for the global fp32 FLA boundary-state behavior.
 
-## Target Structure
+## Batch 2: Dead State And One-Use Helpers
 
-```text
-python/sglang/srt/speculative/dvr_worker.py
-  DecodeVerifyRollbackWorkerV2
-    Owns the DVR target pipeline, GDN state lifecycle, output/logprob repair,
-    spec-v2 deferred actions, and final GenerationBatchResult assembly.
+- Remove unused worker fields copied from EAGLE v2 and the no-op adaptive call.
+- Represent self-DVR hidden state as `None`, using EagleDraftInput's supported
+  no-hidden-state contract instead of zero-width tensors.
+- Merge the two self draft-input builders.
+- Inline one-use worker wrappers for EAGLE forwarding, rollback packaging, plan
+  stream creation, and self-draft graph initialization when this makes the
+  execution order more direct.
+- Move rollback action construction onto the linear-state lifecycle and inline
+  one-use state copy/index helpers.
+- Remove unused optional checkpoint entries and ignored return values.
 
-  _DVRSelfDraftBackend
-    Uses the target model as the draft model.  No independent draft KV, no
-    target hidden states, no draft-extend.  Must keep the dedicated self-draft
-    CUDA graph and non-deterministic decode performance knobs.
+## Batch 3: GDN State Consolidation
 
-  _DVREagleDraftBackend
-    Wraps upstream EAGLE/MTP draft-side logic.  Owns the independent draft KV
-    path, draft prefill/extend, and next-draft hidden-state handoff.  It must not
-    own DVR target verify or GDN state commit.
+- Keep `dvr_state.py` as the model-independent rolling state window and grouped
+  rebuild implementation.
+- Consolidate GDN allocation, rebuild kernels, and adapter behavior into one
+  clearly named GDN module; future KDA support gets its own adapter.
+- Remove forwarding methods that only unpack q/k/v/g/beta into another helper.
+- Reuse preallocated verify indices and remove the extra unused state-input
+  cache slot.
+- Reuse the same conv/QKV split/gating primitives as normal GDN prefill so DVR
+  verify does not maintain a slower copy of the model forward path.
+- Determine backend boundary-state export capability once instead of mutating
+  it as an incidental side effect of every layer forward.
+
+## Batch 4: CUDA Graph And Server Arguments
+
+- Store the standard `DecodeCudaGraphRunner` directly for self draft; remove
+  the three-method DVR wrapper.
+- Validate the short-prompt graph boundary once and remove duplicate block
+  reason/min-length helpers.
+- Limit composite attention-backend traversal to actual SGLang wrapper shapes.
+- Keep the dedicated target-verify runner and the phase-specific deterministic
+  context; these encode real execution differences.
+- Remove repeated DVR string predicates and duplicated page-size validation.
+- Simplify CUDA graph coverage using real ServerArgs invariants rather than
+  defensive branches added for unit-test fake objects.
+- Do not force an arbitrary `max_running_requests` default as a DVR feature.
+
+## Required Invariants
+
+- Non-DVR output, logprob behavior, memory-pool sizing, and throughput do not
+  change.
+- Self-DVR spec v1/v2 and DVR-EAGLE sync/overlap keep exact target logits across
+  chunk boundaries with `return_logprob=True` and `False`.
+- Radix cache may be enabled or disabled without changing DVR correctness.
+- Self draft always uses its dedicated CUDA graph for supported serving inputs;
+  unsupported graph shapes fail explicitly instead of silently using eager.
+- Triton, FA3, and FlashInfer full-attention backends remain selectable. GDN
+  backend-specific fallback is contained in the GDN adapter.
+- The H20/NVLink target remains effective throughput close to
+  `acceptance_rate * non_DVR_baseline`.
+
+## Validation After Every Batch
+
+```bash
+test/manual/dvr/scripts/run_static_unit_checks.sh
+test/manual/dvr/scripts/run_0p8b_self_dvr_kl.sh
 ```
 
-`DECODE_VERIFY_ROLLBACK` and `DECODE_VERIFY_ROLLBACK_EAGLE` should both dispatch
-to `DecodeVerifyRollbackWorkerV2`; the worker chooses the draft backend from the
-speculative algorithm.
+When EAGLE/MTP or shared verify logic changes:
 
-## Draft Feature Matrix
+```bash
+test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
+```
 
-| Feature | self draft | EAGLE/MTP |
-| --- | --- | --- |
-| independent draft KV cache | no | yes |
-| target hidden states needed | no | yes |
-| draft-extend after prefill/verify | no | yes |
-| sampler | chain speculative sampler | upstream EAGLE sampler |
-| partial suffix replay after rejection | no | yes |
-| fast commit from verify state | yes | no |
+Final validation also runs the fixed 80B ShareGPT/LongBench throughput script
+with `return_logprob=True` and `False`, followed by a patch-view refresh against
+the current upstream baseline.
 
-These feature switches are internal worker state.  They must not become new
-server arguments and must not leak into scheduler code.
+## Size Target
 
-## Migration Steps
-
-1. Self-draft backendization only.
-   Move self proposal, self sampling, compact logprob, and next-draft-input
-   construction behind `_DVRSelfDraftBackend`.  Keep the existing self-DVR
-   target flow and validate that KL and throughput do not change.
-
-2. Common DVR pipeline.
-   Make `DecodeVerifyRollbackWorkerV2` call backend methods for proposal,
-   sampling, and next-draft state.  Keep behavior equivalent for self draft.
-
-3. EAGLE backend introduction.
-   Add `_DVREagleDraftBackend` by wrapping the upstream EAGLE draft-side worker.
-   The old `DecodeVerifyRollbackEagleWorkerV2` reference path has been removed;
-   no target-verify logic should be reintroduced outside the unified worker.
-
-4. EAGLE dispatch through the unified worker.
-   Route `DECODE_VERIFY_ROLLBACK_EAGLE` to `DecodeVerifyRollbackWorkerV2` and
-   run EAGLE/MTP through the same DVR target pipeline.
-
-5. Remove the old DVR-EAGLE worker main flow.
-   The temporary `dvr_eagle_worker.py` compatibility alias has been removed;
-   both DVR algorithms now dispatch directly to the unified worker.
-
-6. Shrink DVR core parameters.
-   Once self and EAGLE share the same caller, replace broad
-   `finish_dvr_verify()` parameter lists with a smaller local context/result
-   object or direct local variables if that is clearer.
-
-7. Shrink state-flow entry points.
-   After the worker is unified, remove replay/boundary branches that existed
-   only to support two separate callers.
-
-## Required Validation
-
-After step 1:
-
-- `git diff --check`
-- Python `py_compile`
-- DVR unit tests
-- 0.8B self-DVR v1/v2 KL and boundary smoke
-- fixed 80B self-DVR throughput guard, or at least the fixed ShareGPT/LongBench
-  subset if a quick iteration is required
-
-After touching EAGLE/MTP:
-
-- all step-1 checks
-- 35B MTP/EAGLE smoke for sync/overlap and return_logprob true/false
-
-Final validation:
-
-- 0.8B self-DVR v1/v2 KL and boundary smoke
-- 35B MTP/EAGLE smoke
-- 80B self-DVR ShareGPT/LongBench long-output throughput with return_logprob
-  true/false
-- patch-view refresh against the current upstream baseline
+The starting production Python delta is 3,692 added lines. The low-risk cleanup
+should remove roughly 450-700 lines. Reaching a stable sub-3K implementation
+depends on eliminating the duplicated GDN verify forward path, not on replacing
+clear code with denser abstractions.
