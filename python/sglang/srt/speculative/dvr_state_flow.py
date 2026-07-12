@@ -328,7 +328,7 @@ class DVRLinearStateLifecycle:
         self, batch: ScheduleBatch, require_boundary: bool = False
     ) -> Optional[DVRLinearStateContext]:
         state_adapter = self._state_adapter
-        if state_adapter is None or not state_adapter.has_dvr_state(batch=batch):
+        if state_adapter is None or batch.batch_size() == 0:
             return None
         assert self.server_args.mamba_track_interval == FLA_CHUNK_SIZE, (
             "DVR linear-state target verify must start from FLA chunk boundaries. "

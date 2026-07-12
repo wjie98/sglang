@@ -12,7 +12,6 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 class DVRRecurrentStateBackup:
     conv: Tuple[torch.Tensor, ...]
     temporal: torch.Tensor
-    indices: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -150,33 +149,6 @@ class DVRStateInputCache:
                 )
 
 
-def write_dvr_conv_windows(
-    *,
-    intermediate_conv_window_cache: torch.Tensor,
-    intermediate_state_indices: torch.Tensor,
-    initial_conv_windows: torch.Tensor,
-    conv_input_reshaped: torch.Tensor,
-    num_draft_tokens: int,
-) -> None:
-    conv_source = torch.cat([initial_conv_windows, conv_input_reshaped], dim=2)
-    state_len = initial_conv_windows.shape[-1]
-    conv_windows = conv_source.unfold(
-        dimension=2, size=state_len, step=1
-    )[:, :, 1 : num_draft_tokens + 1].transpose(1, 2)
-    rows = (
-        intermediate_state_indices[: initial_conv_windows.shape[0]]
-        .to(torch.long)
-        .unsqueeze(1)
-        .expand(-1, num_draft_tokens)
-    )
-    cols = torch.arange(
-        num_draft_tokens,
-        dtype=torch.long,
-        device=intermediate_state_indices.device,
-    ).unsqueeze(0)
-    intermediate_conv_window_cache[rows, cols] = conv_windows
-
-
 def run_dvr_chunkwise_verify(
     *,
     state_ops: Any,
@@ -240,7 +212,6 @@ def run_dvr_chunkwise_verify(
 
 def rebuild_dvr_live_state_grouped(
     *,
-    state_ops: Any,
     state_input_cache: DVRStateInputCache,
     temporal_state: torch.Tensor,
     state_input_indices: torch.Tensor,
@@ -248,7 +219,7 @@ def rebuild_dvr_live_state_grouped(
     boundary_indices: torch.Tensor,
     req_indices: torch.Tensor,
     token_count: torch.Tensor,
-    rebuild_fn=None,
+    rebuild_fn,
 ) -> None:
     if req_indices.numel() == 0:
         return
@@ -270,8 +241,6 @@ def rebuild_dvr_live_state_grouped(
     flat_token_count = (
         token_count.unsqueeze(0).expand(num_layers, -1).reshape(-1).contiguous()
     )
-    if rebuild_fn is None:
-        rebuild_fn = state_ops.rebuild_recurrent_state
     rebuilt_state = rebuild_fn(
         window_inputs,
         initial_state=initial_state,

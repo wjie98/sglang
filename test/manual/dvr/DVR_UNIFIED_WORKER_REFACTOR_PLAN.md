@@ -58,12 +58,14 @@ still relevant to the current tree.
 - Consolidate GDN allocation, rebuild kernels, and adapter behavior into one
   clearly named GDN module; future KDA support gets its own adapter.
 - Remove forwarding methods that only unpack q/k/v/g/beta into another helper.
-- Reuse preallocated verify indices and remove the extra unused state-input
-  cache slot.
+- Reuse preallocated verify indices. Retain the request-index offset slot in
+  addition to graph padding slot 0; runtime request-pool indices can start at 1.
 - Reuse the same conv/QKV split/gating primitives as normal GDN prefill so DVR
   verify does not maintain a slower copy of the model forward path.
 - Determine backend boundary-state export capability once instead of mutating
   it as an incidental side effect of every layer forward.
+- Construct the oracle adapter only on the target backend; draft-model GDN
+  layers must not allocate or write target state-input windows.
 
 ## Batch 4: CUDA Graph And Server Arguments
 

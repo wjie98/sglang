@@ -5,11 +5,9 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.attention.linear.dvr_gdn_state import (
+from sglang.srt.layers.attention.linear.dvr_gdn import (
+    DVRGDNStateAdapter,
     create_gdn_state_input_cache,
-)
-from sglang.srt.layers.attention.linear.dvr_state_adapter import (
-    DVRGatedStateAdapter,
 )
 
 
@@ -141,7 +139,7 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
         req_to_token_pool=req_to_token_pool,
         reqs=[SimpleNamespace(mamba_ping_pong_track_buffer=torch.tensor([0]))],
     )
-    adapter = DVRGatedStateAdapter(
+    adapter = DVRGDNStateAdapter(
         kernel_dispatcher=None,
         state_shape=state_shape,
         conv_dtype=torch.float32,
@@ -164,7 +162,7 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
     )
 
 
-def test_gdn_extend_tail_cache_skips_draft_workers():
+def test_gdn_extend_tail_cache_uses_target_request_slots():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
         intermediate_size=32 * 128,
@@ -182,13 +180,7 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         dtype=torch.float32,
         device="cpu",
     )
-    state_cache = SimpleNamespace()
-    draft_adapter = DVRGatedStateAdapter(
-        kernel_dispatcher=None, is_draft_worker=True, state_input_cache=cache
-    )
-    target_adapter = DVRGatedStateAdapter(
-        kernel_dispatcher=None, is_draft_worker=False, state_input_cache=cache
-    )
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, state_input_cache=cache)
 
     q = torch.randn(1, 2, 8, 128)
     k = torch.randn(1, 2, 8, 128)
@@ -196,28 +188,12 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
     g = torch.randn(2, 16)
     beta = torch.randn(2, 16)
 
-    draft_batch = SimpleNamespace(
-        extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
-        extend_seq_lens_cpu=[2],
-        req_pool_indices=torch.tensor([0]),
-    )
-    draft_adapter.cache_extend_tail(
-        forward_batch=draft_batch,
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        layer_idx=0,
-    )
-    assert torch.equal(cache.tail_lens[0, 1], torch.tensor(0, dtype=torch.int32))
-
     target_batch = SimpleNamespace(
         extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
         extend_seq_lens_cpu=[2],
         req_pool_indices=torch.tensor([0]),
     )
-    target_adapter.cache_extend_tail(
+    adapter.cache_extend_tail(
         forward_batch=target_batch,
         q=q,
         k=k,
@@ -246,7 +222,7 @@ def test_gdn_extend_preserves_cached_prefix_boundary_in_request_slot():
         mamba_track_indices=torch.tensor([2, 3]),
         mamba_track_mask=torch.tensor([False, True]),
     )
-    adapter = DVRGatedStateAdapter(kernel_dispatcher=None)
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
 
     adapter.capture_extend_prefix_boundary(
         forward_batch=batch,
