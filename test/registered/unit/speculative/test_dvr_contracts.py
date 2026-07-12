@@ -12,8 +12,10 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
-from sglang.srt.speculative.dvr_core import DVRRollbackActions
-from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
+from sglang.srt.speculative.dvr_state_flow import (
+    DVRLinearStateLifecycle,
+    DVRRollbackActions,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -70,7 +72,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     tree_cache = SimpleNamespace(page_size=64)
 
     dvr_rollback_actions = DVRRollbackActions(
-        pending_mamba_checkpoints=[
+        pending_checkpoints=[
             (0, 128),
         ],
     )
@@ -83,7 +85,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    dvr_rollback_actions.pending_mamba_checkpoints = [(1, 128)]
+    dvr_rollback_actions.pending_checkpoints = [(1, 128)]
     assert dvr_rollback_actions.commit_checkpoint_after_decode(
         req=req,
         batch=batch,
@@ -93,7 +95,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 1
 
-    dvr_rollback_actions.pending_mamba_checkpoints = [(2, 192)]
+    dvr_rollback_actions.pending_checkpoints = [(2, 192)]
     req.kv_committed_len = 127
     assert dvr_rollback_actions.commit_checkpoint_after_decode(
         req=req,
@@ -104,8 +106,8 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_last_track_seqlen == 128
     req.kv_committed_len = 128
 
-    dvr_rollback_actions.pending_mamba_checkpoints = None
-    with pytest.raises(RuntimeError, match="missing Mamba checkpoint actions"):
+    dvr_rollback_actions.pending_checkpoints = None
+    with pytest.raises(RuntimeError, match="missing checkpoint actions"):
         dvr_rollback_actions.commit_checkpoint_after_decode(
             req=req,
             batch=batch,
@@ -113,7 +115,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
             tree_cache=tree_cache,
         )
 
-    dvr_rollback_actions.pending_mamba_checkpoints = [(2, 128)]
+    dvr_rollback_actions.pending_checkpoints = [(2, 128)]
     req.mamba_last_track_seqlen = 64
     with pytest.raises(RuntimeError, match="invalid tracking slot"):
         dvr_rollback_actions.commit_checkpoint_after_decode(

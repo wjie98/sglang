@@ -33,11 +33,11 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _min_seq_len_cpu,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dvr_core import (
+from sglang.srt.speculative.dvr_state_flow import (
     DVRRollbackActions,
+    DVRLinearStateLifecycle,
     rollback_dvr_verify,
 )
-from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,

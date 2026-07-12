@@ -19,6 +19,82 @@ class DVRLinearStateContext:
     boundary_indices: Optional[torch.Tensor] = None
 
 
+@dataclass
+class DVRRollbackActions:
+    """DVR state/cache work deferred until verified tokens are materialized."""
+
+    pending_checkpoints: Optional[list[Optional[tuple[int, int]]]] = None
+    cache_generated_prefix: Optional[list[bool]] = None
+
+    def cache_prefill_after_rollback(
+        self,
+        *,
+        req,
+        batch,
+        req_index: int,
+        tree_cache,
+        enable_hisparse: bool,
+        hisparse_coordinator,
+    ) -> bool:
+        if (
+            self.cache_generated_prefix is None
+            or not self.cache_generated_prefix[req_index]
+        ):
+            return False
+
+        from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+
+        maybe_cache_unfinished_req(req, tree_cache)
+        if enable_hisparse:
+            hisparse_coordinator.admit_request_into_staging(req)
+        return True
+
+    def commit_checkpoint_after_decode(
+        self, *, req, batch, req_index: int, tree_cache
+    ) -> bool:
+        if self.pending_checkpoints is None:
+            if batch.spec_algorithm.is_dvr_eagle() or batch.enable_overlap:
+                raise RuntimeError("DVR decode result is missing checkpoint actions.")
+            return False
+        if req_index >= len(self.pending_checkpoints):
+            raise RuntimeError(
+                "DVR checkpoints do not match the request batch: "
+                f"req_index={req_index}, actions={len(self.pending_checkpoints)}."
+            )
+        checkpoint = self.pending_checkpoints[req_index]
+        if checkpoint is None:
+            return True
+        track_idx, seqlen = checkpoint
+        if seqlen <= 0:
+            raise RuntimeError(f"DVR produced invalid checkpoint length {seqlen}.")
+        if req.mamba_last_track_seqlen is not None and (
+            seqlen <= req.mamba_last_track_seqlen
+        ):
+            return True
+        if seqlen > req.kv_committed_len:
+            return True
+
+        buffer = req.mamba_ping_pong_track_buffer
+        if buffer is None or track_idx < 0 or track_idx >= buffer.numel():
+            raise RuntimeError(
+                "DVR checkpoint references an invalid tracking slot: "
+                f"track_idx={track_idx}, slots={0 if buffer is None else buffer.numel()}."
+            )
+        if buffer[track_idx].item() == -1:
+            raise RuntimeError(f"DVR checkpoint slot {track_idx} is unallocated.")
+        page_size = getattr(tree_cache, "page_size", 1)
+        if page_size != 1 and seqlen % page_size != 0:
+            raise RuntimeError(
+                f"DVR checkpoint is not page aligned: {seqlen=}, {page_size=}."
+            )
+
+        req.mamba_last_track_seqlen = seqlen
+        req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+            track_idx
+        )
+        return True
+
+
 class DVRLinearStateLifecycle:
     """Manage chunk-boundary state for DVR linear-state layers.
 
@@ -194,11 +270,9 @@ class DVRLinearStateLifecycle:
         accepted_steps: torch.Tensor,
         ctx: DVRLinearStateContext,
     ):
-        pending_track_indices = [
-            self.boundary_track_idx[req.rid] for req in batch.reqs
-        ]
-        pending_track_seqlens = [
+        pending_checkpoints = [
             (
+                self.boundary_track_idx[req.rid],
                 self.boundary_seqlen[req.rid]
                 if self.boundary_seqlen[req.rid]
                 > (req.mamba_last_track_seqlen or 0)
@@ -208,7 +282,7 @@ class DVRLinearStateLifecycle:
         ]
         assert ctx.boundary_indices is not None
         if accepted_token_counts.numel() == 0:
-            return pending_track_indices, pending_track_seqlens
+            return pending_checkpoints
 
         verified_tail_lens = ctx.state_input_cache.get_tail_lens(
             indices=ctx.state_input_indices
@@ -228,7 +302,7 @@ class DVRLinearStateLifecycle:
         self.boundary_backup = None
         self.boundary_backup_keys = None
         self.live_backup = None
-        return pending_track_indices, pending_track_seqlens
+        return pending_checkpoints
 
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
@@ -451,3 +525,41 @@ class DVRLinearStateLifecycle:
                 indices=torch.stack(reset_pos_indices),
                 value=torch.tensor(reset_pos_values, device=ctx.live_indices.device),
             )
+
+
+def rollback_dvr_verify(
+    *,
+    batch,
+    linear_state: DVRLinearStateLifecycle,
+    linear_state_ctx: Optional[DVRLinearStateContext],
+    accept_lens: torch.Tensor,
+) -> DVRRollbackActions:
+    pending_checkpoints = None
+    if linear_state_ctx is not None:
+        pending_checkpoints = linear_state.commit_after_verify(
+            batch=batch,
+            accepted_token_counts=accept_lens.to(torch.long),
+            accepted_steps=(accept_lens - 1).to(torch.long),
+            ctx=linear_state_ctx,
+        )
+
+    deferred = batch.spec_algorithm.is_dvr_eagle() or batch.enable_overlap
+    cache_generated_prefix = None
+    if deferred and batch.decoding_reqs:
+        cache_generated_prefix = [
+            req in batch.decoding_reqs
+            and int(
+                batch.extend_lens[i]
+                if batch.extend_lens is not None
+                else req.extend_input_len
+            )
+            > 1
+            for i, req in enumerate(batch.reqs)
+        ]
+        if not any(cache_generated_prefix):
+            cache_generated_prefix = None
+
+    return DVRRollbackActions(
+        pending_checkpoints=pending_checkpoints if deferred else None,
+        cache_generated_prefix=cache_generated_prefix,
+    )
