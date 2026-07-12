@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/common.sh"
 MODEL_PATH="${MODEL_PATH:-/mnt/data/hwj/Qwen3.5-0.8B}"
 PORT="${PORT:-30124}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.50}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/0p8b-self-dvr-kl}"
 SERVER_PID=""
@@ -41,7 +42,7 @@ run_one_mode() {
       --speculative-num-draft-tokens 16 \
       --page-size 1 \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" \
-      --attention-backend triton \
+      --attention-backend "${ATTENTION_BACKEND}" \
       --linear-attn-backend triton \
       --sampling-backend pytorch \
       --enable-deterministic-inference \

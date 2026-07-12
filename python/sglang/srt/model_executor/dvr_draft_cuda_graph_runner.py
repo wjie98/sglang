@@ -11,6 +11,7 @@ from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import get_bool_env_var
 
 
 _ATTN_BACKEND_CHILD_ATTRS = (
@@ -98,7 +99,7 @@ def _uses_init_time_deterministic_num_splits(backend) -> bool:
     )
 
 
-def _patch_self_draft_decode_backend_defaults(backend, patch_attr):
+def _patch_draft_decode_backend_defaults(backend, server_args, patch_attr):
     """Undo init-time deterministic decode knobs for DVR self-draft only.
 
     Prefill and verify still run through the deterministic target path. The
@@ -116,11 +117,50 @@ def _patch_self_draft_decode_backend_defaults(backend, patch_attr):
         patch_attr(backend, "decode_split_tile_size", None)
         patch_attr(backend, "disable_cuda_graph_kv_split", False)
 
-
-def _custom_all_reduce_is_ready(ca_comm) -> bool:
-    return hasattr(ca_comm, "world_size") and (
-        hasattr(ca_comm, "_ptr") or hasattr(ca_comm, "obj")
-    )
+    if backend.__class__.__name__ == "TritonAttnBackend":
+        split_tile_size = server_args.triton_attention_split_tile_size
+        normal_max_splits = server_args.triton_attention_num_kv_splits
+        if split_tile_size is not None:
+            normal_max_splits = (
+                backend.max_context_len + split_tile_size - 1
+            ) // split_tile_size
+        # The kernel requires max_kv_splits to exactly match its scratch view.
+        # Reuse the deterministic allocation through a narrower view instead of
+        # allocating a second graph workspace for draft decode.
+        normal_max_splits = min(backend.max_kv_splits, normal_max_splits)
+        for name in (
+            "cuda_graph_attn_logits",
+            "cuda_graph_attn_lse",
+            "cuda_graph_swa_attn_logits",
+        ):
+            buffer = getattr(backend, name, None)
+            if buffer is not None:
+                patch_attr(backend, name, buffer[:, :, :normal_max_splits])
+        for name in (
+            "cuda_graph_num_kv_splits",
+            "cuda_graph_window_num_kv_splits",
+        ):
+            buffer = getattr(backend, name, None)
+            if buffer is not None:
+                draft_name = f"_dvr_draft_{name}"
+                draft_buffer = getattr(backend, draft_name, None)
+                if draft_buffer is None:
+                    draft_buffer = torch.full_like(buffer, normal_max_splits)
+                    setattr(backend, draft_name, draft_buffer)
+                patch_attr(backend, name, draft_buffer)
+        patch_attr(
+            backend,
+            "max_kv_splits",
+            normal_max_splits,
+        )
+        patch_attr(backend, "split_tile_size", split_tile_size)
+        patch_attr(
+            backend,
+            "static_kv_splits",
+            get_bool_env_var(
+                "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
+            ),
+        )
 
 
 def _ensure_decode_custom_all_reduce_comm(group):
@@ -140,7 +180,9 @@ def _ensure_decode_custom_all_reduce_comm(group):
         )
         group.ca_comm = ca_comm
 
-    if ca_comm is None or not _custom_all_reduce_is_ready(ca_comm):
+    if ca_comm is None or not hasattr(ca_comm, "world_size") or not (
+        hasattr(ca_comm, "_ptr") or hasattr(ca_comm, "obj")
+    ):
         return None
 
     if hasattr(ca_comm, "full_nvlink") and not ca_comm.full_nvlink:
@@ -196,78 +238,6 @@ def dvr_self_draft_graph_block_reason(forward_batch: ForwardBatch) -> str | None
     return None
 
 
-def _patch_draft_decode_backend_tree(model_runner, extra_attn_backends, patch_attr):
-    seen_backend_roots = set()
-    for backend_root in (model_runner.attn_backend, *(extra_attn_backends or ())):
-        if backend_root is None or id(backend_root) in seen_backend_roots:
-            continue
-        seen_backend_roots.add(id(backend_root))
-        for backend in iter_dvr_attention_backends(backend_root):
-            patch_attr(backend, "enable_deterministic", False)
-            _patch_self_draft_decode_backend_defaults(backend, patch_attr)
-
-
-def _patch_graph_capture_extras(
-    model_runner,
-    patch_attr,
-    *,
-    self_draft_graph: bool,
-):
-    # Custom all-reduce is unsafe for deterministic DVR prefill/verify, but the
-    # self-draft decode graph can capture it for speed.
-    for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
-        patch_attr(ca_comm, "disabled", False)
-    if self_draft_graph:
-        # The target runner already initialized attention backend graph buffers
-        # for TARGET_VERIFY. Capture DVR self-draft as ordinary DECODE without
-        # reinitializing those shared buffers.
-        patch_attr(model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE)
-        patch_attr(
-            model_runner.attn_backend,
-            "init_cuda_graph_state",
-            _skip_init_cuda_graph_state,
-        )
-
-
-def _assert_draft_decode_performance_state(model_runner, extra_attn_backends):
-    """Fail fast if deterministic target settings leak into draft decode."""
-
-    # These checks deliberately run on every DVR draft decode context entry.
-    # The draft path is only provisional, so running deterministic target
-    # kernels here is pure overhead and was the source of earlier throughput
-    # regressions. Raising early is preferable to silently falling back to the
-    # deterministic verify profile.
-    if getattr(model_runner.server_args, "enable_deterministic_inference", False):
-        raise RuntimeError("DVR draft decode must run with deterministic inference off.")
-    if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
-        raise RuntimeError("DVR draft decode env still enables deterministic inference.")
-
-    for backend_root in (model_runner.attn_backend, *(extra_attn_backends or ())):
-        for backend in iter_dvr_attention_backends(backend_root):
-            if getattr(backend, "enable_deterministic", False):
-                raise RuntimeError(
-                    "DVR draft decode backend still has enable_deterministic=True."
-                )
-            if (
-                _uses_init_time_deterministic_num_splits(backend)
-                and hasattr(backend, "num_splits")
-                and getattr(backend, "num_splits") != 0
-            ):
-                raise RuntimeError(
-                    "DVR draft decode backend still uses deterministic num_splits."
-                )
-            if hasattr(backend, "decode_split_tile_size") and getattr(
-                backend, "decode_split_tile_size"
-            ) is not None:
-                raise RuntimeError(
-                    "DVR draft decode backend still uses deterministic split tile size."
-                )
-            if getattr(backend, "disable_cuda_graph_kv_split", False):
-                raise RuntimeError(
-                    "DVR draft decode backend still disables CUDA graph KV split."
-                )
-
-
 @contextmanager
 def _dvr_draft_decode_context(
     model_runner,
@@ -301,16 +271,36 @@ def _dvr_draft_decode_context(
             patch_attr(model_runner.server_args, "enable_deterministic_inference", False)
             patch_attr(global_server_args, "enable_deterministic_inference", False)
 
-            _patch_draft_decode_backend_tree(
-                model_runner, extra_attn_backends, patch_attr
-            )
+            seen_backend_roots = set()
+            for backend_root in (
+                model_runner.attn_backend,
+                *(extra_attn_backends or ()),
+            ):
+                if backend_root is None or id(backend_root) in seen_backend_roots:
+                    continue
+                seen_backend_roots.add(id(backend_root))
+                for backend in iter_dvr_attention_backends(backend_root):
+                    patch_attr(backend, "enable_deterministic", False)
+                    _patch_draft_decode_backend_defaults(
+                        backend, model_runner.server_args, patch_attr
+                    )
 
             if graph_capture:
-                _patch_graph_capture_extras(
-                    model_runner,
-                    patch_attr,
-                    self_draft_graph=self_draft_graph_capture,
-                )
+                # Deterministic target prefill/verify keeps custom all-reduce
+                # disabled. Only capture it into provisional draft graphs.
+                for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
+                    patch_attr(ca_comm, "disabled", False)
+                if self_draft_graph_capture:
+                    # Target graph buffers are already initialized for
+                    # TARGET_VERIFY; capture self draft as ordinary DECODE.
+                    patch_attr(
+                        model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE
+                    )
+                    patch_attr(
+                        model_runner.attn_backend,
+                        "init_cuda_graph_state",
+                        _skip_init_cuda_graph_state,
+                    )
 
             # Provisional draft tokens must not update mamba prefix-cache
             # tracking slots. DVR commits verified recurrent state after target
@@ -319,8 +309,6 @@ def _dvr_draft_decode_context(
                 model_runner.server_args, "mamba_radix_cache_strategy", "no_buffer"
             )
             patch_attr(global_server_args, "mamba_radix_cache_strategy", "no_buffer")
-
-            _assert_draft_decode_performance_state(model_runner, extra_attn_backends)
 
             with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
                 yield

@@ -6,6 +6,7 @@ import torch
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     _ensure_decode_custom_all_reduce_comm,
+    _patch_draft_decode_backend_defaults,
     dvr_self_draft_graph_block_reason,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -166,6 +167,56 @@ def test_dvr_custom_all_reduce_uses_current_dispatch_contract(monkeypatch):
     assert group.ca_comm is ca_comm
     assert ca_comm.disabled
     assert ca_comm.original_disabled
+
+
+def test_dvr_draft_restores_backend_decode_defaults(monkeypatch):
+    monkeypatch.delenv("SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", raising=False)
+    server_args = SimpleNamespace(
+        triton_attention_split_tile_size=None,
+        triton_attention_num_kv_splits=8,
+    )
+
+    def patch_attr(obj, name, value):
+        if hasattr(obj, name):
+            setattr(obj, name, value)
+
+    FlashAttentionBackend = type("FlashAttentionBackend", (), {})
+    fa3 = FlashAttentionBackend()
+    fa3.fa_impl_ver = 3
+    fa3.num_splits = 1
+    _patch_draft_decode_backend_defaults(fa3, server_args, patch_attr)
+    assert fa3.num_splits == 0
+
+    FlashInferAttnBackend = type("FlashInferAttnBackend", (), {})
+    flashinfer = FlashInferAttnBackend()
+    flashinfer.decode_split_tile_size = 2048
+    flashinfer.disable_cuda_graph_kv_split = True
+    _patch_draft_decode_backend_defaults(flashinfer, server_args, patch_attr)
+    assert flashinfer.decode_split_tile_size is None
+    assert not flashinfer.disable_cuda_graph_kv_split
+
+    TritonAttnBackend = type("TritonAttnBackend", (), {})
+    triton_backend = TritonAttnBackend()
+    triton_backend.max_context_len = 8192
+    triton_backend.max_kv_splits = 32
+    triton_backend.split_tile_size = 256
+    triton_backend.static_kv_splits = False
+    triton_backend.cuda_graph_attn_logits = torch.zeros(4, 2, 32, 8)
+    triton_backend.cuda_graph_attn_lse = torch.zeros(4, 2, 32)
+    triton_backend.cuda_graph_swa_attn_logits = None
+    triton_backend.cuda_graph_num_kv_splits = torch.full(
+        (4,), 32, dtype=torch.int32
+    )
+    _patch_draft_decode_backend_defaults(triton_backend, server_args, patch_attr)
+    assert triton_backend.max_kv_splits == 8
+    assert triton_backend.split_tile_size is None
+    assert not triton_backend.static_kv_splits
+    assert triton_backend.cuda_graph_attn_logits.shape[2] == 8
+    assert triton_backend.cuda_graph_attn_lse.shape[2] == 8
+    assert torch.equal(
+        triton_backend.cuda_graph_num_kv_splits,
+        torch.full((4,), 8, dtype=torch.int32),
+    )
 
 
 def test_dvr_self_draft_graph_runner_rejects_short_boundary():

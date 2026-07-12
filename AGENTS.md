@@ -15,6 +15,8 @@ Use these entry points:
   - DVR unit tests
 - `test/manual/dvr/scripts/run_0p8b_self_dvr_kl.sh`
   - 0.8B self-DVR spec v1/v2 KL=0 and boundary smoke
+  - `ATTENTION_BACKEND` may select a separately reported Triton/FlashInfer/FA3
+    compatibility run; the fixed default remains `triton`
 - `test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh`
   - 35B Qwen3.5 MTP/DVR-EAGLE sync-v2 and overlap-v2 smoke
   - covers `return_logprob=True` KL and `return_logprob=False` output path

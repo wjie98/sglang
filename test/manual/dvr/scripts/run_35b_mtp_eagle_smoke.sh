@@ -17,6 +17,7 @@ MTP_MIN_ACCEPT_RATE="${MTP_MIN_ACCEPT_RATE:-0.96}"
 MTP_REALDATA_MIN_ACCEPT_RATE="${MTP_REALDATA_MIN_ACCEPT_RATE:-0.0}"
 MTP_REALDATA_NUM_PROMPTS="${MTP_REALDATA_NUM_PROMPTS:-8}"
 MTP_REALDATA_MAX_NEW="${MTP_REALDATA_MAX_NEW:-64}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/35b-mtp-eagle-smoke}"
 SERVER_PID=""
@@ -61,7 +62,7 @@ run_one_mode() {
       --context-length 4096 \
       --max-total-tokens 8192 \
       --mem-fraction-static 0.72 \
-      --attention-backend triton \
+      --attention-backend "${ATTENTION_BACKEND}" \
       --linear-attn-backend triton \
       --sampling-backend pytorch \
       --enable-deterministic-inference \
