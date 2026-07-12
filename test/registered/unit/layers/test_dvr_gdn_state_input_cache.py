@@ -5,9 +5,9 @@ import torch
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.linear.dvr_gdn_state import (
-    DVRGDNStateInputCache,
-    DVRGDNStateInputs,
+    create_gdn_state_input_cache,
 )
+from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputs
 from sglang.srt.layers.attention.linear.dvr_state_adapter import (
     DVRGatedStateAdapter,
 )
@@ -24,7 +24,7 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
         conv_kernel=4,
     )
 
-    cache = DVRGDNStateInputCache.create(
+    cache = create_gdn_state_input_cache(
         num_layers=1,
         num_slots=3,
         num_draft_tokens=16,
@@ -33,19 +33,19 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
         device="cpu",
     )
 
-    cache_inputs = cache.state_inputs()
-    assert cache_inputs.q.shape == (1, 3, FLA_CHUNK_SIZE + 16, 8, 128)
-    assert cache_inputs.k.shape == (1, 3, FLA_CHUNK_SIZE + 16, 8, 128)
-    assert cache_inputs.v.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16, 128)
-    assert cache_inputs.g.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
-    assert cache_inputs.beta.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
+    q_cache, k_cache, v_cache, g_cache, beta_cache = cache.tensors
+    assert q_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 8, 128)
+    assert k_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 8, 128)
+    assert v_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16, 128)
+    assert g_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
+    assert beta_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
 
     q = torch.randn(2, 8, 128)
     k = torch.randn(2, 8, 128)
     v = torch.randn(2, 16, 128)
     g = torch.randn(2, 16)
     beta = torch.randn(2, 16)
-    state_inputs = DVRGDNStateInputs.from_tensors((q, k, v, g, beta))
+    state_inputs = DVRStateInputs.from_tensors((q, k, v, g, beta))
 
     layer_cache = cache[0]
     state_inputs.write_extend_tail(
@@ -56,12 +56,12 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
     )
 
     assert torch.equal(layer_cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
-    layer_inputs = layer_cache.state_inputs()
-    assert torch.equal(layer_inputs.q[1, :2], q)
-    assert torch.equal(layer_inputs.k[1, :2], k)
-    assert torch.equal(layer_inputs.v[1, :2], v)
-    assert torch.equal(layer_inputs.g[1, :2], g)
-    assert torch.equal(layer_inputs.beta[1, :2], beta)
+    q_cache, k_cache, v_cache, g_cache, beta_cache = layer_cache.tensors
+    assert torch.equal(q_cache[1, :2], q)
+    assert torch.equal(k_cache[1, :2], k)
+    assert torch.equal(v_cache[1, :2], v)
+    assert torch.equal(g_cache[1, :2], g)
+    assert torch.equal(beta_cache[1, :2], beta)
 
 
 def test_gdn_state_input_cache_is_its_own_window():
@@ -74,7 +74,7 @@ def test_gdn_state_input_cache_is_its_own_window():
         state_size=128,
         conv_kernel=4,
     )
-    cache = DVRGDNStateInputCache.create(
+    cache = create_gdn_state_input_cache(
         num_layers=1,
         num_slots=3,
         num_draft_tokens=16,
@@ -143,7 +143,7 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         state_size=128,
         conv_kernel=4,
     )
-    cache = DVRGDNStateInputCache.create(
+    cache = create_gdn_state_input_cache(
         num_layers=1,
         num_slots=3,
         num_draft_tokens=16,
@@ -170,17 +170,13 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
         extend_seq_lens_cpu=[2],
         req_pool_indices=torch.tensor([0]),
     )
-    state_inputs = DVRGDNStateInputs.from_extend_forward(
+    draft_adapter.cache_extend_tail(
+        forward_batch=draft_batch,
         q=q,
         k=k,
         v=v,
         g=g,
         beta=beta,
-    )
-
-    draft_adapter.cache_extend_tail(
-        forward_batch=draft_batch,
-        state_inputs=state_inputs,
         layer_idx=0,
     )
     assert torch.equal(cache.tail_lens[0, 1], torch.tensor(0, dtype=torch.int32))
@@ -192,14 +188,18 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
     )
     target_adapter.cache_extend_tail(
         forward_batch=target_batch,
-        state_inputs=state_inputs,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
         layer_idx=0,
     )
     layer_cache = cache[0]
     assert torch.equal(layer_cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
-    layer_inputs = layer_cache.state_inputs()
-    assert torch.equal(layer_inputs.q[1, :2], q.reshape(2, 8, 128))
-    assert torch.equal(layer_inputs.k[1, :2], k.reshape(2, 8, 128))
-    assert torch.equal(layer_inputs.v[1, :2], v.reshape(2, 16, 128))
-    assert torch.equal(layer_inputs.g[1, :2], g)
-    assert torch.equal(layer_inputs.beta[1, :2], beta)
+    q_cache, k_cache, v_cache, g_cache, beta_cache = layer_cache.tensors
+    assert torch.equal(q_cache[1, :2], q.reshape(2, 8, 128))
+    assert torch.equal(k_cache[1, :2], k.reshape(2, 8, 128))
+    assert torch.equal(v_cache[1, :2], v.reshape(2, 16, 128))
+    assert torch.equal(g_cache[1, :2], g)
+    assert torch.equal(beta_cache[1, :2], beta)

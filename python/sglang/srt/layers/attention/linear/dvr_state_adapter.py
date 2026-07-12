@@ -8,10 +8,9 @@ import torch
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.linear.dvr_gdn_state import (
-    DVRGDNStateInputCache,
-    DVRGDNStateInputs,
     _rebuild_gdn_state_from_qkvg_beta_chunkwise,
     _rebuild_gdn_state_from_qkvg_beta_triton,
+    create_gdn_state_input_cache,
 )
 from sglang.srt.layers.attention.linear.dvr_state import (
     DVRRecurrentStateBackup,
@@ -40,7 +39,7 @@ class DVRGatedStateAdapter:
     state_shape: Any = None
     conv_dtype: Optional[torch.dtype] = None
     device: Optional[str] = None
-    state_input_cache: Optional[DVRGDNStateInputCache] = None
+    state_input_cache: Optional[DVRStateInputCache] = None
 
     @classmethod
     def for_gdn(
@@ -86,7 +85,7 @@ class DVRGatedStateAdapter:
 
     def get_or_create_state_input_cache(
         self, *, req_to_token_pool
-    ) -> DVRGDNStateInputCache:
+    ) -> DVRStateInputCache:
         cache = self.state_input_cache
         if cache is not None:
             return cache
@@ -97,7 +96,7 @@ class DVRGatedStateAdapter:
         num_layers = state_cache.intermediate_ssm.shape[0]
         spec_state_size = state_cache.intermediate_ssm.shape[1] - 1
         num_draft_tokens = state_cache.intermediate_ssm.shape[2]
-        cache = DVRGDNStateInputCache.create(
+        cache = create_gdn_state_input_cache(
             num_layers=num_layers,
             # Slot 0 is the padded-row dummy; real DVR rows use req_pool_idx + 1
             # to preserve the v5 hot-path indexing convention.
@@ -151,13 +150,13 @@ class DVRGatedStateAdapter:
         )
 
     def scan_chunkwise(self, *, state_inputs: DVRStateInputs, **kwargs) -> tuple:
-        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
+        q, k, v, g, beta = state_inputs.tensors()
         return self.kernel_dispatcher.extend(
-            q=state_inputs.q,
-            k=state_inputs.k,
-            v=state_inputs.v,
-            g=state_inputs.g,
-            beta=state_inputs.beta,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
             **kwargs,
         )
 
@@ -168,13 +167,13 @@ class DVRGatedStateAdapter:
         initial_state: torch.Tensor,
         token_count=None,
     ) -> torch.Tensor:
-        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
+        q, k, v, g, beta = state_inputs.tensors()
         return _rebuild_gdn_state_from_qkvg_beta_triton(
-            state_inputs.q,
-            state_inputs.k,
-            state_inputs.v,
-            state_inputs.g,
-            state_inputs.beta,
+            q,
+            k,
+            v,
+            g,
+            beta,
             initial_state=initial_state,
             token_count=token_count,
         )
@@ -186,13 +185,13 @@ class DVRGatedStateAdapter:
         initial_state: torch.Tensor,
         token_count=None,
     ) -> torch.Tensor:
-        state_inputs = DVRGDNStateInputs.from_tensors(state_inputs.tensors())
+        q, k, v, g, beta = state_inputs.tensors()
         return _rebuild_gdn_state_from_qkvg_beta_chunkwise(
-            state_inputs.q,
-            state_inputs.k,
-            state_inputs.v,
-            state_inputs.g,
-            state_inputs.beta,
+            q,
+            k,
+            v,
+            g,
+            beta,
             initial_state=initial_state,
             token_count=token_count,
         )
@@ -272,7 +271,11 @@ class DVRGatedStateAdapter:
         self,
         *,
         forward_batch,
-        state_inputs: DVRStateInputs,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
         layer_idx: int,
     ):
         if self.is_draft_worker:
@@ -287,8 +290,17 @@ class DVRGatedStateAdapter:
         ):
             return
 
+        state_inputs = DVRStateInputs.from_tensors(
+            (
+                q.reshape(q.shape[1], q.shape[2], q.shape[3]),
+                k.reshape(k.shape[1], k.shape[2], k.shape[3]),
+                v.reshape(v.shape[1], v.shape[2], v.shape[3]),
+                g.reshape(-1, g.shape[-1]),
+                beta.reshape(-1, beta.shape[-1]),
+            )
+        )
         state_input_indices = forward_batch.req_pool_indices.to(
-            device=state_inputs.tensors()[0].device, dtype=torch.long
+            device=q.device, dtype=torch.long
         )
         state_inputs.write_extend_tail(
             state_window,
@@ -389,20 +401,29 @@ class DVRGatedStateAdapter:
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-        draft_state_inputs = DVRGDNStateInputs.from_draft_rows(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            batch_size=batch_size,
-            draft_token_num=draft_token_num,
-            num_q_heads=layer.num_q_heads,
-            head_q_dim=layer.head_q_dim,
-            num_k_heads=layer.num_k_heads,
-            head_k_dim=layer.head_k_dim,
-            num_v_heads=layer.num_v_heads,
-            head_v_dim=layer.head_v_dim,
+        draft_state_inputs = DVRStateInputs.from_tensors(
+            (
+                query.reshape(
+                    batch_size,
+                    draft_token_num,
+                    layer.num_q_heads,
+                    layer.head_q_dim,
+                ),
+                key.reshape(
+                    batch_size,
+                    draft_token_num,
+                    layer.num_k_heads,
+                    layer.head_k_dim,
+                ),
+                value.reshape(
+                    batch_size,
+                    draft_token_num,
+                    layer.num_v_heads,
+                    layer.head_v_dim,
+                ),
+                g.reshape(batch_size, draft_token_num, layer.num_v_heads),
+                beta.reshape(batch_size, draft_token_num, layer.num_v_heads),
+            )
         )
         state_window = self.state_input_window(layer_idx=layer_idx)
         tail_lens = state_window.get_tail_lens(indices=state_input_indices).to(

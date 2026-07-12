@@ -535,19 +535,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             if dvr_state_adapter is not None:
                 # Cache target-model GDN tail inputs for later DVR verify/replay.
-                from sglang.srt.layers.attention.linear.dvr_gdn_state import (
-                    DVRGDNStateInputs,
-                )
-
                 dvr_state_adapter.cache_extend_tail(
                     forward_batch=forward_batch,
-                    state_inputs=DVRGDNStateInputs.from_extend_forward(
-                        q=query,
-                        k=key,
-                        v=value,
-                        g=g,
-                        beta=beta,
-                    ),
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
                     layer_idx=layer_idx,
                 )
 

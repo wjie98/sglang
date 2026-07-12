@@ -31,26 +31,6 @@ class DVRStateInputs:
     def select(self, indices: torch.Tensor) -> "DVRStateInputs":
         return type(self).from_tensors(tuple(tensor[indices] for tensor in self.values))
 
-    def select_all_layers(self, indices: torch.Tensor) -> "DVRStateInputs":
-        return type(self).from_tensors(
-            tuple(tensor[:, indices] for tensor in self.values)
-        )
-
-    def select_token_range(self, start: int, end: int) -> "DVRStateInputs":
-        return type(self).from_tensors(
-            tuple(tensor[start:end] for tensor in self.values)
-        )
-
-    def flatten_leading_dims(
-        self, flat_dim: int, *, keep_from_dim: int
-    ) -> "DVRStateInputs":
-        return type(self).from_tensors(
-            tuple(
-                tensor.reshape(flat_dim, *tensor.shape[keep_from_dim:])
-                for tensor in self.values
-            )
-        )
-
     def write_rows(
         self,
         state_cache: "DVRStateInputCache",
@@ -59,22 +39,6 @@ class DVRStateInputs:
         cols: torch.Tensor,
     ) -> None:
         state_cache.write_rows(indices=indices, cols=cols, values=self)
-
-    def write_draft_rows(
-        self,
-        state_cache: "DVRStateInputCache",
-        *,
-        indices: torch.Tensor,
-        col_start: torch.Tensor,
-        draft_token_num: int,
-    ) -> None:
-        cols = (
-            torch.arange(draft_token_num, dtype=torch.long, device=indices.device)
-            .unsqueeze(0)
-            .add(col_start.to(torch.long).unsqueeze(1))
-        )
-        rows = indices.unsqueeze(1).expand(-1, draft_token_num)
-        self.write_rows(state_cache, indices=rows, cols=cols)
 
     def write_extend_tail(
         self,
@@ -108,7 +72,9 @@ class DVRStateInputs:
                     dtype=torch.long,
                     device=indices.device,
                 )
-                self.select_token_range(src_start, src_end).write_rows(
+                type(self).from_tensors(
+                    tuple(tensor[src_start:src_end] for tensor in self.values)
+                ).write_rows(
                     state_cache, indices=dst, cols=cols
                 )
             src_base += extend_len
@@ -156,9 +122,6 @@ class DVRStateInputCache:
 
     def read(self, *, indices: torch.Tensor) -> DVRStateInputs:
         return self.state_inputs().select(indices)
-
-    def read_all_layers(self, *, indices: torch.Tensor) -> DVRStateInputs:
-        return self.state_inputs().select_all_layers(indices)
 
     def write_rows(
         self,
@@ -288,11 +251,15 @@ def run_dvr_chunkwise_verify(
     else:
         tail_lens = tail_lens[:batch_size].to(device=indices.device, dtype=torch.long)
     tail_lens = tail_lens.clamp(min=0, max=chunk_size)
-    draft_state_inputs.write_draft_rows(
+    draft_state_inputs.write_rows(
         state_input_cache,
-        indices=input_indices,
-        col_start=tail_lens,
-        draft_token_num=draft_token_num,
+        indices=input_indices.unsqueeze(1).expand(-1, draft_token_num),
+        cols=(
+            torch.arange(
+                draft_token_num, dtype=torch.long, device=input_indices.device
+            ).unsqueeze(0)
+            + tail_lens.unsqueeze(1)
+        ),
     )
     state_input_cache.zero_after_lens(
         indices=input_indices, keep_lens=tail_lens + draft_token_num
@@ -341,16 +308,18 @@ def rebuild_dvr_live_state_grouped(
     selected_input_indices = state_input_indices[req_indices]
     state_live_indices = live_indices[req_indices]
     state_boundary_indices = boundary_indices[req_indices]
-    window_inputs = state_input_cache.read_all_layers(
-        indices=selected_input_indices
-    )
     num_layers = temporal_state.shape[0]
     num_reqs = state_live_indices.numel()
     token_count = token_count.to(device=temporal_state.device, dtype=torch.long)
     initial_state = temporal_state[:, state_boundary_indices]
 
     flat_dim = num_layers * num_reqs
-    window_inputs = window_inputs.flatten_leading_dims(flat_dim, keep_from_dim=2)
+    window_inputs = DVRStateInputs.from_tensors(
+        tuple(
+            tensor[:, selected_input_indices].reshape(flat_dim, *tensor.shape[2:])
+            for tensor in state_input_cache.tensors
+        )
+    )
     initial_state = initial_state.reshape(flat_dim, *initial_state.shape[2:])
     flat_token_count = (
         token_count.unsqueeze(0).expand(num_layers, -1).reshape(-1).contiguous()

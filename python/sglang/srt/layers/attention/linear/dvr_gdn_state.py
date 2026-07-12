@@ -1,6 +1,5 @@
 """GDN-specific DVR state-input cache allocation and operators."""
 
-from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -9,16 +8,10 @@ from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
-from sglang.srt.layers.attention.linear.dvr_state import (
-    DVRStateInputCache,
-    DVRStateInputs,
-)
+from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputCache
 from sglang.srt.utils import is_cpu
 
-__all__ = [
-    "DVRGDNStateInputs",
-    "DVRGDNStateInputCache",
-]
+__all__ = ["create_gdn_state_input_cache"]
 
 if not is_cpu():
     import triton
@@ -248,145 +241,53 @@ def _rebuild_gdn_state_from_qkvg_beta_chunkwise(
     return h[:, -1]
 
 
-@dataclass(frozen=True)
-class DVRGDNStateInputs(DVRStateInputs):
-    """Interpret a generic DVR state-input tuple as GDN q/k/v/g/beta tensors."""
+def create_gdn_state_input_cache(
+    *,
+    num_layers: int,
+    num_slots: int,
+    num_draft_tokens: int,
+    state_shape: Mamba2StateShape,
+    dtype: torch.dtype,
+    device: str,
+) -> DVRStateInputCache:
+    """Allocate the q/k/v/g/beta rolling window used by GDN DVR."""
 
-    @classmethod
-    def from_tensors(cls, tensors: Tuple[torch.Tensor, ...]) -> "DVRGDNStateInputs":
-        tensors = tuple(tensors)
-        assert len(tensors) == 5
-        return cls(values=tensors)
-
-    @property
-    def q(self) -> torch.Tensor:
-        return self.values[0]
-
-    @property
-    def k(self) -> torch.Tensor:
-        return self.values[1]
-
-    @property
-    def v(self) -> torch.Tensor:
-        return self.values[2]
-
-    @property
-    def g(self) -> torch.Tensor:
-        return self.values[3]
-
-    @property
-    def beta(self) -> torch.Tensor:
-        return self.values[4]
-
-    @classmethod
-    def from_draft_rows(
-        cls,
-        *,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        batch_size: int,
-        draft_token_num: int,
-        num_q_heads: int,
-        head_q_dim: int,
-        num_k_heads: int,
-        head_k_dim: int,
-        num_v_heads: int,
-        head_v_dim: int,
-    ) -> "DVRGDNStateInputs":
-        return cls.from_tensors(
-            (
-                q.reshape(batch_size, draft_token_num, num_q_heads, head_q_dim),
-                k.reshape(batch_size, draft_token_num, num_k_heads, head_k_dim),
-                v.reshape(batch_size, draft_token_num, num_v_heads, head_v_dim),
-                g.reshape(batch_size, draft_token_num, num_v_heads),
-                beta.reshape(batch_size, draft_token_num, num_v_heads),
-            )
-        )
-
-    @classmethod
-    def from_extend_forward(
-        cls,
-        *,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-    ) -> "DVRGDNStateInputs":
-        return cls.from_tensors(
-            (
-                q.reshape(q.shape[1], q.shape[2], q.shape[3]),
-                k.reshape(k.shape[1], k.shape[2], k.shape[3]),
-                v.reshape(v.shape[1], v.shape[2], v.shape[3]),
-                g.reshape(-1, g.shape[-1]),
-                beta.reshape(-1, beta.shape[-1]),
-            )
-        )
-
-
-@dataclass(frozen=True)
-class DVRGDNStateInputCache(DVRStateInputCache):
-    """q/k/v/g/beta scratch cache plus rolling-window lengths for GDN DVR."""
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        num_layers: int,
-        num_slots: int,
-        num_draft_tokens: int,
-        state_shape: Mamba2StateShape,
-        dtype: torch.dtype,
-        device: str,
-    ) -> "DVRGDNStateInputCache":
-        (
-            local_key_heads,
-            key_head_dim,
-            local_value_heads,
-            value_head_dim,
-        ) = _infer_gdn_state_input_shapes(state_shape)
-        window_len = FLA_CHUNK_SIZE + num_draft_tokens
-        q_input = torch.zeros(
-            size=(
-                num_layers,
-                num_slots,
-                window_len,
-                local_key_heads,
-                key_head_dim,
-            ),
-            dtype=dtype,
-            device=device,
-        )
-        state_inputs = [
-            q_input,
-            torch.zeros_like(q_input),
-            torch.zeros(
-                size=(
-                    num_layers,
-                    num_slots,
-                    window_len,
-                    local_value_heads,
-                    value_head_dim,
-                ),
-                dtype=dtype,
-                device=device,
-            ),
-            torch.zeros(
-                size=(num_layers, num_slots, window_len, local_value_heads),
-                dtype=torch.float32,
-                device=device,
-            ),
-        ]
-        state_inputs.append(torch.zeros_like(state_inputs[-1]))
-        tail_lens = torch.zeros(
-            size=(num_layers, num_slots),
+    local_key_heads, key_dim, local_value_heads, value_dim = (
+        _infer_gdn_state_input_shapes(state_shape)
+    )
+    window_len = FLA_CHUNK_SIZE + num_draft_tokens
+    q = torch.zeros(
+        num_layers,
+        num_slots,
+        window_len,
+        local_key_heads,
+        key_dim,
+        dtype=dtype,
+        device=device,
+    )
+    v = torch.zeros(
+        num_layers,
+        num_slots,
+        window_len,
+        local_value_heads,
+        value_dim,
+        dtype=dtype,
+        device=device,
+    )
+    gate = torch.zeros(
+        num_layers,
+        num_slots,
+        window_len,
+        local_value_heads,
+        dtype=torch.float32,
+        device=device,
+    )
+    return DVRStateInputCache(
+        tensors=(q, torch.zeros_like(q), v, gate, torch.zeros_like(gate)),
+        tail_lens=torch.zeros(
+            num_layers,
+            num_slots,
             dtype=torch.int32,
             device=device,
-        )
-        return cls(tensors=tuple(state_inputs), tail_lens=tail_lens)
-
-    def state_inputs(self) -> DVRGDNStateInputs:
-        return DVRGDNStateInputs.from_tensors(self.tensors)
+        ),
+    )
