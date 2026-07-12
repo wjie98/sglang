@@ -853,7 +853,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         routed_experts_output=None,
         indexer_topk_output=None,
         extra_keep_alive_refs=None,
-        use_fast_self_draft_commit: bool = False,
     ) -> GenerationBatchResult:
         """Apply DVR rollback and package the scheduler-visible batch result."""
 
@@ -862,7 +861,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
             accept_lens=accept_lens,
-            use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -1050,7 +1048,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
             extra_keep_alive_refs = [verify_forward_batch]
             error_prefix = "DVR EAGLE"
-            use_fast_self_draft_commit = False
         else:
             if not batch.forward_mode.is_idle():
                 batch.input_ids = spec_info.draft_token
@@ -1072,7 +1069,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             forward_output = self._forward_target_verify_for_dvr(batch)
             can_run_cuda_graph = forward_output.can_run_cuda_graph
             error_prefix = "DVR self"
-            use_fast_self_draft_commit = True
 
         logits_output = forward_output.logits_output
         if self.is_dvr_eagle and logits_output.hidden_states is None:
@@ -1138,7 +1134,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             routed_experts_output=forward_output.routed_experts_output,
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=extra_keep_alive_refs,
-            use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
         if self.is_dvr_eagle:
             if linear_state_ctx is not None:

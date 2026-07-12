@@ -9,7 +9,6 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.linear.dvr_gdn_state import (
     _rebuild_gdn_state_from_qkvg_beta_chunkwise,
-    _rebuild_gdn_state_from_qkvg_beta_triton,
     create_gdn_state_input_cache,
 )
 from sglang.srt.layers.attention.linear.dvr_state import (
@@ -40,6 +39,7 @@ class DVRGatedStateAdapter:
     conv_dtype: Optional[torch.dtype] = None
     device: Optional[str] = None
     state_input_cache: Optional[DVRStateInputCache] = None
+    _verify_exports_boundary_state: bool = False
 
     @classmethod
     def for_gdn(
@@ -151,7 +151,7 @@ class DVRGatedStateAdapter:
 
     def scan_chunkwise(self, *, state_inputs: DVRStateInputs, **kwargs) -> tuple:
         q, k, v, g, beta = state_inputs.tensors()
-        return self.kernel_dispatcher.extend(
+        result = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
@@ -159,26 +159,10 @@ class DVRGatedStateAdapter:
             beta=beta,
             **kwargs,
         )
+        self._verify_exports_boundary_state = result[2] is not None
+        return result
 
     def rebuild_recurrent_state(
-        self,
-        state_inputs: DVRStateInputs,
-        *,
-        initial_state: torch.Tensor,
-        token_count=None,
-    ) -> torch.Tensor:
-        q, k, v, g, beta = state_inputs.tensors()
-        return _rebuild_gdn_state_from_qkvg_beta_triton(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state=initial_state,
-            token_count=token_count,
-        )
-
-    def rebuild_recurrent_state_chunkwise(
         self,
         state_inputs: DVRStateInputs,
         *,
@@ -463,7 +447,6 @@ class DVRGatedStateAdapter:
         verified_tail_lens: torch.Tensor,
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
-        use_fast_self_draft_commit: bool = False,
     ) -> torch.Tensor:
         state_window = self.state_input_window()
         tail_lens_before = verified_tail_lens.to(
@@ -477,69 +460,6 @@ class DVRGatedStateAdapter:
             dtype=torch.long,
             device=live_indices.device,
         )
-        if use_fast_self_draft_commit:
-            # Self-DVR uses the target model as its own draft model, so the
-            # target-verify intermediate state is already the v5 hot-path state
-            # for the accepted chain.  EAGLE keeps the exact replay path below
-            # because rejected rows may commit target-generated tokens that did
-            # not come from the draft model.
-            self._scatter_state(
-                state_cache.conv[0],
-                state_cache.intermediate_conv_window[0],
-                live_indices,
-                accepted_steps,
-            )
-
-            boundary_state_step = (
-                0 if state_cache.intermediate_ssm.shape[2] == 1 else self.chunk_size - 1
-            )
-            commit_step = torch.where(
-                crosses_chunk_boundary,
-                torch.full_like(tail_lens_before, boundary_state_step),
-                no_commit_step,
-            )
-            self._scatter_state(
-                state_cache.temporal,
-                state_cache.intermediate_ssm,
-                boundary_indices,
-                commit_step,
-            )
-            self._scatter_state(
-                state_cache.conv[0],
-                state_cache.intermediate_conv_window[0],
-                boundary_indices,
-                torch.where(
-                    crosses_chunk_boundary,
-                    self.chunk_size - 1 - tail_lens_before,
-                    no_commit_step,
-                ),
-            )
-
-            new_tail_lens = tail_lens_after - self.chunk_size
-            tail_lens_after = torch.where(
-                crosses_chunk_boundary, new_tail_lens, tail_lens_after
-            )
-            state_window.shift_after_boundary(
-                indices=state_input_indices,
-                crosses_chunk_boundary=crosses_chunk_boundary,
-                chunk_size=self.chunk_size,
-            )
-            rebuild_dvr_live_state_grouped(
-                state_ops=self,
-                state_input_cache=state_window,
-                temporal_state=state_cache.temporal,
-                state_input_indices=state_input_indices,
-                live_indices=live_indices,
-                boundary_indices=boundary_indices,
-                req_indices=req_indices,
-                token_count=tail_lens_after,
-            )
-
-            state_window.set_tail_lens(
-                indices=state_input_indices, value=tail_lens_after.to(torch.int32)
-            )
-            return crosses_chunk_boundary
-
         boundary_needs_rebuild = crosses_chunk_boundary
 
         has_live_conv_commit = accepted_token_counts > 0
@@ -554,19 +474,37 @@ class DVRGatedStateAdapter:
 
         crossing_req_indices = torch.nonzero(boundary_needs_rebuild).flatten()
         if crossing_req_indices.numel() > 0:
-            # run_dvr_chunkwise_verify stores the state at the first crossed
-            # chunk boundary in step 0. Commit that exact target-verify result;
-            # recomputing it separately can drift from the logits-producing scan.
-            self._scatter_state(
-                state_cache.temporal,
-                state_cache.intermediate_ssm,
-                boundary_indices,
-                torch.where(
-                    boundary_needs_rebuild,
-                    torch.zeros_like(tail_lens_before),
-                    no_commit_step,
-                ),
-            )
+            if self._verify_exports_boundary_state:
+                # run_dvr_chunkwise_verify stores the first crossed boundary in
+                # step 0 when the selected linear backend exports FLA's `h`.
+                self._scatter_state(
+                    state_cache.temporal,
+                    state_cache.intermediate_ssm,
+                    boundary_indices,
+                    torch.where(
+                        boundary_needs_rebuild,
+                        torch.zeros_like(tail_lens_before),
+                        no_commit_step,
+                    ),
+                )
+            else:
+                # Some prefill kernels return only final state. Rebuild only the
+                # crossed boundary; attention backend selection remains free.
+                rebuild_dvr_live_state_grouped(
+                    state_ops=self,
+                    state_input_cache=state_window,
+                    temporal_state=state_cache.temporal,
+                    state_input_indices=state_input_indices,
+                    live_indices=boundary_indices,
+                    boundary_indices=boundary_indices,
+                    req_indices=crossing_req_indices,
+                    token_count=torch.full(
+                        (crossing_req_indices.numel(),),
+                        self.chunk_size,
+                        dtype=torch.long,
+                        device=tail_lens_before.device,
+                    ),
+                )
         self._scatter_state(
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
@@ -606,7 +544,6 @@ class DVRGatedStateAdapter:
                 boundary_indices=boundary_indices,
                 req_indices=partial_accept_req_indices,
                 token_count=tail_lens_after[partial_accept_req_indices],
-                use_chunkwise_rebuild=True,
             )
 
         state_window.set_tail_lens(

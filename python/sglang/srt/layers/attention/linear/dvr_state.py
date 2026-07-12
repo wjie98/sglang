@@ -133,24 +133,6 @@ class DVRStateInputCache:
         for cache, value in zip(self.tensors, values.tensors(), strict=True):
             cache[indices, cols] = value
 
-    def backup_rows(self, *, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        indices = indices.to(device=self.tensors[0].device, dtype=torch.long)
-        if self.tail_lens.dim() == 2:
-            return tuple(cache[:, indices].clone() for cache in self.tensors)
-        return tuple(cache[indices].clone() for cache in self.tensors)
-
-    def restore_rows(
-        self, *, indices: torch.Tensor, backup: Optional[Tuple[torch.Tensor, ...]]
-    ) -> None:
-        if backup is None:
-            return
-        indices = indices.to(device=self.tensors[0].device, dtype=torch.long)
-        for cache, saved in zip(self.tensors, backup, strict=True):
-            if self.tail_lens.dim() == 2:
-                cache[:, indices] = saved.to(cache.dtype, copy=False)
-            else:
-                cache[indices] = saved.to(cache.dtype, copy=False)
-
     def zero_after_lens(
         self, *, indices: torch.Tensor, keep_lens: torch.Tensor
     ) -> None:
@@ -300,7 +282,6 @@ def rebuild_dvr_live_state_grouped(
     boundary_indices: torch.Tensor,
     req_indices: torch.Tensor,
     token_count: torch.Tensor,
-    use_chunkwise_rebuild: bool = False,
 ) -> None:
     if req_indices.numel() == 0:
         return
@@ -324,12 +305,7 @@ def rebuild_dvr_live_state_grouped(
     flat_token_count = (
         token_count.unsqueeze(0).expand(num_layers, -1).reshape(-1).contiguous()
     )
-    rebuild_fn = (
-        state_ops.rebuild_recurrent_state_chunkwise
-        if use_chunkwise_rebuild
-        else state_ops.rebuild_recurrent_state
-    )
-    rebuilt_state = rebuild_fn(
+    rebuilt_state = state_ops.rebuild_recurrent_state(
         window_inputs,
         initial_state=initial_state,
         token_count=flat_token_count,

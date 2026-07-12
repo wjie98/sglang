@@ -120,7 +120,6 @@ def rollback_dvr_verify(
     linear_state: Any,
     linear_state_ctx: Any,
     accept_lens: torch.Tensor,
-    use_fast_self_draft_commit: bool = False,
 ) -> DVRRollbackActions:
     """Rollback target linear state after one verified speculative step."""
 
@@ -132,7 +131,6 @@ def rollback_dvr_verify(
             accepted_token_counts=accept_lens.to(torch.long),
             accepted_steps=(accept_lens - 1).to(torch.long),
             ctx=linear_state_ctx,
-            use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
 
     actions = DVRRollbackActions()

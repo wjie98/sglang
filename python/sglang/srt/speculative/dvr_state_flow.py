@@ -395,7 +395,6 @@ class DVRLinearStateLifecycle:
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
         ctx: DVRLinearStateContext,
-        use_fast_self_draft_commit: bool = False,
     ):
         pending_track_indices = [
             self.boundary_track_idx[req.rid] for req in batch.reqs
@@ -427,7 +426,6 @@ class DVRLinearStateLifecycle:
             verified_tail_lens=verified_tail_lens,
             accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
-            use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
         self.boundary_backup = None
         self.boundary_backup_keys = None
