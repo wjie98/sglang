@@ -17,6 +17,7 @@ MTP_MIN_ACCEPT_RATE="${MTP_MIN_ACCEPT_RATE:-0.96}"
 MTP_REALDATA_MIN_ACCEPT_RATE="${MTP_REALDATA_MIN_ACCEPT_RATE:-0.0}"
 MTP_REALDATA_NUM_PROMPTS="${MTP_REALDATA_NUM_PROMPTS:-8}"
 MTP_REALDATA_MAX_NEW="${MTP_REALDATA_MAX_NEW:-64}"
+MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 RUN_SYNC="${RUN_SYNC:-1}"
@@ -44,11 +45,15 @@ run_one_mode() {
   local realdata_no_logprob_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_false.log"
   local overlap_args=()
   local radix_args=()
+  local mamba_cache_args=()
   if [[ "${spec_v2}" == "0" ]]; then
     overlap_args=(--disable-overlap-schedule)
   fi
   if [[ "${DISABLE_RADIX_CACHE}" == "1" ]]; then
     radix_args=(--disable-radix-cache)
+  fi
+  if [[ -n "${MAX_MAMBA_CACHE_SIZE}" ]]; then
+    mamba_cache_args=(--max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}")
   fi
 
   echo "==> Starting ${label} DVR-EAGLE server on ${BASE_URL}"
@@ -77,6 +82,7 @@ run_one_mode() {
       --cuda-graph-max-bs 4 \
       --max-running-requests 4 \
       "${radix_args[@]}" \
+      "${mamba_cache_args[@]}" \
       "${overlap_args[@]}" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &
