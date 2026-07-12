@@ -288,8 +288,13 @@ def _dvr_draft_decode_context(
             if graph_capture:
                 # Deterministic target prefill/verify keeps custom all-reduce
                 # disabled. Only capture it into provisional draft graphs.
-                for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
-                    patch_attr(ca_comm, "disabled", False)
+                if getattr(
+                    model_runner.server_args,
+                    "_dvr_enable_draft_custom_all_reduce",
+                    False,
+                ):
+                    for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
+                        patch_attr(ca_comm, "disabled", False)
                 if self_draft_graph_capture:
                     # Target graph buffers are already initialized for
                     # TARGET_VERIFY; capture self draft as ordinary DECODE.

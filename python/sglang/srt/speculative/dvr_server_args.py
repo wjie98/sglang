@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 
@@ -33,7 +32,20 @@ def handle_dvr_defaults(server_args):
     if not is_dvr_enabled(server_args):
         return
 
-    normalized_page_size = _normalize_dvr_chunk_page_size(server_args.page_size)
+    # Deterministic target prefill/verify disables custom all-reduce later in
+    # ServerArgs. Preserve the user's original choice for provisional draft
+    # graphs without exposing another CLI option.
+    server_args._dvr_enable_draft_custom_all_reduce = (
+        not server_args.disable_custom_all_reduce
+    )
+
+    normalized_page_size = server_args.page_size
+    if normalized_page_size not in (None, 1) and normalized_page_size > 0:
+        normalized_page_size = 1 << (
+            min(normalized_page_size, FLA_CHUNK_SIZE).bit_length() - 1
+        )
+        while FLA_CHUNK_SIZE % normalized_page_size != 0:
+            normalized_page_size //= 2
     if normalized_page_size != server_args.page_size:
         logger.warning(
             "DVR requires page_size to be no larger "
@@ -124,7 +136,14 @@ def handle_dvr_speculative_decoding(server_args):
             "--speculative-num-draft-tokens."
         )
 
-    _validate_dvr_page_size(server_args)
+    if server_args.page_size != 1 and not (
+        server_args.page_size <= FLA_CHUNK_SIZE
+        and FLA_CHUNK_SIZE % server_args.page_size == 0
+    ):
+        raise ValueError(
+            "DVR page_size > 1 requires page_size to be no larger than and divide "
+            f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}."
+        )
 
     if server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = server_args.speculative_num_draft_tokens - 1
@@ -189,7 +208,9 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
 
     if not is_dvr_self_draft_enabled(server_args):
         return
-    if not _is_dvr_gated_linear_state_model_safe(server_args):
+    if not hasattr(server_args, "get_model_config") or not (
+        _is_dvr_gated_linear_state_model(server_args)
+    ):
         return
 
     if getattr(server_args, "disable_cuda_graph", False) or getattr(
@@ -234,12 +255,6 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
     server_args.cuda_graph_max_bs = max(server_args.cuda_graph_bs)
 
 
-def _is_dvr_gated_linear_state_model_safe(server_args):
-    if not hasattr(server_args, "get_model_config"):
-        return False
-    return _is_dvr_gated_linear_state_model(server_args)
-
-
 def _is_dvr_gated_linear_state_model(server_args):
     from sglang.srt.configs import (
         JetNemotronConfig,
@@ -257,30 +272,4 @@ def _is_dvr_gated_linear_state_model(server_args):
         | Qwen3_5MoeConfig
         | JetNemotronConfig
         | JetVLMConfig,
-    )
-
-
-def _normalize_dvr_chunk_page_size(page_size: Optional[int]) -> Optional[int]:
-    if page_size in (None, 1):
-        return page_size
-    if page_size <= 0:
-        return page_size
-
-    aligned = 1 << (min(page_size, FLA_CHUNK_SIZE).bit_length() - 1)
-    while FLA_CHUNK_SIZE % aligned != 0:
-        aligned //= 2
-    return aligned
-
-
-def _validate_dvr_page_size(server_args):
-    if server_args.page_size == 1:
-        return
-    if (
-        server_args.page_size <= FLA_CHUNK_SIZE
-        and FLA_CHUNK_SIZE % server_args.page_size == 0
-    ):
-        return
-    raise ValueError(
-        "DVR page_size > 1 requires page_size to be no larger than and divide "
-        f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}."
     )

@@ -4,6 +4,7 @@ from unittest.mock import patch
 from sglang.srt.speculative.dvr_server_args import (
     DVR_EAGLE_SPECULATIVE_ALGORITHM,
     DVR_SPECULATIVE_ALGORITHM,
+    handle_dvr_defaults,
     handle_dvr_speculative_decoding,
 )
 
@@ -27,6 +28,10 @@ class _Args:
     cuda_graph_bs = [1, 2]
     cuda_graph_max_bs = 2
     disable_radix_cache = False
+    disable_custom_all_reduce = False
+
+    def get_model_config(self):
+        return None
 
 
 class TestDVRServerArgs(unittest.TestCase):
@@ -41,7 +46,7 @@ class TestDVRServerArgs(unittest.TestCase):
 
         with patch(
             "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model_safe",
+            "_is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             handle_dvr_speculative_decoding(args)
@@ -57,7 +62,7 @@ class TestDVRServerArgs(unittest.TestCase):
 
         with patch(
             "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model_safe",
+            "_is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             handle_dvr_speculative_decoding(args)
@@ -72,7 +77,7 @@ class TestDVRServerArgs(unittest.TestCase):
 
         with patch(
             "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model_safe",
+            "_is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             handle_dvr_speculative_decoding(args)
@@ -86,7 +91,7 @@ class TestDVRServerArgs(unittest.TestCase):
 
         with patch(
             "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model_safe",
+            "_is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
@@ -100,6 +105,28 @@ class TestDVRServerArgs(unittest.TestCase):
         handle_dvr_speculative_decoding(args)
 
         self.assertFalse(args.disable_radix_cache)
+
+    def test_dvr_preserves_draft_custom_all_reduce_intent(self):
+        args = _Args()
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=False,
+        ):
+            handle_dvr_defaults(args)
+
+        self.assertTrue(args._dvr_enable_draft_custom_all_reduce)
+
+        args = _Args()
+        args.disable_custom_all_reduce = True
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=False,
+        ):
+            handle_dvr_defaults(args)
+
+        self.assertFalse(args._dvr_enable_draft_custom_all_reduce)
 
 
 if __name__ == "__main__":

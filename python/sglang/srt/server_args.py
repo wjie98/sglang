@@ -6103,15 +6103,10 @@ class ServerArgs:
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
-                    from sglang.srt.speculative.dvr_server_args import is_dvr_enabled
-
-                    use_draft_decode_custom_all_reduce = (
-                        self.speculative_algorithm is not None
-                        and not self.disable_custom_all_reduce
-                        and is_dvr_enabled(self)
-                    )
                     self.disable_custom_all_reduce = True
-                    if use_draft_decode_custom_all_reduce:
+                    if getattr(
+                        self, "_dvr_enable_draft_custom_all_reduce", False
+                    ):
                         logger.warning(
                             "NCCL_ALGO is set to 'allreduce:tree'. Custom all reduce "
                             "is disabled for deterministic prefill and verify; the "
