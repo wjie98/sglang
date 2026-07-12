@@ -981,188 +981,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             extra_keep_alive_refs=extra_keep_alive_refs,
         )
 
-    def _verify_eagle(
-        self,
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-    ) -> GenerationBatchResult:
-        fwd_stream = torch.get_device_module(self.device).current_stream()
-        assert spec_info.is_verify_input()
-        record_stream_for_v2_verify(batch, spec_info, fwd_stream)
-
-        spec_info.num_tokens_per_req = self.speculative_num_steps + 1
-        bs = len(batch.seq_lens)
-        raise_for_dvr_graph_unsafe_short_prompt(batch)
-
-        with self._target_verify_context(prepare=True) as prepared_on_plan_stream:
-            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
-                spec_info,
-                self.req_to_token_pool,
-                batch,
-                self.target_worker,
-            )
-
-        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
-
-        if prepared_on_plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
-            )
-            if (
-                _is_npu
-                and self.target_worker.model_runner.model_is_mrope
-                and batch.spec_info is not None
-                and getattr(batch.spec_info, "positions", None) is not None
-                and not batch.forward_mode.is_idle()
-            ):
-                verify_forward_batch.compute_spec_mrope_positions(
-                    self.target_worker.model_runner, batch
-                )
-
-            runner = self.target_worker.model_runner.decode_cuda_graph_runner
-            cuda_graph_bs = (
-                None if not can_run_cuda_graph or runner is None else runner.bs
-            )
-            for backend in iter_dvr_attention_backends(
-                self.target_worker.model_runner.attn_backend
-            ):
-                try:
-                    backend.update_verify_buffers_to_fill_after_draft(
-                        spec_info, cuda_graph_bs
-                    )
-                except NotImplementedError:
-                    continue
-
-        if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
-            draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrieve_next_token.shape
-            ).cpu()
-
-        base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        linear_state_ctx = self.linear_state.restore_for_verify(
-            batch,
-            seq_lens_cpu=base_seq_lens_cpu,
-        )
-
-        with self._target_verify_context():
-            forward_batch_output = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=verify_forward_batch,
-                is_verify=True,
-            )
-        logits_output = forward_batch_output.logits_output
-        oracle_output = None
-        if (
-            linear_state_ctx is not None
-            or batch.return_logprob
-            or logits_output.hidden_states is None
-        ):
-            oracle_output = self._replay_target_verify_suffix(
-                batch=batch,
-                spec_info=spec_info,
-                linear_state_ctx=linear_state_ctx,
-            )
-        if oracle_output is not None:
-            oracle_logits, oracle_hidden_states = oracle_output
-            logits_output.next_token_logits = oracle_logits
-            logits_output.hidden_states = oracle_hidden_states
-
-        vocab_mask = None
-        if batch.has_grammar:
-            vocab_mask = generate_token_bitmask(
-                batch.reqs,
-                spec_info,
-                retrieve_next_token_cpu,
-                retrieve_next_sibling_cpu,
-                draft_tokens_cpu,
-                batch.sampling_info.vocab_size,
-            )
-            if vocab_mask is not None:
-                assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
-                batch.sampling_info.vocab_mask = None
-
-        maybe_detect_nan(
-            logits_output.next_token_logits, "dvr eagle verify: target model logits"
-        )
-        maybe_detect_inf(
-            logits_output.next_token_logits, "dvr eagle verify: target model logits"
-        )
-        predict, accept_lens, accept_index = self._sample_target_verify(
-            batch=batch,
-            spec_info=spec_info,
-            logits_output=logits_output,
-            vocab_mask=vocab_mask,
-        )
-        new_seq_lens = batch.seq_lens + accept_lens
-        has_verify_tokens = not batch.forward_mode.is_idle()
-
-        if has_verify_tokens:
-            accept_tokens = predict[accept_index]
-            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            fill_bonus_tokens[(bs,)](
-                accept_tokens,
-                accept_lens,
-                bonus_tokens,
-                accept_index.shape[1],
-            )
-        else:
-            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
-
-        if has_verify_tokens and batch.return_logprob:
-            compute_spec_v2_logprobs(
-                batch,
-                logits_output,
-                predict,
-                accept_index,
-                self.speculative_num_steps,
-            )
-
-        rollback_replay_kwargs = None
-        if linear_state_ctx is not None:
-            rollback_replay_kwargs = dict(
-                target_worker=self.target_worker,
-                linear_state_ctx=linear_state_ctx,
-                base_seq_lens_cpu=base_seq_lens_cpu,
-                num_draft_tokens=self.speculative_num_draft_tokens,
-                request_token_ids_for_replay=self._request_token_ids_for_replay,
-            )
-        batch_result = self._rollback_after_verify(
-            batch=batch,
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
-            predict=predict,
-            accept_lens=accept_lens,
-            accept_index=accept_index,
-            new_seq_lens=new_seq_lens,
-            has_verify_tokens=has_verify_tokens,
-            linear_state_ctx=linear_state_ctx,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            tokens_per_req=spec_info.draft_token_num,
-            accepted_input_tokens=(
-                spec_info.draft_token if rollback_replay_kwargs is not None else None
-            ),
-            next_draft_input=EagleDraftInput(bonus_tokens=bonus_tokens),
-            error_prefix="DVR EAGLE",
-            routed_experts_output=forward_batch_output.routed_experts_output,
-            indexer_topk_output=forward_batch_output.indexer_topk_output,
-            extra_keep_alive_refs=[verify_forward_batch],
-            rollback_replay_kwargs=rollback_replay_kwargs,
-        )
-        if linear_state_ctx is not None:
-            self.linear_state.backup_boundary_state(batch, preserve_existing=False)
-        else:
-            commit_mamba_states_after_verify(
-                self.target_worker,
-                batch,
-                accept_lens,
-                accept_index,
-                self.speculative_num_draft_tokens,
-            )
-        return batch_result
-
     def _run_decode_draft_verify_rollback(
         self,
         batch: ScheduleBatch,
@@ -1254,79 +1072,200 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
     ) -> GenerationBatchResult:
-        if self.is_dvr_eagle:
-            return self._verify_eagle(batch, spec_info)
-
-        if not batch.forward_mode.is_idle():
-            batch.input_ids = spec_info.draft_token
-        spec_info.num_tokens_per_req = self.num_draft_tokens
-        batch.forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if not batch.forward_mode.is_idle()
-            else ForwardMode.IDLE
-        )
-        batch.capture_hidden_mode = CaptureHiddenMode.NULL
-        batch.spec_info = spec_info
-
         scheduler_seq_lens = batch.seq_lens
-        linear_state_ctx = self.linear_state.restore_for_verify(
-            batch,
-            seq_lens_cpu=self.linear_state.batch_seq_lens_cpu(batch),
+        vocab_mask = None
+        rollback_replay_kwargs = None
+        accepted_input_tokens = None
+        extra_keep_alive_refs = None
+
+        if self.is_dvr_eagle:
+            fwd_stream = torch.get_device_module(self.device).current_stream()
+            assert spec_info.is_verify_input()
+            record_stream_for_v2_verify(batch, spec_info, fwd_stream)
+            spec_info.num_tokens_per_req = self.num_draft_tokens
+            bs = len(batch.seq_lens)
+            raise_for_dvr_graph_unsafe_short_prompt(batch)
+
+            with self._target_verify_context(prepare=True) as prepared_on_plan_stream:
+                verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                    spec_info,
+                    self.req_to_token_pool,
+                    batch,
+                    self.target_worker,
+                )
+            record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
+
+            if prepared_on_plan_stream:
+                torch.get_device_module(self.device).current_stream().wait_stream(
+                    self.plan_stream
+                )
+                if (
+                    _is_npu
+                    and self.target_worker.model_runner.model_is_mrope
+                    and batch.spec_info is not None
+                    and getattr(batch.spec_info, "positions", None) is not None
+                    and not batch.forward_mode.is_idle()
+                ):
+                    verify_forward_batch.compute_spec_mrope_positions(
+                        self.target_worker.model_runner, batch
+                    )
+
+                runner = self.target_worker.model_runner.decode_cuda_graph_runner
+                cuda_graph_bs = (
+                    None if not can_run_cuda_graph or runner is None else runner.bs
+                )
+                for backend in iter_dvr_attention_backends(
+                    self.target_worker.model_runner.attn_backend
+                ):
+                    try:
+                        backend.update_verify_buffers_to_fill_after_draft(
+                            spec_info, cuda_graph_bs
+                        )
+                    except NotImplementedError:
+                        continue
+
+            if batch.has_grammar:
+                retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+                retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
+                draft_tokens_cpu = spec_info.draft_token.view(
+                    spec_info.retrieve_next_token.shape
+                ).cpu()
+
+            base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
+            linear_state_ctx = self.linear_state.restore_for_verify(
+                batch,
+                seq_lens_cpu=base_seq_lens_cpu,
+            )
+            with self._target_verify_context():
+                forward_output = self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=verify_forward_batch,
+                    is_verify=True,
+                )
+
+            if batch.has_grammar:
+                vocab_mask = generate_token_bitmask(
+                    batch.reqs,
+                    spec_info,
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    draft_tokens_cpu,
+                    batch.sampling_info.vocab_size,
+                )
+                if vocab_mask is not None:
+                    assert spec_info.grammar is not None
+                    vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
+                    batch.sampling_info.vocab_mask = None
+
+            if linear_state_ctx is not None:
+                rollback_replay_kwargs = dict(
+                    target_worker=self.target_worker,
+                    linear_state_ctx=linear_state_ctx,
+                    base_seq_lens_cpu=base_seq_lens_cpu,
+                    num_draft_tokens=self.num_draft_tokens,
+                    request_token_ids_for_replay=self._request_token_ids_for_replay,
+                )
+                accepted_input_tokens = spec_info.draft_token
+            extra_keep_alive_refs = [verify_forward_batch]
+            error_prefix = "DVR EAGLE"
+            use_fast_self_draft_commit = False
+        else:
+            if not batch.forward_mode.is_idle():
+                batch.input_ids = spec_info.draft_token
+            spec_info.num_tokens_per_req = self.num_draft_tokens
+            batch.forward_mode = (
+                ForwardMode.TARGET_VERIFY
+                if not batch.forward_mode.is_idle()
+                else ForwardMode.IDLE
+            )
+            batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            batch.spec_info = spec_info
+
+            base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
+            linear_state_ctx = self.linear_state.restore_for_verify(
+                batch,
+                seq_lens_cpu=base_seq_lens_cpu,
+            )
+            batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
+            forward_output = self._forward_target_verify_for_dvr(batch)
+            can_run_cuda_graph = forward_output.can_run_cuda_graph
+            error_prefix = "DVR self"
+            use_fast_self_draft_commit = True
+
+        logits_output = forward_output.logits_output
+        needs_suffix_oracle = (
+            self.is_dvr_eagle
+            and (
+                linear_state_ctx is not None
+                or batch.return_logprob
+                or logits_output.hidden_states is None
+            )
+            or (
+                not self.is_dvr_eagle
+                and batch.return_logprob
+                and any(req.return_logprob and req.stream for req in batch.reqs)
+            )
         )
-        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
-        batch_result = self._forward_target_verify_for_dvr(batch)
-        logits_output = batch_result.logits_output
-        oracle_logits = None
-        streaming_return_logprob = any(
-            req.return_logprob and req.stream for req in batch.reqs
-        )
-        if batch.return_logprob and streaming_return_logprob:
-            # Streaming logprob chunks are emitted immediately, so they need the
-            # same prefill-equivalent suffix oracle that DVR-EAGLE uses for
-            # verify hidden states.
+        if needs_suffix_oracle:
             oracle_output = self._replay_target_verify_suffix(
                 batch=batch,
                 spec_info=spec_info,
                 linear_state_ctx=linear_state_ctx,
             )
-            oracle_logits = None if oracle_output is None else oracle_output[0]
-        if oracle_logits is not None:
-            logits_output.next_token_logits = oracle_logits
-        maybe_detect_nan(logits_output.next_token_logits, "dvr v2 target verify")
+            if oracle_output is not None:
+                logits_output.next_token_logits = oracle_output[0]
+                if self.is_dvr_eagle:
+                    logits_output.hidden_states = oracle_output[1]
 
+        maybe_detect_nan(logits_output.next_token_logits, f"{error_prefix} verify")
+        maybe_detect_inf(logits_output.next_token_logits, f"{error_prefix} verify")
         predict, accept_lens, accept_index = self._sample_target_verify(
             batch=batch,
             spec_info=spec_info,
             logits_output=logits_output,
+            vocab_mask=vocab_mask,
         )
         new_seq_lens = scheduler_seq_lens + accept_lens
         has_verify_tokens = (
             not batch.forward_mode.is_idle() and accept_lens.numel() > 0
         )
-        base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        if has_verify_tokens:
-            if batch.return_logprob:
-                compute_spec_v2_logprobs(
-                    batch,
-                    logits_output,
-                    predict,
-                    accept_index,
-                    self.num_draft_steps,
+
+        if has_verify_tokens and batch.return_logprob:
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                predict,
+                accept_index,
+                self.num_draft_steps,
+            )
+
+        if self.is_dvr_eagle:
+            if has_verify_tokens:
+                accept_tokens = predict[accept_index]
+                bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+                fill_bonus_tokens[(bs,)](
+                    accept_tokens,
+                    accept_lens,
+                    bonus_tokens,
+                    accept_index.shape[1],
                 )
+            else:
+                bonus_tokens = torch.empty(
+                    (0,), device=self.device, dtype=torch.int32
+                )
+            next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+        else:
+            next_draft_input = self.draft_backend.next_draft_input(
+                batch=batch,
+                predict=predict,
+                accept_lens=accept_lens,
+                has_verify_tokens=has_verify_tokens,
+            )
 
-        next_draft_input = self.draft_backend.next_draft_input(
-            batch=batch,
-            predict=predict,
-            accept_lens=accept_lens,
-            has_verify_tokens=has_verify_tokens,
-        )
-
-        # Self draft reuses target KV/GDN state directly, so rollback does not
-        # need a target replay of accepted rows; the fast path copies verify state.
-        return self._rollback_after_verify(
+        batch_result = self._rollback_after_verify(
             batch=batch,
             logits_output=logits_output,
-            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            can_run_cuda_graph=can_run_cuda_graph,
             predict=predict,
             accept_lens=accept_lens,
             accept_index=accept_index,
@@ -1334,12 +1273,30 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             has_verify_tokens=has_verify_tokens,
             linear_state_ctx=linear_state_ctx,
             base_seq_lens_cpu=base_seq_lens_cpu,
-            tokens_per_req=self.num_draft_tokens,
+            tokens_per_req=spec_info.draft_token_num,
+            accepted_input_tokens=accepted_input_tokens,
             next_draft_input=next_draft_input,
-            error_prefix="DVR spec-v2",
-            routed_experts_output=batch_result.routed_experts_output,
-            use_fast_self_draft_commit=True,
+            error_prefix=error_prefix,
+            routed_experts_output=forward_output.routed_experts_output,
+            indexer_topk_output=forward_output.indexer_topk_output,
+            extra_keep_alive_refs=extra_keep_alive_refs,
+            rollback_replay_kwargs=rollback_replay_kwargs,
+            use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
+        if self.is_dvr_eagle:
+            if linear_state_ctx is not None:
+                self.linear_state.backup_boundary_state(
+                    batch, preserve_existing=False
+                )
+            else:
+                commit_mamba_states_after_verify(
+                    self.target_worker,
+                    batch,
+                    accept_lens,
+                    accept_index,
+                    self.num_draft_tokens,
+                )
+        return batch_result
 
     def _sample_verify(
         self,
