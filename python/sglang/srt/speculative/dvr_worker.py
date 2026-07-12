@@ -132,7 +132,7 @@ class _DVRSelfDraftBackend:
             seq_lens_cpu=seq_lens_cpu,
             request_token_ids_for_replay=worker._request_token_ids_for_replay,
         )
-        worker.linear_state.backup_boundary_state(batch, preserve_existing=False)
+        worker.linear_state.backup_boundary_state(batch, preserve_existing=True)
         worker._draft_preprocess_decode_for_self_dvr(batch)
 
         spec_info = batch.spec_info
@@ -1145,17 +1145,20 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=extra_keep_alive_refs,
         )
-        if self.is_dvr_eagle:
-            if linear_state_ctx is not None:
-                self.linear_state.backup_boundary_state(
-                    batch, preserve_existing=False
-                )
-            else:
-                commit_mamba_states_after_verify(
-                    self.target_worker,
-                    batch,
-                    accept_lens,
-                    accept_index,
-                    self.num_draft_tokens,
-                )
+        if linear_state_ctx is not None:
+            # Radix insertion may rebind a request's logical ping-pong slot
+            # before the next overlap iteration. Keep the just-committed target
+            # state authoritative and restore it into whichever physical slot
+            # owns that logical boundary on the next verify.
+            self.linear_state.backup_boundary_state(
+                batch, preserve_existing=False, ctx=linear_state_ctx
+            )
+        elif self.is_dvr_eagle:
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                self.num_draft_tokens,
+            )
         return batch_result

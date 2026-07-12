@@ -73,6 +73,17 @@ run_one_mode() {
     --ignore-eos \
     2>&1 | tee "${client_log}"
 
+  echo "==> Running ${label} cross-chunk KL cases"
+  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    --base-url "${BASE_URL}" \
+    --request-modes concurrent,batch \
+    --prompt-token-lengths 63,64,65 \
+    --max-new 63,64,65,128 \
+    --limit-cases 24 \
+    --concurrent-workers 3 \
+    --ignore-eos \
+    2>&1 | tee -a "${client_log}"
+
   grep -q "ALL_OK True" "${client_log}"
   stop_process_group "${SERVER_PID}"
   SERVER_PID=""

@@ -331,19 +331,17 @@ class DVRLinearStateLifecycle:
             )
 
     def backup_boundary_state(
-        self, batch: ScheduleBatch, *, preserve_existing: bool = False
+        self,
+        batch: ScheduleBatch,
+        *,
+        preserve_existing: bool = False,
+        ctx: Optional[DVRLinearStateContext] = None,
     ):
-        ctx = self.state_context(batch, require_boundary=True)
-        if ctx is None:
-            self.boundary_backup = None
-            self.boundary_backup_keys = None
-            self.live_backup = None
-            return
-        assert ctx.boundary_indices is not None
         # Host logical lengths advance after overlap result processing, while
         # the target verify has already updated the physical boundary slot.
-        # Key the snapshot by physical ownership so a delayed seqlen update
-        # cannot make us recapture draft-mutated state before the next verify.
+        # Key the snapshot by request-local boundary ownership. The supplied
+        # verify context pins the physical slot used by this commit, while the
+        # key remains valid if radix later rebinds that logical ping-pong slot.
         backup_keys = [
             (req.rid, int(self.boundary_track_idx.get(req.rid, -1)))
             for req in batch.reqs
@@ -354,6 +352,13 @@ class DVRLinearStateLifecycle:
             and self.boundary_backup_keys == backup_keys
         ):
             return
+        ctx = ctx or self.state_context(batch, require_boundary=True)
+        if ctx is None:
+            self.boundary_backup = None
+            self.boundary_backup_keys = None
+            self.live_backup = None
+            return
+        assert ctx.boundary_indices is not None
         self.boundary_backup = ctx.state_adapter.backup_recurrent_state(
             state_cache=ctx.state_cache,
             indices=ctx.boundary_indices,

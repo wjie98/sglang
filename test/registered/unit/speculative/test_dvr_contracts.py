@@ -8,6 +8,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _ensure_decode_custom_all_reduce_comm,
     _patch_draft_decode_backend_defaults,
     dvr_self_draft_graph_block_reason,
+    iter_dvr_attention_backends,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
@@ -222,6 +223,23 @@ def test_dvr_draft_restores_backend_decode_defaults(monkeypatch):
     )
 
 
+def test_dvr_draft_reaches_nested_hybrid_attention_backends():
+    full_attention = SimpleNamespace()
+    linear_attention = SimpleNamespace()
+    hybrid = SimpleNamespace(
+        attn_backend_list=[full_attention, linear_attention],
+        full_attn_backend=full_attention,
+    )
+
+    backends = list(iter_dvr_attention_backends(hybrid))
+
+    assert {id(backend) for backend in backends} == {
+        id(hybrid),
+        id(full_attention),
+        id(linear_attention),
+    }
+
+
 def test_dvr_self_draft_graph_runner_rejects_short_boundary():
     graph_runner = object.__new__(DVRDraftDecodeCudaGraphRunner)
     graph_runner.runner = SimpleNamespace(can_run_graph=lambda forward_batch: True)
@@ -275,14 +293,14 @@ def test_dvr_boundary_metadata_advances_from_next_scheduler_length():
     assert lifecycle.boundary_track_idx == {"r0": 1}
 
 
-def test_dvr_boundary_backup_tracks_physical_slot_not_delayed_seqlen():
+def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     class Adapter:
         def __init__(self):
-            self.backup_calls = 0
+            self.backup_indices = []
 
-        def backup_recurrent_state(self, **_kwargs):
-            self.backup_calls += 1
-            return self.backup_calls
+        def backup_recurrent_state(self, *, indices, **_kwargs):
+            self.backup_indices.append(indices.tolist())
+            return len(self.backup_indices)
 
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle.boundary_seqlen = {"r0": 64}
@@ -297,19 +315,42 @@ def test_dvr_boundary_backup_tracks_physical_slot_not_delayed_seqlen():
         boundary_indices=torch.tensor([11]),
         live_indices=torch.tensor([12]),
     )
-    lifecycle.state_context = lambda batch, require_boundary: context
+    rebound_context = SimpleNamespace(
+        state_adapter=adapter,
+        state_cache=object(),
+        boundary_indices=torch.tensor([21]),
+        live_indices=torch.tensor([22]),
+    )
+    state_context_calls = []
+
+    def state_context(batch, require_boundary):
+        state_context_calls.append((batch, require_boundary))
+        return rebound_context if len(state_context_calls) > 1 else context
+
+    lifecycle.state_context = state_context
     batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
 
     lifecycle.backup_boundary_state(batch)
-    assert adapter.backup_calls == 2
+    assert adapter.backup_indices == [[11], [12]]
+    assert len(state_context_calls) == 1
 
-    # Overlap publishes the new logical boundary after verify. The physical
-    # slot and its saved target state are unchanged, so do not recapture state
-    # after an EAGLE draft may have mutated shared request slots.
+    # Radix may rebind the physical slot while the logical ping-pong owner is
+    # unchanged. Preserve the authoritative verify snapshot before resolving
+    # that mutable request mapping again.
     lifecycle.boundary_seqlen["r0"] = 128
     lifecycle.backup_boundary_state(batch, preserve_existing=True)
-    assert adapter.backup_calls == 2
+    assert adapter.backup_indices == [[11], [12]]
+    assert len(state_context_calls) == 1
+
+    # Post-verify commit supplies the exact physical context used by target
+    # verify, independent of the request mapping currently visible to radix.
+    lifecycle.backup_boundary_state(
+        batch, preserve_existing=False, ctx=rebound_context
+    )
+    assert adapter.backup_indices == [[11], [12], [21], [22]]
+    assert len(state_context_calls) == 1
 
     lifecycle.boundary_track_idx["r0"] = 0
     lifecycle.backup_boundary_state(batch, preserve_existing=True)
-    assert adapter.backup_calls == 4
+    assert adapter.backup_indices == [[11], [12], [21], [22], [21], [22]]
+    assert len(state_context_calls) == 2
