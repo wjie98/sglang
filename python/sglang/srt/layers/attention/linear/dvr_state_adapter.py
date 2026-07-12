@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.linear.dvr_gdn_state import (
+    _rebuild_gdn_state_for_self_draft,
     _rebuild_gdn_state_from_qkvg_beta_chunkwise,
     create_gdn_state_input_cache,
 )
@@ -35,6 +36,7 @@ class DVRGatedStateAdapter:
     kernel_dispatcher: Any
     chunk_size: int = FLA_CHUNK_SIZE
     is_draft_worker: bool = False
+    draft_reuses_target_state: bool = False
     state_shape: Any = None
     conv_dtype: Optional[torch.dtype] = None
     device: Optional[str] = None
@@ -54,6 +56,10 @@ class DVRGatedStateAdapter:
         return cls(
             kernel_dispatcher,
             is_draft_worker=is_draft_worker,
+            draft_reuses_target_state=(
+                not is_draft_worker
+                and model_runner.spec_algorithm.is_dvr_self_draft()
+            ),
             state_shape=mamba_cache_params.shape,
             conv_dtype=mamba_cache_params.dtype.conv,
             device=model_runner.device,
@@ -171,6 +177,24 @@ class DVRGatedStateAdapter:
     ) -> torch.Tensor:
         q, k, v, g, beta = state_inputs.tensors()
         return _rebuild_gdn_state_from_qkvg_beta_chunkwise(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            token_count=token_count,
+        )
+
+    def rebuild_self_draft_state(
+        self,
+        state_inputs: DVRStateInputs,
+        *,
+        initial_state: torch.Tensor,
+        token_count=None,
+    ) -> torch.Tensor:
+        q, k, v, g, beta = state_inputs.tensors()
+        return _rebuild_gdn_state_for_self_draft(
             q,
             k,
             v,
@@ -462,32 +486,41 @@ class DVRGatedStateAdapter:
         )
         boundary_needs_rebuild = crosses_chunk_boundary
 
-        has_live_conv_commit = accepted_token_counts > 0
-        live_conv_req_indices = torch.nonzero(has_live_conv_commit).flatten()
-        if live_conv_req_indices.numel() > 0:
+        if self.draft_reuses_target_state:
             self._scatter_state(
                 state_cache.conv[0],
                 state_cache.intermediate_conv_window[0],
-                live_indices[live_conv_req_indices],
-                accepted_steps[live_conv_req_indices],
+                live_indices,
+                accepted_steps,
             )
-
-        crossing_req_indices = torch.nonzero(boundary_needs_rebuild).flatten()
-        if crossing_req_indices.numel() > 0:
-            if self._verify_exports_boundary_state:
-                # run_dvr_chunkwise_verify stores the first crossed boundary in
-                # step 0 when the selected linear backend exports FLA's `h`.
+        else:
+            live_conv_req_indices = torch.nonzero(
+                accepted_token_counts > 0
+            ).flatten()
+            if live_conv_req_indices.numel() > 0:
                 self._scatter_state(
-                    state_cache.temporal,
-                    state_cache.intermediate_ssm,
-                    boundary_indices,
-                    torch.where(
-                        boundary_needs_rebuild,
-                        torch.zeros_like(tail_lens_before),
-                        no_commit_step,
-                    ),
+                    state_cache.conv[0],
+                    state_cache.intermediate_conv_window[0],
+                    live_indices[live_conv_req_indices],
+                    accepted_steps[live_conv_req_indices],
                 )
-            else:
+
+        if self._verify_exports_boundary_state:
+            # run_dvr_chunkwise_verify stores the first crossed boundary in
+            # step 0 when the selected linear backend exports FLA's `h`.
+            self._scatter_state(
+                state_cache.temporal,
+                state_cache.intermediate_ssm,
+                boundary_indices,
+                torch.where(
+                    boundary_needs_rebuild,
+                    torch.zeros_like(tail_lens_before),
+                    no_commit_step,
+                ),
+            )
+        else:
+            crossing_req_indices = torch.nonzero(boundary_needs_rebuild).flatten()
+            if crossing_req_indices.numel() > 0:
                 # Some prefill kernels return only final state. Rebuild only the
                 # crossed boundary; attention backend selection remains free.
                 rebuild_dvr_live_state_grouped(
@@ -525,16 +558,22 @@ class DVRGatedStateAdapter:
             crosses_chunk_boundary=crosses_chunk_boundary,
             chunk_size=self.chunk_size,
         )
-        state_window.zero_after_lens(
-            indices=state_input_indices,
-            keep_lens=tail_lens_after,
-        )
-        draft_token_num = state_cache.intermediate_conv_window[0].shape[2]
-        partial_accept = accepted_token_counts < draft_token_num
-        partial_accept_req_indices = req_indices[partial_accept]
-        if partial_accept_req_indices.numel() > 0:
-            # Target verify already left the full accepted chain in the live
-            # slot. Only rejection shortens that chain and requires a rebuild.
+        if self.draft_reuses_target_state:
+            # Self draft consumes the target model's live recurrent slot. Keep
+            # this path host-sync free and rebuild every accepted suffix.
+            rebuild_req_indices = req_indices
+            rebuild_fn = self.rebuild_self_draft_state
+        else:
+            state_window.zero_after_lens(
+                indices=state_input_indices,
+                keep_lens=tail_lens_after,
+            )
+            draft_token_num = state_cache.intermediate_conv_window[0].shape[2]
+            rebuild_req_indices = req_indices[
+                accepted_token_counts < draft_token_num
+            ]
+            rebuild_fn = None
+        if rebuild_req_indices.numel() > 0:
             rebuild_dvr_live_state_grouped(
                 state_ops=self,
                 state_input_cache=state_window,
@@ -542,8 +581,9 @@ class DVRGatedStateAdapter:
                 state_input_indices=state_input_indices,
                 live_indices=live_indices,
                 boundary_indices=boundary_indices,
-                req_indices=partial_accept_req_indices,
-                token_count=tail_lens_after[partial_accept_req_indices],
+                req_indices=rebuild_req_indices,
+                token_count=tail_lens_after[rebuild_req_indices],
+                rebuild_fn=rebuild_fn,
             )
 
         state_window.set_tail_lens(

@@ -282,6 +282,7 @@ def rebuild_dvr_live_state_grouped(
     boundary_indices: torch.Tensor,
     req_indices: torch.Tensor,
     token_count: torch.Tensor,
+    rebuild_fn=None,
 ) -> None:
     if req_indices.numel() == 0:
         return
@@ -305,7 +306,9 @@ def rebuild_dvr_live_state_grouped(
     flat_token_count = (
         token_count.unsqueeze(0).expand(num_layers, -1).reshape(-1).contiguous()
     )
-    rebuilt_state = state_ops.rebuild_recurrent_state(
+    if rebuild_fn is None:
+        rebuild_fn = state_ops.rebuild_recurrent_state
+    rebuilt_state = rebuild_fn(
         window_inputs,
         initial_state=initial_state,
         token_count=flat_token_count,
