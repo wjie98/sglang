@@ -19,116 +19,6 @@ from sglang.srt.speculative.dvr_server_args import is_dvr_eagle_enabled
 _BoundaryReplayTask = tuple[Any, int, int, Optional[torch.Tensor], int, torch.Tensor]
 
 
-def _build_suffix_replay_plan(
-    *,
-    batch,
-    base_seq_lens_cpu: list[int],
-    boundary_lens: list[int],
-    append_tokens_cpu_by_req: list[list[int]],
-    append_cache_locs_by_req: list[torch.Tensor],
-    request_token_ids_for_replay,
-    hidden_gather_append_count: Optional[int] = None,
-) -> Optional[dict[str, Any]]:
-    """Plan replay over the open chunk tail plus caller-owned append tokens."""
-
-    tail_lens_cpu = []
-    extend_lens_cpu = []
-    final_seq_lens_cpu = []
-    input_ids = []
-    out_cache_locs = []
-    append_cache_locs = []
-    append_rows = []
-    append_offsets = []
-
-    for req_i, (
-        req,
-        seq_len,
-        boundary,
-        append_tokens,
-        append_locs,
-    ) in enumerate(
-        zip(
-            batch.reqs,
-            base_seq_lens_cpu,
-            boundary_lens,
-            append_tokens_cpu_by_req,
-            append_cache_locs_by_req,
-            strict=True,
-        )
-    ):
-        seq_len = int(seq_len)
-        boundary = int(boundary)
-        append_count = len(append_tokens)
-        tail_len = seq_len - boundary
-        extend_len = tail_len + append_count
-
-        tail_lens_cpu.append(tail_len)
-        extend_lens_cpu.append(extend_len)
-        final_seq_lens_cpu.append(boundary + extend_len)
-
-        token_ids = request_token_ids_for_replay(req, seq_len)
-        input_ids.extend(token_ids[boundary:seq_len])
-        input_ids.extend(append_tokens)
-        if tail_len > 0:
-            out_cache_locs.append(
-                batch.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, boundary:seq_len
-                ].to(torch.long)
-            )
-        if append_count > 0:
-            append_locs = append_locs.to(torch.long)
-            out_cache_locs.append(append_locs)
-            append_cache_locs.append(append_locs)
-            append_rows.append(
-                batch.req_pool_indices[req_i].to(dtype=torch.long).repeat(append_count)
-            )
-            append_offsets.append(
-                torch.arange(
-                    seq_len,
-                    seq_len + append_count,
-                    dtype=torch.long,
-                    device=batch.seq_lens.device,
-                )
-            )
-    if not input_ids:
-        return None
-
-    hidden_gather_indices = None
-    if hidden_gather_append_count is not None:
-        gather_indices = []
-        offset = 0
-        for tail_len, extend_len in zip(tail_lens_cpu, extend_lens_cpu, strict=True):
-            gather_indices.extend(
-                range(
-                    offset + int(tail_len),
-                    offset + int(tail_len) + hidden_gather_append_count,
-                )
-            )
-            offset += int(extend_len)
-        hidden_gather_indices = torch.tensor(
-            gather_indices, dtype=torch.long, device=batch.seq_lens.device
-        )
-
-    return dict(
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        tail_lens_cpu=tail_lens_cpu,
-        extend_lens_cpu=extend_lens_cpu,
-        final_seq_lens_cpu=final_seq_lens_cpu,
-        append_token_counts_cpu=[len(tokens) for tokens in append_tokens_cpu_by_req],
-        input_ids=input_ids,
-        out_cache_locs=out_cache_locs,
-        append_cache_locs=(
-            torch.cat(append_cache_locs)
-            if append_cache_locs
-            else torch.empty(0, dtype=torch.long, device=batch.seq_lens.device)
-        ),
-        append_rows=torch.cat(append_rows) if append_rows else None,
-        append_offsets=torch.cat(append_offsets) if append_offsets else None,
-        hidden_gather_indices=hidden_gather_indices,
-    )
-
-
 def build_dvr_private_extend_batch(
     batch,
     *,
@@ -251,27 +141,78 @@ def dvr_suffix_replay_context(
         raise RuntimeError("DVR suffix replay requires a chunk-boundary state slot.")
 
     boundary_lens = linear_state.boundary_lens_for_replay(batch, base_seq_lens_cpu)
-    replay_plan = _build_suffix_replay_plan(
-        batch=batch,
-        base_seq_lens_cpu=base_seq_lens_cpu,
-        boundary_lens=boundary_lens,
-        append_tokens_cpu_by_req=append_tokens_cpu_by_req,
-        append_cache_locs_by_req=append_cache_locs_by_req,
-        request_token_ids_for_replay=request_token_ids_for_replay,
-        hidden_gather_append_count=hidden_gather_append_count,
-    )
-    if replay_plan is None:
-        raise RuntimeError("DVR suffix replay received no tail or append tokens.")
+    extend_lens = []
+    final_seq_lens = []
+    input_ids = []
+    out_cache_locs = []
+    append_locs = []
+    append_rows = []
+    append_offsets = []
+    hidden_gather_indices = []
+    token_offset = 0
 
+    for req_i, (req, seq_len, boundary, tokens, cache_locs) in enumerate(
+        zip(
+            batch.reqs,
+            base_seq_lens_cpu,
+            boundary_lens,
+            append_tokens_cpu_by_req,
+            append_cache_locs_by_req,
+            strict=True,
+        )
+    ):
+        seq_len = int(seq_len)
+        boundary = int(boundary)
+        tail_len = seq_len - boundary
+        append_count = len(tokens)
+        extend_len = tail_len + append_count
+        extend_lens.append(extend_len)
+        final_seq_lens.append(seq_len + append_count)
+
+        replay_tokens = request_token_ids_for_replay(req, seq_len)
+        input_ids.extend(replay_tokens[boundary:seq_len])
+        input_ids.extend(tokens)
+        if tail_len:
+            out_cache_locs.append(
+                batch.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, boundary:seq_len
+                ].to(torch.long)
+            )
+        if append_count:
+            cache_locs = cache_locs.to(torch.long)
+            out_cache_locs.append(cache_locs)
+            append_locs.append(cache_locs)
+            append_rows.append(
+                batch.req_pool_indices[req_i].to(torch.long).repeat(append_count)
+            )
+            append_offsets.append(
+                torch.arange(
+                    seq_len,
+                    seq_len + append_count,
+                    dtype=torch.long,
+                    device=batch.seq_lens.device,
+                )
+            )
+        if hidden_gather_append_count is not None:
+            hidden_gather_indices.extend(
+                range(
+                    token_offset + tail_len,
+                    token_offset + tail_len + hidden_gather_append_count,
+                )
+            )
+        token_offset += extend_len
+
+    if not input_ids:
+        raise RuntimeError("DVR suffix replay received no tail or append tokens.")
     replay_batch = build_dvr_private_extend_batch(
         batch,
         reqs=batch.reqs,
-        input_ids=replay_plan["input_ids"],
-        out_cache_locs=replay_plan["out_cache_locs"],
-        prefix_lens=replay_plan["boundary_lens"],
-        extend_lens=replay_plan["extend_lens_cpu"],
-        final_seq_lens=replay_plan["final_seq_lens_cpu"],
-        extend_logprob_start_lens=replay_plan["extend_lens_cpu"],
+        input_ids=input_ids,
+        out_cache_locs=out_cache_locs,
+        prefix_lens=boundary_lens,
+        extend_lens=extend_lens,
+        final_seq_lens=final_seq_lens,
+        extend_logprob_start_lens=extend_lens,
         capture_hidden_mode=capture_hidden_mode,
         is_prefill_only=batch.is_prefill_only,
     )
@@ -297,15 +238,32 @@ def dvr_suffix_replay_context(
 
         # Draft KV rows must be visible at absolute positions
         # base_seq_len..base_seq_len+draft during the oracle forward.
-        linear_state.write_replay_append_cache_locs(replay_batch, replay_plan)
-        yield replay_batch, replay_plan
+        if append_rows:
+            replay_batch.req_to_token_pool.write(
+                (torch.cat(append_rows), torch.cat(append_offsets)),
+                torch.cat(append_locs).to(
+                    device=replay_batch.seq_lens.device,
+                    dtype=torch.int32,
+                ),
+            )
+        gather_indices = (
+            torch.tensor(
+                hidden_gather_indices,
+                dtype=torch.long,
+                device=batch.seq_lens.device,
+            )
+            if hidden_gather_append_count is not None
+            else None
+        )
+        yield replay_batch, gather_indices
 
 
 def run_target_verify_replay(
     *,
     target_worker,
     replay_batch: ScheduleBatch,
-    replay_plan: dict[str, Any],
+    hidden_gather_indices: torch.Tensor,
+    append_token_count: int,
     use_forward_batch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run target verify replay and return only draft-row outputs."""
@@ -314,18 +272,19 @@ def run_target_verify_replay(
     if use_forward_batch:
         forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
         if model_runner.model_is_mrope:
-            draft_token_num = int(replay_plan["append_token_counts_cpu"][0])
             device = replay_batch.seq_lens.device
             mrope_chunks = []
             mm_inputs = replay_batch.multimodal_inputs
-            for req_i, (seq_len, boundary, tail_len) in enumerate(
+            for req_i, (final_seq_len, boundary, extend_len) in enumerate(
                 zip(
-                    replay_plan["base_seq_lens_cpu"],
-                    replay_plan["boundary_lens"],
-                    replay_plan["tail_lens_cpu"],
+                    replay_batch.seq_lens_cpu.tolist(),
+                    replay_batch.prefix_lens,
+                    replay_batch.extend_lens,
                     strict=True,
                 )
             ):
+                seq_len = int(final_seq_len) - append_token_count
+                tail_len = int(extend_len) - append_token_count
                 mm_input = (
                     None
                     if mm_inputs is None or req_i >= len(mm_inputs)
@@ -354,7 +313,7 @@ def run_target_verify_replay(
                 chunk_parts.append(
                     torch.arange(
                         int(seq_len),
-                        int(seq_len) + draft_token_num,
+                        int(seq_len) + append_token_count,
                         dtype=torch.long,
                         device=device,
                     )
@@ -375,8 +334,6 @@ def run_target_verify_replay(
         )
         forward_batch = ForwardBatch.init_new(replay_batch, model_runner)
 
-    hidden_gather_indices = replay_plan["hidden_gather_indices"]
-    assert hidden_gather_indices is not None
     hidden_states = oracle_output.logits_output.hidden_states
     if hidden_states is None:
         raise RuntimeError("DVR target replay did not return hidden states.")
@@ -448,24 +405,6 @@ class DVRLinearStateLifecycle:
         self.boundary_backup = None
         self.boundary_backup_keys = None
         self.live_backup = None
-
-    @staticmethod
-    def write_replay_append_cache_locs(
-        replay_batch: ScheduleBatch,
-        replay_plan: dict[str, Any],
-    ) -> None:
-        append_rows = replay_plan["append_rows"]
-        append_offsets = replay_plan["append_offsets"]
-        if append_rows is None:
-            return
-        assert append_offsets is not None
-        replay_batch.req_to_token_pool.write(
-            (append_rows, append_offsets),
-            replay_plan["append_cache_locs"].to(
-                device=replay_batch.seq_lens.device,
-                dtype=torch.int32,
-            ),
-        )
 
     @contextmanager
     def replay_state_context(
@@ -734,43 +673,23 @@ class DVRLinearStateLifecycle:
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
         accepted_token_counts_cpu,
-        ctx: Optional[DVRLinearStateContext] = None,
-        seq_lens_cpu: Optional[List[int]] = None,
-        live_state_already_replayed: Optional[torch.Tensor] = None,
+        ctx: DVRLinearStateContext,
+        seq_lens_cpu: List[int],
         accepted_suffix_replay=None,
         use_fast_self_draft_commit: bool = False,
     ):
         pending_track_indices = [None] * len(batch.reqs)
         pending_track_seqlens = [None] * len(batch.reqs)
-        ctx = ctx or self.state_context(batch, require_boundary=True)
-        if ctx is None:
-            return pending_track_indices, pending_track_seqlens
         assert ctx.boundary_indices is not None
         if accepted_token_counts.numel() == 0:
             return pending_track_indices, pending_track_seqlens
 
-        if use_fast_self_draft_commit and seq_lens_cpu is None:
-            # Self-DVR follows the original v5 lifecycle: verify has already
-            # appended accepted tokens to Req, so recover the pre-verify tail
-            # from request metadata. Spec-v2 overlap passes seq_lens_cpu
-            # explicitly because Req materialization is delayed there, even
-            # though it still uses the fast self-draft adapter commit path.
-            verified_tail_lens_cpu = [
-                req.seqlen - accepted_token_num - 1 - self.boundary_seqlen[req.rid]
-                for req, accepted_token_num in zip(
-                    batch.reqs, accepted_token_counts_cpu, strict=True
-                )
-            ]
-        else:
-            seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
-            # Use the immutable pre-verify logical lengths from ScheduleBatch.
-            # Request metadata can already reflect accepted tokens in some spec
-            # paths, which is exactly the off-by-one/full-prefix replay dependency
-            # that suffix replay must avoid.
-            verified_tail_lens_cpu = [
-                int(seq_len) - self.boundary_seqlen[req.rid]
-                for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
-            ]
+        # Use immutable pre-verify lengths. Request metadata can already include
+        # accepted tokens when the synchronous result reaches this method.
+        verified_tail_lens_cpu = [
+            int(seq_len) - self.boundary_seqlen[req.rid]
+            for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
+        ]
         verified_tail_lens = ctx.state_input_cache.get_tail_lens(
             indices=ctx.state_input_indices
         )
@@ -785,7 +704,11 @@ class DVRLinearStateLifecycle:
             verified_tail_lens=verified_tail_lens,
             accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
-            live_state_already_replayed=live_state_already_replayed,
+            live_state_already_replayed=(
+                None
+                if accepted_suffix_replay is None
+                else accepted_suffix_replay[0]
+            ),
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
         if accepted_suffix_replay is not None:
@@ -898,7 +821,7 @@ class DVRLinearStateLifecycle:
         ) as replay:
             if replay is None:
                 raise RuntimeError("Active DVR accepted-suffix replay was skipped.")
-            replay_batch, _ = replay
+            replay_batch, _hidden_gather_indices = replay
             target_worker.forward_batch_generation(batch=replay_batch, is_verify=True)
             accepted_tail_lens = linear_state_ctx.state_input_cache.get_tail_lens(
                 indices=linear_state_ctx.state_input_indices

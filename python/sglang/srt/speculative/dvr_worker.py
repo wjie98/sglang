@@ -784,11 +784,13 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         ) as replay:
             if replay is None:
                 return None
-            replay_batch, replay_plan = replay
+            replay_batch, hidden_gather_indices = replay
+            assert hidden_gather_indices is not None
             return run_target_verify_replay(
                 target_worker=self.target_worker,
                 replay_batch=replay_batch,
-                replay_plan=replay_plan,
+                hidden_gather_indices=hidden_gather_indices,
+                append_token_count=self.num_draft_tokens,
                 use_forward_batch=self.is_dvr_eagle,
             )
 

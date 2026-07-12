@@ -315,11 +315,6 @@ def rollback_dvr_verify(
             accepted_token_counts_cpu=accept_lens_cpu,
             ctx=linear_state_ctx,
             seq_lens_cpu=base_seq_lens_cpu,
-            live_state_already_replayed=(
-                None
-                if accepted_suffix_replay is None
-                else accepted_suffix_replay[0]
-            ),
             accepted_suffix_replay=accepted_suffix_replay,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
