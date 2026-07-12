@@ -6104,19 +6104,9 @@ class ServerArgs:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
                     self.disable_custom_all_reduce = True
-                    if getattr(
-                        self, "_dvr_enable_draft_custom_all_reduce", False
-                    ):
-                        logger.warning(
-                            "NCCL_ALGO is set to 'allreduce:tree'. Custom all reduce "
-                            "is disabled for deterministic prefill and verify; the "
-                            "speculative draft decode CUDA graph may enable it "
-                            "temporarily."
-                        )
-                    else:
-                        logger.warning(
-                            "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
-                        )
+                    logger.warning(
+                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
+                    )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:

@@ -238,30 +238,22 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                    else:
-                        # DVR spec-v2 can attach a generated-prefix Mamba
-                        # checkpoint to a cache insert that upstream would not
-                        # normally see.  If it does not handle this request,
-                        # keep the original unfinished-prefill cache path.
-                        dvr_cached = False
-                        dvr_rollback_actions = result.dvr_rollback_actions
-                        if dvr_rollback_actions is not None:
-                            dvr_cached = dvr_rollback_actions.cache_prefill_after_rollback(
-                                req=req,
-                                batch=batch,
-                                req_index=i,
-                                tree_cache=self.tree_cache,
-                                enable_hisparse=self.server_args.enable_hisparse,
-                                hisparse_coordinator=self.hisparse_coordinator,
-                            )
-                        if not dvr_cached and (
-                            not batch.decoding_reqs or req not in batch.decoding_reqs
-                        ):
-                            maybe_cache_unfinished_req(req, self.tree_cache)
-                            if self.server_args.enable_hisparse:
-                                self.hisparse_coordinator.admit_request_into_staging(
-                                    req
-                                )
+                    elif (
+                        result.dvr_rollback_actions is None
+                        or not result.dvr_rollback_actions.cache_prefill_after_rollback(
+                            req=req,
+                            batch=batch,
+                            req_index=i,
+                            tree_cache=self.tree_cache,
+                            enable_hisparse=self.server_args.enable_hisparse,
+                            hisparse_coordinator=self.hisparse_coordinator,
+                        )
+                    ) and (
+                        not batch.decoding_reqs or req not in batch.decoding_reqs
+                    ):
+                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        if self.server_args.enable_hisparse:
+                            self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
@@ -574,6 +566,7 @@ class SchedulerBatchResultProcessor:
         # delayed result is processed. Use the draft token count recorded on result.
         stride = result.speculative_num_draft_tokens
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
@@ -671,6 +664,7 @@ class SchedulerBatchResultProcessor:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
             result=result,
