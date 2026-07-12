@@ -139,7 +139,6 @@ def test_dvr_custom_all_reduce_uses_current_dispatch_contract(monkeypatch):
         def __init__(self, *, group, device):
             calls.append(("init", group, device))
             self.world_size = 2
-            self._ptr = 1
             self.full_nvlink = True
             self.disabled = False
             self.original_disabled = False
@@ -171,9 +170,17 @@ def test_dvr_custom_all_reduce_uses_current_dispatch_contract(monkeypatch):
 
 def test_dvr_draft_restores_backend_decode_defaults(monkeypatch):
     monkeypatch.delenv("SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", raising=False)
-    server_args = SimpleNamespace(
-        triton_attention_split_tile_size=None,
-        triton_attention_num_kv_splits=8,
+    model_runner = SimpleNamespace(
+        server_args=SimpleNamespace(
+            triton_attention_split_tile_size=None,
+            triton_attention_num_kv_splits=8,
+        ),
+        kv_cache_dtype=torch.bfloat16,
+        tp_size=2,
+        model_config=SimpleNamespace(
+            num_attention_heads=16,
+            get_num_kv_heads=lambda tp_size: 8 // tp_size,
+        ),
     )
 
     def patch_attr(obj, name, value):
@@ -184,16 +191,19 @@ def test_dvr_draft_restores_backend_decode_defaults(monkeypatch):
     fa3 = FlashAttentionBackend()
     fa3.fa_impl_ver = 3
     fa3.num_splits = 1
-    _patch_draft_decode_backend_defaults(fa3, server_args, patch_attr)
+    _patch_draft_decode_backend_defaults(fa3, model_runner, patch_attr)
     assert fa3.num_splits == 0
 
     FlashInferAttnBackend = type("FlashInferAttnBackend", (), {})
     flashinfer = FlashInferAttnBackend()
     flashinfer.decode_split_tile_size = 2048
     flashinfer.disable_cuda_graph_kv_split = True
-    _patch_draft_decode_backend_defaults(flashinfer, server_args, patch_attr)
+    flashinfer.decode_use_tensor_cores = True
+    monkeypatch.setenv("SGLANG_FLASHINFER_USE_TENSOR_CORE", "false")
+    _patch_draft_decode_backend_defaults(flashinfer, model_runner, patch_attr)
     assert flashinfer.decode_split_tile_size is None
     assert not flashinfer.disable_cuda_graph_kv_split
+    assert not flashinfer.decode_use_tensor_cores
 
     TritonAttnBackend = type("TritonAttnBackend", (), {})
     triton_backend = TritonAttnBackend()
@@ -207,7 +217,7 @@ def test_dvr_draft_restores_backend_decode_defaults(monkeypatch):
     triton_backend.cuda_graph_num_kv_splits = torch.full(
         (4,), 32, dtype=torch.int32
     )
-    _patch_draft_decode_backend_defaults(triton_backend, server_args, patch_attr)
+    _patch_draft_decode_backend_defaults(triton_backend, model_runner, patch_attr)
     assert triton_backend.max_kv_splits == 8
     assert triton_backend.split_tile_size is None
     assert not triton_backend.static_kv_splits

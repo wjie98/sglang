@@ -33,6 +33,10 @@ variables near the top of each file.  When reporting a run, include the script
 path, commit, key override variables, result directory, and whether the server
 log confirms the expected CUDA graph and effective concurrency.
 
+The 0.8B and 35B scripts also accept `DISABLE_RADIX_CACHE=1`. Use this fixed
+variant to validate deterministic attention backends such as FlashInfer that
+disable prefix matching; DVR must still preserve request-local GDN checkpoints.
+
 Do not use the removed `SGLANG_ENABLE_SPEC_V2` environment variable.  The fixed
 scripts select the self-DVR v1 compatibility worker with
 `--disable-overlap-schedule`; omitting that flag uses the spec-v2 overlap worker.

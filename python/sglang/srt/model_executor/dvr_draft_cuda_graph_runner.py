@@ -99,7 +99,7 @@ def _uses_init_time_deterministic_num_splits(backend) -> bool:
     )
 
 
-def _patch_draft_decode_backend_defaults(backend, server_args, patch_attr):
+def _patch_draft_decode_backend_defaults(backend, model_runner, patch_attr):
     """Undo init-time deterministic decode knobs for DVR self-draft only.
 
     Prefill and verify still run through the deterministic target path. The
@@ -107,6 +107,8 @@ def _patch_draft_decode_backend_defaults(backend, server_args, patch_attr):
     use the same decode heuristics as normal non-deterministic serving whenever
     the deterministic choice was baked into a backend field at init time.
     """
+
+    server_args = model_runner.server_args
 
     if _uses_init_time_deterministic_num_splits(backend):
         patch_attr(backend, "num_splits", 0)
@@ -116,6 +118,25 @@ def _patch_draft_decode_backend_defaults(backend, server_args, patch_attr):
         # CUDA graph KV split. Restore normal decode planning for self-draft.
         patch_attr(backend, "decode_split_tile_size", None)
         patch_attr(backend, "disable_cuda_graph_kv_split", False)
+        if hasattr(backend, "decode_use_tensor_cores"):
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                should_use_tensor_core,
+            )
+
+            patch_attr(
+                backend,
+                "decode_use_tensor_cores",
+                should_use_tensor_core(
+                    kv_cache_dtype=model_runner.kv_cache_dtype,
+                    num_attention_heads=(
+                        model_runner.model_config.num_attention_heads
+                        // model_runner.tp_size
+                    ),
+                    num_kv_heads=model_runner.model_config.get_num_kv_heads(
+                        model_runner.tp_size
+                    ),
+                ),
+            )
 
     if backend.__class__.__name__ == "TritonAttnBackend":
         split_tile_size = server_args.triton_attention_split_tile_size
@@ -180,9 +201,7 @@ def _ensure_decode_custom_all_reduce_comm(group):
         )
         group.ca_comm = ca_comm
 
-    if ca_comm is None or not hasattr(ca_comm, "world_size") or not (
-        hasattr(ca_comm, "_ptr") or hasattr(ca_comm, "obj")
-    ):
+    if ca_comm is None or not hasattr(ca_comm, "world_size"):
         return None
 
     if hasattr(ca_comm, "full_nvlink") and not ca_comm.full_nvlink:
@@ -282,7 +301,7 @@ def _dvr_draft_decode_context(
                 for backend in iter_dvr_attention_backends(backend_root):
                     patch_attr(backend, "enable_deterministic", False)
                     _patch_draft_decode_backend_defaults(
-                        backend, model_runner.server_args, patch_attr
+                        backend, model_runner, patch_attr
                     )
 
             if graph_capture:

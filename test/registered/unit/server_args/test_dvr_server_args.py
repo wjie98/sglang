@@ -7,12 +7,14 @@ from sglang.srt.speculative.dvr_server_args import (
     handle_dvr_defaults,
     handle_dvr_speculative_decoding,
 )
+from sglang.srt.server_args import ServerArgs
 
 
 class _Args:
     speculative_algorithm = DVR_SPECULATIVE_ALGORITHM
     device = "cuda"
     enable_dp_attention = False
+    enable_pdmux = False
     disaggregation_mode = "null"
     speculative_draft_model_path = None
     speculative_num_draft_tokens = 16
@@ -29,6 +31,9 @@ class _Args:
     cuda_graph_max_bs = 2
     disable_radix_cache = False
     disable_custom_all_reduce = False
+    mamba_radix_cache_strategy = "auto"
+    mamba_track_interval = 1
+    mamba_ssm_dtype = "float32"
 
     def get_model_config(self):
         return None
@@ -105,6 +110,28 @@ class TestDVRServerArgs(unittest.TestCase):
         handle_dvr_speculative_decoding(args)
 
         self.assertFalse(args.disable_radix_cache)
+
+    def test_dvr_preserves_disabled_radix_cache_with_request_checkpoints(self):
+        args = _Args()
+        args.disable_radix_cache = True
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            handle_dvr_defaults(args)
+
+        self.assertTrue(args.disable_radix_cache)
+        self.assertEqual(args.mamba_radix_cache_strategy, "extra_buffer")
+        self.assertTrue(ServerArgs.enable_mamba_extra_buffer(args))
+
+    def test_dvr_rejects_pdmux_attention(self):
+        args = _Args()
+        args.enable_pdmux = True
+
+        with self.assertRaisesRegex(ValueError, "PDMux"):
+            handle_dvr_speculative_decoding(args)
 
     def test_dvr_preserves_draft_custom_all_reduce_intent(self):
         args = _Args()

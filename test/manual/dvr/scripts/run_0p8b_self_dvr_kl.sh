@@ -9,6 +9,7 @@ MODEL_PATH="${MODEL_PATH:-/mnt/data/hwj/Qwen3.5-0.8B}"
 PORT="${PORT:-30124}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.50}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
+DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/0p8b-self-dvr-kl}"
 SERVER_PID=""
@@ -26,8 +27,12 @@ run_one_mode() {
   local server_log="${RESULT_ROOT}/logs/${label}_server.log"
   local client_log="${RESULT_ROOT}/results/${label}_kl.log"
   local overlap_args=()
+  local radix_args=()
   if [[ "${spec_v2}" == "0" ]]; then
     overlap_args=(--disable-overlap-schedule)
+  fi
+  if [[ "${DISABLE_RADIX_CACHE}" == "1" ]]; then
+    radix_args=(--disable-radix-cache)
   fi
 
   echo "==> Starting ${label} server on ${BASE_URL}"
@@ -49,6 +54,7 @@ run_one_mode() {
       --cuda-graph-bs 1 2 4 \
       --cuda-graph-max-bs 4 \
       --max-running-requests 8 \
+      "${radix_args[@]}" \
       "${overlap_args[@]}" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &

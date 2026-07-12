@@ -18,6 +18,7 @@ MTP_REALDATA_MIN_ACCEPT_RATE="${MTP_REALDATA_MIN_ACCEPT_RATE:-0.0}"
 MTP_REALDATA_NUM_PROMPTS="${MTP_REALDATA_NUM_PROMPTS:-8}"
 MTP_REALDATA_MAX_NEW="${MTP_REALDATA_MAX_NEW:-64}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
+DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/35b-mtp-eagle-smoke}"
 SERVER_PID=""
@@ -40,8 +41,12 @@ run_one_mode() {
   local realdata_kl_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_true.log"
   local realdata_no_logprob_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_false.log"
   local overlap_args=()
+  local radix_args=()
   if [[ "${spec_v2}" == "0" ]]; then
     overlap_args=(--disable-overlap-schedule)
+  fi
+  if [[ "${DISABLE_RADIX_CACHE}" == "1" ]]; then
+    radix_args=(--disable-radix-cache)
   fi
 
   echo "==> Starting ${label} DVR-EAGLE server on ${BASE_URL}"
@@ -69,6 +74,7 @@ run_one_mode() {
       --cuda-graph-bs 1 2 4 \
       --cuda-graph-max-bs 4 \
       --max-running-requests 4 \
+      "${radix_args[@]}" \
       "${overlap_args[@]}" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &

@@ -272,7 +272,12 @@ class ModelRunnerKVCacheMixin:
         return kv_cache_dim
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
-        if self.server_args.disable_radix_cache:
+        # DVR keeps request-local recurrent checkpoints even when deterministic
+        # attention disables prefix matching (for example, FlashInfer).
+        if (
+            self.server_args.disable_radix_cache
+            and not self.server_args.enable_mamba_extra_buffer()
+        ):
             return 1
 
         additional_ratio = 0

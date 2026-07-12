@@ -60,19 +60,10 @@ def handle_dvr_defaults(server_args):
     if not _is_dvr_gated_linear_state_model(server_args):
         return
 
-    if server_args.disable_radix_cache:
-        logger.warning(
-            "DVR for gated linear-state models requires radix-cache "
-            "infrastructure for mamba extra_buffer state tracking. Keeping "
-            "radix cache enabled; use explicit cache flushes for no-prefix-cache "
-            "tests."
-        )
-        server_args.disable_radix_cache = False
-
     if server_args.page_size != FLA_CHUNK_SIZE:
         logger.warning(
             "DVR for gated linear-state models requires page_size to match "
-            "FLA_CHUNK_SIZE=%s so radix prefixes and chunkwise verify "
+            "FLA_CHUNK_SIZE=%s so attention pages and chunkwise verify "
             "checkpoints share the same boundary. Setting --page-size %s.",
             FLA_CHUNK_SIZE,
             FLA_CHUNK_SIZE,
@@ -114,6 +105,8 @@ def handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR currently only supports CUDA device.")
     if server_args.enable_dp_attention:
         raise ValueError("DVR currently does not support DP attention.")
+    if server_args.enable_pdmux:
+        raise ValueError("DVR currently does not support PDMux attention backends.")
     if server_args.disaggregation_mode != "null":
         raise ValueError("DVR currently does not support disaggregation mode.")
     if (
