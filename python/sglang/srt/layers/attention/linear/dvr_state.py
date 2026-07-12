@@ -16,71 +16,6 @@ class DVRRecurrentStateBackup:
 
 
 @dataclass(frozen=True)
-class DVRStateInputs:
-    """Model-family tensors stored in a DVR rolling input cache."""
-
-    values: Tuple[torch.Tensor, ...]
-
-    @classmethod
-    def from_tensors(cls, tensors: Tuple[torch.Tensor, ...]) -> "DVRStateInputs":
-        return cls(values=tuple(tensors))
-
-    def tensors(self) -> Tuple[torch.Tensor, ...]:
-        return self.values
-
-    def select(self, indices: torch.Tensor) -> "DVRStateInputs":
-        return type(self).from_tensors(tuple(tensor[indices] for tensor in self.values))
-
-    def write_rows(
-        self,
-        state_cache: "DVRStateInputCache",
-        *,
-        indices: torch.Tensor,
-        cols: torch.Tensor,
-    ) -> None:
-        state_cache.write_rows(indices=indices, cols=cols, values=self)
-
-    def write_extend_tail(
-        self,
-        state_cache: "DVRStateInputCache",
-        *,
-        indices: torch.Tensor,
-        extend_prefix_lens_cpu,
-        extend_seq_lens_cpu,
-        chunk_size: int = FLA_CHUNK_SIZE,
-    ) -> None:
-        src_base = 0
-        for req_i, (prefix_len, extend_len) in enumerate(
-            zip(extend_prefix_lens_cpu, extend_seq_lens_cpu, strict=True)
-        ):
-            seq_len = prefix_len + extend_len
-            boundary = (seq_len // chunk_size) * chunk_size
-            tail_len = seq_len - boundary
-            dst = indices[req_i].to(torch.long)
-            state_cache.set_tail_lens(indices=dst, value=tail_len)
-            if tail_len == 0:
-                src_base += extend_len
-                continue
-
-            write_start = max(prefix_len, boundary)
-            if write_start < seq_len:
-                src_start = src_base + write_start - prefix_len
-                src_end = src_start + seq_len - write_start
-                cols = torch.arange(
-                    write_start - boundary,
-                    seq_len - boundary,
-                    dtype=torch.long,
-                    device=indices.device,
-                )
-                type(self).from_tensors(
-                    tuple(tensor[src_start:src_end] for tensor in self.values)
-                ).write_rows(
-                    state_cache, indices=dst, cols=cols
-                )
-            src_base += extend_len
-
-
-@dataclass(frozen=True)
 class DVRStateInputCache:
     """Rolling input cache shared by DVR linear-state adapters."""
 
@@ -92,9 +27,6 @@ class DVRStateInputCache:
             tensors=tuple(tensor[layer] for tensor in self.tensors),
             tail_lens=self.tail_lens[layer],
         )
-
-    def state_inputs(self) -> DVRStateInputs:
-        return DVRStateInputs.from_tensors(self.tensors)
 
     @property
     def capacity(self) -> int:
@@ -120,18 +52,52 @@ class DVRStateInputCache:
         else:
             self.tail_lens[indices] = value
 
-    def read(self, *, indices: torch.Tensor) -> DVRStateInputs:
-        return self.state_inputs().select(indices)
+    def read(self, *, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        return tuple(tensor[indices] for tensor in self.tensors)
 
     def write_rows(
         self,
         *,
         indices: torch.Tensor,
         cols: torch.Tensor,
-        values: DVRStateInputs,
+        values: Tuple[torch.Tensor, ...],
     ) -> None:
-        for cache, value in zip(self.tensors, values.tensors(), strict=True):
+        for cache, value in zip(self.tensors, values, strict=True):
             cache[indices, cols] = value
+
+    def write_extend_tail(
+        self,
+        *,
+        values: Tuple[torch.Tensor, ...],
+        indices: torch.Tensor,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        chunk_size: int = FLA_CHUNK_SIZE,
+    ) -> None:
+        src_base = 0
+        for req_i, (prefix_len, extend_len) in enumerate(
+            zip(extend_prefix_lens_cpu, extend_seq_lens_cpu, strict=True)
+        ):
+            seq_len = prefix_len + extend_len
+            boundary = (seq_len // chunk_size) * chunk_size
+            tail_len = seq_len - boundary
+            dst = indices[req_i].to(torch.long)
+            self.set_tail_lens(indices=dst, value=tail_len)
+            write_start = max(prefix_len, boundary)
+            if write_start < seq_len:
+                src_start = src_base + write_start - prefix_len
+                src_end = src_start + seq_len - write_start
+                self.write_rows(
+                    indices=dst,
+                    cols=torch.arange(
+                        write_start - boundary,
+                        seq_len - boundary,
+                        dtype=torch.long,
+                        device=indices.device,
+                    ),
+                    values=tuple(value[src_start:src_end] for value in values),
+                )
+            src_base += extend_len
 
     def zero_after_lens(
         self, *, indices: torch.Tensor, keep_lens: torch.Tensor
@@ -215,7 +181,7 @@ def run_dvr_chunkwise_verify(
     *,
     state_ops: Any,
     state_input_cache: DVRStateInputCache,
-    draft_state_inputs: DVRStateInputs,
+    draft_state_inputs: Tuple[torch.Tensor, ...],
     ssm_states: torch.Tensor,
     cache_indices: torch.Tensor,
     state_input_indices: torch.Tensor,
@@ -233,8 +199,7 @@ def run_dvr_chunkwise_verify(
     else:
         tail_lens = tail_lens[:batch_size].to(device=indices.device, dtype=torch.long)
     tail_lens = tail_lens.clamp(min=0, max=chunk_size)
-    draft_state_inputs.write_rows(
-        state_input_cache,
+    state_input_cache.write_rows(
         indices=input_indices.unsqueeze(1).expand(-1, draft_token_num),
         cols=(
             torch.arange(
@@ -242,6 +207,7 @@ def run_dvr_chunkwise_verify(
             ).unsqueeze(0)
             + tail_lens.unsqueeze(1)
         ),
+        values=draft_state_inputs,
     )
     state_input_cache.zero_after_lens(
         indices=input_indices, keep_lens=tail_lens + draft_token_num
@@ -296,11 +262,9 @@ def rebuild_dvr_live_state_grouped(
     initial_state = temporal_state[:, state_boundary_indices]
 
     flat_dim = num_layers * num_reqs
-    window_inputs = DVRStateInputs.from_tensors(
-        tuple(
-            tensor[:, selected_input_indices].reshape(flat_dim, *tensor.shape[2:])
-            for tensor in state_input_cache.tensors
-        )
+    window_inputs = tuple(
+        tensor[:, selected_input_indices].reshape(flat_dim, *tensor.shape[2:])
+        for tensor in state_input_cache.tensors
     )
     initial_state = initial_state.reshape(flat_dim, *initial_state.shape[2:])
     flat_token_count = (

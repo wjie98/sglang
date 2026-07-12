@@ -7,7 +7,6 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.layers.attention.linear.dvr_gdn_state import (
     create_gdn_state_input_cache,
 )
-from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputs
 from sglang.srt.layers.attention.linear.dvr_state_adapter import (
     DVRGatedStateAdapter,
 )
@@ -45,11 +44,9 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
     v = torch.randn(2, 16, 128)
     g = torch.randn(2, 16)
     beta = torch.randn(2, 16)
-    state_inputs = DVRStateInputs.from_tensors((q, k, v, g, beta))
-
     layer_cache = cache[0]
-    state_inputs.write_extend_tail(
-        layer_cache,
+    layer_cache.write_extend_tail(
+        values=(q, k, v, g, beta),
         indices=torch.tensor([1]),
         extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
         extend_seq_lens_cpu=[2],
