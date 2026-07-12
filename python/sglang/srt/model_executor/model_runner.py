@@ -2708,12 +2708,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     DVRTargetVerifyCudaGraphRunner,
                 )
 
-                self.decode_cuda_graph_runner = DVRTargetVerifyCudaGraphRunner(
-                    self,
-                    dvr_target_verify_cuda_graph=(
-                        self.spec_algorithm.is_dvr_eagle()
-                    ),
-                )
+                self.decode_cuda_graph_runner = DVRTargetVerifyCudaGraphRunner(self)
             else:
                 self.decode_cuda_graph_runner = graph_runners[self.device](self)
 

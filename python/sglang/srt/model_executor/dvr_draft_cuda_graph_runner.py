@@ -385,28 +385,6 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     spec_info data object.
     """
 
-    def __init__(
-        self,
-        model_runner,
-        *,
-        dvr_target_verify_cuda_graph: bool = False,
-        **kwargs,
-    ):
-        had_override = hasattr(model_runner, "enable_dvr_target_verify_cuda_graph")
-        old_override = getattr(
-            model_runner, "enable_dvr_target_verify_cuda_graph", False
-        )
-        model_runner.enable_dvr_target_verify_cuda_graph = (
-            dvr_target_verify_cuda_graph
-        )
-        try:
-            super().__init__(model_runner, **kwargs)
-        finally:
-            if had_override:
-                model_runner.enable_dvr_target_verify_cuda_graph = old_override
-            else:
-                delattr(model_runner, "enable_dvr_target_verify_cuda_graph")
-
     def get_spec_info(self, num_tokens: int):
         capture_hidden_mode = (
             CaptureHiddenMode.FULL
@@ -415,7 +393,7 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
         )
         spec_info = EagleVerifyInput(
             draft_token=None,
-            custom_mask=self.buffers.custom_mask,
+            custom_mask=None,
             positions=None,
             retrieve_index=None,
             retrieve_next_token=None,
@@ -443,39 +421,6 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.batch_size * self.num_tokens_per_bs
         )
         return super().load_batch(forward_batch, pp_proxy_tensors)
-
-    @contextmanager
-    def _forward_metadata_out_graph_context(
-        self,
-        *,
-        forward_batch: ForwardBatch,
-        attn_backend,
-        forward_mode,
-    ):
-        spec_info = getattr(forward_batch, "spec_info", None)
-        old_custom_mask = getattr(spec_info, "custom_mask", None)
-        should_clear_custom_mask = (
-            self.model_runner.spec_algorithm.is_dvr()
-            and forward_mode.is_target_verify()
-            and spec_info is not None
-        )
-        if should_clear_custom_mask:
-            spec_info.custom_mask = None
-        try:
-            yield
-        finally:
-            if not should_clear_custom_mask:
-                return
-            spec_info.custom_mask = old_custom_mask
-            for backend in iter_dvr_attention_backends(attn_backend):
-                metadata = getattr(backend, "forward_metadata", None)
-                if metadata is None:
-                    continue
-                if hasattr(metadata, "custom_mask"):
-                    metadata.custom_mask = None
-                if hasattr(metadata, "mask_indptr"):
-                    metadata.mask_indptr = None
-
 
 class DVRDraftDecodeCudaGraphRunner:
     """CUDA graph runner for DVR self-draft decode.

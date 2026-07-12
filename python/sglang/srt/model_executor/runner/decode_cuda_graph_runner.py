@@ -689,8 +689,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with patch_prefill_only_deterministic_inference_for_cuda_graph(
             self.model_runner.server_args,
             attn_backend=getattr(self.model_runner, "attn_backend", None),
-            dvr_target_verify_cuda_graph=getattr(
-                self.model_runner, "enable_dvr_target_verify_cuda_graph", False
+            dvr_target_verify_cuda_graph=(
+                self.model_runner.spec_algorithm.is_dvr_eagle()
             ),
         ):
             with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
@@ -754,17 +754,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
-    def _forward_metadata_out_graph_context(
-        self,
-        *,
-        forward_batch: ForwardBatch,
-        attn_backend,
-        forward_mode: ForwardMode,
-    ):
-        """Scoped fixups around init_forward_metadata_out_graph."""
-
-        return empty_context()
-
     def capture_one_shape(
         self,
         size: int,
@@ -794,15 +783,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            metadata_context = self._forward_metadata_out_graph_context(
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-                forward_mode=forward_batch.forward_mode,
-            )
-            with metadata_context:
-                attn_backend.init_forward_metadata_out_graph(
-                    forward_batch, in_capture=True
-                )
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
                 # Must run inside the capture block: warmup mutations here are
@@ -981,13 +962,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        metadata_context = self._forward_metadata_out_graph_context(
-            forward_batch=forward_batch,
-            attn_backend=attn_backend,
-            forward_mode=self.capture_forward_mode,
-        )
-        with metadata_context:
-            attn_backend.init_forward_metadata_out_graph(fb_view)
+        attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Store fields
         self.raw_bs = raw_bs

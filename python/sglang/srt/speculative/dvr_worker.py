@@ -390,7 +390,13 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 penalizer.apply(
                     logits_output.next_token_logits, repeat=self.num_draft_tokens
                 )
-        return eagle_sample(spec_info, batch, logits_output, vocab_mask)
+        return eagle_sample(
+            spec_info,
+            batch,
+            logits_output,
+            vocab_mask,
+            use_rejection_sampling=spec_info.draft_probs is not None,
+        )
 
     @property
     def target_worker(self):
@@ -970,6 +976,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         if self.is_dvr_eagle:
             fwd_stream = torch.get_device_module(self.device).current_stream()
             assert spec_info.is_verify_input()
+            # DVR only supports topk=1 chains, whose tree mask is exactly the
+            # backend's native causal mask. Keep graph and eager verify on that
+            # native path instead of carrying EAGLE tree-mask metadata.
+            spec_info.custom_mask = None
             record_stream_for_v2_verify(batch, spec_info, fwd_stream)
             spec_info.num_tokens_per_req = self.num_draft_tokens
             bs = len(batch.seq_lens)

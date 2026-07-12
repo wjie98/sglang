@@ -359,6 +359,8 @@ def eagle_sample(
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
+    *,
+    use_rejection_sampling: Optional[bool] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -459,10 +461,10 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        # The proposal tensor is the runtime capability contract. Upstream
-        # EAGLE only populates it when rejection sampling is enabled, while
-        # self-draft workers can provide it directly without mutating globals.
-        use_rejection_sampling = verify_input.draft_probs is not None
+        if use_rejection_sampling is None:
+            use_rejection_sampling = (
+                get_global_server_args().speculative_use_rejection_sampling
+            )
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
