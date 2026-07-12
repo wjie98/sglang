@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
@@ -10,6 +11,39 @@ from sglang.srt.layers.attention.linear.dvr_gdn_state import (
 from sglang.srt.layers.attention.linear.dvr_state_adapter import (
     DVRGatedStateAdapter,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fla_boundary_state_preserves_fp32_initial_state_dtype():
+    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+
+    q = torch.randn(1, 64, 1, 16, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = torch.nn.functional.logsigmoid(
+        torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
+    )
+    beta = torch.sigmoid(
+        torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
+    )
+    initial_state = torch.zeros(
+        1, 1, 16, 16, dtype=torch.float32, device="cuda"
+    )
+    initial_state_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    output, _, boundary_states = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    assert output.dtype == q.dtype
+    assert boundary_states.dtype == initial_state.dtype
 
 
 def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():

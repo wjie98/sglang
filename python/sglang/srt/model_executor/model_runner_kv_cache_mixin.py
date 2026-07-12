@@ -407,9 +407,9 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-                    enable_overlap_schedule=(
-                        not self.server_args.disable_overlap_schedule
-                        or self.spec_algorithm.is_dvr()
+                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                    mamba_ping_pong_track_buffer_size=(
+                        2 if self.spec_algorithm.is_dvr() else None
                     ),
                     start_layer=self.start_layer,
                 )

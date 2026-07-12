@@ -250,6 +250,7 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
 
 def _is_dvr_gated_linear_state_model(server_args):
     from sglang.srt.configs import (
+        InternS2PreviewConfig,
         JetNemotronConfig,
         JetVLMConfig,
         Qwen3_5Config,
@@ -263,6 +264,7 @@ def _is_dvr_gated_linear_state_model(server_args):
         Qwen3NextConfig
         | Qwen3_5Config
         | Qwen3_5MoeConfig
+        | InternS2PreviewConfig
         | JetNemotronConfig
         | JetVLMConfig,
     )

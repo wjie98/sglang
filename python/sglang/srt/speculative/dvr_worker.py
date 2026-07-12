@@ -372,6 +372,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backends()
         # Self-DVR target worker owns the model and attention backend. Scheduler
         # already initializes it before calling this self-draft worker hook.
+        self.linear_state.bind_state_adapter()
 
     def init_cuda_graphs(self):
         if self.is_dvr_eagle:
@@ -613,8 +614,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
     @contextmanager
     def _target_verify_context(self, *, prepare: bool = False):
-        runner = self.target_worker.model_runner.decode_cuda_graph_runner
-        use_plan_stream = prepare and self.plan_stream is not None and runner is None
+        use_plan_stream = prepare and self.plan_stream is not None
         stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
         with stream_ctx:
             yield use_plan_stream
@@ -853,6 +853,13 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         vocab_mask = None
         extra_keep_alive_refs = None
 
+        if batch.has_grammar:
+            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
+            draft_tokens_cpu = spec_info.draft_token.view(
+                spec_info.retrieve_next_token.shape
+            ).cpu()
+
         if self.is_dvr_eagle:
             fwd_stream = torch.get_device_module(self.device).current_stream()
             assert spec_info.is_verify_input()
@@ -903,13 +910,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     except NotImplementedError:
                         continue
 
-            if batch.has_grammar:
-                retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
-                retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
-                draft_tokens_cpu = spec_info.draft_token.view(
-                    spec_info.retrieve_next_token.shape
-                ).cpu()
-
             base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
             linear_state_ctx = self.linear_state.restore_for_verify(
                 batch,
@@ -921,20 +921,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     forward_batch=verify_forward_batch,
                     is_verify=True,
                 )
-
-            if batch.has_grammar:
-                vocab_mask = generate_token_bitmask(
-                    batch.reqs,
-                    spec_info,
-                    retrieve_next_token_cpu,
-                    retrieve_next_sibling_cpu,
-                    draft_tokens_cpu,
-                    batch.sampling_info.vocab_size,
-                )
-                if vocab_mask is not None:
-                    assert spec_info.grammar is not None
-                    vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
-                    batch.sampling_info.vocab_mask = None
 
             extra_keep_alive_refs = [verify_forward_batch]
             error_prefix = "DVR EAGLE"
@@ -959,6 +945,20 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             forward_output = self._forward_target_verify_for_dvr(batch)
             can_run_cuda_graph = forward_output.can_run_cuda_graph
             error_prefix = "DVR self"
+
+        if batch.has_grammar:
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                spec_info,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None:
+                assert spec_info.grammar is not None
+                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
+                batch.sampling_info.vocab_mask = None
 
         logits_output = forward_output.logits_output
         if self.is_dvr_eagle and logits_output.hidden_states is None:

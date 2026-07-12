@@ -7,6 +7,9 @@ import torch
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+    iter_dvr_attention_backends,
+)
 
 
 @dataclass
@@ -106,6 +109,7 @@ class DVRLinearStateLifecycle:
     def __init__(self, *, server_args, model_runner):
         self.server_args = server_args
         self.model_runner = model_runner
+        self._state_adapter = None
         self.boundary_seqlen = {}
         self.boundary_track_idx = {}
         self.pending_boundary_publish = set()
@@ -117,7 +121,24 @@ class DVRLinearStateLifecycle:
         # request and chunk boundary are unchanged.
         self.boundary_backup_keys = None
         self.live_backup = None
-        if self.state_adapter() is None:
+    def bind_state_adapter(self) -> None:
+        adapters = []
+        for backend in iter_dvr_attention_backends(
+            getattr(self.model_runner, "attn_backend", None)
+        ):
+            adapter = getattr(backend, "dvr_state_adapter", None)
+            if adapter is not None and all(adapter is not item for item in adapters):
+                adapters.append(adapter)
+        if len(adapters) > 1:
+            raise RuntimeError("DVR target resolved multiple linear-state adapters.")
+        self._state_adapter = adapters[0] if adapters else None
+
+        if self._state_adapter is None:
+            if getattr(self.model_runner, "mambaish_config", None) is not None:
+                raise RuntimeError(
+                    "DVR does not support this hybrid linear-state backend: no "
+                    "target state adapter was initialized."
+                )
             return
         if self.server_args.mamba_track_interval != FLA_CHUNK_SIZE:
             raise ValueError(
@@ -352,14 +373,7 @@ class DVRLinearStateLifecycle:
         return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
     def state_adapter(self):
-        # Scheduler constructs the DVR worker before attention backends are
-        # initialized. Treat a missing backend as "not ready" and resolve the
-        # adapter lazily when verify/draft state is actually used.
-        attn_backend = getattr(self.model_runner, "attn_backend", None)
-        linear_backend = getattr(attn_backend, "linear_attn_backend", None)
-        if linear_backend is None:
-            return None
-        return getattr(linear_backend, "dvr_state_adapter", None)
+        return self._state_adapter
 
     def set_boundary_checkpoint(
         self,
