@@ -5,7 +5,6 @@ from contextlib import contextmanager, nullcontext
 from typing import List, Optional
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -14,7 +13,6 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -51,21 +49,13 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_prepare_for_verify,
     eagle_sample,
     organize_draft_results,
-    verify_tree_greedy_func,
 )
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.spec_utils import (
-    SIMULATE_ACC_LEN,
-    TREE_SPEC_KERNEL_AVAILABLE,
     commit_mamba_states_after_verify,
-    generate_simulated_accept_index,
     generate_token_bitmask,
     record_stream_each,
     record_stream_for_v2_verify,
     select_top_k_tokens,
-)
-from sglang.srt.speculative.reject_sampling import (
-    chain_speculative_sampling_triton as chain_speculative_sampling,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.environ import envs
@@ -78,7 +68,6 @@ if is_cuda():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
-        tree_speculative_sampling_target_only,
     )
 
 logger = logging.getLogger(__name__)
@@ -385,9 +374,23 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         logits_output: LogitsProcessorOutput,
         vocab_mask: Optional[torch.Tensor] = None,
     ):
-        if self.is_dvr_eagle:
-            return eagle_sample(spec_info, batch, logits_output, vocab_mask)
-        return self._sample_verify(batch, spec_info, logits_output, vocab_mask)
+        if not self.is_dvr_eagle:
+            # Upstream EAGLE applies the shared penalties, bias, grammar, and
+            # accept kernel. Self-DVR only needs to add processors that its
+            # target-only forward does not run before entering that common path.
+            sampling_info = batch.sampling_info
+            if sampling_info.has_custom_logit_processor:
+                apply_custom_logit_processor(
+                    logits_output.next_token_logits,
+                    sampling_info,
+                    num_tokens_in_batch=self.num_draft_tokens,
+                )
+            penalizer = sampling_info.penalizer_orchestrator
+            if penalizer is not None and penalizer.is_required:
+                penalizer.apply(
+                    logits_output.next_token_logits, repeat=self.num_draft_tokens
+                )
+        return eagle_sample(spec_info, batch, logits_output, vocab_mask)
 
     @property
     def target_worker(self):
@@ -1151,179 +1154,3 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     self.num_draft_tokens,
                 )
         return batch_result
-
-    def _sample_verify(
-        self,
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-        logits_output: LogitsProcessorOutput,
-        vocab_mask: Optional[torch.Tensor] = None,
-    ):
-        if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.int32, device=self.device)
-            accept_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-            accept_index = torch.empty(0, dtype=torch.int32, device=self.device)
-            return predict, accept_lens, accept_index
-
-        bs = len(batch.seq_lens)
-        candidates = spec_info.draft_token.reshape(bs, self.num_draft_tokens)
-        sampling_info = batch.sampling_info
-        next_token_logits = logits_output.next_token_logits
-        predict = torch.zeros(
-            (bs * self.num_draft_tokens,), dtype=torch.int32, device=self.device
-        )
-        accept_index = torch.full(
-            (bs, self.num_draft_steps + 1),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        accept_lens = torch.empty((bs,), dtype=torch.int32, device=self.device)
-
-        if sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(
-                next_token_logits,
-                sampling_info,
-                num_tokens_in_batch=self.num_draft_tokens,
-            )
-
-        if sampling_info.acc_additive_penalties is not None:
-            next_token_logits.add_(
-                torch.repeat_interleave(
-                    sampling_info.acc_additive_penalties, self.num_draft_tokens, dim=0
-                )
-            )
-        if sampling_info.acc_scaling_penalties is not None:
-            apply_scaling_penalties(
-                next_token_logits,
-                torch.repeat_interleave(
-                    sampling_info.acc_scaling_penalties, self.num_draft_tokens, dim=0
-                ),
-            )
-
-        penalizer_orchestrator = sampling_info.penalizer_orchestrator
-        if penalizer_orchestrator is not None and penalizer_orchestrator.is_required:
-            penalizer_orchestrator.apply(next_token_logits, repeat=self.num_draft_tokens)
-
-        if sampling_info.logit_bias is not None:
-            next_token_logits.add_(
-                torch.repeat_interleave(
-                    sampling_info.logit_bias, self.num_draft_tokens, dim=0
-                )
-            )
-
-        if vocab_mask is not None:
-            assert spec_info.grammar is not None
-            spec_info.grammar.apply_vocab_mask(
-                logits=next_token_logits, vocab_mask=vocab_mask
-            )
-
-        if sampling_info.is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
-                bs, self.num_draft_tokens
-            )
-            predict, accept_index, accept_lens = verify_tree_greedy_func(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_lens,
-                candidates=candidates,
-                retrieve_index=spec_info.retrieve_index,
-                retrieve_next_token=spec_info.retrieve_next_token,
-                retrieve_next_sibling=spec_info.retrieve_next_sibling,
-                target_predict=target_predict,
-                topk=self.topk,
-            )
-        else:
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.num_draft_tokens, dim=0
-            )
-            target_probs = F.softmax(
-                next_token_logits / expanded_temperature, dim=-1
-            )
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.num_draft_tokens, dim=0
-                ),
-            )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, self.num_draft_tokens, dim=0
-                    ),
-                )
-            target_probs = target_probs.reshape(bs, self.num_draft_tokens, -1)
-
-            draft_probs = spec_info.draft_probs
-            if draft_probs is None:
-                draft_probs = torch.zeros_like(target_probs)
-            sampling_fn = (
-                chain_speculative_sampling
-                if spec_info.draft_probs is not None
-                else tree_speculative_sampling_target_only
-            )
-            if spec_info.draft_probs is not None:
-                sampling_seed = getattr(sampling_info, "sampling_seed", None)
-                if sampling_seed is None:
-                    uniform_samples = torch.rand_like(candidates, dtype=torch.float32)
-                    uniform_samples_for_final_sampling = torch.rand(
-                        (bs,), dtype=torch.float32, device=self.device
-                    )
-                else:
-                    num_slots = candidates.shape[1]
-                    seed = sampling_seed.to(device=self.device).repeat_interleave(
-                        num_slots + 1
-                    )
-                    slot_offsets = torch.arange(
-                        num_slots + 1, dtype=torch.int64, device=self.device
-                    )
-                    positions = (
-                        batch.seq_lens.to(device=self.device, dtype=torch.int64)
-                        .unsqueeze(1)
-                        + slot_offsets
-                    ).reshape(-1)
-                    cols = torch.zeros((1,), dtype=torch.int32, device=self.device)
-                    uniforms = (
-                        murmur_hash32(seed, positions, cols)
-                        .reshape(bs, num_slots + 1)
-                        .to(torch.float32)
-                        / 4294967296.0
-                    )
-                    uniform_samples = uniforms[:, :num_slots]
-                    uniform_samples_for_final_sampling = uniforms[
-                        :, num_slots
-                    ].contiguous()
-            else:
-                uniform_samples = torch.rand_like(candidates, dtype=torch.float32)
-                uniform_samples_for_final_sampling = torch.rand(
-                    (bs,), dtype=torch.float32, device=self.device
-                )
-            sampling_fn(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_lens,
-                candidates=candidates,
-                retrive_index=spec_info.retrieve_index,
-                retrive_next_token=spec_info.retrieve_next_token,
-                retrive_next_sibling=spec_info.retrieve_next_sibling,
-                uniform_samples=uniform_samples,
-                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=self.server_args.speculative_accept_threshold_single,
-                threshold_acc=self.server_args.speculative_accept_threshold_acc,
-                deterministic=True,
-            )
-
-        if SIMULATE_ACC_LEN > 0.0:
-            accept_index = generate_simulated_accept_index(
-                accept_index=accept_index,
-                predict=predict,
-                accept_length=accept_lens,
-                bs=bs,
-                spec_steps=self.num_draft_steps,
-            )
-
-        accept_lens.add_(1)
-        return predict, accept_lens, accept_index

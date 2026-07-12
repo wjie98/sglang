@@ -459,9 +459,10 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        use_rejection_sampling = (
-            get_global_server_args().speculative_use_rejection_sampling
-        )
+        # The proposal tensor is the runtime capability contract. Upstream
+        # EAGLE only populates it when rejection sampling is enabled, while
+        # self-draft workers can provide it directly without mutating globals.
+        use_rejection_sampling = verify_input.draft_probs is not None
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
