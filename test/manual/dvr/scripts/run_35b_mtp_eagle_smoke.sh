@@ -19,6 +19,8 @@ MTP_REALDATA_NUM_PROMPTS="${MTP_REALDATA_NUM_PROMPTS:-8}"
 MTP_REALDATA_MAX_NEW="${MTP_REALDATA_MAX_NEW:-64}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+RUN_SYNC="${RUN_SYNC:-1}"
+RUN_OVERLAP="${RUN_OVERLAP:-1}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/35b-mtp-eagle-smoke}"
 SERVER_PID=""
@@ -189,5 +191,9 @@ run_one_mode() {
 }
 
 # DVR-EAGLE uses v2 semantics in both modes: sync when disabled, overlap when enabled.
-run_one_mode "sync_v2" "0"
-run_one_mode "overlap_v2" "1"
+if [[ "${RUN_SYNC}" == "1" ]]; then
+  run_one_mode "sync_v2" "0"
+fi
+if [[ "${RUN_OVERLAP}" == "1" ]]; then
+  run_one_mode "overlap_v2" "1"
+fi

@@ -554,25 +554,18 @@ class DVRGatedStateAdapter:
 
         crossing_req_indices = torch.nonzero(boundary_needs_rebuild).flatten()
         if crossing_req_indices.numel() > 0:
-            # Build the chunk checkpoint from DVR's prefill-equivalent
-            # state-input window.  The target-verify intermediate buffer is
-            # row-indexed for accepted draft steps; rebuilding from the rolling
-            # window keeps boundary checkpoints aligned with full prefill.
-            rebuild_dvr_live_state_grouped(
-                state_ops=self,
-                state_input_cache=state_window,
-                temporal_state=state_cache.temporal,
-                state_input_indices=state_input_indices,
-                live_indices=boundary_indices,
-                boundary_indices=boundary_indices,
-                req_indices=crossing_req_indices,
-                token_count=torch.full(
-                    (crossing_req_indices.numel(),),
-                    self.chunk_size,
-                    dtype=torch.long,
-                    device=tail_lens_before.device,
+            # run_dvr_chunkwise_verify stores the state at the first crossed
+            # chunk boundary in step 0. Commit that exact target-verify result;
+            # recomputing it separately can drift from the logits-producing scan.
+            self._scatter_state(
+                state_cache.temporal,
+                state_cache.intermediate_ssm,
+                boundary_indices,
+                torch.where(
+                    boundary_needs_rebuild,
+                    torch.zeros_like(tail_lens_before),
+                    no_commit_step,
                 ),
-                use_chunkwise_rebuild=True,
             )
         self._scatter_state(
             state_cache.conv[0],
@@ -600,41 +593,10 @@ class DVRGatedStateAdapter:
         )
         draft_token_num = state_cache.intermediate_conv_window[0].shape[2]
         partial_accept = accepted_token_counts < draft_token_num
-        full_accept_req_indices = req_indices[~partial_accept]
-        full_accept_crossing_req_indices = full_accept_req_indices[
-            crosses_chunk_boundary[full_accept_req_indices]
-        ]
-        if full_accept_crossing_req_indices.numel() > 0:
-            rebuild_dvr_live_state_grouped(
-                state_ops=self,
-                state_input_cache=state_window,
-                temporal_state=state_cache.temporal,
-                state_input_indices=state_input_indices,
-                live_indices=live_indices,
-                boundary_indices=boundary_indices,
-                req_indices=full_accept_crossing_req_indices,
-                token_count=tail_lens_after[full_accept_crossing_req_indices],
-                use_chunkwise_rebuild=True,
-            )
-        full_accept_fast_req_indices = full_accept_req_indices[
-            ~crosses_chunk_boundary[full_accept_req_indices]
-        ]
-        if full_accept_fast_req_indices.numel() > 0:
-            rebuild_dvr_live_state_grouped(
-                state_ops=self,
-                state_input_cache=state_window,
-                temporal_state=state_cache.temporal,
-                state_input_indices=state_input_indices,
-                live_indices=live_indices,
-                boundary_indices=boundary_indices,
-                req_indices=full_accept_fast_req_indices,
-                token_count=tail_lens_after[full_accept_fast_req_indices],
-            )
         partial_accept_req_indices = req_indices[partial_accept]
         if partial_accept_req_indices.numel() > 0:
-            # Partial accept is the only time DVR must start the next draft from
-            # a shortened suffix.  Use the same chunkwise GDN math as prefill
-            # here; the all-accepted hot path keeps the faster recurrent rebuild.
+            # Target verify already left the full accepted chain in the live
+            # slot. Only rejection shortens that chain and requires a rebuild.
             rebuild_dvr_live_state_grouped(
                 state_ops=self,
                 state_input_cache=state_window,

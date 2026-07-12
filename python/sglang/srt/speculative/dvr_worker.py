@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import weakref
 from contextlib import contextmanager, nullcontext
 from typing import List, Optional
 
@@ -37,9 +36,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_core import (
     DVRRollbackActions,
-    append_dvr_batch_output_tokens,
-    compact_dvr_output_rows,
-    request_dvr_output_prefix_token_ids,
     rollback_dvr_verify,
 )
 from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
@@ -296,8 +292,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         )
         self.speculative_num_steps = self.num_draft_steps
         self.speculative_num_draft_tokens = self.num_draft_tokens
-        self.dvr_output_journal = weakref.WeakKeyDictionary()
-
     def _dummy_hidden_states(self, num_tokens: int, device=None) -> torch.Tensor:
         """Keep EAGLE indexing contracts without storing real DVR hidden states.
 
@@ -346,23 +340,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
-
-    def _append_output_journal_tokens(
-        self,
-        *,
-        batch: ScheduleBatch,
-        next_token_ids: torch.Tensor,
-        error_prefix: str = "DVR output prefix",
-    ) -> None:
-        if batch.forward_mode.is_idle() or batch.reqs is None:
-            return
-
-        append_dvr_batch_output_tokens(
-            self.dvr_output_journal,
-            batch,
-            [[token_id] for token_id in next_token_ids.detach().cpu().tolist()],
-            error_prefix=error_prefix,
         )
 
     @contextmanager
@@ -815,16 +792,17 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
     def clear_cache_pool(self):
         self.linear_state.clear_cache_state()
-        self.dvr_output_journal.clear()
 
     def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
-        error_prefix = "DVR EAGLE" if self.is_dvr_eagle else "DVR spec-v2"
-        return request_dvr_output_prefix_token_ids(
-            self.dvr_output_journal,
-            req,
-            boundary_seqlen,
-            error_prefix=error_prefix,
-        )
+        token_ids = list(req.origin_input_ids) + list(req.output_ids)
+        if len(token_ids) < boundary_seqlen:
+            raise RuntimeError(
+                "DVR cannot rebuild a missing boundary before output "
+                "materialization: "
+                f"rid={req.rid}, available={len(token_ids)}, "
+                f"boundary={boundary_seqlen}."
+            )
+        return token_ids
 
     def _forward_batch_generation_eagle(
         self, batch: ScheduleBatch, on_publish=None
@@ -834,12 +812,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(batch)
             batch_output.new_seq_lens = batch.seq_lens
             self._prepare_dvr_boundary_for_verify(batch)
-            if batch_output.next_token_ids is not None:
-                self._append_output_journal_tokens(
-                    batch=batch,
-                    next_token_ids=batch_output.next_token_ids,
-                    error_prefix="DVR EAGLE prefill output prefix",
-                )
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             with self._draft_context():
@@ -872,14 +844,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         can_run_cuda_graph: bool,
         predict: torch.Tensor,
         accept_lens: torch.Tensor,
-        accept_index: torch.Tensor,
         new_seq_lens: torch.Tensor,
-        has_verify_tokens: bool,
         linear_state_ctx,
-        base_seq_lens_cpu: list[int],
-        tokens_per_req: int,
         next_draft_input: EagleDraftInput,
-        error_prefix: str,
         routed_experts_output=None,
         indexer_topk_output=None,
         extra_keep_alive_refs=None,
@@ -887,28 +854,11 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         """Apply DVR rollback and package the scheduler-visible batch result."""
 
-        accept_lens_cpu = None
-        if has_verify_tokens:
-            accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
-                output_tokens=predict,
-                accept_lens=accept_lens,
-                tokens_per_req=tokens_per_req,
-            )
-            append_dvr_batch_output_tokens(
-                self.dvr_output_journal,
-                batch,
-                token_ids_per_req,
-                base_seq_lens_cpu=base_seq_lens_cpu,
-                error_prefix=f"{error_prefix} output prefix",
-            )
-
         dvr_rollback_actions = rollback_dvr_verify(
             batch=batch,
             linear_state=self.linear_state,
             linear_state_ctx=linear_state_ctx,
             accept_lens=accept_lens,
-            accept_lens_cpu=accept_lens_cpu,
-            base_seq_lens_cpu=base_seq_lens_cpu,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
         return GenerationBatchResult(
@@ -959,10 +909,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             )
             batch.spec_info = self._self_prefill_next_draft_input(
                 logits_output=logits_output,
-                next_token_ids=next_token_ids,
-            )
-            self._append_output_journal_tokens(
-                batch=batch,
                 next_token_ids=next_token_ids,
             )
             batch_result = GenerationBatchResult(
@@ -1183,14 +1129,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             predict=predict,
             accept_lens=accept_lens,
-            accept_index=accept_index,
             new_seq_lens=new_seq_lens,
-            has_verify_tokens=has_verify_tokens,
             linear_state_ctx=linear_state_ctx,
-            base_seq_lens_cpu=base_seq_lens_cpu,
-            tokens_per_req=spec_info.draft_token_num,
             next_draft_input=next_draft_input,
-            error_prefix=error_prefix,
             routed_experts_output=forward_output.routed_experts_output,
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=extra_keep_alive_refs,

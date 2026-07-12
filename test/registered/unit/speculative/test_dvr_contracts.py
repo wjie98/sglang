@@ -11,18 +11,9 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
-from sglang.srt.speculative.dvr_core import (
-    DVRRollbackActions,
-    append_dvr_batch_output_tokens,
-    compact_dvr_output_rows,
-    request_dvr_output_prefix_token_ids,
-)
+from sglang.srt.speculative.dvr_core import DVRRollbackActions
+from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-
-class _MockReq:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
 
 
 def test_dvr_spec_algorithm_contracts():
@@ -65,6 +56,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
         rid="r0",
         origin_input_ids=[1] * 64,
         output_ids=[2] * 64,
+        kv_committed_len=128,
         mamba_last_track_seqlen=64,
         mamba_next_track_idx=0,
         mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
@@ -101,13 +93,15 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     assert req.mamba_next_track_idx == 1
 
     dvr_rollback_actions.pending_mamba_checkpoints = [(2, 192)]
-    with pytest.raises(RuntimeError, match="precedes output materialization"):
-        dvr_rollback_actions.commit_checkpoint_after_decode(
-            req=req,
-            batch=batch,
-            req_index=0,
-            tree_cache=tree_cache,
-        )
+    req.kv_committed_len = 127
+    assert dvr_rollback_actions.commit_checkpoint_after_decode(
+        req=req,
+        batch=batch,
+        req_index=0,
+        tree_cache=tree_cache,
+    )
+    assert req.mamba_last_track_seqlen == 128
+    req.kv_committed_len = 128
 
     dvr_rollback_actions.pending_mamba_checkpoints = None
     with pytest.raises(RuntimeError, match="missing Mamba checkpoint actions"):
@@ -268,137 +262,54 @@ def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
         )
 
 
-def test_dvr_replay_prefix_records_only_visible_output_tokens():
-    req = _MockReq(
-        rid="r0",
-        origin_input_ids=[101, 102, 103],
-        output_ids=[],
+def test_dvr_boundary_metadata_advances_from_next_scheduler_length():
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle.boundary_seqlen = {"r0": 64}
+    lifecycle.boundary_track_idx = {"r0": 1}
+    lifecycle.ensure_boundary_state = lambda batch, seq_lens_cpu: []
+    batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
+
+    lifecycle.prepare_for_draft(batch, seq_lens_cpu=[128])
+
+    assert lifecycle.boundary_seqlen == {"r0": 128}
+    assert lifecycle.boundary_track_idx == {"r0": 1}
+
+
+def test_dvr_boundary_backup_tracks_physical_slot_not_delayed_seqlen():
+    class Adapter:
+        def __init__(self):
+            self.backup_calls = 0
+
+        def backup_recurrent_state(self, **_kwargs):
+            self.backup_calls += 1
+            return self.backup_calls
+
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle.boundary_seqlen = {"r0": 64}
+    lifecycle.boundary_track_idx = {"r0": 1}
+    lifecycle.boundary_backup = None
+    lifecycle.boundary_backup_keys = None
+    lifecycle.live_backup = None
+    adapter = Adapter()
+    context = SimpleNamespace(
+        state_adapter=adapter,
+        state_cache=object(),
+        boundary_indices=torch.tensor([11]),
+        live_indices=torch.tensor([12]),
     )
-    batch = SimpleNamespace(reqs=[req])
-    journal = {}
+    lifecycle.state_context = lambda batch, require_boundary: context
+    batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
 
-    # Target EXTEND publishes the first client-visible token before overlap
-    # scheduling has necessarily materialized it into Req.output_ids.
-    append_dvr_batch_output_tokens(
-        journal,
-        batch,
-        [[748]],
-    )
-    assert request_dvr_output_prefix_token_ids(
-        journal,
-        req,
-        4,
-        error_prefix="DVR EAGLE output replay prefix",
-    ) == [101, 102, 103, 748]
-    with pytest.raises(RuntimeError, match="not yet owned"):
-        request_dvr_output_prefix_token_ids(
-            journal,
-            req,
-            5,
-            error_prefix="DVR EAGLE output replay prefix",
-        )
+    lifecycle.backup_boundary_state(batch)
+    assert adapter.backup_calls == 2
 
-    # A rejected EAGLE draft must append the target-predicted output tokens,
-    # not the rejected draft candidates.
-    req.output_ids = [748]
-    append_dvr_batch_output_tokens(
-        journal,
-        batch,
-        [[749, 750]],
-        base_seq_lens_cpu=[4],
-        error_prefix="DVR EAGLE output replay prefix",
-    )
+    # Overlap publishes the new logical boundary after verify. The physical
+    # slot and its saved target state are unchanged, so do not recapture state
+    # after an EAGLE draft may have mutated shared request slots.
+    lifecycle.boundary_seqlen["r0"] = 128
+    lifecycle.backup_boundary_state(batch, preserve_existing=True)
+    assert adapter.backup_calls == 2
 
-    assert request_dvr_output_prefix_token_ids(
-        journal,
-        req,
-        6,
-        error_prefix="DVR EAGLE final logprob",
-    ) == [101, 102, 103, 748, 749, 750]
-
-    req.output_ids = [748, 999]
-    with pytest.raises(RuntimeError, match="diverged"):
-        request_dvr_output_prefix_token_ids(
-            journal,
-            req,
-            5,
-            error_prefix="DVR EAGLE output replay prefix",
-        )
-
-
-def test_dvr_output_replay_prefix_tracks_self_draft_visible_output():
-    req = _MockReq(
-        rid="r0",
-        origin_input_ids=[101, 102],
-        output_ids=[201],
-    )
-    batch = SimpleNamespace(reqs=[req])
-    journal = {}
-
-    assert request_dvr_output_prefix_token_ids(
-        journal,
-        req,
-        3,
-        error_prefix="DVR spec-v2",
-    ) == [101, 102, 201]
-
-    append_dvr_batch_output_tokens(
-        journal,
-        batch,
-        [[202, 203]],
-    )
-
-    assert request_dvr_output_prefix_token_ids(
-        journal,
-        req,
-        5,
-        error_prefix="DVR spec-v2",
-    ) == [101, 102, 201, 202, 203]
-
-
-def test_dvr_output_replay_prefix_is_req_lifecycle_scoped():
-    old_req = _MockReq(
-        rid="reused",
-        origin_input_ids=[101, 102],
-        output_ids=[],
-    )
-    new_req = _MockReq(
-        rid="reused",
-        origin_input_ids=[101, 102],
-        output_ids=[301],
-    )
-    journal = {}
-
-    append_dvr_batch_output_tokens(
-        journal, SimpleNamespace(reqs=[old_req]), [[201, 202]]
-    )
-    append_dvr_batch_output_tokens(journal, SimpleNamespace(reqs=[new_req]), [[]])
-
-    # rid is client/protocol state and can be reused.  The pending output
-    # journal must be scoped to the live Req object, otherwise a new request can
-    # inherit stale overlap output tokens from a completed request.
-    assert request_dvr_output_prefix_token_ids(
-        journal,
-        new_req,
-        3,
-        error_prefix="DVR spec-v2",
-    ) == [101, 102, 301]
-
-
-def test_dvr_eagle_compacts_accepted_output_rows():
-    accept_tokens = torch.tensor(
-        [
-            [10, 11, 99, 99],
-            [20, 21, 22, 99],
-        ],
-        dtype=torch.int32,
-    )
-    accept_lens = torch.tensor([2, 3], dtype=torch.int32)
-
-    accept_lens_cpu, token_ids_per_req = compact_dvr_output_rows(
-        output_tokens=accept_tokens,
-        accept_lens=accept_lens,
-        tokens_per_req=4,
-    )
-    assert accept_lens_cpu == [2, 3]
-    assert token_ids_per_req == [[10, 11], [20, 21, 22]]
+    lifecycle.boundary_track_idx["r0"] = 0
+    lifecycle.backup_boundary_state(batch, preserve_existing=True)
+    assert adapter.backup_calls == 4

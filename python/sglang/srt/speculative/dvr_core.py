@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, MutableMapping, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -83,12 +83,12 @@ class DVRRollbackActions:
         if last_track_seqlen is not None and seqlen <= last_track_seqlen:
             return True
 
-        materialized_len = len(req.origin_input_ids) + len(req.output_ids)
-        if seqlen > materialized_len:
-            raise RuntimeError(
-                "DVR Mamba checkpoint precedes output materialization: "
-                f"checkpoint={seqlen}, materialized={materialized_len}."
-            )
+        # The worker records the next possible chunk boundary without pulling
+        # accept_lens back to the host. The newest output token is materialized
+        # before it has a committed KV row, so only publish a recurrent checkpoint
+        # once KV ownership reaches the same boundary.
+        if seqlen > req.kv_committed_len:
+            return True
 
         buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
         if buffer is None or track_idx < 0 or track_idx >= buffer.numel():
@@ -114,139 +114,15 @@ class DVRRollbackActions:
         )
         return True
 
-
-def _dvr_output_stream(
-    journal: MutableMapping[Any, list[int]],
-    req: Any,
-    *,
-    error_prefix: str,
-) -> list[int]:
-    stream = journal.setdefault(req, [])
-    output_ids = list(req.output_ids)
-    if not output_ids:
-        return stream
-
-    common_len = min(len(stream), len(output_ids))
-    if stream[:common_len] != output_ids[:common_len]:
-        raise RuntimeError(
-            f"{error_prefix} diverged from materialized output ids: "
-            f"rid={req.rid}, tracked_tail={stream[-8:]}, "
-            f"req_tail={output_ids[-8:]}, tracked_len={len(stream)}, "
-            f"req_output_len={len(output_ids)}."
-        )
-    stream.extend(int(token_id) for token_id in output_ids[len(stream) :])
-    return stream
-
-
-def request_dvr_output_prefix_token_ids(
-    journal: MutableMapping[Any, list[int]],
-    req: Any,
-    seq_len: int,
-    *,
-    error_prefix: str,
-) -> list[int]:
-    """Return a target-owned token prefix before overlap materializes outputs."""
-
-    origin_input_ids = list(req.origin_input_ids)
-    output_len = seq_len - len(origin_input_ids)
-    if output_len <= 0:
-        return origin_input_ids[:seq_len]
-
-    stream = _dvr_output_stream(journal, req, error_prefix=error_prefix)
-    if len(stream) >= output_len:
-        return origin_input_ids + stream[:output_len]
-    raise RuntimeError(
-        f"{error_prefix} replay prefix is not yet owned by DVR: "
-        f"rid={req.rid}, origin_tokens={len(req.origin_input_ids)}, "
-        f"req_output_tokens={len(req.output_ids)}, "
-        f"tracked_output_tokens={len(stream)}, seq_len={seq_len}."
-    )
-
-
-def append_dvr_batch_output_tokens(
-    journal: MutableMapping[Any, list[int]],
-    batch: Any,
-    tokens_per_req,
-    *,
-    base_seq_lens_cpu: Optional[list[int]] = None,
-    error_prefix: str = "DVR output prefix",
-) -> None:
-    """Advance the target-owned output journal for active requests."""
-
-    if batch.reqs is None:
-        journal.clear()
-        return
-    active_reqs = set(batch.reqs)
-    for req in list(journal):
-        if req not in active_reqs:
-            journal.pop(req, None)
-
-    if base_seq_lens_cpu is None and getattr(batch, "seq_lens", None) is not None:
-        base_seq_lens_cpu = (
-            batch.seq_lens_cpu.tolist()
-            if getattr(batch, "seq_lens_cpu", None) is not None
-            else batch.seq_lens.detach().cpu().tolist()
-        )
-    if base_seq_lens_cpu is None:
-        base_seq_lens_cpu = [None] * len(batch.reqs)
-
-    for req, base_seq_len, token_ids in zip(
-        batch.reqs, base_seq_lens_cpu, tokens_per_req, strict=True
-    ):
-        stream = _dvr_output_stream(journal, req, error_prefix=error_prefix)
-        if base_seq_len is not None:
-            required_len = max(0, int(base_seq_len) - len(req.origin_input_ids))
-            if len(stream) < required_len:
-                raise RuntimeError(
-                    f"{error_prefix} is behind the batch logical length: "
-                    f"rid={req.rid}, tracked={len(stream)}, required={required_len}."
-                )
-        stream.extend(int(token_id) for token_id in token_ids)
-
-
-def compact_dvr_output_rows(
-    *,
-    output_tokens: torch.Tensor,
-    accept_lens,
-    tokens_per_req: Optional[int] = None,
-) -> tuple[list[int], list[list[int]]]:
-    """Return accepted output rows in scheduler materialization order."""
-
-    if torch.is_tensor(accept_lens):
-        accept_lens_cpu = [int(x) for x in accept_lens.detach().cpu().tolist()]
-    else:
-        accept_lens_cpu = [int(x) for x in accept_lens]
-    token_ids = output_tokens.detach().cpu().reshape(-1).tolist()
-
-    token_ids_per_req = []
-    if tokens_per_req is None:
-        offset = 0
-        for accept_len in accept_lens_cpu:
-            end = offset + accept_len
-            token_ids_per_req.append([int(x) for x in token_ids[offset:end]])
-            offset = end
-    else:
-        for req_i, accept_len in enumerate(accept_lens_cpu):
-            start = req_i * tokens_per_req
-            end = start + accept_len
-            token_ids_per_req.append([int(x) for x in token_ids[start:end]])
-    return accept_lens_cpu, token_ids_per_req
-
-
 def rollback_dvr_verify(
     *,
     batch: Any,
     linear_state: Any,
     linear_state_ctx: Any,
     accept_lens: torch.Tensor,
-    accept_lens_cpu: Optional[list[int]],
-    base_seq_lens_cpu: list[int],
     use_fast_self_draft_commit: bool = False,
 ) -> DVRRollbackActions:
     """Rollback target linear state after one verified speculative step."""
-
-    if accept_lens_cpu is None:
-        accept_lens_cpu = accept_lens.detach().cpu().tolist()
 
     pending_track_indices = None
     pending_track_seqlens = None
@@ -255,9 +131,7 @@ def rollback_dvr_verify(
             batch=batch,
             accepted_token_counts=accept_lens.to(torch.long),
             accepted_steps=(accept_lens - 1).to(torch.long),
-            accepted_token_counts_cpu=accept_lens_cpu,
             ctx=linear_state_ctx,
-            seq_lens_cpu=base_seq_lens_cpu,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
 

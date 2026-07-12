@@ -181,6 +181,15 @@ class DVRLinearStateLifecycle:
                 int(seq_lens_cpu[i])
             )
             if (
+                req.rid in self.boundary_track_idx
+                and current_boundary == recorded_boundary + FLA_CHUNK_SIZE
+            ):
+                # The preceding target verify already committed this boundary
+                # into the same request-local slot. Advance host metadata from
+                # the scheduler's normal seq_lens mirror instead of synchronously
+                # copying accept_lens in the worker hot path.
+                self.boundary_seqlen[req.rid] = current_boundary
+            elif (
                 req.rid not in self.boundary_track_idx
                 or recorded_boundary != current_boundary
                 or recorded_boundary % FLA_CHUNK_SIZE != 0
@@ -331,8 +340,12 @@ class DVRLinearStateLifecycle:
             self.live_backup = None
             return
         assert ctx.boundary_indices is not None
+        # Host logical lengths advance after overlap result processing, while
+        # the target verify has already updated the physical boundary slot.
+        # Key the snapshot by physical ownership so a delayed seqlen update
+        # cannot make us recapture draft-mutated state before the next verify.
         backup_keys = [
-            (req.rid, int(self.boundary_seqlen.get(req.rid, -1)))
+            (req.rid, int(self.boundary_track_idx.get(req.rid, -1)))
             for req in batch.reqs
         ]
         if (
@@ -381,23 +394,25 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         accepted_token_counts: torch.Tensor,
         accepted_steps: torch.Tensor,
-        accepted_token_counts_cpu,
         ctx: DVRLinearStateContext,
-        seq_lens_cpu: List[int],
         use_fast_self_draft_commit: bool = False,
     ):
-        pending_track_indices = [None] * len(batch.reqs)
-        pending_track_seqlens = [None] * len(batch.reqs)
+        pending_track_indices = [
+            self.boundary_track_idx[req.rid] for req in batch.reqs
+        ]
+        pending_track_seqlens = [
+            (
+                self.boundary_seqlen[req.rid]
+                if self.boundary_seqlen[req.rid]
+                > (req.mamba_last_track_seqlen or 0)
+                else self.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
+            )
+            for req in batch.reqs
+        ]
         assert ctx.boundary_indices is not None
         if accepted_token_counts.numel() == 0:
             return pending_track_indices, pending_track_seqlens
 
-        # Use immutable pre-verify lengths. Request metadata can already include
-        # accepted tokens when the synchronous result reaches this method.
-        verified_tail_lens_cpu = [
-            int(seq_len) - self.boundary_seqlen[req.rid]
-            for req, seq_len in zip(batch.reqs, seq_lens_cpu, strict=True)
-        ]
         verified_tail_lens = ctx.state_input_cache.get_tail_lens(
             indices=ctx.state_input_indices
         )
@@ -414,24 +429,6 @@ class DVRLinearStateLifecycle:
             accepted_steps=accepted_steps,
             use_fast_self_draft_commit=use_fast_self_draft_commit,
         )
-
-        for i, (req, verified_tail_len, accepted_token_num) in enumerate(
-            zip(
-                batch.reqs,
-                verified_tail_lens_cpu,
-                accepted_token_counts_cpu,
-                strict=True,
-            )
-        ):
-            if verified_tail_len + accepted_token_num >= FLA_CHUNK_SIZE:
-                new_boundary_seqlen = self.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
-                self.boundary_seqlen[req.rid] = new_boundary_seqlen
-                track_idx = self.boundary_track_idx[req.rid]
-                # Scheduler materializes accepted tokens after the worker
-                # returns. Keep the checkpoint pending until result processing
-                # has committed those tokens to Req.output_ids.
-                pending_track_indices[i] = track_idx
-                pending_track_seqlens[i] = new_boundary_seqlen
         self.boundary_backup = None
         self.boundary_backup_keys = None
         self.live_backup = None

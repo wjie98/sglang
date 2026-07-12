@@ -259,9 +259,17 @@ def maybe_check_kl(
         return False, None, None, "token_ids"
     if len(output_lps) != len(oracle_lps):
         return False, None, None, "logprob_len"
-    maxdiff = max([abs(a - b) for a, b in zip(output_lps, oracle_lps)] or [0.0])
+    diffs = [abs(a - b) for a, b in zip(output_lps, oracle_lps)]
+    maxdiff = max(diffs or [0.0])
     kl_proxy = selected_token_kl_proxy(output_lps, oracle_lps)
-    return maxdiff <= tolerance and kl_proxy <= tolerance, maxdiff, kl_proxy, None
+    error = None
+    if maxdiff > tolerance or kl_proxy > tolerance:
+        index = diffs.index(maxdiff)
+        error = (
+            f"logprob[{index}]: output={output_lps[index]}, "
+            f"oracle={oracle_lps[index]}"
+        )
+    return maxdiff <= tolerance and kl_proxy <= tolerance, maxdiff, kl_proxy, error
 
 
 def main() -> None:
