@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.speculative.dvr_server_args import (
@@ -27,13 +28,16 @@ class _Args:
     disable_cuda_graph = False
     disable_draft_cuda_graph = False
     disable_cuda_graph_padding = False
-    cuda_graph_bs = [1, 2]
-    cuda_graph_max_bs = 2
     disable_radix_cache = False
     disable_custom_all_reduce = False
     mamba_radix_cache_strategy = "auto"
     mamba_track_interval = 1
     mamba_ssm_dtype = "float32"
+
+    def __init__(self):
+        self.cuda_graph_config = SimpleNamespace(
+            decode=SimpleNamespace(bs=[1, 2], max_bs=2)
+        )
 
     def get_model_config(self):
         return None
@@ -56,14 +60,15 @@ class TestDVRServerArgs(unittest.TestCase):
         ):
             handle_dvr_speculative_decoding(args)
 
-        self.assertEqual(args.cuda_graph_bs, [1, 2, 4])
-        self.assertEqual(args.cuda_graph_max_bs, 4)
+        self.assertEqual(args.cuda_graph_config.decode.bs, [1, 2, 4])
+        self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
 
     def test_dvr_self_draft_extends_exact_cuda_graph_bs_without_padding(self):
         args = _Args()
         args.disable_cuda_graph_padding = True
-        args.cuda_graph_bs = [1, 4]
-        args.cuda_graph_max_bs = 4
+        args.cuda_graph_config = SimpleNamespace(
+            decode=SimpleNamespace(bs=[1, 4], max_bs=4)
+        )
 
         with patch(
             "sglang.srt.speculative.dvr_server_args."
@@ -72,13 +77,14 @@ class TestDVRServerArgs(unittest.TestCase):
         ):
             handle_dvr_speculative_decoding(args)
 
-        self.assertEqual(args.cuda_graph_bs, [1, 2, 3, 4])
-        self.assertEqual(args.cuda_graph_max_bs, 4)
+        self.assertEqual(args.cuda_graph_config.decode.bs, [1, 2, 3, 4])
+        self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
 
     def test_dvr_self_draft_extends_cuda_graph_max_before_default_bs(self):
         args = _Args()
-        args.cuda_graph_bs = None
-        args.cuda_graph_max_bs = 2
+        args.cuda_graph_config = SimpleNamespace(
+            decode=SimpleNamespace(bs=None, max_bs=2)
+        )
 
         with patch(
             "sglang.srt.speculative.dvr_server_args."
@@ -87,8 +93,8 @@ class TestDVRServerArgs(unittest.TestCase):
         ):
             handle_dvr_speculative_decoding(args)
 
-        self.assertIsNone(args.cuda_graph_bs)
-        self.assertEqual(args.cuda_graph_max_bs, 4)
+        self.assertIsNone(args.cuda_graph_config.decode.bs)
+        self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
 
     def test_dvr_self_draft_gdn_requires_draft_cuda_graph(self):
         args = _Args()

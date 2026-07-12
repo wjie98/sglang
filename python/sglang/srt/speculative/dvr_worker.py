@@ -6,7 +6,6 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -22,16 +21,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    DVRDraftDecodeCudaGraphRunner,
     dvr_draft_graph_capture_context,
     dvr_draft_graph_replay_context,
+    dvr_self_draft_graph_capture_context,
     dvr_self_draft_graph_replay_context,
-    dvr_self_draft_graph_block_reason,
     iter_dvr_attention_backends,
-    _min_seq_len_cpu,
 )
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_state_flow import (
     DVRRollbackActions,
@@ -106,14 +104,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     ):
         if server_args.speculative_eagle_topk != 1:
             raise ValueError("DVR currently supports only chain mode with topk == 1.")
-        if server_args.page_size != 1 and (
-            server_args.page_size > FLA_CHUNK_SIZE
-            or FLA_CHUNK_SIZE % server_args.page_size != 0
-        ):
-            raise ValueError(
-                "DVR page_size > 1 requires page_size no larger than and "
-                "aligned to FLA_CHUNK_SIZE."
-            )
         self.server_args = server_args
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
@@ -299,9 +289,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             and not self.server_args.disable_cuda_graph
             and not self.server_args.disable_draft_cuda_graph
         ):
-            self.cuda_graph_runner_for_draft_decode = DVRDraftDecodeCudaGraphRunner(
-                self
-            )
+            with dvr_self_draft_graph_capture_context(self.model_runner):
+                self.cuda_graph_runner_for_draft_decode = DecodeCudaGraphRunner(
+                    self.model_runner
+                )
 
     def alloc_memory_pool(
         self,
@@ -340,7 +331,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # accept/reject and GDN state commit, so keep its logprob metadata path
         # disabled.
         need_return_logprob = batch.return_logprob
-        raise_for_dvr_graph_unsafe_short_prompt(batch)
         batch.return_logprob = False
         try:
             return self.target_worker.forward_batch_generation(batch, is_verify=True)
@@ -468,32 +458,26 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         return torch.stack(draft_tokens, dim=1), draft_probs
 
     def _draft_decode_forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        graph_block_reason = dvr_self_draft_graph_block_reason(forward_batch)
         can_cuda_graph = (
-            graph_block_reason is None
-            and self.cuda_graph_runner_for_draft_decode is not None
-            and self.cuda_graph_runner_for_draft_decode.can_run(forward_batch)
+            self.cuda_graph_runner_for_draft_decode is not None
+            and self.cuda_graph_runner_for_draft_decode.can_run_graph(forward_batch)
         )
         if can_cuda_graph:
-            return self.cuda_graph_runner_for_draft_decode.replay(forward_batch)
+            return self.cuda_graph_runner_for_draft_decode.execute(forward_batch)
 
-        min_seq_len = _min_seq_len_cpu(forward_batch)
+        seq_lens = forward_batch.seq_lens_cpu
+        if seq_lens is None:
+            seq_lens = forward_batch.seq_lens
+        min_seq_len = int(seq_lens.min().item())
         capture_bs = []
         if self.cuda_graph_runner_for_draft_decode is not None:
             capture_bs = self.cuda_graph_runner_for_draft_decode.capture_bs
-        reason = (
-            f" reason={graph_block_reason}."
-            if graph_block_reason is not None
-            else ""
-        )
         raise RuntimeError(
             "DVR self-draft decode requires the dedicated CUDA graph; no eager "
             "fallback is used. The current batch cannot run it: "
             f"batch_size={forward_batch.batch_size}, min_seq_len={min_seq_len}, "
-            f"capture_bs={capture_bs}.{reason} "
-            "For seq_len<=2, use a normal chat-template prompt or disable DVR "
-            "for tiny synthetic prompt tests. For batch-size misses, use the "
-            "default CUDA graph batch sizes or include the running batch size "
+            f"capture_bs={capture_bs}. For batch-size misses, use the default "
+            "CUDA graph batch sizes or include the running batch size "
             "in --cuda-graph-bs/--cuda-graph-max-bs."
         )
 
@@ -634,6 +618,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
         if batch.spec_info is None:
             batch.spec_info = self._idle_draft_input()
+        raise_for_dvr_graph_unsafe_short_prompt(batch)
         self._prepare_dvr_boundary_for_verify(batch)
 
         verify_input = self.draft(batch)
@@ -740,7 +725,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             record_stream_for_v2_verify(batch, spec_info, fwd_stream)
             spec_info.num_tokens_per_req = self.num_draft_tokens
             bs = len(batch.seq_lens)
-            raise_for_dvr_graph_unsafe_short_prompt(batch)
 
             with self._target_verify_context(prepare=True) as prepared_on_plan_stream:
                 verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(

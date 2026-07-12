@@ -6,27 +6,12 @@ import torch
 
 from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_bool_env_var
-
-
-_ATTN_BACKEND_CHILD_ATTRS = (
-    "decode_backend",
-    "prefill_backend",
-    "full_attn_backend",
-    "linear_attn_backend",
-    "primary",
-)
-_ATTN_BACKEND_CHILD_LIST_ATTRS = (
-    "attn_backend_list",
-    "attn_backends",
-    "backends",
-    "children",
-)
 
 
 def iter_dvr_attention_backends(attn_backend):
@@ -39,15 +24,15 @@ def iter_dvr_attention_backends(attn_backend):
     stack = [attn_backend]
     while stack:
         backend = stack.pop()
-        if backend is None or id(backend) in seen:
+        if backend is None or isinstance(backend, str) or id(backend) in seen:
             continue
         seen.add(id(backend))
         yield backend
 
-        for attr_name in _ATTN_BACKEND_CHILD_ATTRS:
+        for attr_name in ("decode_backend", "prefill_backend", "primary"):
             stack.append(getattr(backend, attr_name, None))
 
-        for attr_name in _ATTN_BACKEND_CHILD_LIST_ATTRS:
+        for attr_name in ("attn_backend_list", "attn_backends", "children"):
             for child in getattr(backend, attr_name, None) or ():
                 stack.append(child)
 
@@ -90,15 +75,6 @@ def _clear_determinism_sensitive_kernel_caches():
     should_enable_swap_ab.cache_clear()
 
 
-def _uses_init_time_deterministic_num_splits(backend) -> bool:
-    # FA3 and NSA store deterministic split policy at backend init time. FA4 is
-    # deliberately excluded because FA4 CUDA graph does not support num_splits=0.
-    return (
-        getattr(backend, "fa_impl_ver", None) == 3
-        or backend.__class__.__name__ == "NativeSparseAttnBackend"
-    )
-
-
 def _patch_draft_decode_backend_defaults(backend, model_runner, patch_attr):
     """Undo init-time deterministic decode knobs for DVR self-draft only.
 
@@ -110,7 +86,12 @@ def _patch_draft_decode_backend_defaults(backend, model_runner, patch_attr):
 
     server_args = model_runner.server_args
 
-    if _uses_init_time_deterministic_num_splits(backend):
+    # FA3 and NSA store deterministic split policy at backend init time. FA4 is
+    # excluded because its CUDA graph does not support num_splits=0.
+    if (
+        getattr(backend, "fa_impl_ver", None) == 3
+        or backend.__class__.__name__ == "NativeSparseAttnBackend"
+    ):
         patch_attr(backend, "num_splits", 0)
 
     if hasattr(backend, "decode_split_tile_size"):
@@ -235,25 +216,6 @@ def _iter_decode_custom_all_reduce_comms(model_runner):
 
 
 def _skip_init_cuda_graph_state(*args, **kwargs):
-    return None
-
-
-def _min_seq_len_cpu(forward_batch: ForwardBatch) -> int:
-    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-    if seq_lens_cpu is not None:
-        return int(seq_lens_cpu.min().item())
-    return int(forward_batch.seq_lens.min().item())
-
-
-def dvr_self_draft_graph_block_reason(forward_batch: ForwardBatch) -> str | None:
-    """Return why a self-draft decode step is unsupported for graph replay."""
-
-    # The first self-draft decode after a one-token prompt reaches the graph as
-    # seq_len=2 (prompt token + anchor token).  Normal chat-template prompts are
-    # much longer, so keep this synthetic edge out of the DVR serving path
-    # instead of hiding it behind a slow eager branch.
-    if _min_seq_len_cpu(forward_batch) <= 2:
-        return "seq_len<=2 initial GDN state-input graph boundary"
     return None
 
 
@@ -433,29 +395,3 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.batch_size * self.num_tokens_per_bs
         )
         return super().load_batch(forward_batch, pp_proxy_tensors)
-
-class DVRDraftDecodeCudaGraphRunner:
-    """CUDA graph runner for DVR self-draft decode.
-
-    DVR's normal target-model graph runner captures TARGET_VERIFY graphs. The
-    self-draft path still runs ordinary one-token DECODE steps, so it needs a
-    separate decode graph runner instead of reusing the target-verify graph.
-    """
-
-    def __init__(self, dvr_worker):
-        self.dvr_worker = dvr_worker
-        model_runner = dvr_worker.model_runner
-        with dvr_self_draft_graph_capture_context(model_runner):
-            self.runner = DecodeCudaGraphRunner(model_runner)
-
-    @property
-    def capture_bs(self):
-        return self.runner.capture_bs
-
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
-        if dvr_self_draft_graph_block_reason(forward_batch) is not None:
-            return False
-        return self.runner.can_run_graph(forward_batch)
-
-    def replay(self, forward_batch: ForwardBatch):
-        return self.runner.execute(forward_batch)

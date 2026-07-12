@@ -16,20 +16,8 @@ DVR_SPECULATIVE_ALGORITHMS = {
 }
 
 
-def is_dvr_enabled(server_args) -> bool:
-    return server_args.speculative_algorithm in DVR_SPECULATIVE_ALGORITHMS
-
-
-def is_dvr_self_draft_enabled(server_args) -> bool:
-    return server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
-
-
-def is_dvr_eagle_enabled(server_args) -> bool:
-    return server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
-
-
 def handle_dvr_defaults(server_args):
-    if not is_dvr_enabled(server_args):
+    if server_args.speculative_algorithm not in DVR_SPECULATIVE_ALGORITHMS:
         return
 
     # Deterministic target prefill/verify disables custom all-reduce later in
@@ -98,7 +86,7 @@ def handle_dvr_defaults(server_args):
 
 
 def handle_dvr_speculative_decoding(server_args):
-    if not is_dvr_enabled(server_args):
+    if server_args.speculative_algorithm not in DVR_SPECULATIVE_ALGORITHMS:
         return
 
     if not server_args.device.startswith("cuda"):
@@ -110,12 +98,12 @@ def handle_dvr_speculative_decoding(server_args):
     if server_args.disaggregation_mode != "null":
         raise ValueError("DVR currently does not support disaggregation mode.")
     if (
-        is_dvr_self_draft_enabled(server_args)
+        server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is not None
     ):
         raise ValueError("DVR self draft does not use a draft model path.")
     if (
-        is_dvr_eagle_enabled(server_args)
+        server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is None
     ):
         raise ValueError(
@@ -127,15 +115,6 @@ def handle_dvr_speculative_decoding(server_args):
             "speculative_num_draft_tokens is set to 16 by default for DVR. "
             "You can override this by explicitly setting "
             "--speculative-num-draft-tokens."
-        )
-
-    if server_args.page_size != 1 and not (
-        server_args.page_size <= FLA_CHUNK_SIZE
-        and FLA_CHUNK_SIZE % server_args.page_size == 0
-    ):
-        raise ValueError(
-            "DVR page_size > 1 requires page_size to be no larger than and divide "
-            f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}."
         )
 
     if server_args.speculative_num_steps is None:
@@ -163,16 +142,9 @@ def handle_dvr_speculative_decoding(server_args):
     elif server_args.speculative_eagle_topk != 1:
         raise ValueError("DVR currently supports only chain mode with topk == 1.")
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for DVR. You can override "
-            "this by explicitly setting --max-running-requests."
-        )
-
     _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
 
-    if is_dvr_eagle_enabled(server_args):
+    if server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM:
         if server_args.disable_overlap_schedule:
             logger.warning("Synchronous spec v2 is used for DVR EAGLE.")
         else:
@@ -199,24 +171,21 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
     adding a DVR-specific server argument.
     """
 
-    if not is_dvr_self_draft_enabled(server_args):
+    if server_args.speculative_algorithm != DVR_SPECULATIVE_ALGORITHM:
         return
-    if not hasattr(server_args, "get_model_config") or not (
-        _is_dvr_gated_linear_state_model(server_args)
-    ):
+    if not _is_dvr_gated_linear_state_model(server_args):
         return
 
-    if getattr(server_args, "disable_cuda_graph", False) or getattr(
-        server_args, "disable_draft_cuda_graph", False
-    ):
+    if server_args.disable_cuda_graph or server_args.disable_draft_cuda_graph:
         raise ValueError(
             "DVR self-draft for gated linear-state models requires draft CUDA "
             "graphs. Remove --disable-cuda-graph/--disable-draft-cuda-graph "
             "or use a non-self-draft DVR mode."
         )
 
-    cuda_graph_bs = getattr(server_args, "cuda_graph_bs", None)
-    max_running_requests = getattr(server_args, "max_running_requests", None)
+    decode_graph = server_args.cuda_graph_config.decode
+    cuda_graph_bs = decode_graph.bs
+    max_running_requests = server_args.max_running_requests
     if max_running_requests is None:
         return
 
@@ -225,27 +194,27 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
         return
 
     if cuda_graph_bs is None:
-        cuda_graph_max_bs = getattr(server_args, "cuda_graph_max_bs", None)
+        cuda_graph_max_bs = decode_graph.max_bs
         if (
             cuda_graph_max_bs is not None
             and int(cuda_graph_max_bs) < max_running_requests
         ):
-            server_args.cuda_graph_max_bs = max_running_requests
+            decode_graph.max_bs = max_running_requests
         return
 
     graph_bs = {int(bs) for bs in cuda_graph_bs if int(bs) > 0}
     if not graph_bs:
         return
 
-    if getattr(server_args, "disable_cuda_graph_padding", False):
+    if server_args.disable_cuda_graph_padding:
         graph_bs.update(range(1, max_running_requests + 1))
     elif max(graph_bs) < max_running_requests:
         graph_bs.add(max_running_requests)
     else:
         return
 
-    server_args.cuda_graph_bs = sorted(graph_bs)
-    server_args.cuda_graph_max_bs = max(server_args.cuda_graph_bs)
+    decode_graph.bs = sorted(graph_bs)
+    decode_graph.max_bs = max(decode_graph.bs)
 
 
 def _is_dvr_gated_linear_state_model(server_args):

@@ -4,14 +4,15 @@ import pytest
 import torch
 
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    DVRDraftDecodeCudaGraphRunner,
     _ensure_decode_custom_all_reduce_comm,
     _patch_draft_decode_backend_defaults,
-    dvr_self_draft_graph_block_reason,
     iter_dvr_attention_backends,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dvr_worker import DecodeVerifyRollbackWorkerV2
+from sglang.srt.speculative.dvr_worker import (
+    DecodeVerifyRollbackWorkerV2,
+    raise_for_dvr_graph_unsafe_short_prompt,
+)
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
     DVRRollbackActions,
@@ -242,22 +243,14 @@ def test_dvr_draft_reaches_nested_hybrid_attention_backends():
     }
 
 
-def test_dvr_self_draft_graph_runner_rejects_short_boundary():
-    graph_runner = object.__new__(DVRDraftDecodeCudaGraphRunner)
-    graph_runner.runner = SimpleNamespace(can_run_graph=lambda forward_batch: True)
-
-    short_batch = SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
-    assert dvr_self_draft_graph_block_reason(short_batch) is not None
-    assert not graph_runner.can_run(short_batch)
-    assert graph_runner.can_run(
-        SimpleNamespace(
-            dvr_disable_draft_cuda_graph=True,
-            seq_lens_cpu=torch.tensor([4]),
-            batch_size=1,
+def test_dvr_self_draft_rejects_one_token_prompt_once_at_core_entry():
+    with pytest.raises(RuntimeError, match="one-token synthetic prompts"):
+        raise_for_dvr_graph_unsafe_short_prompt(
+            SimpleNamespace(reqs=[SimpleNamespace(origin_input_ids=[1])])
         )
-    )
-    assert graph_runner.can_run(
-        SimpleNamespace(seq_lens_cpu=torch.tensor([3]), batch_size=1)
+
+    raise_for_dvr_graph_unsafe_short_prompt(
+        SimpleNamespace(reqs=[SimpleNamespace(origin_input_ids=[1, 2])])
     )
 
 
