@@ -126,6 +126,7 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
         conv_kernel=4,
     )
     all_layers_state_cache = SimpleNamespace(
+        temporal=torch.zeros(1, 3, 16, 128, 128),
         intermediate_ssm=torch.zeros(1, 3, 4, 16, 128, 128),
     )
     req_to_token_pool = SimpleNamespace(

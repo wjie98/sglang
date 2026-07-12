@@ -438,69 +438,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            if dvr_state_adapter is None:
-                mixed_qkv_reshaped = mixed_qkv.view(
-                    batch_size, draft_token_num, -1
-                ).transpose(1, 2)
-                mixed_qkv_processed = causal_conv1d_update(
-                    mixed_qkv_reshaped,
-                    conv_states,
-                    layer.conv_weights,
-                    layer.bias,
-                    layer.activation,
-                    conv_state_indices=cache_indices[:batch_size],
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                    intermediate_state_indices=intermediate_state_indices[:batch_size],
-                    retrieve_next_token=retrieve_next_token,
-                    retrieve_next_sibling=retrieve_next_sibling,
-                    retrieve_parent_token=retrieve_parent_token,
-                )
-                mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-            else:
-                # DVR verifies a topk=1 causal chain from the deterministic
-                # chunk boundary. Reuse normal GDN convolution/split/gating;
-                # only the recurrent-state scan below is DVR-specific.
+            verify_cache_indices = cache_indices[:batch_size]
+            if dvr_state_adapter is not None:
                 dvr_indices, state_input_indices, valid_mask = (
                     dvr_state_adapter.target_verify_indices(
                         forward_batch=forward_batch,
                         cache_indices=cache_indices,
                     )
                 )
-                has_initial_states = (forward_batch.seq_lens[:batch_size] > 0) & (
-                    valid_mask.to(device=forward_batch.seq_lens.device)
-                )
-                conv_input_reshaped = mixed_qkv.view(
-                    batch_size, draft_token_num, -1
-                ).transpose(1, 2)
-                initial_conv_windows = conv_states[dvr_indices].clone()
-                mixed_qkv = causal_conv1d_fn(
-                    mixed_qkv.transpose(0, 1),
-                    layer.conv_weights,
-                    layer.bias,
-                    activation=layer.activation,
-                    conv_states=conv_states,
-                    has_initial_state=has_initial_states,
-                    cache_indices=dvr_indices,
-                    query_start_loc=query_start_loc,
-                    seq_lens_cpu=[draft_token_num] * batch_size,
-                ).transpose(0, 1)[:seq_len]
+                verify_cache_indices = dvr_indices
 
-                conv_source = torch.cat(
-                    [initial_conv_windows, conv_input_reshaped], dim=2
-                )
-                conv_state_len = initial_conv_windows.shape[-1]
-                conv_windows = conv_source.unfold(
-                    dimension=2, size=conv_state_len, step=1
-                )[:, :, 1 : draft_token_num + 1].transpose(1, 2)
-                rows = intermediate_state_indices[:batch_size].to(
-                    torch.long
-                ).unsqueeze(1)
-                cols = torch.arange(
-                    draft_token_num,
-                    dtype=torch.long,
-                    device=cache_indices.device,
-                ).unsqueeze(0)
-                intermediate_conv_window_cache[rows, cols] = conv_windows
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
+            mixed_qkv_processed = causal_conv1d_update(
+                mixed_qkv_reshaped,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=verify_cache_indices,
+                intermediate_conv_window=intermediate_conv_window_cache,
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:

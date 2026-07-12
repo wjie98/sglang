@@ -333,18 +333,15 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle.boundary_seqlen = {"r0": 64}
     lifecycle.boundary_track_idx = {"r0": 1}
-    lifecycle.boundary_backup = None
-    lifecycle.boundary_backup_keys = None
-    lifecycle.live_backup = None
+    lifecycle.state_backup = None
     adapter = Adapter()
+    lifecycle._state_adapter = adapter
     context = SimpleNamespace(
-        state_adapter=adapter,
         state_cache=object(),
         boundary_indices=torch.tensor([11]),
         live_indices=torch.tensor([12]),
     )
     rebound_context = SimpleNamespace(
-        state_adapter=adapter,
         state_cache=object(),
         boundary_indices=torch.tensor([21]),
         live_indices=torch.tensor([22]),

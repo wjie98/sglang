@@ -582,34 +582,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         self.linear_state.clear_cache_state()
 
-    def _forward_batch_generation_eagle(
-        self, batch: ScheduleBatch, on_publish=None
-    ) -> GenerationBatchResult:
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(batch)
-            batch_output.new_seq_lens = batch.seq_lens
-            self._prepare_dvr_boundary_for_verify(batch)
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-            with self._draft_context():
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
-                    )
-                )
-            return batch_output
-
-        batch_output = self._run_decode_draft_verify_rollback(batch)
-        if on_publish is not None:
-            on_publish(batch_output.new_seq_lens)
-        with self._draft_context():
-            self.draft_worker._draft_extend_for_decode(batch, batch_output)
-        return batch_output
-
     def _run_decode_draft_verify_rollback(
         self,
         batch: ScheduleBatch,
@@ -630,41 +602,53 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         self, model_worker_batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
         batch = model_worker_batch
-        if self.is_dvr_eagle:
-            return self._forward_batch_generation_eagle(batch, on_publish)
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            batch.capture_hidden_mode = CaptureHiddenMode.NULL
-            target_result = self.target_worker.forward_batch_generation(batch)
+            batch.capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if self.is_dvr_eagle
+                else CaptureHiddenMode.NULL
+            )
+            batch_result = self.target_worker.forward_batch_generation(batch)
+            batch_result.new_seq_lens = batch.seq_lens
             self._prepare_dvr_boundary_for_verify(batch)
-            next_token_ids = target_result.next_token_ids
-            batch.spec_info = EagleDraftInput(
-                hidden_states=None,
-                bonus_tokens=next_token_ids,
-                topk_p=torch.ones(
-                    (next_token_ids.shape[0], 1),
-                    dtype=torch.float32,
-                    device=next_token_ids.device,
-                ),
-                topk_index=next_token_ids.to(torch.long).unsqueeze(-1),
-                num_tokens_per_req=1,
-                num_tokens_for_logprob_per_req=1,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-            )
-            batch_result = GenerationBatchResult(
-                logits_output=target_result.logits_output,
-                next_token_ids=next_token_ids,
-                can_run_cuda_graph=target_result.can_run_cuda_graph,
-                next_draft_input=batch.spec_info,
-                new_seq_lens=batch.seq_lens,
-            )
-            if on_publish is not None:
-                on_publish(batch_result.new_seq_lens)
+            if self.is_dvr_eagle:
+                if on_publish is not None:
+                    on_publish(batch_result.new_seq_lens)
+                with self._draft_context():
+                    batch_result.next_draft_input = (
+                        self.draft_worker._draft_extend_for_prefill(
+                            batch,
+                            batch_result.logits_output.hidden_states,
+                            batch_result.next_token_ids,
+                            batch_result.logits_output.mm_input_embeds,
+                        )
+                    )
+            else:
+                next_token_ids = batch_result.next_token_ids
+                batch.spec_info = EagleDraftInput(
+                    hidden_states=None,
+                    bonus_tokens=next_token_ids,
+                    topk_p=torch.ones(
+                        (next_token_ids.shape[0], 1),
+                        dtype=torch.float32,
+                        device=next_token_ids.device,
+                    ),
+                    topk_index=next_token_ids.to(torch.long).unsqueeze(-1),
+                    num_tokens_per_req=1,
+                    num_tokens_for_logprob_per_req=1,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,
+                )
+                batch_result.next_draft_input = batch.spec_info
+                if on_publish is not None:
+                    on_publish(batch_result.new_seq_lens)
             return batch_result
 
         batch_result = self._run_decode_draft_verify_rollback(batch)
         if on_publish is not None:
             on_publish(batch_result.new_seq_lens)
+        if self.is_dvr_eagle:
+            with self._draft_context():
+                self.draft_worker._draft_extend_for_decode(batch, batch_result)
         return batch_result
 
     def _draft_preprocess_decode_for_self_dvr(self, batch: ScheduleBatch):
@@ -764,11 +748,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     except NotImplementedError:
                         continue
 
-            base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-            linear_state_ctx = self.linear_state.restore_for_verify(
-                batch,
-                seq_lens_cpu=base_seq_lens_cpu,
-            )
+            linear_state_ctx = self.linear_state.restore_for_verify(batch)
             with self._target_verify_context():
                 forward_output = self.target_worker.forward_batch_generation(
                     batch=None,
@@ -790,11 +770,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = CaptureHiddenMode.NULL
             batch.spec_info = spec_info
 
-            base_seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-            linear_state_ctx = self.linear_state.restore_for_verify(
-                batch,
-                seq_lens_cpu=base_seq_lens_cpu,
-            )
+            linear_state_ctx = self.linear_state.restore_for_verify(batch)
             batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
             forward_output = self._forward_target_verify_for_dvr(batch)
             can_run_cuda_graph = forward_output.can_run_cuda_graph

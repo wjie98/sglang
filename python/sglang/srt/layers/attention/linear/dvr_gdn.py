@@ -305,6 +305,13 @@ class DVRGDNStateAdapter:
             raise RuntimeError("DVR GDN state-input cache metadata is not initialized.")
 
         state_cache = req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        if (
+            state_cache.temporal.dtype != torch.float32
+            or state_cache.intermediate_ssm.dtype != torch.float32
+        ):
+            raise RuntimeError(
+                "DVR GDN verify requires fp32 recurrent and intermediate states."
+            )
         num_layers = state_cache.intermediate_ssm.shape[0]
         spec_state_size = state_cache.intermediate_ssm.shape[1] - 1
         num_draft_tokens = state_cache.intermediate_ssm.shape[2]
@@ -377,16 +384,6 @@ class DVRGDNStateAdapter:
         elif self._verify_exports_boundary_state != exports_boundary_state:
             raise RuntimeError("GDN verify backend changed its boundary-state contract.")
         return result
-
-    def validate_state_cache(self, *, state_cache):
-        assert state_cache.temporal.dtype == torch.float32, (
-            "DVR linear-state verify requires fp32 temporal state checkpoints. "
-            "bf16/fp16 checkpoints round the chunkwise scan state and can "
-            "diverge from full prefill across chunks."
-        )
-        assert state_cache.intermediate_ssm.dtype == torch.float32, (
-            "DVR linear-state verify requires fp32 intermediate prefill states."
-        )
 
     def zero_recurrent_state(self, *, state_cache, indices: torch.Tensor):
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)

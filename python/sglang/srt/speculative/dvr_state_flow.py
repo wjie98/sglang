@@ -15,8 +15,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 @dataclass
 class DVRLinearStateContext:
     state_cache: Any
-    state_adapter: Any
-    state_input_cache: Any
     state_input_indices: torch.Tensor
     live_indices: torch.Tensor
     boundary_indices: Optional[torch.Tensor] = None
@@ -112,13 +110,9 @@ class DVRLinearStateLifecycle:
         self.boundary_track_idx = {}
         self.pending_boundary_publish = set()
         self.slot_owner = {}
-        self.boundary_backup = None
-        # Identifies the worker-local target boundary snapshot.  Separate
-        # EAGLE/MTP draft phases can mutate shared linear-state slots before
-        # the next target verify, so DVR-EAGLE preserves this snapshot when the
-        # request and chunk boundary are unchanged.
-        self.boundary_backup_keys = None
-        self.live_backup = None
+        # (logical request/slot keys, boundary state, draft-start live state).
+        # Keep the snapshot atomic when radix rebinds physical request slots.
+        self.state_backup = None
 
     def bind_state_adapter(self) -> None:
         adapters = []
@@ -158,9 +152,7 @@ class DVRLinearStateLifecycle:
         self.boundary_track_idx.clear()
         self.pending_boundary_publish.clear()
         self.slot_owner.clear()
-        self.boundary_backup = None
-        self.boundary_backup_keys = None
-        self.live_backup = None
+        self.state_backup = None
 
     def prepare_for_draft(
         self,
@@ -241,44 +233,45 @@ class DVRLinearStateLifecycle:
         ]
         if (
             preserve_existing
-            and self.boundary_backup is not None
-            and self.boundary_backup_keys == backup_keys
+            and self.state_backup is not None
+            and self.state_backup[0] == backup_keys
         ):
             return
         ctx = ctx or self.state_context(batch, require_boundary=True)
         if ctx is None:
-            self.boundary_backup = None
-            self.boundary_backup_keys = None
-            self.live_backup = None
+            self.state_backup = None
             return
         assert ctx.boundary_indices is not None
-        self.boundary_backup = ctx.state_adapter.backup_recurrent_state(
-            state_cache=ctx.state_cache,
-            indices=ctx.boundary_indices,
+        self.state_backup = (
+            backup_keys,
+            self._state_adapter.backup_recurrent_state(
+                state_cache=ctx.state_cache, indices=ctx.boundary_indices
+            ),
+            self._state_adapter.backup_recurrent_state(
+                state_cache=ctx.state_cache, indices=ctx.live_indices
+            ),
         )
-        self.live_backup = ctx.state_adapter.backup_recurrent_state(
-            state_cache=ctx.state_cache,
-            indices=ctx.live_indices,
-        )
-        self.boundary_backup_keys = backup_keys
 
     def restore_for_verify(
         self,
         batch,
-        *,
-        seq_lens_cpu: Optional[List[int]] = None,
     ) -> Optional[DVRLinearStateContext]:
-        self.ensure_boundary_state(batch, seq_lens_cpu=seq_lens_cpu)
+        # Overlap result processing may rebind a logical request checkpoint
+        # after draft preparation but before target verify reaches this stream.
+        self.ensure_boundary_state(batch)
         ctx = self.state_context(batch, require_boundary=True)
         if ctx is None:
             return None
         assert ctx.boundary_indices is not None
-        ctx.state_adapter.prepare_recurrent_state_for_verify(
+        boundary_backup = live_backup = None
+        if self.state_backup is not None:
+            _, boundary_backup, live_backup = self.state_backup
+        self._state_adapter.prepare_recurrent_state_for_verify(
             state_cache=ctx.state_cache,
             live_indices=ctx.live_indices,
             boundary_indices=ctx.boundary_indices,
-            boundary_backup=self.boundary_backup,
-            live_backup=self.live_backup,
+            boundary_backup=boundary_backup,
+            live_backup=live_backup,
         )
         return ctx
 
@@ -304,13 +297,14 @@ class DVRLinearStateLifecycle:
         if accepted_token_counts.numel() == 0:
             return pending_checkpoints
 
-        verified_tail_lens = ctx.state_input_cache.get_tail_lens(
+        state_input_cache = self._state_adapter.state_input_window()
+        verified_tail_lens = state_input_cache.get_tail_lens(
             indices=ctx.state_input_indices
         )
         verified_tail_lens = verified_tail_lens.to(
             device=ctx.live_indices.device, dtype=torch.long
         )
-        ctx.state_adapter.commit_after_verify(
+        self._state_adapter.commit_after_verify(
             state_cache=ctx.state_cache,
             state_input_indices=ctx.state_input_indices,
             live_indices=ctx.live_indices,
@@ -319,9 +313,7 @@ class DVRLinearStateLifecycle:
             accepted_token_counts=accepted_token_counts,
             accepted_steps=accepted_steps,
         )
-        self.boundary_backup = None
-        self.boundary_backup_keys = None
-        self.live_backup = None
+        self.state_backup = None
         return pending_checkpoints
 
     def state_context(
@@ -340,7 +332,6 @@ class DVRLinearStateLifecycle:
             batch=batch, device=live_indices.device
         )
         state_cache = state_adapter.get_state_cache(batch=batch)
-        state_adapter.validate_state_cache(state_cache=state_cache)
         boundary_indices = None
         if require_boundary:
             boundary_indices = torch.stack(
@@ -353,8 +344,6 @@ class DVRLinearStateLifecycle:
             ).to(device=live_indices.device, dtype=torch.long)
         return DVRLinearStateContext(
             state_cache=state_cache,
-            state_adapter=state_adapter,
-            state_input_cache=state_adapter.state_input_window(),
             state_input_indices=state_input_indices,
             live_indices=live_indices,
             boundary_indices=boundary_indices,
@@ -509,11 +498,11 @@ class DVRLinearStateLifecycle:
             boundary_indices_to_zero = torch.stack(zero_boundary_indices).to(
                 device=ctx.live_indices.device, dtype=torch.long
             )
-            ctx.state_adapter.zero_recurrent_state(
+            self._state_adapter.zero_recurrent_state(
                 state_cache=ctx.state_cache, indices=boundary_indices_to_zero
             )
         if reset_pos_indices:
-            ctx.state_input_cache.set_tail_lens(
+            self._state_adapter.state_input_window().set_tail_lens(
                 indices=torch.stack(reset_pos_indices),
                 value=torch.tensor(reset_pos_values, device=ctx.live_indices.device),
             )
