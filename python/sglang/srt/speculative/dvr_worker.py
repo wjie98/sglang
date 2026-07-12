@@ -130,7 +130,6 @@ class _DVRSelfDraftBackend:
         worker.linear_state.prepare_for_draft(
             batch,
             seq_lens_cpu=seq_lens_cpu,
-            request_token_ids_for_replay=worker._request_token_ids_for_replay,
         )
         worker.linear_state.backup_boundary_state(batch, preserve_existing=True)
         worker._draft_preprocess_decode_for_self_dvr(batch)
@@ -740,10 +739,14 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             return
 
         seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
+        prefill_prefix_lens = None
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            prefill_prefix_lens = [int(x) for x in batch.prefix_lens]
         self.linear_state.prepare_for_draft(
             batch,
             seq_lens_cpu=seq_lens_cpu,
-            request_token_ids_for_replay=self._request_token_ids_for_replay,
+            prefill_prefix_lens=prefill_prefix_lens,
+            defer_request_publish=prefill_prefix_lens is not None,
         )
         # EAGLE/MTP draft can run before the next target verify in overlap mode.
         # Preserve the target checkpoint authority across draft-side mutations.
@@ -801,17 +804,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
     def clear_cache_pool(self):
         self.linear_state.clear_cache_state()
-
-    def _request_token_ids_for_replay(self, req, boundary_seqlen: int):
-        token_ids = list(req.origin_input_ids) + list(req.output_ids)
-        if len(token_ids) < boundary_seqlen:
-            raise RuntimeError(
-                "DVR cannot rebuild a missing boundary before output "
-                "materialization: "
-                f"rid={req.rid}, available={len(token_ids)}, "
-                f"boundary={boundary_seqlen}."
-            )
-        return token_ids
 
     def _forward_batch_generation_eagle(
         self, batch: ScheduleBatch, on_publish=None
@@ -910,6 +902,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             batch.capture_hidden_mode = CaptureHiddenMode.NULL
             target_result = self.target_worker.forward_batch_generation(batch)
+            self._prepare_dvr_boundary_for_verify(batch)
             logits_output, next_token_ids = (
                 target_result.logits_output,
                 target_result.next_token_ids,

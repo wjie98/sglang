@@ -282,9 +282,11 @@ class ModelRunnerKVCacheMixin:
 
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
-            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
-            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not self.server_args.disable_overlap_schedule:
+            # DVR keeps one request-local rollback checkpoint while radix may
+            # donate another, so both sync and overlap modes require two slots.
+            if self.spec_algorithm.is_dvr():
+                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+            elif not self.server_args.disable_overlap_schedule:
                 if self.server_args.enable_mamba_extra_buffer_lazy():
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
                 else:
@@ -405,7 +407,10 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                    enable_overlap_schedule=(
+                        not self.server_args.disable_overlap_schedule
+                        or self.spec_algorithm.is_dvr()
+                    ),
                     start_layer=self.start_layer,
                 )
             else:

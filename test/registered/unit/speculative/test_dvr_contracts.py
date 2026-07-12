@@ -284,13 +284,46 @@ def test_dvr_boundary_metadata_advances_from_next_scheduler_length():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle.boundary_seqlen = {"r0": 64}
     lifecycle.boundary_track_idx = {"r0": 1}
-    lifecycle.ensure_boundary_state = lambda batch, seq_lens_cpu: []
+    lifecycle.pending_boundary_publish = set()
+    lifecycle.ensure_boundary_state = lambda *_args, **_kwargs: None
     batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
 
     lifecycle.prepare_for_draft(batch, seq_lens_cpu=[128])
 
     assert lifecycle.boundary_seqlen == {"r0": 128}
     assert lifecycle.boundary_track_idx == {"r0": 1}
+
+
+def test_dvr_prefill_boundary_uses_request_local_track_slot():
+    class Pool:
+        @staticmethod
+        def get_mamba_ping_pong_other_idx(track_idx):
+            return 1 - track_idx
+
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle.boundary_seqlen = {}
+    lifecycle.boundary_track_idx = {}
+    lifecycle.pending_boundary_publish = set()
+    req = SimpleNamespace(
+        rid="r0",
+        mamba_last_track_seqlen=None,
+        mamba_next_track_idx=0,
+        mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
+    )
+    batch = SimpleNamespace(req_to_token_pool=Pool())
+
+    assert lifecycle.init_boundary_for_req(batch, req, 64, 64, False) is None
+    assert lifecycle.boundary_seqlen == {"r0": 64}
+    assert lifecycle.boundary_track_idx == {"r0": 0}
+    assert lifecycle.pending_boundary_publish == {"r0"}
+    assert req.mamba_next_track_idx == 0
+
+    lifecycle._publish_boundary_checkpoint(batch, req)
+    assert req.mamba_next_track_idx == 1
+
+    req.mamba_last_track_seqlen = None
+    with pytest.raises(RuntimeError, match="did not publish"):
+        lifecycle.init_boundary_for_req(batch, req, 128, None, True)
 
 
 def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():

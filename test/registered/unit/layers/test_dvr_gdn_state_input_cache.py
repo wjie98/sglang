@@ -203,3 +203,28 @@ def test_gdn_extend_tail_cache_skips_draft_workers():
     assert torch.equal(v_cache[1, :2], v.reshape(2, 16, 128))
     assert torch.equal(g_cache[1, :2], g)
     assert torch.equal(beta_cache[1, :2], beta)
+
+
+def test_gdn_extend_preserves_cached_prefix_boundary_in_request_slot():
+    conv = torch.arange(12, dtype=torch.float32).view(4, 3)
+    temporal = torch.arange(20, dtype=torch.float32).view(4, 5)
+    state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
+    batch = SimpleNamespace(
+        extend_prefix_lens=torch.tensor([64, 64]),
+        seq_lens=torch.tensor([70, 128]),
+        mamba_track_indices=torch.tensor([2, 3]),
+        mamba_track_mask=torch.tensor([False, True]),
+    )
+    adapter = DVRGatedStateAdapter(kernel_dispatcher=None)
+
+    adapter.capture_extend_prefix_boundary(
+        forward_batch=batch,
+        state_cache=state_cache,
+        cache_indices=torch.tensor([0, 1]),
+    )
+
+    assert torch.equal(conv[2], conv[0])
+    assert torch.equal(temporal[2], temporal[0])
+    # The normal prefill tracker owns requests whose extend reaches a new chunk.
+    assert not torch.equal(conv[3], conv[1])
+    assert not torch.equal(temporal[3], temporal[1])

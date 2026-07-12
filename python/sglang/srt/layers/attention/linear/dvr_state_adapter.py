@@ -275,6 +275,38 @@ class DVRGatedStateAdapter:
             for conv, saved_conv in zip(state_cache.conv, live_backup.conv, strict=True):
                 conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)
 
+    def capture_extend_prefix_boundary(
+        self,
+        *,
+        forward_batch,
+        state_cache,
+        cache_indices: torch.Tensor,
+    ) -> None:
+        """Preserve an exact cached-prefix boundary before target EXTEND mutates it."""
+
+        if self.is_draft_worker or forward_batch.mamba_track_indices is None:
+            return
+
+        prefix_lens = forward_batch.extend_prefix_lens
+        if prefix_lens is None:
+            return
+        batch_size = prefix_lens.numel()
+        seq_lens = forward_batch.seq_lens[:batch_size]
+        boundaries = torch.div(
+            seq_lens, self.chunk_size, rounding_mode="floor"
+        ) * self.chunk_size
+        capture_mask = (boundaries > 0) & (boundaries == prefix_lens)
+        if forward_batch.mamba_track_mask is not None:
+            capture_mask &= ~forward_batch.mamba_track_mask[:batch_size]
+
+        src = cache_indices[:batch_size][capture_mask].to(torch.long)
+        dst = forward_batch.mamba_track_indices[:batch_size][capture_mask].to(
+            torch.long
+        )
+        for conv in state_cache.conv:
+            conv[dst] = conv[src]
+        state_cache.temporal[dst] = state_cache.temporal[src]
+
     def cache_extend_tail(
         self,
         *,
