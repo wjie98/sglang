@@ -438,9 +438,11 @@ class ModelRunnerKVCacheMixin:
                         1 if self.spec_algorithm.is_dvr() else None
                     ),
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
-                    mamba_ping_pong_track_buffer_size=(
-                        2 if self.spec_algorithm.is_dvr() else None
+                    # The pool uses this flag only to choose one or two tracking
+                    # slots. DVR needs a committed rollback slot in sync mode too.
+                    enable_overlap_schedule=(
+                        not self.server_args.disable_overlap_schedule
+                        or self.spec_algorithm.is_dvr()
                     ),
                     start_layer=self.start_layer,
                 )
