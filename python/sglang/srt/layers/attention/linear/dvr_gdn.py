@@ -478,6 +478,11 @@ class DVRGDNStateAdapter:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             chunk_size=self.chunk_size,
         )
+        state_input_indices = state_input_indices + 1
+        state_window.zero_after_lens(
+            indices=state_input_indices,
+            keep_lens=state_window.get_tail_lens(indices=state_input_indices),
+        )
 
     def target_verify_indices(self, *, forward_batch, cache_indices: torch.Tensor):
         """Map padded target-verify rows to DVR live and input-window slots."""
@@ -556,10 +561,6 @@ class DVRGDNStateAdapter:
                 + tail_lens.unsqueeze(1)
             ),
             values=draft_state_inputs,
-        )
-        state_window.zero_after_lens(
-            indices=state_input_indices,
-            keep_lens=tail_lens + draft_token_num,
         )
         q, k, v, cached_g, cached_beta = state_window.read(
             indices=state_input_indices
@@ -684,6 +685,11 @@ class DVRGDNStateAdapter:
             indices=state_input_indices,
             crosses_chunk_boundary=crosses_chunk_boundary,
             chunk_size=self.chunk_size,
+        )
+        # Keep the fixed verify window clean once per batch, not once per GDN
+        # layer inside the captured target forward.
+        state_window.zero_after_lens(
+            indices=state_input_indices, keep_lens=tail_lens_after
         )
         if self.draft_reuses_target_state:
             # Self draft consumes the target model's live recurrent slot. Keep
