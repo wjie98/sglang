@@ -10,6 +10,8 @@ PORT="${PORT:-30124}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.50}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+RUN_V1="${RUN_V1:-1}"
+RUN_V2="${RUN_V2:-1}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/0p8b-self-dvr-kl}"
 SERVER_PID=""
@@ -100,5 +102,9 @@ run_one_mode() {
   SERVER_PID=""
 }
 
-run_one_mode "spec_v1" "0"
-run_one_mode "spec_v2" "1"
+if [[ "${RUN_V1}" == "1" ]]; then
+  run_one_mode "spec_v1" "0"
+fi
+if [[ "${RUN_V2}" == "1" ]]; then
+  run_one_mode "spec_v2" "1"
+fi

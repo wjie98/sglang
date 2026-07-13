@@ -18,6 +18,8 @@ Use these entry points:
   - includes concurrent and batch 512-token strict KL checks
   - `ATTENTION_BACKEND` may select a separately reported Triton/FlashInfer/FA3
     compatibility run; the fixed default remains `triton`
+  - `RUN_V1=0` or `RUN_V2=0` may resume one half of an interrupted run in the
+    same `RESULT_ROOT`; the default remains the complete v1/v2 matrix
 - `test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh`
   - 35B Qwen3.5 MTP/DVR-EAGLE sync-v2 and overlap-v2 smoke
   - covers `return_logprob=True` KL and `return_logprob=False` output path
