@@ -244,7 +244,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             batch,
             logits_output,
             vocab_mask,
-            use_rejection_sampling=spec_info.draft_probs is not None,
         )
 
     @property

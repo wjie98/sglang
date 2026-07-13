@@ -130,26 +130,32 @@ class ModelRunnerKVCacheMixin:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
             draft_steps = server_args.speculative_num_draft_tokens
-            ssm_state_steps = 1 if self.spec_algorithm.is_dvr() else draft_steps
-            params = config.mamba2_cache_params
-            dedup_conv_window = conv_window_dedup_enabled(
-                _is_npu,
-                current_platform.is_cpu(),
-                server_args.speculative_eagle_topk,
-            )
-            intermediate_conv_numel = 0
-            for conv_dim, window_size in params.shape.conv:
-                intermediate_conv_numel += conv_dim * (
-                    draft_steps + window_size - 1
-                    if dedup_conv_window
-                    else draft_steps * window_size
+            if self.spec_algorithm.is_dvr():
+                # DVR stores one committed temporal step while retaining every
+                # conv step needed for rollback. Size that layout exactly; keep
+                # the established estimate unchanged for other spec workers.
+                params = config.mamba2_cache_params
+                dedup_conv_window = conv_window_dedup_enabled(
+                    _is_npu,
+                    current_platform.is_cpu(),
+                    server_args.speculative_eagle_topk,
                 )
-            intermediate_per_req = len(params.layers) * (
-                intermediate_conv_numel * params.dtype.conv.itemsize
-                + math.prod(params.shape.temporal)
-                * ssm_state_steps
-                * params.dtype.temporal.itemsize
-            )
+                intermediate_conv_numel = 0
+                for conv_dim, window_size in params.shape.conv:
+                    intermediate_conv_numel += conv_dim * (
+                        draft_steps + window_size - 1
+                        if dedup_conv_window
+                        else draft_steps * window_size
+                    )
+                intermediate_per_req = len(params.layers) * (
+                    intermediate_conv_numel * params.dtype.conv.itemsize
+                    + math.prod(params.shape.temporal)
+                    * params.dtype.temporal.itemsize
+                )
+            else:
+                intermediate_per_req = (
+                    config.mamba2_cache_params.mamba_cache_per_req * draft_steps
+                )
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -198,10 +204,18 @@ class ModelRunnerKVCacheMixin:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req + intermediate_per_req / ratio)
-                )
+                if self.spec_algorithm.is_dvr():
+                    server_args.max_mamba_cache_size = int(
+                        mamba_budget_bytes
+                        // (per_req + intermediate_per_req / ratio)
+                    )
+                else:
+                    # Preserve the upstream arithmetic, including operation
+                    # order, for every non-DVR speculative worker.
+                    server_args.max_mamba_cache_size = int(
+                        mamba_budget_bytes
+                        // (per_req * (1 + draft_steps / ratio))
+                    )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
@@ -384,9 +398,6 @@ class ModelRunnerKVCacheMixin:
                             ]
                         ),
                         speculative_num_draft_tokens=max_spec_draft_tokens,
-                        speculative_ssm_state_steps=(
-                            1 if self.spec_algorithm.is_dvr() else None
-                        ),
                         speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,

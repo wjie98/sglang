@@ -359,8 +359,6 @@ def eagle_sample(
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
-    *,
-    use_rejection_sampling: Optional[bool] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -461,7 +459,9 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        if use_rejection_sampling is None:
+        if batch.spec_algorithm.is_dvr():
+            use_rejection_sampling = verify_input.draft_probs is not None
+        else:
             use_rejection_sampling = (
                 get_global_server_args().speculative_use_rejection_sampling
             )
@@ -489,7 +489,7 @@ def eagle_sample(
             ),
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        if sampling_info.need_min_p_sampling:
+        if batch.spec_algorithm.is_dvr() and sampling_info.need_min_p_sampling:
             min_ps = torch.repeat_interleave(
                 sampling_info.min_ps, verify_input.draft_token_num, dim=0
             )
