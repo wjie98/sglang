@@ -17,8 +17,13 @@ DVR_SPECULATIVE_ALGORITHMS = {
 
 
 def handle_dvr_defaults(server_args):
-    if server_args.speculative_algorithm not in DVR_SPECULATIVE_ALGORITHMS:
+    algorithm = server_args.speculative_algorithm
+    if algorithm is None:
         return
+    algorithm = algorithm.upper()
+    if algorithm not in DVR_SPECULATIVE_ALGORITHMS:
+        return
+    server_args.speculative_algorithm = algorithm
 
     # Deterministic target prefill/verify disables custom all-reduce later in
     # ServerArgs. Preserve the user's original choice for provisional draft
@@ -26,24 +31,6 @@ def handle_dvr_defaults(server_args):
     server_args._dvr_enable_draft_custom_all_reduce = (
         not server_args.disable_custom_all_reduce
     )
-
-    normalized_page_size = server_args.page_size
-    if normalized_page_size not in (None, 1) and normalized_page_size > 0:
-        normalized_page_size = 1 << (
-            min(normalized_page_size, FLA_CHUNK_SIZE).bit_length() - 1
-        )
-        while FLA_CHUNK_SIZE % normalized_page_size != 0:
-            normalized_page_size //= 2
-    if normalized_page_size != server_args.page_size:
-        logger.warning(
-            "DVR requires page_size to be no larger "
-            "than and divide FLA_CHUNK_SIZE=%s. Setting --page-size %s "
-            "instead of %s.",
-            FLA_CHUNK_SIZE,
-            normalized_page_size,
-            server_args.page_size,
-        )
-        server_args.page_size = normalized_page_size
 
     if not _is_dvr_gated_linear_state_model(server_args):
         return
@@ -131,7 +118,10 @@ def handle_dvr_speculative_decoding(server_args):
             "DVR requires speculative_num_draft_tokens >= 2 because chain mode "
             "needs at least one draft step."
         )
-    if server_args.speculative_num_draft_tokens > FLA_CHUNK_SIZE:
+    if (
+        server_args.speculative_num_draft_tokens > FLA_CHUNK_SIZE
+        and _is_dvr_gated_linear_state_model(server_args)
+    ):
         raise ValueError(
             "DVR currently commits at most one FLA chunk boundary per verify. "
             f"Please set --speculative-num-draft-tokens <= {FLA_CHUNK_SIZE}."

@@ -499,6 +499,17 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         sampling_probs = top_k_renorm_prob(sampling_probs, sampling_info.top_ks)
         if sampling_info.need_top_p_sampling:
             sampling_probs = top_p_renorm_prob(sampling_probs, sampling_info.top_ps)
+        if sampling_info.need_min_p_sampling:
+            min_p_thresholds = (
+                sampling_probs.amax(dim=-1, keepdim=True)
+                * sampling_info.min_ps.unsqueeze(-1)
+            )
+            sampling_probs = torch.where(
+                sampling_probs >= min_p_thresholds,
+                sampling_probs,
+                torch.zeros_like(sampling_probs),
+            )
+            sampling_probs /= sampling_probs.sum(dim=-1, keepdim=True)
         return sampling_probs
 
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,

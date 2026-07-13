@@ -357,9 +357,12 @@ class DVRLinearStateLifecycle:
 
     @staticmethod
     def batch_seq_lens_cpu(batch: ScheduleBatch) -> List[int]:
-        if batch.seq_lens_cpu is not None:
-            return [int(x) for x in batch.seq_lens_cpu.tolist()]
-        return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
+        if batch.seq_lens_cpu is None:
+            raise RuntimeError(
+                "DVR requires FutureMap to publish seq_lens_cpu; a synchronous "
+                "GPU-to-CPU fallback is intentionally not used in the draft path."
+            )
+        return [int(x) for x in batch.seq_lens_cpu.tolist()]
 
     def set_boundary_checkpoint(
         self,

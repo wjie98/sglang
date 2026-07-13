@@ -161,6 +161,37 @@ class TestDVRServerArgs(unittest.TestCase):
 
         self.assertFalse(args._dvr_enable_draft_custom_all_reduce)
 
+    def test_dvr_defaults_normalize_algorithm_before_generic_spec_handling(self):
+        args = _Args()
+        args.speculative_algorithm = DVR_SPECULATIVE_ALGORITHM.lower()
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=False,
+        ):
+            handle_dvr_defaults(args)
+
+        self.assertEqual(args.speculative_algorithm, DVR_SPECULATIVE_ALGORITHM)
+        self.assertTrue(args._dvr_enable_draft_custom_all_reduce)
+
+    def test_non_gdn_dvr_does_not_inherit_fla_limits(self):
+        args = _Args()
+        args.page_size = 32
+        args.speculative_num_draft_tokens = 65
+        args.speculative_num_steps = 64
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=False,
+        ):
+            handle_dvr_defaults(args)
+            handle_dvr_speculative_decoding(args)
+
+        self.assertEqual(args.page_size, 32)
+        self.assertEqual(args.speculative_num_draft_tokens, 65)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,15 +25,17 @@ def decide_needs_cpu_seq_lens(
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
     OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
-    CPU mirror outside the backend layer to split the batch) or ngram (its
-    USE_FULL_MASK verify path reads the host mirror regardless of backend).
+    CPU mirror outside the backend layer to split the batch), ngram, or DVR
+    (their control flow reads the host mirror regardless of backend).
     """
     if server_args.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    if SpeculativeAlgorithm.from_string(server_args.speculative_algorithm).is_ngram():
+    spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if spec_algo.is_ngram() or spec_algo.is_dvr():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
-        # the tree mask, regardless of the attn backend (e.g. Triton opts out).
+        # the tree mask. DVR uses it for draft metadata and request-local linear
+        # state boundaries. Both requirements are independent of the backend.
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
     # missing flag -> True so undeclared backends stay on the legacy path.

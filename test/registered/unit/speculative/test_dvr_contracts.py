@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang.srt.speculative.dvr_worker as dvr_worker_module
+from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _ensure_decode_custom_all_reduce_comm,
     _patch_draft_decode_backend_defaults,
@@ -35,6 +37,59 @@ def test_dvr_spec_algorithm_contracts():
 def test_dvr_worker_uses_base_spec_worker_contract():
     assert issubclass(DecodeVerifyRollbackWorkerV2, BaseSpecWorker)
     assert not DecodeVerifyRollbackWorkerV2.__abstractmethods__
+
+
+@pytest.mark.parametrize(
+    "algorithm",
+    [
+        "DECODE_VERIFY_ROLLBACK",
+        "DECODE_VERIFY_ROLLBACK_EAGLE",
+    ],
+)
+def test_dvr_future_map_publishes_cpu_seq_lens(algorithm):
+    server_args = SimpleNamespace(
+        enable_two_batch_overlap=False,
+        speculative_algorithm=algorithm,
+    )
+    backend = SimpleNamespace(needs_cpu_seq_lens=False)
+
+    assert decide_needs_cpu_seq_lens(server_args, [backend])
+
+
+def test_dvr_draft_proposal_applies_min_p(monkeypatch):
+    monkeypatch.setattr(
+        dvr_worker_module, "top_k_renorm_prob", lambda probs, _top_ks: probs, raising=False
+    )
+    monkeypatch.setattr(
+        dvr_worker_module, "top_p_renorm_prob", lambda probs, _top_ps: probs, raising=False
+    )
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.model_runner = SimpleNamespace(
+        sampler=SimpleNamespace(use_log_softmax_logprob=False)
+    )
+    forward_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            top_ks=torch.tensor([3]),
+            top_ps=torch.tensor([1.0]),
+            min_ps=torch.tensor([0.5]),
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=True,
+        )
+    )
+
+    proposal = worker.get_draft_sampling_probs(
+        forward_batch, torch.tensor([[0.6, 0.3, 0.1]])
+    )
+
+    torch.testing.assert_close(proposal, torch.tensor([[2 / 3, 1 / 3, 0.0]]))
+
+
+def test_dvr_seq_lens_has_no_synchronous_fallback():
+    with pytest.raises(RuntimeError, match="synchronous GPU-to-CPU fallback"):
+        DVRLinearStateLifecycle.batch_seq_lens_cpu(
+            SimpleNamespace(seq_lens_cpu=None, seq_lens=torch.tensor([8]))
+        )
 
 
 def test_dvr_self_draft_weight_update_does_not_reload_target():

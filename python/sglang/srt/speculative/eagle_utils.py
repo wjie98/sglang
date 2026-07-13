@@ -489,6 +489,18 @@ def eagle_sample(
             ),
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        if sampling_info.need_min_p_sampling:
+            min_ps = torch.repeat_interleave(
+                sampling_info.min_ps, verify_input.draft_token_num, dim=0
+            )
+            min_p_thresholds = target_probs.amax(dim=-1, keepdim=True) * min_ps[:, None]
+            target_probs = torch.where(
+                target_probs >= min_p_thresholds,
+                target_probs,
+                torch.zeros_like(target_probs),
+            )
+            target_probs /= target_probs.sum(dim=-1, keepdim=True)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after min_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
