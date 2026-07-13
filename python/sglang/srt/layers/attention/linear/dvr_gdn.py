@@ -647,25 +647,24 @@ class DVRGDNStateAdapter:
                 ),
             )
         else:
-            crossing_req_indices = torch.nonzero(crosses_chunk_boundary).flatten()
-            if crossing_req_indices.numel() > 0:
-                # Some prefill kernels return only final state. Rebuild only the
-                # crossed boundary; attention backend selection remains free.
-                rebuild_dvr_live_state_grouped(
-                    state_input_cache=state_window,
-                    temporal_state=state_cache.temporal,
-                    state_input_indices=state_input_indices,
-                    live_indices=boundary_indices,
-                    boundary_indices=boundary_indices,
-                    req_indices=crossing_req_indices,
-                    token_count=torch.full(
-                        (crossing_req_indices.numel(),),
-                        self.chunk_size,
-                        dtype=torch.long,
-                        device=tail_lens_before.device,
-                    ),
-                    rebuild_fn=_rebuild_gdn_state_from_qkvg_beta_chunkwise,
-                )
+            # Some linear backends return only final state. Keep this fallback
+            # shape-static: zero-token rows reproduce their initial boundary,
+            # while crossed rows replay exactly one chunk. Dynamic nonzero()
+            # compaction would synchronize the host before every fallback.
+            rebuild_dvr_live_state_grouped(
+                state_input_cache=state_window,
+                temporal_state=state_cache.temporal,
+                state_input_indices=state_input_indices,
+                live_indices=boundary_indices,
+                boundary_indices=boundary_indices,
+                req_indices=req_indices,
+                token_count=torch.where(
+                    crosses_chunk_boundary,
+                    torch.full_like(tail_lens_before, self.chunk_size),
+                    torch.zeros_like(tail_lens_before),
+                ),
+                rebuild_fn=_rebuild_gdn_state_from_qkvg_beta_chunkwise,
+            )
         self._scatter_state(
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
@@ -694,25 +693,20 @@ class DVRGDNStateAdapter:
         if self.draft_reuses_target_state:
             # Self draft consumes the target model's live recurrent slot. Keep
             # this path host-sync free and rebuild every accepted suffix.
-            rebuild_req_indices = req_indices
-            rebuild_fn = _rebuild_gdn_state_for_self_draft
-        else:
-            draft_token_num = state_cache.intermediate_conv_window[0].shape[2]
-            rebuild_req_indices = req_indices[
-                accepted_token_counts < draft_token_num
-            ]
-            rebuild_fn = _rebuild_gdn_state_from_qkvg_beta_chunkwise
-        if rebuild_req_indices.numel() > 0:
             rebuild_dvr_live_state_grouped(
                 state_input_cache=state_window,
                 temporal_state=state_cache.temporal,
                 state_input_indices=state_input_indices,
                 live_indices=live_indices,
                 boundary_indices=boundary_indices,
-                req_indices=rebuild_req_indices,
-                token_count=tail_lens_after[rebuild_req_indices],
-                rebuild_fn=rebuild_fn,
+                req_indices=req_indices,
+                token_count=tail_lens_after,
+                rebuild_fn=_rebuild_gdn_state_for_self_draft,
             )
+        # EAGLE/MTP owns a separate draft recurrent cache. Its next target
+        # verify restores target temporal state from boundary_indices, so
+        # rebuilding the target live temporal slot here is dead work. The live
+        # convolution state above remains necessary for accepted target tokens.
 
         state_window.set_tail_lens(
             indices=state_input_indices, value=tail_lens_after.to(torch.int32)

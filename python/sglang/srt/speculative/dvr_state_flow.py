@@ -75,8 +75,9 @@ class DVRRollbackActions:
                 "DVR checkpoint references an invalid tracking slot: "
                 f"track_idx={track_idx}, slots={0 if buffer is None else buffer.numel()}."
             )
-        if buffer[track_idx].item() == -1:
-            raise RuntimeError(f"DVR checkpoint slot {track_idx} is unallocated.")
+        # Pool ownership and the host-side slot bound above are authoritative.
+        # Reading the GPU slot value here only duplicates that contract and
+        # forces a device-wide synchronization in every overlap result.
         page_size = getattr(tree_cache, "page_size", 1)
         if page_size != 1 and seqlen % page_size != 0:
             raise RuntimeError(
