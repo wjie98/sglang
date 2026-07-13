@@ -358,12 +358,20 @@ class DVRGDNStateAdapter:
         state_cache.temporal[:, indices] = 0
 
     def backup_recurrent_state(
-        self, *, state_cache, indices: torch.Tensor
+        self,
+        *,
+        state_cache,
+        indices: torch.Tensor,
+        include_temporal: bool = True,
     ) -> DVRRecurrentStateBackup:
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
         return DVRRecurrentStateBackup(
             conv=tuple(conv[:, indices].clone() for conv in state_cache.conv),
-            temporal=state_cache.temporal[:, indices].clone(),
+            temporal=(
+                state_cache.temporal[:, indices].clone()
+                if include_temporal
+                else None
+            ),
         )
 
     def prepare_recurrent_state_for_verify(
@@ -388,6 +396,7 @@ class DVRGDNStateAdapter:
         # Draft decode mutates the live recurrent slot. DVR target verify needs
         # the chunk-boundary SSM state for chunkwise scan, but the draft-start
         # conv state for producing the draft suffix inputs.
+        assert boundary_backup.temporal is not None
         for conv, saved_conv in zip(
             state_cache.conv, boundary_backup.conv, strict=True
         ):

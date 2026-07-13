@@ -1,7 +1,7 @@
 """Model-independent rolling state-input storage for DVR linear attention."""
 
 from dataclasses import dataclass
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -9,7 +9,7 @@ import torch
 @dataclass(frozen=True)
 class DVRRecurrentStateBackup:
     conv: Tuple[torch.Tensor, ...]
-    temporal: torch.Tensor
+    temporal: Optional[torch.Tensor]
 
 
 @dataclass(frozen=True)

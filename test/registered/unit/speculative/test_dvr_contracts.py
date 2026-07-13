@@ -380,9 +380,12 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     class Adapter:
         def __init__(self):
             self.backup_indices = []
+            self.draft_reuses_target_state = True
 
-        def backup_recurrent_state(self, *, indices, **_kwargs):
-            self.backup_indices.append(indices.tolist())
+        def backup_recurrent_state(
+            self, *, indices, include_temporal=True, **_kwargs
+        ):
+            self.backup_indices.append((indices.tolist(), include_temporal))
             return len(self.backup_indices)
 
     lifecycle = object.__new__(DVRLinearStateLifecycle)
@@ -411,7 +414,7 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
 
     lifecycle.backup_boundary_state(batch)
-    assert adapter.backup_indices == [[11], [12]]
+    assert adapter.backup_indices == [([11], True), ([12], False)]
     assert len(state_context_calls) == 1
 
     # Radix may rebind the physical slot while the logical ping-pong owner is
@@ -419,7 +422,7 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     # that mutable request mapping again.
     lifecycle.boundary_seqlen["r0"] = 128
     lifecycle.backup_boundary_state(batch, preserve_existing=True)
-    assert adapter.backup_indices == [[11], [12]]
+    assert adapter.backup_indices == [([11], True), ([12], False)]
     assert len(state_context_calls) == 1
 
     # Post-verify commit supplies the exact physical context used by target
@@ -427,10 +430,29 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     lifecycle.backup_boundary_state(
         batch, preserve_existing=False, ctx=rebound_context
     )
-    assert adapter.backup_indices == [[11], [12], [21], [22]]
+    assert adapter.backup_indices == [
+        ([11], True),
+        ([12], False),
+        ([21], True),
+        ([22], False),
+    ]
     assert len(state_context_calls) == 1
 
     lifecycle.boundary_track_idx["r0"] = 0
     lifecycle.backup_boundary_state(batch, preserve_existing=True)
-    assert adapter.backup_indices == [[11], [12], [21], [22], [21], [22]]
+    assert adapter.backup_indices == [
+        ([11], True),
+        ([12], False),
+        ([21], True),
+        ([22], False),
+        ([21], True),
+        ([22], False),
+    ]
     assert len(state_context_calls) == 2
+
+    # A separate EAGLE/MTP draft model cannot mutate the target live slot.
+    adapter.draft_reuses_target_state = False
+    lifecycle.state_backup = None
+    lifecycle.backup_boundary_state(batch, ctx=context)
+    assert adapter.backup_indices[-1] == ([11], True)
+    assert len(adapter.backup_indices) == 7

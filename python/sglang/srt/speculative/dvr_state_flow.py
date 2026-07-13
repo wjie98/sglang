@@ -228,15 +228,19 @@ class DVRLinearStateLifecycle:
             self.state_backup = None
             return
         assert ctx.boundary_indices is not None
-        self.state_backup = (
-            backup_keys,
-            self._state_adapter.backup_recurrent_state(
-                state_cache=ctx.state_cache, indices=ctx.boundary_indices
-            ),
-            self._state_adapter.backup_recurrent_state(
-                state_cache=ctx.state_cache, indices=ctx.live_indices
-            ),
+        boundary_backup = self._state_adapter.backup_recurrent_state(
+            state_cache=ctx.state_cache, indices=ctx.boundary_indices
         )
+        # Only self-draft mutates the target live slot. Its temporal state is
+        # rebuilt from the boundary oracle, so preserve only convolution state.
+        live_backup = None
+        if self._state_adapter.draft_reuses_target_state:
+            live_backup = self._state_adapter.backup_recurrent_state(
+                state_cache=ctx.state_cache,
+                indices=ctx.live_indices,
+                include_temporal=False,
+            )
+        self.state_backup = (backup_keys, boundary_backup, live_backup)
 
     def restore_for_verify(
         self,
