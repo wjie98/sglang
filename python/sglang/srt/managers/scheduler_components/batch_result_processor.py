@@ -242,7 +242,6 @@ class SchedulerBatchResultProcessor:
                         result.dvr_rollback_actions is None
                         or not result.dvr_rollback_actions.cache_prefill_after_rollback(
                             req=req,
-                            batch=batch,
                             req_index=i,
                             tree_cache=self.tree_cache,
                             enable_hisparse=self.server_args.enable_hisparse,

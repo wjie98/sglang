@@ -27,7 +27,6 @@ class DVRRollbackActions:
         self,
         *,
         req,
-        batch,
         req_index: int,
         tree_cache,
         enable_hisparse: bool,
@@ -58,8 +57,7 @@ class DVRRollbackActions:
                 "DVR checkpoints do not match the request batch: "
                 f"req_index={req_index}, actions={len(self.pending_checkpoints)}."
             )
-        checkpoint = self.pending_checkpoints[req_index]
-        track_idx, seqlen = checkpoint
+        track_idx, seqlen = self.pending_checkpoints[req_index]
         if seqlen <= 0:
             raise RuntimeError(f"DVR produced invalid checkpoint length {seqlen}.")
         if req.mamba_last_track_seqlen is not None and (
@@ -287,7 +285,7 @@ class DVRLinearStateLifecycle:
                 self.boundary_seqlen[req.rid]
                 if self.boundary_seqlen[req.rid]
                 > (req.mamba_last_track_seqlen or 0)
-                else self.boundary_seqlen[req.rid] + chunk_size
+                else self.boundary_seqlen[req.rid] + chunk_size,
             )
             for req in batch.reqs
         ]

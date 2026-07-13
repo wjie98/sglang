@@ -126,9 +126,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
     tree_cache = SimpleNamespace(page_size=64)
 
     dvr_rollback_actions = DVRRollbackActions(
-        pending_checkpoints=[
-            (0, 128),
-        ],
+        pending_checkpoints=[(0, 128)],
     )
     assert dvr_rollback_actions.commit_checkpoint_after_decode(
         req=req,
