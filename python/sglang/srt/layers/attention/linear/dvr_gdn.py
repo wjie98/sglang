@@ -290,7 +290,9 @@ class DVRGDNStateAdapter:
             )
         num_layers = state_cache.intermediate_ssm.shape[0]
         spec_state_size = state_cache.intermediate_ssm.shape[1] - 1
-        num_draft_tokens = state_cache.intermediate_ssm.shape[2]
+        num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        if num_draft_tokens is None:
+            raise RuntimeError("DVR requires speculative_num_draft_tokens.")
 
         return cls(
             kernel_dispatcher,

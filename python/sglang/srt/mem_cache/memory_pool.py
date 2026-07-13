@@ -336,6 +336,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_ssm_state_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
@@ -393,6 +394,16 @@ class MambaPool:
                 device=device,
             )
             if speculative_num_draft_tokens is not None:
+                ssm_state_steps = (
+                    speculative_num_draft_tokens
+                    if speculative_ssm_state_steps is None
+                    else speculative_ssm_state_steps
+                )
+                if not 1 <= ssm_state_steps <= speculative_num_draft_tokens:
+                    raise ValueError(
+                        "speculative_ssm_state_steps must be between 1 and "
+                        "speculative_num_draft_tokens"
+                    )
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
                     temporal_state_shape = (
@@ -406,7 +417,7 @@ class MambaPool:
                     size=(
                         num_mamba_layers,
                         spec_state_size + 1,
-                        speculative_num_draft_tokens,
+                        ssm_state_steps,
                         temporal_state_shape[0],
                         temporal_state_shape[1],
                         temporal_state_shape[2],
@@ -660,6 +671,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
+        speculative_ssm_state_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         mamba_ping_pong_track_buffer_size: Optional[int] = None,
@@ -692,6 +704,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_ssm_state_steps=speculative_ssm_state_steps,
             speculative_eagle_topk=speculative_eagle_topk,
         )
 
@@ -704,6 +717,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        speculative_ssm_state_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
     ):
         self.mamba_pool = MambaPool(
@@ -714,6 +728,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_ssm_state_steps=speculative_ssm_state_steps,
             speculative_eagle_topk=speculative_eagle_topk,
         )
         self.mamba_allocator = MambaSlotAllocator(

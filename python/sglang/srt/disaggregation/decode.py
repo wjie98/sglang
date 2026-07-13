@@ -193,6 +193,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         pre_alloc_size: int,
         enable_overlap_schedule: bool,
+        speculative_ssm_state_steps: Optional[int] = None,
         mamba_size: int = None,
         start_layer: int = None,
         speculative_eagle_topk: Optional[int] = None,
@@ -239,6 +240,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_ssm_state_steps=speculative_ssm_state_steps,
             speculative_eagle_topk=speculative_eagle_topk,
         )
 

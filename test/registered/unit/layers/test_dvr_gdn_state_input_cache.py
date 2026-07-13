@@ -128,7 +128,9 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
     )
     all_layers_state_cache = SimpleNamespace(
         temporal=torch.zeros(1, 3, 16, 128, 128),
-        intermediate_ssm=torch.zeros(1, 3, 4, 16, 128, 128),
+        # DVR stores only the exported chunk-boundary recurrent state here;
+        # the state-input window still needs all four draft positions.
+        intermediate_ssm=torch.zeros(1, 3, 1, 16, 128, 128),
     )
     req_to_token_pool = SimpleNamespace(
         mamba_pool=SimpleNamespace(mamba_cache=all_layers_state_cache),
@@ -151,6 +153,7 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
                 )
             ),
             req_to_token_pool=req_to_token_pool,
+            server_args=SimpleNamespace(speculative_num_draft_tokens=4),
             spec_algorithm=SimpleNamespace(is_dvr_self_draft=lambda: False),
             device="cpu",
         ),
