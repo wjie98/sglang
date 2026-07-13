@@ -331,7 +331,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 self.topk, self.num_draft_steps, self.num_draft_tokens
             )
 
-        seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         self._draft_preprocess_decode_for_self_dvr(batch)
 
         spec_info = batch.spec_info
@@ -346,15 +345,23 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         try:
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
             if forward_batch.seq_lens_cpu is None:
+                # Normal decode reuses the one-shot host mirror prepared with
+                # the boundary oracle below. Keep this defensive path for
+                # direct unit/integration callers that bypass that entrypoint.
                 forward_batch.seq_lens_cpu = torch.tensor(
-                    seq_lens_cpu, dtype=torch.int64, device="cpu"
+                    batch.seq_lens.detach().cpu().tolist(),
+                    dtype=torch.int64,
+                    device="cpu",
                 )
             elif not torch.is_tensor(forward_batch.seq_lens_cpu):
                 forward_batch.seq_lens_cpu = torch.tensor(
                     forward_batch.seq_lens_cpu, dtype=torch.int64, device="cpu"
                 )
-            if forward_batch.seq_lens_sum is None:
-                forward_batch.seq_lens_sum = int(sum(seq_lens_cpu))
+            if (
+                forward_batch.seq_lens_sum is None
+                and forward_batch.seq_lens_cpu is not None
+            ):
+                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
             draft_tokens, draft_probs = self._draft_self_tokens(forward_batch)
         finally:
             batch.return_logprob = saved_return_logprob
@@ -391,12 +398,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
         out_cache_loc = forward_batch.out_cache_loc.reshape(
             forward_batch.batch_size, self.num_draft_tokens
-        ).transpose(0, 1)
+        ).transpose(0, 1).contiguous()
         draft_tokens = [spec_info.bonus_tokens.to(torch.long)]
         draft_probs_list: List[torch.Tensor] = []
 
         origin_seq_lens = forward_batch.seq_lens.clone()
-        origin_seq_lens_cpu = forward_batch.seq_lens_cpu.clone()
+        origin_seq_lens_cpu = forward_batch.seq_lens_cpu
         origin_seq_lens_sum = forward_batch.seq_lens_sum
         origin_spec_info = forward_batch.spec_info
         origin_positions = forward_batch.positions.clone()
@@ -410,11 +417,17 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 if step:
                     forward_batch.positions.add_(1)
                 forward_batch.input_ids = draft_tokens[-1]
-                forward_batch.out_cache_loc = out_cache_loc[step].contiguous()
+                forward_batch.out_cache_loc = out_cache_loc[step]
                 forward_batch.seq_lens = origin_seq_lens + step + 1
-                forward_batch.seq_lens_cpu = origin_seq_lens_cpu + step + 1
+                forward_batch.seq_lens_cpu = (
+                    None
+                    if origin_seq_lens_cpu is None
+                    else origin_seq_lens_cpu + step + 1
+                )
                 forward_batch.seq_lens_sum = (
-                    origin_seq_lens_sum
+                    None
+                    if origin_seq_lens_sum is None
+                    else origin_seq_lens_sum
                     + (step + 1) * forward_batch.batch_size
                 )
                 logits_output = self._draft_decode_forward(forward_batch)
@@ -450,12 +463,19 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             and self.cuda_graph_runner_for_draft_decode.can_run_graph(forward_batch)
         )
         if can_cuda_graph:
-            return self.cuda_graph_runner_for_draft_decode.execute(forward_batch)
+            output = self.cuda_graph_runner_for_draft_decode.execute(forward_batch)
+            # DecodeCudaGraphRunner treats an ordinary decode graph as the
+            # step's last shared-pool reader. A self-draft graph is only a
+            # provisional phase; target verify still reads req_to_token/state
+            # pools. Do not let Scheduler's WAR barrier consume this early
+            # event after the DVR worker returns.
+            self.model_runner.war_fastpath_read_done_event = None
+            return output
 
         seq_lens = forward_batch.seq_lens_cpu
-        if seq_lens is None:
-            seq_lens = forward_batch.seq_lens
-        min_seq_len = int(seq_lens.min().item())
+        min_seq_len = (
+            int(seq_lens.min()) if seq_lens is not None else "GPU-only"
+        )
         capture_bs = []
         if self.cuda_graph_runner_for_draft_decode is not None:
             capture_bs = self.cuda_graph_runner_for_draft_decode.capture_bs
@@ -506,10 +526,17 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             return
 
-        seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         prefill_prefix_lens = None
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             prefill_prefix_lens = [int(x) for x in batch.prefix_lens]
+        seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
+        if not self.is_dvr_eagle and prefill_prefix_lens is None:
+            # ForwardBatch.init_new consumes this one-shot cache. Reuse the
+            # boundary oracle's required D2H result instead of synchronizing a
+            # second time when self draft builds its graph input.
+            batch.seq_lens_cpu_cache = torch.tensor(
+                seq_lens_cpu, dtype=torch.int64, device="cpu"
+            )
         self.linear_state.prepare_for_draft(
             batch,
             seq_lens_cpu=seq_lens_cpu,
@@ -780,6 +807,15 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 )
             finally:
                 batch.return_logprob = need_return_logprob
+            # The provisional decode graphs deliberately discard their
+            # ordinary-DECODE WAR events. Target verify is self-DVR's final
+            # shared-pool reader, so publish one authoritative event only after
+            # its replay has completed. Later sampling, logprob, and state
+            # commit can overlap with scheduling without exposing mutable pool
+            # metadata to the verifier.
+            read_done = torch.get_device_module(self.device).Event()
+            read_done.record()
+            self.model_runner.war_fastpath_read_done_event = read_done
             can_run_cuda_graph = forward_output.can_run_cuda_graph
             error_prefix = "DVR self"
 
