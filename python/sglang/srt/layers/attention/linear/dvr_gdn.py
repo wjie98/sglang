@@ -612,24 +612,14 @@ class DVRGDNStateAdapter:
             dtype=torch.long,
             device=live_indices.device,
         )
-        if self.draft_reuses_target_state:
-            self._scatter_state(
-                state_cache.conv[0],
-                state_cache.intermediate_conv_window[0],
-                live_indices,
-                accepted_steps,
-            )
-        else:
-            live_conv_req_indices = torch.nonzero(
-                accepted_token_counts > 0
-            ).flatten()
-            if live_conv_req_indices.numel() > 0:
-                self._scatter_state(
-                    state_cache.conv[0],
-                    state_cache.intermediate_conv_window[0],
-                    live_indices[live_conv_req_indices],
-                    accepted_steps[live_conv_req_indices],
-                )
+        # accept_lens includes the bonus token, so every non-idle request has a
+        # valid accepted step. The fused scatter already handles the empty batch.
+        self._scatter_state(
+            state_cache.conv[0],
+            state_cache.intermediate_conv_window[0],
+            live_indices,
+            accepted_steps,
+        )
 
         if self._verify_exports_boundary_state is None:
             raise RuntimeError("GDN verify committed before its state scan completed.")
@@ -692,10 +682,6 @@ class DVRGDNStateAdapter:
             rebuild_req_indices = req_indices
             rebuild_fn = _rebuild_gdn_state_for_self_draft
         else:
-            state_window.zero_after_lens(
-                indices=state_input_indices,
-                keep_lens=tail_lens_after,
-            )
             draft_token_num = state_cache.intermediate_conv_window[0].shape[2]
             rebuild_req_indices = req_indices[
                 accepted_token_counts < draft_token_num
