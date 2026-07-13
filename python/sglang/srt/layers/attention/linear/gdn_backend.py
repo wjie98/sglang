@@ -411,9 +411,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer_idx = None
         if dvr_state_adapter is not None:
             layer_idx = self.req_to_token_pool.mamba_map[layer.layer_id]
-            dvr_state_adapter.get_or_create_state_input_cache(
-                req_to_token_pool=self.req_to_token_pool
-            )
 
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal

@@ -5,11 +5,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    iter_dvr_attention_backends,
-)
 
 
 @dataclass
@@ -114,18 +110,8 @@ class DVRLinearStateLifecycle:
         # Keep the snapshot atomic when radix rebinds physical request slots.
         self.state_backup = None
 
-    def bind_state_adapter(self) -> None:
-        adapters = []
-        for backend in iter_dvr_attention_backends(
-            getattr(self.model_runner, "attn_backend", None)
-        ):
-            adapter = getattr(backend, "dvr_state_adapter", None)
-            if adapter is not None and all(adapter is not item for item in adapters):
-                adapters.append(adapter)
-        if len(adapters) > 1:
-            raise RuntimeError("DVR target resolved multiple linear-state adapters.")
-        self._state_adapter = adapters[0] if adapters else None
-
+    def bind_state_adapter(self, state_adapter) -> None:
+        self._state_adapter = state_adapter
         if self._state_adapter is None:
             if getattr(self.model_runner, "mambaish_config", None) is not None:
                 raise RuntimeError(
@@ -133,18 +119,15 @@ class DVRLinearStateLifecycle:
                     "target state adapter was initialized."
                 )
             return
-        if self.server_args.mamba_track_interval != FLA_CHUNK_SIZE:
+        chunk_size = self._state_adapter.chunk_size
+        if self.server_args.mamba_track_interval != chunk_size:
             raise ValueError(
                 "DVR linear-state verify requires mamba_track_interval to match "
-                f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, got "
+                f"the adapter chunk size {chunk_size}, got "
                 f"{self.server_args.mamba_track_interval}. Multiples larger than "
-                "FLA_CHUNK_SIZE can miss the latest chunk boundary from the "
+                "the chunk size can miss the latest boundary from the "
                 "first prefill because the current extra_buffer path stores "
                 "only one tracked prefill checkpoint."
-            )
-        if self.server_args.mamba_ssm_dtype != "float32":
-            raise ValueError(
-                "DVR linear-state verify requires fp32 recurrent state storage."
             )
 
     def clear_cache_state(self):
@@ -162,6 +145,9 @@ class DVRLinearStateLifecycle:
         prefill_prefix_lens: Optional[List[int]] = None,
         defer_request_publish: bool = False,
     ) -> None:
+        if self._state_adapter is None:
+            return
+        chunk_size = self._state_adapter.chunk_size
         # Batches contain only a subset of running requests. Prune ownership
         # when a bounded request-pool slot is reused, not merely when a request
         # is absent from the current batch.
@@ -193,7 +179,7 @@ class DVRLinearStateLifecycle:
             )
             if (
                 req.rid in self.boundary_track_idx
-                and current_boundary == recorded_boundary + FLA_CHUNK_SIZE
+                and current_boundary == recorded_boundary + chunk_size
             ):
                 # The preceding target verify already committed this boundary
                 # into the same request-local slot. Advance host metadata from
@@ -203,7 +189,7 @@ class DVRLinearStateLifecycle:
             elif (
                 req.rid not in self.boundary_track_idx
                 or recorded_boundary != current_boundary
-                or recorded_boundary % FLA_CHUNK_SIZE != 0
+                or recorded_boundary % chunk_size != 0
             ):
                 self.boundary_seqlen.pop(req.rid, None)
                 self.boundary_track_idx.pop(req.rid, None)
@@ -283,13 +269,14 @@ class DVRLinearStateLifecycle:
         accepted_steps: torch.Tensor,
         ctx: DVRLinearStateContext,
     ):
+        chunk_size = self._state_adapter.chunk_size
         pending_checkpoints = [
             (
                 self.boundary_track_idx[req.rid],
                 self.boundary_seqlen[req.rid]
                 if self.boundary_seqlen[req.rid]
                 > (req.mamba_last_track_seqlen or 0)
-                else self.boundary_seqlen[req.rid] + FLA_CHUNK_SIZE
+                else self.boundary_seqlen[req.rid] + chunk_size
             )
             for req in batch.reqs
         ]
@@ -322,10 +309,10 @@ class DVRLinearStateLifecycle:
         state_adapter = self._state_adapter
         if state_adapter is None or batch.batch_size() == 0:
             return None
-        assert self.server_args.mamba_track_interval == FLA_CHUNK_SIZE, (
-            "DVR linear-state target verify must start from FLA chunk boundaries. "
+        assert self.server_args.mamba_track_interval == state_adapter.chunk_size, (
+            "DVR linear-state target verify must start from adapter chunk boundaries. "
             "The current prefill tracker only guarantees the latest boundary "
-            "when mamba_track_interval equals FLA_CHUNK_SIZE."
+            "when mamba_track_interval equals the adapter chunk size."
         )
         live_indices = state_adapter.get_live_indices(batch=batch)
         state_input_indices = state_adapter.get_state_input_indices(
@@ -349,20 +336,17 @@ class DVRLinearStateLifecycle:
             boundary_indices=boundary_indices,
         )
 
-    @staticmethod
-    def boundary_and_tail_for_seq_len(seq_len: int) -> Tuple[int, int]:
-        boundary_seqlen = (seq_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+    def boundary_and_tail_for_seq_len(self, seq_len: int) -> Tuple[int, int]:
+        chunk_size = self._state_adapter.chunk_size
+        boundary_seqlen = (seq_len // chunk_size) * chunk_size
         verified_tail_len = seq_len - boundary_seqlen
         return boundary_seqlen, verified_tail_len
 
     @staticmethod
     def batch_seq_lens_cpu(batch: ScheduleBatch) -> List[int]:
-        if batch.seq_lens_cpu is None:
-            raise RuntimeError(
-                "DVR requires FutureMap to publish seq_lens_cpu; a synchronous "
-                "GPU-to-CPU fallback is intentionally not used in the draft path."
-            )
-        return [int(x) for x in batch.seq_lens_cpu.tolist()]
+        if batch.seq_lens_cpu is not None:
+            return [int(x) for x in batch.seq_lens_cpu.tolist()]
+        return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
     def set_boundary_checkpoint(
         self,
@@ -395,10 +379,11 @@ class DVRLinearStateLifecycle:
         prefill_prefix_len: Optional[int],
         publish_to_request: bool,
     ) -> Optional[torch.Tensor]:
-        assert boundary_seqlen % FLA_CHUNK_SIZE == 0
+        chunk_size = self._state_adapter.chunk_size
+        assert boundary_seqlen % chunk_size == 0
         last_track_seqlen = req.mamba_last_track_seqlen
         if last_track_seqlen is not None and last_track_seqlen > 0:
-            assert last_track_seqlen % FLA_CHUNK_SIZE == 0, (
+            assert last_track_seqlen % chunk_size == 0, (
                 "DVR linear-state verify must not reuse non-chunk-boundary "
                 "checkpoints."
             )

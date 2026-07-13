@@ -265,7 +265,14 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backends()
         # Self-DVR target worker owns the model and attention backend. Scheduler
         # already initializes it before calling this self-draft worker hook.
-        self.linear_state.bind_state_adapter()
+        adapters = []
+        for backend in iter_dvr_attention_backends(self.model_runner.attn_backend):
+            adapter = getattr(backend, "dvr_state_adapter", None)
+            if adapter is not None and all(adapter is not item for item in adapters):
+                adapters.append(adapter)
+        if len(adapters) > 1:
+            raise RuntimeError("DVR target resolved multiple linear-state adapters.")
+        self.linear_state.bind_state_adapter(adapters[0] if adapters else None)
 
     def init_cuda_graphs(self):
         if self.is_dvr_eagle:

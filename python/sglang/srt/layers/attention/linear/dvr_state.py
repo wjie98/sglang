@@ -1,11 +1,9 @@
 """Model-independent rolling state-input storage for DVR linear attention."""
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
+from typing import Tuple, Union
 
 import torch
-
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 
 
 @dataclass(frozen=True)
@@ -71,7 +69,7 @@ class DVRStateInputCache:
         indices: torch.Tensor,
         extend_prefix_lens_cpu,
         extend_seq_lens_cpu,
-        chunk_size: int = FLA_CHUNK_SIZE,
+        chunk_size: int,
     ) -> None:
         src_base = 0
         for req_i, (prefix_len, extend_len) in enumerate(
@@ -125,7 +123,7 @@ class DVRStateInputCache:
         *,
         indices: torch.Tensor,
         crosses_chunk_boundary: torch.Tensor,
-        chunk_size: int = FLA_CHUNK_SIZE,
+        chunk_size: int,
     ) -> None:
         tail_capacity = self.capacity - chunk_size
         if tail_capacity <= 0:
@@ -147,68 +145,6 @@ class DVRStateInputCache:
                 cache[indices, :tail_capacity] = torch.where(
                     mask.view(mask_shape), src, dst
                 )
-
-
-def run_dvr_chunkwise_verify(
-    *,
-    state_ops: Any,
-    state_input_cache: DVRStateInputCache,
-    draft_state_inputs: Tuple[torch.Tensor, ...],
-    ssm_states: torch.Tensor,
-    cache_indices: torch.Tensor,
-    state_input_indices: torch.Tensor,
-    intermediate_state_cache: torch.Tensor,
-    intermediate_state_indices: torch.Tensor,
-    batch_size: int,
-    draft_token_num: int,
-    chunk_size: int = FLA_CHUNK_SIZE,
-    tail_lens: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    indices = cache_indices[:batch_size].to(torch.long)
-    input_indices = state_input_indices[:batch_size].to(torch.long)
-    if tail_lens is None:
-        tail_lens = state_input_cache.get_tail_lens(indices=input_indices).to(torch.long)
-    else:
-        tail_lens = tail_lens[:batch_size].to(device=indices.device, dtype=torch.long)
-    tail_lens = tail_lens.clamp(min=0, max=chunk_size)
-    state_input_cache.write_rows(
-        indices=input_indices.unsqueeze(1).expand(-1, draft_token_num),
-        cols=(
-            torch.arange(
-                draft_token_num, dtype=torch.long, device=input_indices.device
-            ).unsqueeze(0)
-            + tail_lens.unsqueeze(1)
-        ),
-        values=draft_state_inputs,
-    )
-    state_input_cache.zero_after_lens(
-        indices=input_indices, keep_lens=tail_lens + draft_token_num
-    )
-    verify_window_size = chunk_size + draft_token_num
-    window_inputs = state_input_cache.read(indices=input_indices)
-    core_attn_out, _, h = state_ops.scan_chunkwise(
-        state_inputs=window_inputs,
-        ssm_states=ssm_states,
-        cache_indices=indices,
-        query_start_loc=None,
-    )
-    if h is not None and h.shape[1] > 1:
-        intermediate_state_cache[
-            intermediate_state_indices[:batch_size].to(torch.long), 0
-        ] = h[:batch_size, 1].to(intermediate_state_cache.dtype)
-
-    value_shape = core_attn_out.shape[-2:]
-    core_attn_out = core_attn_out.view(batch_size, verify_window_size, *value_shape)
-    rows = torch.arange(
-        batch_size, dtype=torch.long, device=core_attn_out.device
-    ).unsqueeze(1)
-    cols = torch.arange(
-        draft_token_num, dtype=torch.long, device=core_attn_out.device
-    ).unsqueeze(0) + tail_lens.unsqueeze(1)
-    return core_attn_out[
-        rows.expand(-1, draft_token_num), cols
-    ].reshape(1, batch_size * draft_token_num, *value_shape).contiguous()
-
 
 def rebuild_dvr_live_state_grouped(
     *,

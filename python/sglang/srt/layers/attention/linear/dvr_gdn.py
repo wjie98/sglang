@@ -13,7 +13,6 @@ from sglang.srt.layers.attention.linear.dvr_state import (
     DVRRecurrentStateBackup,
     DVRStateInputCache,
     rebuild_dvr_live_state_grouped,
-    run_dvr_chunkwise_verify,
 )
 from sglang.srt.utils import is_cpu
 
@@ -268,9 +267,6 @@ class DVRGDNStateAdapter:
     kernel_dispatcher: Any
     chunk_size: int = FLA_CHUNK_SIZE
     draft_reuses_target_state: bool = False
-    state_shape: Any = None
-    conv_dtype: Optional[torch.dtype] = None
-    device: Optional[str] = None
     state_input_cache: Optional[DVRStateInputCache] = None
     _verify_exports_boundary_state: Optional[bool] = None
 
@@ -282,29 +278,9 @@ class DVRGDNStateAdapter:
         model_runner: Any,
     ) -> "DVRGDNStateAdapter":
         mamba_cache_params = model_runner.mambaish_config.mamba2_cache_params
-
-        return cls(
-            kernel_dispatcher,
-            draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
-            state_shape=mamba_cache_params.shape,
-            conv_dtype=mamba_cache_params.dtype.conv,
-            device=model_runner.device,
+        state_cache = (
+            model_runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
-
-    def get_state_cache(self, *, batch):
-        self.get_or_create_state_input_cache(req_to_token_pool=batch.req_to_token_pool)
-        return batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-
-    def get_or_create_state_input_cache(
-        self, *, req_to_token_pool
-    ) -> DVRStateInputCache:
-        cache = self.state_input_cache
-        if cache is not None:
-            return cache
-        if self.state_shape is None or self.conv_dtype is None or self.device is None:
-            raise RuntimeError("DVR GDN state-input cache metadata is not initialized.")
-
-        state_cache = req_to_token_pool.get_speculative_mamba2_params_all_layers()
         if (
             state_cache.temporal.dtype != torch.float32
             or state_cache.intermediate_ssm.dtype != torch.float32
@@ -315,18 +291,23 @@ class DVRGDNStateAdapter:
         num_layers = state_cache.intermediate_ssm.shape[0]
         spec_state_size = state_cache.intermediate_ssm.shape[1] - 1
         num_draft_tokens = state_cache.intermediate_ssm.shape[2]
-        cache = create_gdn_state_input_cache(
-            num_layers=num_layers,
-            # Slot 0 is the padded-row dummy; real DVR rows use req_pool_idx + 1
-            # to preserve the v5 hot-path indexing convention.
-            num_slots=spec_state_size + 2,
-            num_draft_tokens=num_draft_tokens,
-            state_shape=self.state_shape,
-            dtype=self.conv_dtype,
-            device=self.device,
+
+        return cls(
+            kernel_dispatcher,
+            draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
+            state_input_cache=create_gdn_state_input_cache(
+                num_layers=num_layers,
+                # Slot 0 is the padded-row dummy; real DVR rows use req_pool_idx + 1.
+                num_slots=spec_state_size + 2,
+                num_draft_tokens=num_draft_tokens,
+                state_shape=mamba_cache_params.shape,
+                dtype=mamba_cache_params.dtype.conv,
+                device=model_runner.device,
+            ),
         )
-        self.state_input_cache = cache
-        return cache
+
+    def get_state_cache(self, *, batch):
+        return batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
 
     def state_input_window(
         self, *, layer_idx: Optional[int] = None
@@ -368,23 +349,6 @@ class DVRGDNStateAdapter:
             dst, src, dst_indices, step_indices
         )
 
-    def scan_chunkwise(self, *, state_inputs, **kwargs) -> tuple:
-        q, k, v, g, beta = state_inputs
-        result = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            **kwargs,
-        )
-        exports_boundary_state = result[2] is not None
-        if self._verify_exports_boundary_state is None:
-            self._verify_exports_boundary_state = exports_boundary_state
-        elif self._verify_exports_boundary_state != exports_boundary_state:
-            raise RuntimeError("GDN verify backend changed its boundary-state contract.")
-        return result
-
     def zero_recurrent_state(self, *, state_cache, indices: torch.Tensor):
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
         for conv in state_cache.conv:
@@ -410,6 +374,10 @@ class DVRGDNStateAdapter:
         live_backup: Optional[DVRRecurrentStateBackup],
     ):
         if boundary_backup is None:
+            if self.draft_reuses_target_state:
+                raise RuntimeError(
+                    "DVR self-draft target verify is missing its recurrent-state snapshot."
+                )
             state_cache.temporal[:, live_indices] = state_cache.temporal[
                 :, boundary_indices
             ]
@@ -566,20 +534,58 @@ class DVRGDNStateAdapter:
             tail_lens.clamp(min=0, max=self.chunk_size),
             torch.zeros_like(tail_lens),
         )
-        return run_dvr_chunkwise_verify(
-            state_ops=self,
-            state_input_cache=state_window,
-            draft_state_inputs=draft_state_inputs,
+        state_window.write_rows(
+            indices=state_input_indices.unsqueeze(1).expand(-1, draft_token_num),
+            cols=(
+                torch.arange(
+                    draft_token_num,
+                    dtype=torch.long,
+                    device=state_input_indices.device,
+                ).unsqueeze(0)
+                + tail_lens.unsqueeze(1)
+            ),
+            values=draft_state_inputs,
+        )
+        state_window.zero_after_lens(
+            indices=state_input_indices,
+            keep_lens=tail_lens + draft_token_num,
+        )
+        q, k, v, cached_g, cached_beta = state_window.read(
+            indices=state_input_indices
+        )
+        core_attn_out, _, h = self.kernel_dispatcher.extend(
+            q=q,
+            k=k,
+            v=v,
+            g=cached_g,
+            beta=cached_beta,
             ssm_states=state_cache.temporal,
             cache_indices=dvr_indices,
-            state_input_indices=state_input_indices,
-            tail_lens=tail_lens,
-            intermediate_state_cache=state_cache.intermediate_ssm,
-            intermediate_state_indices=intermediate_state_indices,
-            batch_size=batch_size,
-            draft_token_num=draft_token_num,
-            chunk_size=self.chunk_size,
+            query_start_loc=None,
         )
+        exports_boundary_state = h is not None
+        if self._verify_exports_boundary_state is None:
+            self._verify_exports_boundary_state = exports_boundary_state
+        elif self._verify_exports_boundary_state != exports_boundary_state:
+            raise RuntimeError("GDN verify backend changed its boundary-state contract.")
+        if exports_boundary_state and h.shape[1] > 1:
+            state_cache.intermediate_ssm[
+                intermediate_state_indices[:batch_size].to(torch.long), 0
+            ] = h[:batch_size, 1].to(state_cache.intermediate_ssm.dtype)
+
+        value_shape = core_attn_out.shape[-2:]
+        core_attn_out = core_attn_out.view(
+            batch_size, self.chunk_size + draft_token_num, *value_shape
+        )
+        rows = torch.arange(
+            batch_size, dtype=torch.long, device=core_attn_out.device
+        ).unsqueeze(1)
+        cols = torch.arange(
+            draft_token_num, dtype=torch.long, device=core_attn_out.device
+        ).unsqueeze(0) + tail_lens.unsqueeze(1)
+        return core_attn_out[
+            rows.expand(-1, draft_token_num), cols
+        ].reshape(1, batch_size * draft_token_num, *value_shape).contiguous()
 
     def commit_after_verify(
         self,
@@ -626,8 +632,8 @@ class DVRGDNStateAdapter:
         if self._verify_exports_boundary_state is None:
             raise RuntimeError("GDN verify committed before its state scan completed.")
         if self._verify_exports_boundary_state:
-            # run_dvr_chunkwise_verify stores the first crossed boundary in
-            # step 0 when the selected linear backend exports FLA's `h`.
+            # Target verify stores the first crossed boundary in step 0 when
+            # the selected linear backend exports FLA's `h`.
             self._scatter_state(
                 state_cache.temporal,
                 state_cache.intermediate_ssm,

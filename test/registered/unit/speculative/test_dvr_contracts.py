@@ -46,14 +46,14 @@ def test_dvr_worker_uses_base_spec_worker_contract():
         "DECODE_VERIFY_ROLLBACK_EAGLE",
     ],
 )
-def test_dvr_future_map_publishes_cpu_seq_lens(algorithm):
+def test_dvr_future_map_respects_backend_cpu_seq_lens_policy(algorithm):
     server_args = SimpleNamespace(
         enable_two_batch_overlap=False,
         speculative_algorithm=algorithm,
     )
     backend = SimpleNamespace(needs_cpu_seq_lens=False)
 
-    assert decide_needs_cpu_seq_lens(server_args, [backend])
+    assert not decide_needs_cpu_seq_lens(server_args, [backend])
 
 
 def test_dvr_draft_proposal_applies_min_p(monkeypatch):
@@ -85,11 +85,10 @@ def test_dvr_draft_proposal_applies_min_p(monkeypatch):
     torch.testing.assert_close(proposal, torch.tensor([[2 / 3, 1 / 3, 0.0]]))
 
 
-def test_dvr_seq_lens_has_no_synchronous_fallback():
-    with pytest.raises(RuntimeError, match="synchronous GPU-to-CPU fallback"):
-        DVRLinearStateLifecycle.batch_seq_lens_cpu(
-            SimpleNamespace(seq_lens_cpu=None, seq_lens=torch.tensor([8]))
-        )
+def test_dvr_seq_lens_uses_current_batch_when_host_mirror_is_absent():
+    assert DVRLinearStateLifecycle.batch_seq_lens_cpu(
+        SimpleNamespace(seq_lens_cpu=None, seq_lens=torch.tensor([8]))
+    ) == [8]
 
 
 def test_dvr_self_draft_weight_update_does_not_reload_target():
@@ -332,6 +331,7 @@ def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
 
 def test_dvr_boundary_metadata_advances_from_next_scheduler_length():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle._state_adapter = SimpleNamespace(chunk_size=64)
     lifecycle.boundary_seqlen = {"r0": 64}
     lifecycle.boundary_track_idx = {"r0": 1}
     lifecycle.pending_boundary_publish = set()
@@ -351,6 +351,7 @@ def test_dvr_prefill_boundary_uses_request_local_track_slot():
             return 1 - track_idx
 
     lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle._state_adapter = SimpleNamespace(chunk_size=64)
     lifecycle.boundary_seqlen = {}
     lifecycle.boundary_track_idx = {}
     lifecycle.pending_boundary_publish = set()

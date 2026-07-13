@@ -82,6 +82,7 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
         indices=torch.tensor([1]),
         extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
         extend_seq_lens_cpu=[2],
+        chunk_size=FLA_CHUNK_SIZE,
     )
 
     assert torch.equal(layer_cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
@@ -140,11 +141,19 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
         req_to_token_pool=req_to_token_pool,
         reqs=[SimpleNamespace(mamba_ping_pong_track_buffer=torch.tensor([0]))],
     )
-    adapter = DVRGDNStateAdapter(
-        kernel_dispatcher=None,
-        state_shape=state_shape,
-        conv_dtype=torch.float32,
-        device="cpu",
+    adapter = DVRGDNStateAdapter.for_gdn(
+        None,
+        model_runner=SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    shape=state_shape,
+                    dtype=SimpleNamespace(conv=torch.float32),
+                )
+            ),
+            req_to_token_pool=req_to_token_pool,
+            spec_algorithm=SimpleNamespace(is_dvr_self_draft=lambda: False),
+            device="cpu",
+        ),
     )
 
     returned_state_cache = adapter.get_state_cache(batch=batch)
