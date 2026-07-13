@@ -34,6 +34,7 @@ DVR_PY_FILES=(
 )
 
 git diff --check
+bash -n test/manual/dvr/scripts/*.sh
 conda_python -m py_compile "${DVR_PY_FILES[@]}"
 conda_python -m pytest \
   test/registered/unit/speculative/test_dvr_contracts.py \

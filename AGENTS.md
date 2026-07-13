@@ -25,6 +25,11 @@ Use these entry points:
   - ShareGPT cases use a separate `0.70` floor based on the fixed two-token
     MTP baseline; this catches routing regressions without pretending real-data
     acceptance should be nearly one
+- `test/manual/dvr/scripts/run_35b_dvr_throughput.sh`
+  - matching 35B no-DVR, self-v1/v2, and EAGLE sync/overlap ShareGPT runs
+  - runs TP=4 self-DVR KL boundary checks before its throughput pair
+  - fixes 8 requests, 512 output tokens, concurrency 4, and covers
+    `return_logprob=True/False`
 - `test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh`
   - Qwen3-Next 80B no-DVR baseline and self-DVR spec v1/v2 long-output throughput
   - covers ShareGPT and fixed LongBench custom-cache inputs

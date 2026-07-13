@@ -108,6 +108,18 @@ Fixed EAGLE/MTP smoke script:
 test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
 ```
 
+Fixed no-DVR/self-DVR/DVR-EAGLE throughput comparison:
+
+```bash
+test/manual/dvr/scripts/run_35b_dvr_throughput.sh
+```
+
+It uses 8 ShareGPT requests, 512 generated tokens, concurrency 4, and runs both
+returned-logprob modes.  Self-v1/v2 also run the TP=4 boundary KL client before
+the benchmark.  EAGLE correctness and per-prompt acceptance remain the
+responsibility of `run_35b_mtp_eagle_smoke.sh`; the throughput script measures
+the five matching server modes without duplicating that matrix.
+
 Self-DVR server:
 
 ```bash
