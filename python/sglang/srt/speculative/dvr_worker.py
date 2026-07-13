@@ -603,6 +603,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     def _run_decode_draft_verify_rollback(
         self,
         batch: ScheduleBatch,
+        on_publish=None,
     ) -> GenerationBatchResult:
         """Run one decode step through DVR's core draft -> verify -> rollback path."""
 
@@ -621,7 +622,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         verify_input = self.draft(batch)
         assert verify_input.is_verify_input()
         batch.spec_info = verify_input
-        return self.verify(batch, verify_input)
+        return self.verify(batch, verify_input, on_publish=on_publish)
 
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
@@ -668,9 +669,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     on_publish(batch_result.new_seq_lens)
             return batch_result
 
-        batch_result = self._run_decode_draft_verify_rollback(batch)
-        if on_publish is not None:
-            on_publish(batch_result.new_seq_lens)
+        batch_result = self._run_decode_draft_verify_rollback(
+            batch, on_publish=on_publish
+        )
         if self.is_dvr_eagle:
             with self._draft_context():
                 self.draft_worker._draft_extend_for_decode(batch, batch_result)
@@ -712,6 +713,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
+        on_publish=None,
     ) -> GenerationBatchResult:
         scheduler_seq_lens = batch.seq_lens
         vocab_mask = None
@@ -849,6 +851,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             vocab_mask=vocab_mask,
         )
         new_seq_lens = scheduler_seq_lens + accept_lens
+        if on_publish is not None:
+            # Publish as soon as acceptance determines the next scheduler
+            # lengths. Exact logprob, rollback, and recurrent-state commit stay
+            # ordered later on the same forward stream, while host scheduling
+            # can overlap with that post-verify work.
+            on_publish(new_seq_lens)
         has_verify_tokens = (
             not batch.forward_mode.is_idle() and accept_lens.numel() > 0
         )
