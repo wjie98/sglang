@@ -363,8 +363,21 @@ class DVRGDNStateAdapter:
         state_cache,
         indices: torch.Tensor,
         include_temporal: bool = True,
+        out: Optional[DVRRecurrentStateBackup] = None,
     ) -> DVRRecurrentStateBackup:
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
+        if out is not None:
+            for conv, saved_conv in zip(
+                state_cache.conv, out.conv, strict=True
+            ):
+                torch.index_select(conv, 1, indices, out=saved_conv)
+            if include_temporal:
+                if out.temporal is None:
+                    raise RuntimeError("DVR boundary backup has no temporal storage.")
+                torch.index_select(
+                    state_cache.temporal, 1, indices, out=out.temporal
+                )
+            return out
         return DVRRecurrentStateBackup(
             conv=tuple(conv[:, indices].clone() for conv in state_cache.conv),
             temporal=(
@@ -478,11 +491,6 @@ class DVRGDNStateAdapter:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             chunk_size=self.chunk_size,
         )
-        state_input_indices = state_input_indices + 1
-        state_window.zero_after_lens(
-            indices=state_input_indices,
-            keep_lens=state_window.get_tail_lens(indices=state_input_indices),
-        )
 
     def target_verify_indices(self, *, forward_batch, cache_indices: torch.Tensor):
         """Map padded target-verify rows to DVR live and input-window slots."""
@@ -550,6 +558,9 @@ class DVRGDNStateAdapter:
             tail_lens.clamp(min=0, max=self.chunk_size),
             torch.zeros_like(tail_lens),
         )
+        # The fixed window may retain values after tail_lens + draft_token_num.
+        # They are causally after every returned logit, a boundary is exported
+        # only after all chunk rows are valid, and state rebuilds use token_count.
         state_window.write_rows(
             indices=state_input_indices.unsqueeze(1).expand(-1, draft_token_num),
             cols=(
@@ -684,11 +695,6 @@ class DVRGDNStateAdapter:
             indices=state_input_indices,
             crosses_chunk_boundary=crosses_chunk_boundary,
             chunk_size=self.chunk_size,
-        )
-        # Keep the fixed verify window clean once per batch, not once per GDN
-        # layer inside the captured target forward.
-        state_window.zero_after_lens(
-            indices=state_input_indices, keep_lens=tail_lens_after
         )
         if self.draft_reuses_target_state:
             # Self draft consumes the target model's live recurrent slot. Keep

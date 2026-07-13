@@ -225,8 +225,10 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
     assert torch.equal(v_cache[1, :2], v.reshape(2, 16, 128))
     assert torch.equal(g_cache[1, :2], g)
     assert torch.equal(beta_cache[1, :2], beta)
+    # Rows after tail_lens are outside every consumed causal prefix. Keeping
+    # them untouched avoids clearing the full q/k/v/g/beta window per verify.
     for tensor in layer_cache.tensors:
-        assert torch.count_nonzero(tensor[1, 2:]) == 0
+        assert torch.all(tensor[1, 2:] == 1)
 
 
 def test_gdn_extend_preserves_cached_prefix_boundary_in_request_slot():

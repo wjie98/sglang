@@ -96,28 +96,6 @@ class DVRStateInputCache:
                 )
             src_base += extend_len
 
-    def zero_after_lens(
-        self, *, indices: torch.Tensor, keep_lens: torch.Tensor
-    ) -> None:
-        indices = indices.to(device=self.tensors[0].device, dtype=torch.long)
-        keep_lens = keep_lens.to(device=indices.device, dtype=torch.long)
-        cols = torch.arange(self.capacity, dtype=torch.long, device=indices.device)
-        stale = cols.unsqueeze(0) >= keep_lens.unsqueeze(1)
-
-        for cache in self.tensors:
-            if self.tail_lens.dim() == 2:
-                rows = cache[:, indices]
-                mask_shape = (1,) + stale.shape + (1,) * (rows.dim() - 3)
-                cache[:, indices] = torch.where(
-                    stale.view(mask_shape), torch.zeros_like(rows), rows
-                )
-            else:
-                rows = cache[indices]
-                mask_shape = stale.shape + (1,) * (rows.dim() - 2)
-                cache[indices] = torch.where(
-                    stale.view(mask_shape), torch.zeros_like(rows), rows
-                )
-
     def shift_after_boundary(
         self,
         *,
