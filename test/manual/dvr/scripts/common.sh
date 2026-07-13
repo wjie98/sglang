@@ -48,6 +48,22 @@ wait_for_server() {
   return 1
 }
 
+assert_server_capacity() {
+  local server_log="$1"
+  local expected_graph_bs="$2"
+
+  if grep -q "max_running_requests was reduced" "${server_log}"; then
+    echo "Server reduced the requested concurrency; benchmark results would not be comparable." >&2
+    grep "max_running_requests was reduced" "${server_log}" >&2 || true
+    return 1
+  fi
+  if ! grep -q "Capturing batches (bs=${expected_graph_bs}" "${server_log}"; then
+    echo "CUDA graph batch size ${expected_graph_bs} was not captured." >&2
+    tail -120 "${server_log}" >&2 || true
+    return 1
+  fi
+}
+
 stop_process_group() {
   local server_pid="${1:-}"
   if [[ -z "${server_pid}" ]]; then

@@ -11,13 +11,19 @@ SHAREGPT_DATASET="${SHAREGPT_DATASET:-/mnt/data/hwj/ShareGPT_Vicuna_unfiltered/S
 PORT="${PORT:-30136}"
 NUM_PROMPTS="${NUM_PROMPTS:-8}"
 OUTPUT_LEN="${OUTPUT_LEN:-512}"
-MAX_CONCURRENCY="${MAX_CONCURRENCY:-4}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-3}"
+MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-16}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
 RUN_SELF="${RUN_SELF:-1}"
 RUN_EAGLE="${RUN_EAGLE:-1}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/35b-dvr-throughput}"
 SERVER_PID=""
+CUDA_GRAPH_BS=()
+
+for ((bs = 1; bs <= MAX_CONCURRENCY; bs++)); do
+  CUDA_GRAPH_BS+=("${bs}")
+done
 
 mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
 
@@ -50,18 +56,19 @@ start_server() {
       --context-length 4096 \
       --max-total-tokens 8192 \
       --mem-fraction-static 0.72 \
-      --max-running-requests 4 \
-      --max-mamba-cache-size 16 \
+      --max-running-requests "${MAX_CONCURRENCY}" \
+      --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}" \
       --attention-backend triton \
       --linear-attn-backend triton \
       --sampling-backend pytorch \
-      --cuda-graph-bs 1 2 3 4 \
-      --cuda-graph-max-bs 4 \
+      --cuda-graph-bs "${CUDA_GRAPH_BS[@]}" \
+      --cuda-graph-max-bs "${MAX_CONCURRENCY}" \
       "$@" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &
   SERVER_PID="$!"
   wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
+  assert_server_capacity "${server_log}" "${MAX_CONCURRENCY}"
 }
 
 stop_server() {

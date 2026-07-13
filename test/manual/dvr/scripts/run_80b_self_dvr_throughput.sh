@@ -13,7 +13,19 @@ BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/80b-self-dvr-throughput}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
 RUN_DVR="${RUN_DVR:-1}"
+SHAREGPT_MAX_CONCURRENCY="${SHAREGPT_MAX_CONCURRENCY:-3}"
+LONGBENCH_MAX_CONCURRENCY="${LONGBENCH_MAX_CONCURRENCY:-2}"
+MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-16}"
 SERVER_PID=""
+SERVER_MAX_CONCURRENCY="${SHAREGPT_MAX_CONCURRENCY}"
+CUDA_GRAPH_BS=()
+
+if ((LONGBENCH_MAX_CONCURRENCY > SERVER_MAX_CONCURRENCY)); then
+  SERVER_MAX_CONCURRENCY="${LONGBENCH_MAX_CONCURRENCY}"
+fi
+for ((bs = 1; bs <= SERVER_MAX_CONCURRENCY; bs++)); do
+  CUDA_GRAPH_BS+=("${bs}")
+done
 
 mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
 
@@ -65,10 +77,10 @@ run_bench() {
 
 run_benchmark_matrix() {
   local label="$1"
-  run_bench "80b_${label}_sharegpt_logprob_false" "${SHAREGPT_DATASET}" "sharegpt" 3 false
-  run_bench "80b_${label}_sharegpt_logprob_true" "${SHAREGPT_DATASET}" "sharegpt" 3 true
-  run_bench "80b_${label}_longbench_logprob_false" "${LONGBENCH_CUSTOM_DATASET}" "custom" 2 false
-  run_bench "80b_${label}_longbench_logprob_true" "${LONGBENCH_CUSTOM_DATASET}" "custom" 2 true
+  run_bench "80b_${label}_sharegpt_logprob_false" "${SHAREGPT_DATASET}" "sharegpt" "${SHAREGPT_MAX_CONCURRENCY}" false
+  run_bench "80b_${label}_sharegpt_logprob_true" "${SHAREGPT_DATASET}" "sharegpt" "${SHAREGPT_MAX_CONCURRENCY}" true
+  run_bench "80b_${label}_longbench_logprob_false" "${LONGBENCH_CUSTOM_DATASET}" "custom" "${LONGBENCH_MAX_CONCURRENCY}" false
+  run_bench "80b_${label}_longbench_logprob_true" "${LONGBENCH_CUSTOM_DATASET}" "custom" "${LONGBENCH_MAX_CONCURRENCY}" true
 }
 
 run_baseline() {
@@ -85,20 +97,21 @@ run_baseline() {
       --context-length 8192 \
       --max-total-tokens 6144 \
       --mem-fraction-static 0.9 \
-      --max-running-requests 4 \
-      --max-mamba-cache-size 16 \
+      --max-running-requests "${SERVER_MAX_CONCURRENCY}" \
+      --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}" \
       --page-size 1 \
       --attention-backend triton \
       --linear-attn-backend triton \
       --sampling-backend pytorch \
-      --cuda-graph-bs 1 2 3 4 \
-      --cuda-graph-max-bs 4 \
+      --cuda-graph-bs "${CUDA_GRAPH_BS[@]}" \
+      --cuda-graph-max-bs "${SERVER_MAX_CONCURRENCY}" \
       --disable-overlap-schedule \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &
   SERVER_PID="$!"
 
   wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
+  assert_server_capacity "${server_log}" "${SERVER_MAX_CONCURRENCY}"
   run_benchmark_matrix "baseline"
   stop_process_group "${SERVER_PID}"
   SERVER_PID=""
@@ -126,8 +139,8 @@ run_one_mode() {
       --context-length 8192 \
       --max-total-tokens 6144 \
       --mem-fraction-static 0.9 \
-      --max-running-requests 4 \
-      --max-mamba-cache-size 16 \
+      --max-running-requests "${SERVER_MAX_CONCURRENCY}" \
+      --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}" \
       --page-size 64 \
       --attention-backend triton \
       --linear-attn-backend triton \
@@ -136,8 +149,8 @@ run_one_mode() {
       --speculative-algorithm DECODE_VERIFY_ROLLBACK \
       --speculative-num-draft-tokens 16 \
       --speculative-num-steps 15 \
-      --cuda-graph-bs 1 2 3 4 \
-      --cuda-graph-max-bs 4 \
+      --cuda-graph-bs "${CUDA_GRAPH_BS[@]}" \
+      --cuda-graph-max-bs "${SERVER_MAX_CONCURRENCY}" \
       "${overlap_args[@]}" \
       "$@" \
       --skip-server-warmup \
@@ -145,6 +158,7 @@ run_one_mode() {
   SERVER_PID="$!"
 
   wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
+  assert_server_capacity "${server_log}" "${SERVER_MAX_CONCURRENCY}"
 
   run_benchmark_matrix "${label}"
 
@@ -187,7 +201,8 @@ require_file "${LONGBENCH_CUSTOM_DATASET}"
 # - baseline: normal no-DVR decode, overlap disabled.
 # - v1: compatibility scheduler, overlap disabled.
 # - v2: spec-v2 worker with overlap enabled.
-# - max_mamba_cache_size must stay 16; omitting it lowers effective concurrency.
+# - server/graph concurrency is the maximum requested by either dataset.
+# - max_mamba_cache_size must cover that concurrency without a runtime reduction.
 if [[ "${RUN_BASELINE}" == "1" ]]; then
   run_baseline
 fi

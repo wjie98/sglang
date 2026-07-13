@@ -29,7 +29,7 @@ Use these entry points:
 - `test/manual/dvr/scripts/run_35b_dvr_throughput.sh`
   - matching 35B no-DVR, self-v1/v2, and EAGLE sync/overlap ShareGPT runs
   - runs TP=4 self-DVR KL boundary checks before its throughput pair
-  - fixes 8 requests, 512 output tokens, concurrency 4, and covers
+  - fixes 8 requests, 512 output tokens, concurrency 3, and covers
     `return_logprob=True/False`
 - `test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh`
   - Qwen3-Next 80B no-DVR baseline and self-DVR spec v1/v2 long-output throughput
@@ -55,8 +55,10 @@ max concurrency, `--max-mamba-cache-size`, overlap mode, backend, or returned
 logprob handling.  If a new experiment needs different knobs, create a separate
 script or clearly mark it as a new baseline and keep the fixed scripts intact.
 
-The 80B throughput script intentionally pins `--max-mamba-cache-size 16`.
-Omitting it can lower effective request concurrency and produce misleadingly
-low self-DVR throughput.  Its default run includes baseline, v1, and v2;
+The throughput scripts pin `--max-mamba-cache-size 16` and fail if the runtime
+reduces the requested concurrency or omits its largest CUDA graph batch.
+Their concurrency knobs must be overridden together with enough Mamba cache
+capacity; otherwise the run is not a valid comparison.  The 80B default run
+includes baseline, v1, and v2;
 `RUN_BASELINE=0` or `RUN_DVR=0` may be used only to resume an interrupted
 matrix in the same `RESULT_ROOT`.
