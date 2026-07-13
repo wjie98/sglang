@@ -13,6 +13,8 @@ NUM_PROMPTS="${NUM_PROMPTS:-8}"
 OUTPUT_LEN="${OUTPUT_LEN:-512}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-3}"
 MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-16}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-8192}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
 RUN_SELF="${RUN_SELF:-1}"
 RUN_EAGLE="${RUN_EAGLE:-1}"
@@ -53,8 +55,8 @@ start_server() {
       --host 127.0.0.1 \
       --port "${PORT}" \
       --tp-size 4 \
-      --context-length 4096 \
-      --max-total-tokens 8192 \
+      --context-length "${CONTEXT_LENGTH}" \
+      --max-total-tokens "${MAX_TOTAL_TOKENS}" \
       --mem-fraction-static 0.72 \
       --max-running-requests "${MAX_CONCURRENCY}" \
       --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}" \

@@ -64,3 +64,9 @@ capacity; otherwise the run is not a valid comparison.  The 80B default run
 includes baseline, v1, and v2;
 `RUN_BASELINE=0` or `RUN_DVR=0` may be used only to resume an interrupted
 matrix in the same `RESULT_ROOT`.
+
+The 35B script exposes `CONTEXT_LENGTH` and `MAX_TOTAL_TOKENS` for separately
+reported large-batch EAGLE runs. Keep its defaults for the fixed BS=3 matrix;
+when increasing `MAX_CONCURRENCY`, set both capacity overrides explicitly and
+retain the script's server-capacity check so a silently reduced batch is never
+reported as the requested large-batch result.
