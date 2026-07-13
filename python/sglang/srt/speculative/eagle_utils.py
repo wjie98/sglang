@@ -459,11 +459,19 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        if batch.spec_algorithm.is_dvr():
-            use_rejection_sampling = verify_input.draft_probs is not None
-        else:
-            use_rejection_sampling = (
-                get_global_server_args().speculative_use_rejection_sampling
+        configured_rejection_sampling = (
+            get_global_server_args().speculative_use_rejection_sampling
+        )
+        # draft_probs is the authoritative proposal distribution. Standard
+        # EAGLE only publishes it when rejection sampling is configured, while
+        # DVR self-draft publishes it whenever stochastic target sampling needs
+        # an exact proposal q. Keeping the contract on the verify input avoids
+        # algorithm-specific sampling branches here.
+        use_rejection_sampling = verify_input.draft_probs is not None
+        if configured_rejection_sampling and not use_rejection_sampling:
+            raise ValueError(
+                "Rejection sampling is enabled, but the draft worker did not "
+                "provide draft_probs."
             )
 
         # Apply temperature and get target probs
@@ -489,7 +497,7 @@ def eagle_sample(
             ),
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        if batch.spec_algorithm.is_dvr() and sampling_info.need_min_p_sampling:
+        if sampling_info.need_min_p_sampling:
             min_ps = torch.repeat_interleave(
                 sampling_info.min_ps, verify_input.draft_token_num, dim=0
             )
