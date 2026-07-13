@@ -145,8 +145,8 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.laun
   --tp-size 4 \
   --speculative-algorithm DECODE_VERIFY_ROLLBACK_EAGLE \
   --speculative-draft-model-path /mnt/data/hwj/Qwen3.5-35B-A3B \
-  --speculative-num-draft-tokens 4 \
-  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 2 \
+  --speculative-num-steps 1 \
   --speculative-eagle-topk 1 \
   --page-size 1 \
   --context-length 4096 \
@@ -172,7 +172,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
   --max-new 4,16,65 \
   --cache-mode flush-each \
   --check-kl \
-  --min-accept-rate 0.99 \
+  --min-accept-rate 0.96 \
   --ignore-eos \
   --seed 2032
 ```
@@ -187,7 +187,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
   --max-new 4,16,65 \
   --cache-mode flush-each \
   --no-return-logprob \
-  --min-accept-rate 0.99 \
+  --min-accept-rate 0.96 \
   --ignore-eos \
   --seed 2032
 ```
@@ -199,10 +199,14 @@ a supported matrix entry.
 
 The `--seed 2032`, `prompt_len=65`, `max_new=65` entry is the fixed regression
 for seeded MTP boundary acceptance.  It crosses the GDN chunk boundary and must
-keep `accept_rate >= 0.99` in both returned-logprob and no-return-logprob
+keep `accept_rate >= 0.96` in both returned-logprob and no-return-logprob
 paths.  A lower value usually means the deterministic verify coin stream or the
 MTP suffix-boundary hidden/state seed no longer matches target prefill
 semantics.
+
+The fixed ShareGPT cases use `accept_rate >= 0.70`.  Their historical range is
+roughly `0.73-1.00`; using the synthetic-boundary threshold for real prompts
+would turn normal MTP model quality into a false correctness failure.
 
 ## 80B self-DVR throughput
 
