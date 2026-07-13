@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager, nullcontext
 
 import torch
@@ -12,6 +13,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 
 def iter_dvr_attention_backends(attn_backend):
@@ -172,15 +175,19 @@ def _ensure_decode_custom_all_reduce_comm(group):
             dispatch_custom_allreduce,
         )
 
-        custom_allreduce_cls = dispatch_custom_allreduce(
-            group=group.cpu_group,
-            device=group.device,
-        )
-        ca_comm = custom_allreduce_cls(
-            group=group.cpu_group,
-            device=group.device,
-        )
-        group.ca_comm = ca_comm
+        try:
+            custom_allreduce_cls = dispatch_custom_allreduce(
+                group=group.cpu_group,
+                device=group.device,
+            )
+            ca_comm = custom_allreduce_cls(
+                group=group.cpu_group,
+                device=group.device,
+            )
+            group.ca_comm = ca_comm
+        except Exception as exc:
+            logger.warning("DVR draft custom all-reduce setup failed: %s", exc)
+            return None
 
     if ca_comm is None or not hasattr(ca_comm, "world_size"):
         return None
@@ -220,24 +227,22 @@ def _skip_init_cuda_graph_state(*args, **kwargs):
 
 
 @contextmanager
-def _dvr_draft_decode_context(
+def dvr_draft_decode_context(
     model_runner,
     *,
-    graph_capture: bool = False,
-    self_draft_graph_capture: bool = False,
-    disable_batch_invariant_ops: bool = False,
-    clear_kernel_config_caches: bool = False,
-    patch_global_state: bool = True,
+    capture: bool = False,
+    self_draft: bool = False,
     extra_attn_backends=(),
 ):
     """Temporarily switch a DVR draft runner into performance-first decode mode.
 
-    This is intentionally private: callers should use one of the fixed semantic
-    wrappers below instead of composing graph/determinism/mamba knobs manually.
+    Self-draft replay only patches backend fields consumed by its captured graph;
+    EAGLE replay and both capture paths also switch global deterministic state.
     """
 
     patched_attrs = []
     global_server_args = get_global_server_args()
+    patch_global_state = capture or not self_draft
 
     def patch_attr(obj, attr_name, value):
         if obj is None or not hasattr(obj, attr_name):
@@ -252,7 +257,7 @@ def _dvr_draft_decode_context(
     )
     with deterministic_env:
         try:
-            if clear_kernel_config_caches:
+            if capture:
                 _clear_determinism_sensitive_kernel_caches()
 
             if patch_global_state:
@@ -273,7 +278,7 @@ def _dvr_draft_decode_context(
                         backend, model_runner, patch_attr
                     )
 
-            if graph_capture:
+            if capture:
                 # Deterministic target prefill/verify keeps custom all-reduce
                 # disabled. Only capture it into provisional draft graphs.
                 if getattr(
@@ -283,7 +288,7 @@ def _dvr_draft_decode_context(
                 ):
                     for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
                         patch_attr(ca_comm, "disabled", False)
-                if self_draft_graph_capture:
+                if self_draft:
                     # Target graph buffers are already initialized for
                     # TARGET_VERIFY; capture self draft as ordinary DECODE.
                     patch_attr(
@@ -302,52 +307,13 @@ def _dvr_draft_decode_context(
                 for server_args in (model_runner.server_args, global_server_args):
                     patch_attr(server_args, "mamba_radix_cache_strategy", "no_buffer")
 
-            with _maybe_disable_batch_invariant_ops(disable_batch_invariant_ops):
+            with _maybe_disable_batch_invariant_ops(capture):
                 yield
         finally:
             for obj, attr_name, original_value in reversed(patched_attrs):
                 setattr(obj, attr_name, original_value)
-            if clear_kernel_config_caches:
+            if capture:
                 _clear_determinism_sensitive_kernel_caches()
-
-
-def dvr_self_draft_graph_capture_context(model_runner):
-    """Capture the dedicated DVR self-draft decode CUDA graph."""
-
-    return _dvr_draft_decode_context(
-        model_runner,
-        graph_capture=True,
-        self_draft_graph_capture=True,
-        disable_batch_invariant_ops=True,
-        clear_kernel_config_caches=True,
-    )
-
-
-def dvr_draft_graph_capture_context(model_runner, *, extra_attn_backends=()):
-    """Capture a DVR draft-model graph with performance-first decode settings."""
-
-    return _dvr_draft_decode_context(
-        model_runner,
-        graph_capture=True,
-        disable_batch_invariant_ops=True,
-        clear_kernel_config_caches=True,
-        extra_attn_backends=extra_attn_backends,
-    )
-
-
-def dvr_draft_graph_replay_context(model_runner, *, extra_attn_backends=()):
-    """Run one complete DVR draft phase without target determinism settings."""
-
-    return _dvr_draft_decode_context(
-        model_runner,
-        extra_attn_backends=extra_attn_backends,
-    )
-
-
-def dvr_self_draft_graph_replay_context(model_runner):
-    """Patch only decode metadata fields needed by the captured self-draft graph."""
-
-    return _dvr_draft_decode_context(model_runner, patch_global_state=False)
 
 
 class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
@@ -358,6 +324,13 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     those rules on the graph runner instead of attaching execution hooks to the
     spec_info data object.
     """
+
+    def __init__(self, model_runner):
+        # DecodeCudaGraphRunner already exposes this narrow extension point.
+        model_runner.enable_dvr_target_verify_cuda_graph = (
+            model_runner.spec_algorithm.is_dvr_eagle()
+        )
+        super().__init__(model_runner)
 
     def get_spec_info(self, num_tokens: int):
         capture_hidden_mode = (

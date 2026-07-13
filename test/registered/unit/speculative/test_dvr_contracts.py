@@ -13,7 +13,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorkerV2,
-    raise_for_dvr_graph_unsafe_short_prompt,
 )
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
@@ -297,15 +296,15 @@ def test_dvr_draft_reaches_nested_hybrid_attention_backends():
     }
 
 
-def test_dvr_self_draft_rejects_one_token_prompt_once_at_core_entry():
+def test_dvr_self_draft_rejects_one_token_prompt_at_core_entry():
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
     with pytest.raises(RuntimeError, match="one-token synthetic prompts"):
-        raise_for_dvr_graph_unsafe_short_prompt(
-            SimpleNamespace(reqs=[SimpleNamespace(origin_input_ids=[1])])
+        worker._run_decode_draft_verify_rollback(
+            SimpleNamespace(
+                spec_info=object(),
+                reqs=[SimpleNamespace(origin_input_ids=[1])],
+            )
         )
-
-    raise_for_dvr_graph_unsafe_short_prompt(
-        SimpleNamespace(reqs=[SimpleNamespace(origin_input_ids=[1, 2])])
-    )
 
 
 def test_dvr_self_draft_rejects_short_boundary_without_eager_fallback():

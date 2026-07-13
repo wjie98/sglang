@@ -22,17 +22,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    dvr_draft_graph_capture_context,
-    dvr_draft_graph_replay_context,
-    dvr_self_draft_graph_capture_context,
-    dvr_self_draft_graph_replay_context,
+    dvr_draft_decode_context,
     iter_dvr_attention_backends,
 )
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_state_flow import (
-    DVRRollbackActions,
     DVRLinearStateLifecycle,
     rollback_dvr_verify,
 )
@@ -67,19 +63,6 @@ if is_cuda():
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
-
-
-def raise_for_dvr_graph_unsafe_short_prompt(batch) -> None:
-    """Reject the synthetic one-token prompt edge instead of running a slow path."""
-
-    for req in batch.reqs:
-        if len(req.origin_input_ids) <= 1:
-            raise RuntimeError(
-                "DVR does not support one-token synthetic prompts on gated "
-                "linear-state models because the first draft/verify graph step "
-                "hits the seq_len<=2 state-input boundary. Use a normal "
-                "chat-template prompt or disable DVR for this tiny prompt test."
-            )
 
 
 class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
@@ -186,7 +169,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     @contextmanager
     def _draft_context(self):
         if not self.is_dvr_eagle:
-            with dvr_self_draft_graph_replay_context(self.model_runner):
+            with dvr_draft_decode_context(self.model_runner, self_draft=True):
                 yield
             return
         draft_worker = self._draft_worker
@@ -199,7 +182,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             draft_worker.draft_tp_context(draft_worker.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
-            dvr_draft_graph_replay_context(
+            dvr_draft_decode_context(
                 draft_worker.draft_runner,
                 extra_attn_backends=extra_attn_backends,
             ),
@@ -207,21 +190,29 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             yield
 
     def _idle_draft_input(self) -> EagleDraftInput:
-        if not self.is_dvr_eagle:
-            return EagleDraftInput.create_idle_input(
-                device=self.device,
-                hidden_size=None,
-                dtype=None,
-                topk=self.topk,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-            )
         return EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=EagleDraftInput.hidden_size_for(self._draft_worker),
-            dtype=EagleDraftInput.dtype_for(self._draft_worker),
+            hidden_size=(
+                EagleDraftInput.hidden_size_for(self._draft_worker)
+                if self.is_dvr_eagle
+                else None
+            ),
+            dtype=(
+                EagleDraftInput.dtype_for(self._draft_worker)
+                if self.is_dvr_eagle
+                else None
+            ),
             topk=self.topk,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
-            vocab_size=self.target_worker.model_config.vocab_size,
+            capture_hidden_mode=(
+                CaptureHiddenMode.LAST
+                if self.is_dvr_eagle
+                else CaptureHiddenMode.NULL
+            ),
+            vocab_size=(
+                self.target_worker.model_config.vocab_size
+                if self.is_dvr_eagle
+                else 0
+            ),
         )
 
     def _sample_target_verify(
@@ -282,8 +273,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 draft_worker.draft_extend_attn_backend
                 or draft_worker.draft_runner.attn_backend,
             )
-            with dvr_draft_graph_capture_context(
+            with dvr_draft_decode_context(
                 draft_worker.draft_runner,
+                capture=True,
                 extra_attn_backends=extra_attn_backends,
             ):
                 draft_worker.init_cuda_graphs()
@@ -296,7 +288,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             and not self.server_args.disable_cuda_graph
             and not self.server_args.disable_draft_cuda_graph
         ):
-            with dvr_self_draft_graph_capture_context(self.model_runner):
+            with dvr_draft_decode_context(
+                self.model_runner, capture=True, self_draft=True
+            ):
                 self.cuda_graph_runner_for_draft_decode = DecodeCudaGraphRunner(
                     self.model_runner
                 )
@@ -329,20 +323,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
     # Self-draft path. DVR uses the target model's decode path as a draft model,
     # but keeps EAGLE-compatible tree/retrieve metadata for verification.
-
-    def _forward_target_verify_for_dvr(
-        self, batch: ScheduleBatch
-    ) -> GenerationBatchResult:
-        # DVR derives exact output logprobs from target-verify logits after
-        # sampling. The ordinary target-verify pass only needs logits for
-        # accept/reject and GDN state commit, so keep its logprob metadata path
-        # disabled.
-        need_return_logprob = batch.return_logprob
-        batch.return_logprob = False
-        try:
-            return self.target_worker.forward_batch_generation(batch, is_verify=True)
-        finally:
-            batch.return_logprob = need_return_logprob
 
     def _draft_self(self, batch: ScheduleBatch) -> EagleVerifyInput:
         if batch.forward_mode.is_idle():
@@ -522,13 +502,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
 
-    @contextmanager
-    def _target_verify_context(self, *, prepare: bool = False):
-        use_plan_stream = prepare and self.plan_stream is not None
-        stream_ctx = self.plan_stream_ctx if use_plan_stream else nullcontext()
-        with stream_ctx:
-            yield use_plan_stream
-
     def _prepare_dvr_boundary_for_verify(self, batch: ScheduleBatch) -> None:
         if batch.forward_mode.is_idle():
             return
@@ -608,7 +581,14 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
         if batch.spec_info is None:
             batch.spec_info = self._idle_draft_input()
-        raise_for_dvr_graph_unsafe_short_prompt(batch)
+        for req in batch.reqs:
+            if len(req.origin_input_ids) <= 1:
+                raise RuntimeError(
+                    "DVR does not support one-token synthetic prompts on gated "
+                    "linear-state models because the first draft/verify graph step "
+                    "hits the seq_len<=2 state-input boundary. Use a normal "
+                    "chat-template prompt or disable DVR for this tiny prompt test."
+                )
         self._prepare_dvr_boundary_for_verify(batch)
 
         verify_input = self.draft(batch)
@@ -728,7 +708,8 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             spec_info.num_tokens_per_req = self.num_draft_tokens
             bs = len(batch.seq_lens)
 
-            with self._target_verify_context(prepare=True) as prepared_on_plan_stream:
+            prepared_on_plan_stream = self.plan_stream is not None
+            with self.plan_stream_ctx:
                 verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                     spec_info,
                     self.req_to_token_pool,
@@ -767,12 +748,11 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                         continue
 
             linear_state_ctx = self.linear_state.restore_for_verify(batch)
-            with self._target_verify_context():
-                forward_output = self.target_worker.forward_batch_generation(
-                    batch=None,
-                    forward_batch=verify_forward_batch,
-                    is_verify=True,
-                )
+            forward_output = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+            )
 
             extra_keep_alive_refs = [verify_forward_batch]
             error_prefix = "DVR EAGLE"
@@ -790,7 +770,16 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
             linear_state_ctx = self.linear_state.restore_for_verify(batch)
             batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
-            forward_output = self._forward_target_verify_for_dvr(batch)
+            # Exact output logprobs are derived from target-verify logits below;
+            # the forward itself only needs accept/reject and GDN commit data.
+            need_return_logprob = batch.return_logprob
+            batch.return_logprob = False
+            try:
+                forward_output = self.target_worker.forward_batch_generation(
+                    batch, is_verify=True
+                )
+            finally:
+                batch.return_logprob = need_return_logprob
             can_run_cuda_graph = forward_output.can_run_cuda_graph
             error_prefix = "DVR self"
 
