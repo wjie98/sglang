@@ -88,8 +88,9 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
   --ignore-eos
 ```
 
-For a long-sequence check, remove `--limit-cases` and include
-`--max-new 512,513`.
+The fixed script also runs concurrent and batch `prompt_len=65`, `max_new=512`
+cases. Add a separate fixed case for 513 tokens when a change specifically
+touches end-of-chunk termination behavior.
 
 One-token synthetic prompts are intentionally not part of the positive DVR
 smoke matrix. The first self-draft graph step reaches the internal

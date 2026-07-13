@@ -84,6 +84,17 @@ run_one_mode() {
     --ignore-eos \
     2>&1 | tee -a "${client_log}"
 
+  echo "==> Running ${label} 512-token KL cases"
+  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    --base-url "${BASE_URL}" \
+    --request-modes concurrent,batch \
+    --prompt-token-lengths 65 \
+    --max-new 512 \
+    --limit-cases 2 \
+    --concurrent-workers 2 \
+    --ignore-eos \
+    2>&1 | tee -a "${client_log}"
+
   grep -q "ALL_OK True" "${client_log}"
   stop_process_group "${SERVER_PID}"
   SERVER_PID=""
