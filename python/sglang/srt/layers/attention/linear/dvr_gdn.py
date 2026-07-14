@@ -13,6 +13,10 @@ from sglang.srt.layers.attention.linear.dvr_state import (
     DVRStateInputCache,
     rebuild_dvr_live_state_grouped,
 )
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
+    fused_mamba_state_scatter_with_mask,
+)
 from sglang.srt.utils import is_cpu
 
 __all__ = ["DVRGDNStateAdapter", "create_gdn_state_input_cache"]
@@ -278,26 +282,6 @@ class DVRGDNStateAdapter:
         self, *, batch, device: torch.device
     ) -> torch.Tensor:
         return batch.req_pool_indices.to(device=device, dtype=torch.long) + 1
-
-    def _scatter_state(
-        self,
-        dst: torch.Tensor,
-        src: torch.Tensor,
-        dst_indices: torch.Tensor,
-        step_indices: torch.Tensor,
-    ) -> None:
-        # The fused scatter kernel flat-copies source rows and requires a
-        # contiguous source buffer.  DVR sometimes receives layer views from the
-        # speculative Mamba cache, so normalize layout at the DVR commit edge.
-        if not src.is_contiguous():
-            src = src.contiguous()
-        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-            fused_mamba_state_scatter_with_mask,
-        )
-
-        fused_mamba_state_scatter_with_mask(
-            dst, src, dst_indices, step_indices
-        )
 
     def zero_recurrent_state(self, *, state_cache, indices: torch.Tensor):
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
@@ -583,7 +567,7 @@ class DVRGDNStateAdapter:
         )
         # accept_lens includes the bonus token, so every non-idle request has a
         # valid accepted step. The fused scatter already handles the empty batch.
-        self._scatter_state(
+        fused_conv_window_scatter_with_mask(
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
             live_indices,
@@ -591,7 +575,7 @@ class DVRGDNStateAdapter:
         )
 
         # Target verify exports the first crossed boundary in step 0.
-        self._scatter_state(
+        fused_mamba_state_scatter_with_mask(
             state_cache.temporal,
             state_cache.intermediate_ssm,
             boundary_indices,
@@ -601,7 +585,7 @@ class DVRGDNStateAdapter:
                 no_commit_step,
             ),
         )
-        self._scatter_state(
+        fused_conv_window_scatter_with_mask(
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
             boundary_indices,
