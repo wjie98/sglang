@@ -33,6 +33,8 @@ class _Args:
     mamba_radix_cache_strategy = "auto"
     mamba_track_interval = 1
     mamba_ssm_dtype = "float32"
+    linear_attn_backend = "triton"
+    linear_attn_prefill_backend = None
 
     def __init__(self):
         self.cuda_graph_config = SimpleNamespace(
@@ -40,7 +42,9 @@ class _Args:
         )
 
     def get_model_config(self):
-        return None
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(get_text_config=lambda: object())
+        )
 
 
 class TestDVRServerArgs(unittest.TestCase):
@@ -131,6 +135,18 @@ class TestDVRServerArgs(unittest.TestCase):
         self.assertTrue(args.disable_radix_cache)
         self.assertEqual(args.mamba_radix_cache_strategy, "extra_buffer")
         self.assertTrue(ServerArgs.enable_mamba_extra_buffer(args))
+
+    def test_dvr_gdn_requires_boundary_exporting_linear_prefill(self):
+        args = _Args()
+        args.linear_attn_prefill_backend = "flashinfer"
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "linear-attn-prefill-backend"):
+                handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_pdmux_attention(self):
         args = _Args()

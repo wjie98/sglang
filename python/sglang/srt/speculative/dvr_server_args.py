@@ -104,6 +104,16 @@ def handle_dvr_speculative_decoding(server_args):
             "--speculative-num-draft-tokens."
         )
 
+    uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
+    linear_prefill_backend = (
+        server_args.linear_attn_prefill_backend or server_args.linear_attn_backend
+    )
+    if uses_gated_linear_state and linear_prefill_backend != "triton":
+        raise ValueError(
+            "DVR GDN verify requires --linear-attn-prefill-backend triton "
+            "because the selected backend must export exact chunk-boundary states."
+        )
+
     if server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = server_args.speculative_num_draft_tokens - 1
     elif server_args.speculative_num_draft_tokens != server_args.speculative_num_steps + 1:
@@ -120,7 +130,7 @@ def handle_dvr_speculative_decoding(server_args):
         )
     if (
         server_args.speculative_num_draft_tokens > FLA_CHUNK_SIZE
-        and _is_dvr_gated_linear_state_model(server_args)
+        and uses_gated_linear_state
     ):
         raise ValueError(
             "DVR currently commits at most one FLA chunk boundary per verify. "
@@ -132,7 +142,9 @@ def handle_dvr_speculative_decoding(server_args):
     elif server_args.speculative_eagle_topk != 1:
         raise ValueError("DVR currently supports only chain mode with topk == 1.")
 
-    _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
+    _ensure_dvr_self_draft_cuda_graph_coverage(
+        server_args, uses_gated_linear_state=uses_gated_linear_state
+    )
 
     if server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM:
         if server_args.disable_overlap_schedule:
@@ -151,7 +163,9 @@ def handle_dvr_speculative_decoding(server_args):
     logger.warning("Mixed chunked prefill is disabled for DVR.")
 
 
-def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
+def _ensure_dvr_self_draft_cuda_graph_coverage(
+    server_args, *, uses_gated_linear_state: bool
+):
     """Keep GDN self-draft on the existing CUDA graph decode contract.
 
     DVR self-draft for gated linear-state models must use the dedicated draft
@@ -163,7 +177,7 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
 
     if server_args.speculative_algorithm != DVR_SPECULATIVE_ALGORITHM:
         return
-    if not _is_dvr_gated_linear_state_model(server_args):
+    if not uses_gated_linear_state:
         return
 
     if server_args.disable_cuda_graph or server_args.disable_draft_cuda_graph:
@@ -208,22 +222,9 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
 
 
 def _is_dvr_gated_linear_state_model(server_args):
-    from sglang.srt.configs import (
-        InternS2PreviewConfig,
-        JetNemotronConfig,
-        JetVLMConfig,
-        Qwen3_5Config,
-        Qwen3_5MoeConfig,
-        Qwen3NextConfig,
-    )
+    from sglang.srt.configs import JetNemotronConfig, Qwen3NextConfig
 
     config = server_args.get_model_config().hf_config.get_text_config()
-    return isinstance(
-        config,
-        Qwen3NextConfig
-        | Qwen3_5Config
-        | Qwen3_5MoeConfig
-        | InternS2PreviewConfig
-        | JetNemotronConfig
-        | JetVLMConfig,
-    )
+    # Qwen3.5/InternS2 text configs inherit Qwen3NextConfig; JetVLM unwraps
+    # to JetNemotronConfig. Check the normalized text families, not wrappers.
+    return isinstance(config, Qwen3NextConfig | JetNemotronConfig)
