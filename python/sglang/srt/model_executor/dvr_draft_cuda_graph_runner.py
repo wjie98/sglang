@@ -17,14 +17,11 @@ from sglang.srt.utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 
-def iter_dvr_attention_backends(attn_backend):
-    """Yield every backend wrapper that may carry decode determinism state."""
-
-    if attn_backend is None:
-        return
+def iter_dvr_attention_backends(*roots):
+    """Yield each backend reachable through SGLang's attention wrappers once."""
 
     seen = set()
-    stack = [attn_backend]
+    stack = list(reversed(roots))
     while stack:
         backend = stack.pop()
         if backend is None or isinstance(backend, str) or id(backend) in seen:
@@ -264,19 +261,12 @@ def dvr_draft_decode_context(
                 for server_args in (model_runner.server_args, global_server_args):
                     patch_attr(server_args, "enable_deterministic_inference", False)
 
-            seen_backend_roots = set()
-            for backend_root in (
+            for backend in iter_dvr_attention_backends(
                 model_runner.attn_backend,
                 *(extra_attn_backends or ()),
             ):
-                if backend_root is None or id(backend_root) in seen_backend_roots:
-                    continue
-                seen_backend_roots.add(id(backend_root))
-                for backend in iter_dvr_attention_backends(backend_root):
-                    patch_attr(backend, "enable_deterministic", False)
-                    _patch_draft_decode_backend_defaults(
-                        backend, model_runner, patch_attr
-                    )
+                patch_attr(backend, "enable_deterministic", False)
+                _patch_draft_decode_backend_defaults(backend, model_runner, patch_attr)
 
             if capture:
                 # Deterministic target prefill/verify keeps custom all-reduce
@@ -326,8 +316,9 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     """
 
     def __init__(self, model_runner):
-        # DecodeCudaGraphRunner already exposes this narrow extension point.
-        model_runner.enable_dvr_target_verify_cuda_graph = (
+        # Keep this capture policy on the dedicated runner rather than adding
+        # transient DVR state to the shared ModelRunner.
+        self.dvr_target_verify_cuda_graph = (
             model_runner.spec_algorithm.is_dvr_eagle()
         )
         super().__init__(model_runner)

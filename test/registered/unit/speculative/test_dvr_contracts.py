@@ -293,6 +293,10 @@ def test_dvr_draft_reaches_nested_hybrid_attention_backends():
         id(linear_attention),
     }
 
+    assert list(
+        iter_dvr_attention_backends(hybrid, full_attention, linear_attention)
+    ) == backends
+
 
 def test_dvr_self_draft_rejects_one_token_prompt_at_core_entry():
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
