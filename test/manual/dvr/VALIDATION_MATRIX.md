@@ -327,6 +327,12 @@ gated-linear integration smoke, one reusable server launcher, and one KL/
 acceptance client. Do not copy benchmark scheduling or throughput calculations
 into Python clients; invoke SGLang's `bench_serving` and keep its raw JSONL.
 
+DVR deliberately rejects one-token synthetic prompts on gated linear-state
+models. Upstream's generation-based `/health` probe uses `[0]` as its prompt,
+so DVR deployments should set `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false`
+and use the resulting non-generating `/health` endpoint. The fixed scripts poll
+`/v1/models` for readiness and must not use `/health_generate`.
+
 ## Regression note: returned logprobs
 
 `return_logprob=True` is part of the deterministic-inference validation surface,
@@ -340,13 +346,21 @@ Do not use output-layer final repair or accepted-suffix replay as the self-DVR
 commit path just because returned logprobs are requested; that changes the next
 draft state, lowers the acceptance rate, and cuts long-output throughput.
 
-The fixed 80B ShareGPT 16x1024 reference results are:
+The fixed A40 PCIe 80B reference results from 2026-07-14 are below. These use
+16 requests with 1024 generated tokens each; ShareGPT uses concurrency 3 and
+LongBench uses concurrency 2. Compare H20/NVLink runs by configuration rather
+than treating these PCIe numbers as a release target.
 
 ```text
-spec-v1 return_logprob=True: 152.62 tok/s, accept length 14.58
-spec-v2 return_logprob=True: 154.08 tok/s, accept length 14.75
-spec-v1 return_logprob=False: 159.91 tok/s, accept length 14.58
-spec-v2 return_logprob=False: 159.65 tok/s, accept length 14.68
+configuration                         ShareGPT tok/s   LongBench tok/s   accept length
+sync baseline, return_logprob=False        209.10           172.46          n/a
+sync baseline, return_logprob=True         208.36           171.10          n/a
+overlap baseline, return_logprob=False     226.13           187.04          n/a
+overlap baseline, return_logprob=True      225.19           186.04          n/a
+spec-v1, return_logprob=False              161.54           129.67       14.88/14.82
+spec-v1, return_logprob=True               161.15           129.42       14.87/14.78
+spec-v2, return_logprob=False              160.10           128.74       14.89/14.80
+spec-v2, return_logprob=True               159.45           128.49       14.84/14.80
 ```
 
 The expected overhead of returned logprobs is only the scoring/output overhead;
