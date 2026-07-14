@@ -27,14 +27,19 @@ if not is_cpu():
 if not is_cpu():
 
     @triton.jit
-    def _dvr_gdn_final_state_kernel(
+    def _dvr_gdn_rebuild_live_state_kernel(
         k,
         v,
         g,
         beta,
-        initial_state,
-        final_state,
+        state,
+        state_input_indices,
+        boundary_indices,
+        live_indices,
         token_count,
+        N: tl.constexpr,
+        S: tl.constexpr,
+        C: tl.constexpr,
         T: tl.constexpr,
         H: tl.constexpr,
         HV: tl.constexpr,
@@ -44,7 +49,8 @@ if not is_cpu():
         BV: tl.constexpr,
     ):
         i_v, i_nh = tl.program_id(0), tl.program_id(1)
-        i_n, i_hv = i_nh // HV, i_nh % HV
+        i_ln, i_hv = i_nh // HV, i_nh % HV
+        i_l, i_n = i_ln // N, i_ln % N
         i_h = i_hv // (HV // H)
 
         o_k = tl.arange(0, BK)
@@ -53,71 +59,90 @@ if not is_cpu():
         mask_v = o_v < V
         mask_h = mask_v[:, None] & mask_k[None, :]
 
-        state_offset = i_n * HV * V * K + i_hv * V * K
-        p_h0 = initial_state + state_offset + o_v[:, None] * K + o_k[None, :]
-        state = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+        state_input_idx = tl.load(state_input_indices + i_n).to(tl.int64)
+        boundary_idx = tl.load(boundary_indices + i_n).to(tl.int64)
+        live_idx = tl.load(live_indices + i_n).to(tl.int64)
+        state_offset = (
+            (i_l * C + boundary_idx) * HV * V * K + i_hv * V * K
+        )
+        p_h0 = state + state_offset + o_v[:, None] * K + o_k[None, :]
+        recurrent_state = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
         steps = tl.load(token_count + i_n).to(tl.int64)
-        p_k = k + ((i_n * T * H + i_h) * K + o_k)
-        p_v = v + ((i_n * T * HV + i_hv) * V + o_v)
-        p_g = g + (i_n * T * HV + i_hv)
-        p_beta = beta + (i_n * T * HV + i_hv)
+        p_k = k + (((i_l * S + state_input_idx) * T * H + i_h) * K + o_k)
+        p_v = v + (((i_l * S + state_input_idx) * T * HV + i_hv) * V + o_v)
+        p_g = g + ((i_l * S + state_input_idx) * T * HV + i_hv)
+        p_beta = beta + ((i_l * S + state_input_idx) * T * HV + i_hv)
 
         for step in range(0, T):
             if step < steps:
                 key = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
                 value = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
                 key /= tl.sqrt(tl.sum(key * key) + 1e-6)
-                state *= exp(tl.load(p_g).to(tl.float32))
-                value -= tl.sum(state * key[None, :], 1)
+                recurrent_state *= exp(tl.load(p_g).to(tl.float32))
+                value -= tl.sum(recurrent_state * key[None, :], 1)
                 value *= tl.load(p_beta).to(tl.float32)
-                state += value[:, None] * key[None, :]
+                recurrent_state += value[:, None] * key[None, :]
 
             p_k += H * K
             p_v += HV * V
             p_g += HV
             p_beta += HV
 
-        p_ht = final_state + state_offset + o_v[:, None] * K + o_k[None, :]
-        tl.store(p_ht, state.to(p_ht.dtype.element_ty), mask=mask_h)
+        state_offset = (i_l * C + live_idx) * HV * V * K + i_hv * V * K
+        p_ht = state + state_offset + o_v[:, None] * K + o_k[None, :]
+        tl.store(p_ht, recurrent_state.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
-def _rebuild_gdn_state_for_self_draft(
-    state_inputs: Tuple[torch.Tensor, ...],
+def _rebuild_gdn_live_state_for_self_draft(
+    state_window: DVRStateInputCache,
     *,
-    initial_state: torch.Tensor,
+    state_cache,
+    state_input_indices: torch.Tensor,
+    boundary_indices: torch.Tensor,
+    live_indices: torch.Tensor,
     token_count: Optional[Union[int, torch.Tensor]] = None,
-) -> torch.Tensor:
-    """Rebuild only the final recurrent state consumed by self draft."""
+) -> None:
+    """Rebuild the live state directly from request-local window slots."""
 
-    q, k, v, g, beta = state_inputs
+    _, k, v, g, beta = state_window.tensors
     if is_cpu():
         raise NotImplementedError("DVR GDN self-draft state rebuild is GPU-only.")
     if token_count is None:
-        token_count = q.shape[1]
+        token_count = k.shape[2]
     if isinstance(token_count, int):
         token_count = torch.full(
-            (q.shape[0],), token_count, dtype=torch.long, device=q.device
+            (state_input_indices.numel(),),
+            token_count,
+            dtype=torch.int32,
+            device=k.device,
         )
 
-    _, num_tokens, num_key_heads, key_dim = q.shape
-    batch_size, _, num_value_heads, value_dim = v.shape
-    token_count = token_count.to(device=k.device, dtype=torch.long).clamp(
-        min=0, max=num_tokens
-    )
-    final_state = torch.empty_like(initial_state)
+    num_layers, num_slots, num_tokens, num_key_heads, key_dim = k.shape
+    _, _, _, num_value_heads, value_dim = v.shape
+    num_reqs = state_input_indices.numel()
+    if num_reqs == 0:
+        return
     block_k = triton.next_power_of_2(key_dim)
     block_v = min(triton.next_power_of_2(value_dim), 8)
-    _dvr_gdn_final_state_kernel[
-        (triton.cdiv(value_dim, block_v), batch_size * num_value_heads)
+    _dvr_gdn_rebuild_live_state_kernel[
+        (
+            triton.cdiv(value_dim, block_v),
+            num_layers * num_reqs * num_value_heads,
+        )
     ](
         k=k,
         v=v,
         g=g,
         beta=beta,
-        initial_state=initial_state,
-        final_state=final_state,
-        token_count=token_count,
+        state=state_cache.temporal,
+        state_input_indices=state_input_indices,
+        boundary_indices=boundary_indices,
+        live_indices=live_indices,
+        token_count=token_count.contiguous(),
+        N=num_reqs,
+        S=num_slots,
+        C=state_cache.temporal.shape[1],
         T=num_tokens,
         H=num_key_heads,
         HV=num_value_heads,
@@ -128,7 +153,6 @@ def _rebuild_gdn_state_for_self_draft(
         num_warps=1,
         num_stages=3,
     )
-    return final_state
 
 
 @dataclass
@@ -572,31 +596,13 @@ class DVRGDNStateAdapter:
         if self.draft_reuses_target_state:
             # Self draft consumes the target model's live recurrent slot. Keep
             # this path host-sync free and rebuild every accepted suffix.
-            num_layers = state_cache.temporal.shape[0]
-            num_reqs = live_indices.numel()
-            flat_dim = num_layers * num_reqs
-            window_inputs = tuple(
-                tensor[:, state_input_indices].reshape(
-                    flat_dim, *tensor.shape[2:]
-                )
-                for tensor in state_window.tensors
-            )
-            initial_state = state_cache.temporal[:, boundary_indices].reshape(
-                flat_dim, *state_cache.temporal.shape[2:]
-            )
-            token_count = (
-                tail_lens_after.unsqueeze(0)
-                .expand(num_layers, -1)
-                .reshape(-1)
-                .contiguous()
-            )
-            rebuilt_state = _rebuild_gdn_state_for_self_draft(
-                window_inputs,
-                initial_state=initial_state,
-                token_count=token_count,
-            )
-            state_cache.temporal[:, live_indices] = rebuilt_state.reshape(
-                num_layers, num_reqs, *rebuilt_state.shape[1:]
+            _rebuild_gdn_live_state_for_self_draft(
+                state_window,
+                state_cache=state_cache,
+                state_input_indices=state_input_indices,
+                boundary_indices=boundary_indices,
+                live_indices=live_indices,
+                token_count=tail_lens_after,
             )
         # EAGLE/MTP owns a separate draft recurrent cache. Its next target
         # verify restores target temporal state from boundary_indices, so

@@ -349,9 +349,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         try:
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
             if forward_batch.seq_lens_cpu is None:
-                # Normal decode reuses the one-shot host mirror prepared with
-                # the boundary oracle below. Keep this defensive path for
-                # direct unit/integration callers that bypass that entrypoint.
                 forward_batch.seq_lens_cpu = torch.tensor(
                     batch.seq_lens.detach().cpu().tolist(),
                     dtype=torch.int64,
@@ -535,9 +532,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             prefill_prefix_lens = [int(x) for x in batch.prefix_lens]
         seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         if not self.is_dvr_eagle and prefill_prefix_lens is None:
-            # ForwardBatch.init_new consumes this one-shot cache. Reuse the
-            # boundary oracle's required D2H result instead of synchronizing a
-            # second time when self draft builds its graph input.
             batch.seq_lens_cpu_cache = torch.tensor(
                 seq_lens_cpu, dtype=torch.int64, device="cpu"
             )
@@ -736,17 +730,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 is_verify=True,
             )
 
-        if not self.is_dvr_eagle:
-            # The provisional decode graphs deliberately discard their
-            # ordinary-DECODE WAR events. Target verify is self-DVR's final
-            # shared-pool reader, so publish one authoritative event only after
-            # its replay has completed. Later sampling, logprob, and state
-            # commit can overlap with scheduling without exposing mutable pool
-            # metadata to the verifier.
-            read_done = torch.get_device_module(self.device).Event()
-            read_done.record()
-            self.model_runner.war_fastpath_read_done_event = read_done
-
         if batch.has_grammar:
             vocab_mask = generate_token_bitmask(
                 batch.reqs,
@@ -792,24 +775,13 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             )
         new_seq_lens = scheduler_seq_lens + accept_lens
         if on_publish is not None:
-            # Publish as soon as acceptance determines the next scheduler
-            # lengths. Exact logprob, rollback, and recurrent-state commit stay
-            # ordered later on the same forward stream, while host scheduling
-            # can overlap with that post-verify work.
+            # FutureMap publishes only next-iteration lengths. Shared-pool
+            # mutation remains fenced by the WAR event recorded after DVR
+            # rollback/checkpoint, so host scheduling may overlap this tail.
             on_publish(new_seq_lens)
         has_verify_tokens = (
             not batch.forward_mode.is_idle() and accept_lens.numel() > 0
         )
-
-        if has_verify_tokens and batch.return_logprob:
-            with spec_stage_span("verify_logprob"):
-                compute_spec_v2_logprobs(
-                    batch,
-                    logits_output,
-                    predict,
-                    accept_index,
-                    self.num_draft_steps,
-                )
 
         if has_verify_tokens:
             accept_tokens = predict[accept_index]
@@ -835,6 +807,38 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 accept_lens=accept_lens,
             )
 
+        if linear_state_ctx is not None:
+            # FutureMap readiness must cover the state consumed by the next
+            # overlap forward, not only accepted sequence lengths.
+            with spec_stage_span("dvr_checkpoint"):
+                self.linear_state.backup_boundary_state(
+                    batch, preserve_existing=False, ctx=linear_state_ctx
+                )
+        elif self.is_dvr_eagle:
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                self.num_draft_tokens,
+            )
+        if not self.is_dvr_eagle:
+            # Provisional draft graphs discard their ordinary-DECODE event.
+            # Rollback and checkpoint backup still touch shared request/state
+            # pools, so this is self-DVR's actual final-reader boundary.
+            read_done = torch.get_device_module(self.device).Event()
+            read_done.record()
+            self.model_runner.war_fastpath_read_done_event = read_done
+        if has_verify_tokens and batch.return_logprob:
+            with spec_stage_span("verify_logprob"):
+                compute_spec_v2_logprobs(
+                    batch,
+                    logits_output,
+                    predict,
+                    accept_index,
+                    self.num_draft_steps,
+                )
+
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -848,21 +852,4 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
         )
-        if linear_state_ctx is not None:
-            # Radix insertion may rebind a request's logical ping-pong slot
-            # before the next overlap iteration. Keep the just-committed target
-            # state authoritative and restore it into whichever physical slot
-            # owns that logical boundary on the next verify.
-            with spec_stage_span("dvr_checkpoint"):
-                self.linear_state.backup_boundary_state(
-                    batch, preserve_existing=False, ctx=linear_state_ctx
-                )
-        elif self.is_dvr_eagle:
-            commit_mamba_states_after_verify(
-                self.target_worker,
-                batch,
-                accept_lens,
-                accept_index,
-                self.num_draft_tokens,
-            )
         return batch_result

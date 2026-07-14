@@ -14,12 +14,13 @@ PROFILE_DIR="${RESULT_ROOT}/torch-profile"
 
 mkdir -p "${RESULT_ROOT}"
 
-request_payload="$(printf '{"text":"Explain why deterministic verification can validate provisional decoding.","sampling_params":{"temperature":0,"max_new_tokens":%s,"ignore_eos":true}}' "${MAX_NEW_TOKENS}")"
+profile_input_ids='[10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25]'
+request_payload="$(printf '{"input_ids":%s,"sampling_params":{"temperature":0,"max_new_tokens":%s,"ignore_eos":true}}' "${profile_input_ids}" "${MAX_NEW_TOKENS}")"
 profile_payload="$(printf '{"output_dir":"%s","num_steps":%s,"activities":["CPU","GPU"],"record_shapes":false,"with_stack":false,"profile_prefix":"dvr-decode"}' "${PROFILE_DIR}" "${PROFILE_NUM_STEPS}")"
 
 # Warm kernels before collecting a decode-only trace.
 curl -fsS -H 'Content-Type: application/json' \
-  -d '{"text":"Warm up DVR profiling.","sampling_params":{"temperature":0,"max_new_tokens":32,"ignore_eos":true}}' \
+  -d "{\"input_ids\":${profile_input_ids},\"sampling_params\":{\"temperature\":0,\"max_new_tokens\":32,\"ignore_eos\":true}}" \
   "${BASE_URL}/generate" >"${RESULT_ROOT}/warmup_response.json"
 
 curl -fsS -H 'Content-Type: application/json' \

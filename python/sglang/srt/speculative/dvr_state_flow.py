@@ -257,6 +257,8 @@ class DVRLinearStateLifecycle:
     ) -> Optional[DVRLinearStateContext]:
         # Overlap result processing may rebind a logical request checkpoint
         # after draft preparation but before target verify reaches this stream.
+        # Resolving the current GPU lengths also waits for asynchronous
+        # self-draft graph writes before target state is restored in place.
         self._ensure_boundary_state(batch)
         ctx = self.state_context(batch, require_boundary=True)
         if ctx is None:

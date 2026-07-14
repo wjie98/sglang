@@ -299,6 +299,25 @@ field restoration: that would duplicate CUDA graph workspaces and complicate
 GDN adapter ownership for a smaller gain. Reconsider only if
 `draft_context_gate` is materially larger on the target server.
 
+## Self-draft state rebuild and synchronization gate
+
+The A40 profile also justified one narrower GDN optimization. Rebuilding the
+accepted self-draft state directly from request-local state-window slots avoids
+materializing per-layer gathered inputs and a separate final-state tensor. On
+the fixed 0.8B trace, rollback CPU time fell from about 1.86 ms to 1.57 ms and
+rollback GPU time from about 0.70 ms to 0.41 ms. Keep this fused write because
+it reduces real work without changing the draft/verify/rollback contract.
+
+Do not remove the GPU-length resolution at the start of target state restore
+merely because self draft already has a host length mirror. CUDA graph replay
+returns before the 15 draft forwards finish on the device; the measured restore
+call spent about 36 ms waiting for that remaining draft work. Reusing the host
+mirror removed the wait but reproducibly allowed target restore and pool
+reclamation to race unfinished draft graph writes, ending in device-side index
+assertions. The wait overlaps useful draft GPU work and is not 36 ms of idle
+device time. Revisit it only together with an explicit, backend-independent
+graph completion/ownership contract and an end-to-end throughput gain.
+
 ## Development and release tests
 
 The full 0.8B/35B/80B matrix is a development qualification suite and may rely
