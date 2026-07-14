@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 import torch
 
@@ -166,7 +166,12 @@ class DVRLinearStateLifecycle:
                 checkpoint = self._checkpoint(req)
                 if checkpoint is None or not checkpoint.publish_pending:
                     continue
-                self._publish_boundary_checkpoint(batch, req, checkpoint)
+                req.mamba_last_track_seqlen = checkpoint.seq_len
+                req.mamba_next_track_idx = (
+                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        checkpoint.track_idx
+                    )
+                )
                 checkpoint.publish_pending = False
 
         seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
@@ -174,9 +179,7 @@ class DVRLinearStateLifecycle:
             checkpoint = self._checkpoint(req)
             if checkpoint is None:
                 continue
-            current_boundary, _ = self.boundary_and_tail_for_seq_len(
-                int(seq_lens_cpu[i])
-            )
+            current_boundary = int(seq_lens_cpu[i]) // chunk_size * chunk_size
             if current_boundary == checkpoint.seq_len + chunk_size:
                 # The preceding target verify already committed this boundary
                 # into the same request-local slot. Advance host metadata from
@@ -186,7 +189,7 @@ class DVRLinearStateLifecycle:
             elif checkpoint.seq_len != current_boundary:
                 del self.boundaries[req.req_pool_idx]
 
-        self.ensure_boundary_state(
+        self._ensure_boundary_state(
             batch,
             seq_lens_cpu=seq_lens_cpu,
             prefill_prefix_lens=prefill_prefix_lens,
@@ -254,7 +257,7 @@ class DVRLinearStateLifecycle:
     ) -> Optional[DVRLinearStateContext]:
         # Overlap result processing may rebind a logical request checkpoint
         # after draft preparation but before target verify reaches this stream.
-        self.ensure_boundary_state(batch)
+        self._ensure_boundary_state(batch)
         ctx = self.state_context(batch, require_boundary=True)
         if ctx is None:
             return None
@@ -367,125 +370,13 @@ class DVRLinearStateLifecycle:
             boundary_indices=boundary_indices,
         )
 
-    def boundary_and_tail_for_seq_len(self, seq_len: int) -> Tuple[int, int]:
-        chunk_size = self._state_adapter.chunk_size
-        boundary_seqlen = (seq_len // chunk_size) * chunk_size
-        verified_tail_len = seq_len - boundary_seqlen
-        return boundary_seqlen, verified_tail_len
-
     @staticmethod
     def batch_seq_lens_cpu(batch: ScheduleBatch) -> List[int]:
         if batch.seq_lens_cpu is not None:
             return [int(x) for x in batch.seq_lens_cpu.tolist()]
         return [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
 
-    def set_boundary_checkpoint(
-        self,
-        batch: ScheduleBatch,
-        req,
-        track_idx: int,
-        boundary_seqlen: int,
-        publish_to_request: bool,
-    ):
-        slot = req.req_pool_idx
-        if slot is None:
-            raise RuntimeError("DVR cannot own a checkpoint without a request slot.")
-        checkpoint = _DVRBoundaryCheckpoint(
-            rid=req.rid,
-            track_idx=track_idx,
-            seq_len=boundary_seqlen,
-            publish_pending=not publish_to_request,
-        )
-        self.boundaries[slot] = checkpoint
-        if checkpoint.publish_pending:
-            return
-        self._publish_boundary_checkpoint(batch, req, checkpoint)
-
-    @staticmethod
-    def _publish_boundary_checkpoint(
-        batch: ScheduleBatch, req, checkpoint: _DVRBoundaryCheckpoint
-    ) -> None:
-        req.mamba_last_track_seqlen = checkpoint.seq_len
-        req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-            checkpoint.track_idx
-        )
-
-    def init_boundary_for_req(
-        self,
-        batch: ScheduleBatch,
-        req,
-        boundary_seqlen: int,
-        prefill_prefix_len: Optional[int],
-        publish_to_request: bool,
-    ) -> Optional[torch.Tensor]:
-        chunk_size = self._state_adapter.chunk_size
-        assert boundary_seqlen % chunk_size == 0
-        last_track_seqlen = req.mamba_last_track_seqlen
-        if last_track_seqlen is not None and last_track_seqlen > 0:
-            assert last_track_seqlen % chunk_size == 0, (
-                "DVR linear-state verify must not reuse non-chunk-boundary "
-                "checkpoints."
-            )
-        checkpoint_track_idx = (
-            batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                req.mamba_next_track_idx
-            )
-            if boundary_seqlen > 0 and last_track_seqlen == boundary_seqlen
-            else None
-        )
-        if checkpoint_track_idx is not None:
-            # Normal prefill already wrote the chunk-aligned state into the
-            # ping-pong checkpoint buffer. DVR verify mutates its boundary
-            # slot after every accepted chunk, so copy-on-write the prefill
-            # checkpoint into the request's next writable ping-pong slot before
-            # registering it as the DVR boundary.
-            boundary_track_idx = req.mamba_next_track_idx
-            dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
-            src = req.mamba_ping_pong_track_buffer[checkpoint_track_idx]
-            batch.req_to_token_pool.mamba_pool.copy_from(
-                src.reshape(-1), dst.reshape(-1)
-            )
-            self.set_boundary_checkpoint(
-                batch,
-                req,
-                boundary_track_idx,
-                boundary_seqlen,
-                publish_to_request,
-            )
-            return None
-
-        boundary_track_idx = req.mamba_next_track_idx
-        dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
-        if boundary_seqlen == 0:
-            self.set_boundary_checkpoint(
-                batch,
-                req,
-                boundary_track_idx,
-                boundary_seqlen,
-                publish_to_request,
-            )
-            return dst
-
-        if prefill_prefix_len == boundary_seqlen:
-            # GDN EXTEND copied the initial recurrent state into this request's
-            # writable track slot before consuming the unclosed prefix tail.
-            self.set_boundary_checkpoint(
-                batch,
-                req,
-                boundary_track_idx,
-                boundary_seqlen,
-                publish_to_request,
-            )
-            return None
-
-        raise RuntimeError(
-            "DVR target prefill did not publish the required request-local "
-            "linear-state checkpoint: "
-            f"rid={req.rid}, boundary={boundary_seqlen}, "
-            f"last_track={last_track_seqlen}, prefix={prefill_prefix_len}."
-        )
-
-    def ensure_boundary_state(
+    def _ensure_boundary_state(
         self,
         batch: ScheduleBatch,
         ctx: Optional[DVRLinearStateContext] = None,
@@ -497,30 +388,74 @@ class DVRLinearStateLifecycle:
         ctx = ctx or self.state_context(batch)
         if ctx is None:
             return
+        chunk_size = self._state_adapter.chunk_size
         zero_boundary_indices = []
         reset_pos_indices = []
         reset_pos_values = []
         seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
         for i, req in enumerate(batch.reqs):
             if self._checkpoint(req) is None:
-                boundary_seqlen, verified_tail_len = (
-                    self.boundary_and_tail_for_seq_len(int(seq_lens_cpu[i]))
-                )
+                seq_len = int(seq_lens_cpu[i])
+                boundary_seqlen = seq_len // chunk_size * chunk_size
+                verified_tail_len = seq_len - boundary_seqlen
                 reset_pos_indices.append(ctx.state_input_indices[i])
                 reset_pos_values.append(verified_tail_len)
-                zero_boundary_idx = self.init_boundary_for_req(
-                    batch,
-                    req,
-                    boundary_seqlen,
-                    (
-                        None
-                        if prefill_prefix_lens is None
-                        else int(prefill_prefix_lens[i])
-                    ),
-                    publish_to_request,
+                last_track_seqlen = req.mamba_last_track_seqlen
+                if last_track_seqlen is not None and last_track_seqlen > 0:
+                    assert last_track_seqlen % chunk_size == 0, (
+                        "DVR linear-state verify must not reuse non-chunk-boundary "
+                        "checkpoints."
+                    )
+
+                boundary_track_idx = req.mamba_next_track_idx
+                if boundary_seqlen > 0 and last_track_seqlen == boundary_seqlen:
+                    # Normal prefill owns the keep slot. DVR copy-on-writes it
+                    # into the request's next writable slot before verify starts.
+                    keep_idx = batch.req_to_token_pool.get_mamba_ping_pong_keep_idx(
+                        req
+                    )
+                    src = req.mamba_ping_pong_track_buffer[keep_idx]
+                    dst = req.mamba_ping_pong_track_buffer[boundary_track_idx]
+                    batch.req_to_token_pool.mamba_pool.copy_from(
+                        src.reshape(-1), dst.reshape(-1)
+                    )
+                elif boundary_seqlen == 0:
+                    zero_boundary_indices.append(
+                        req.mamba_ping_pong_track_buffer[boundary_track_idx]
+                    )
+                elif (
+                    prefill_prefix_lens is None
+                    or int(prefill_prefix_lens[i]) != boundary_seqlen
+                ):
+                    raise RuntimeError(
+                        "DVR target prefill did not publish the required "
+                        "request-local linear-state checkpoint: "
+                        f"rid={req.rid}, boundary={boundary_seqlen}, "
+                        f"last_track={last_track_seqlen}, "
+                        "prefix="
+                        f"{None if prefill_prefix_lens is None else int(prefill_prefix_lens[i])}."
+                    )
+                # Otherwise GDN EXTEND copied the initial recurrent state into
+                # this writable slot before consuming the unclosed prefix tail.
+                slot = req.req_pool_idx
+                if slot is None:
+                    raise RuntimeError(
+                        "DVR cannot own a checkpoint without a request slot."
+                    )
+                checkpoint = _DVRBoundaryCheckpoint(
+                    rid=req.rid,
+                    track_idx=boundary_track_idx,
+                    seq_len=boundary_seqlen,
+                    publish_pending=not publish_to_request,
                 )
-                if zero_boundary_idx is not None:
-                    zero_boundary_indices.append(zero_boundary_idx)
+                self.boundaries[slot] = checkpoint
+                if publish_to_request:
+                    req.mamba_last_track_seqlen = boundary_seqlen
+                    req.mamba_next_track_idx = (
+                        batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                            boundary_track_idx
+                        )
+                    )
         if zero_boundary_indices:
             boundary_indices_to_zero = torch.stack(zero_boundary_indices).to(
                 device=ctx.live_indices.device, dtype=torch.long
