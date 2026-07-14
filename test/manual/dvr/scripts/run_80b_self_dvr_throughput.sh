@@ -12,13 +12,23 @@ PORT="${PORT:-30180}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/80b-self-dvr-throughput}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
+RUN_BASELINE_SYNC="${RUN_BASELINE_SYNC:-${RUN_BASELINE}}"
+RUN_BASELINE_OVERLAP="${RUN_BASELINE_OVERLAP:-${RUN_BASELINE}}"
 RUN_DVR="${RUN_DVR:-1}"
 SHAREGPT_MAX_CONCURRENCY="${SHAREGPT_MAX_CONCURRENCY:-3}"
 LONGBENCH_MAX_CONCURRENCY="${LONGBENCH_MAX_CONCURRENCY:-2}"
 MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-16}"
+TP_SIZE="${TP_SIZE:-4}"
+PAGE_SIZE="${PAGE_SIZE:-64}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
+LINEAR_ATTN_BACKEND="${LINEAR_ATTN_BACKEND:-triton}"
+DISABLE_RADIX_CACHE="$(resolve_radix_setting "${ATTENTION_BACKEND}" "${DISABLE_RADIX_CACHE:-auto}")"
+DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-0}"
 SERVER_PID=""
 SERVER_MAX_CONCURRENCY="${SHAREGPT_MAX_CONCURRENCY}"
 CUDA_GRAPH_BS=()
+RADIX_ARGS=()
+CUSTOM_AR_ARGS=()
 
 if ((LONGBENCH_MAX_CONCURRENCY > SERVER_MAX_CONCURRENCY)); then
   SERVER_MAX_CONCURRENCY="${LONGBENCH_MAX_CONCURRENCY}"
@@ -26,8 +36,26 @@ fi
 for ((bs = 1; bs <= SERVER_MAX_CONCURRENCY; bs++)); do
   CUDA_GRAPH_BS+=("${bs}")
 done
+if [[ "${DISABLE_RADIX_CACHE}" == "1" ]]; then
+  RADIX_ARGS=(--disable-radix-cache)
+fi
+if [[ "${DISABLE_CUSTOM_ALL_REDUCE}" == "1" ]]; then
+  CUSTOM_AR_ARGS=(--disable-custom-all-reduce)
+fi
 
 mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
+write_run_metadata "${RESULT_ROOT}"
+append_run_config "${RESULT_ROOT}" \
+  "script=$(basename "$0")" "model=${MODEL_PATH}" \
+  "sharegpt_dataset=${SHAREGPT_DATASET}" \
+  "longbench_dataset=${LONGBENCH_CUSTOM_DATASET}" \
+  "tp=${TP_SIZE}" "page_size=${PAGE_SIZE}" \
+  "attention_backend=${ATTENTION_BACKEND}" \
+  "linear_attn_backend=${LINEAR_ATTN_BACKEND}" \
+  "disable_radix_cache=${DISABLE_RADIX_CACHE}" \
+  "disable_custom_all_reduce=${DISABLE_CUSTOM_ALL_REDUCE}" \
+  "sharegpt_concurrency=${SHAREGPT_MAX_CONCURRENCY}" \
+  "longbench_concurrency=${LONGBENCH_MAX_CONCURRENCY}"
 
 cleanup() {
   stop_process_group "${SERVER_PID}"
@@ -83,36 +111,46 @@ run_benchmark_matrix() {
   run_bench "80b_${label}_longbench_logprob_true" "${LONGBENCH_CUSTOM_DATASET}" "custom" "${LONGBENCH_MAX_CONCURRENCY}" true
 }
 
-run_baseline() {
-  local server_log="${RESULT_ROOT}/logs/80b_baseline_server.log"
+run_baseline_mode() {
+  local label="$1"
+  local overlap_enabled="$2"
+  local server_log="${RESULT_ROOT}/logs/80b_${label}_server.log"
+  local overlap_args=()
+  if [[ "${overlap_enabled}" == "0" ]]; then
+    overlap_args=(--disable-overlap-schedule)
+  fi
 
-  echo "==> Starting 80B no-DVR baseline server on ${BASE_URL}"
+  echo "==> Starting 80B no-DVR ${label} server on ${BASE_URL}"
   setsid env \
     PYTHONPATH="${PYTHONPATH}" \
     conda run --no-capture-output -n "${CONDA_ENV}" python -m sglang.launch_server \
       --model-path "${MODEL_PATH}" \
       --host 127.0.0.1 \
       --port "${PORT}" \
-      --tp-size 4 \
+      --tp-size "${TP_SIZE}" \
       --context-length 8192 \
       --max-total-tokens 6144 \
       --mem-fraction-static 0.9 \
       --max-running-requests "${SERVER_MAX_CONCURRENCY}" \
       --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}" \
-      --page-size 1 \
-      --attention-backend triton \
-      --linear-attn-backend triton \
+      --page-size "${PAGE_SIZE}" \
+      --attention-backend "${ATTENTION_BACKEND}" \
+      --linear-attn-backend "${LINEAR_ATTN_BACKEND}" \
       --sampling-backend pytorch \
       --cuda-graph-bs "${CUDA_GRAPH_BS[@]}" \
       --cuda-graph-max-bs "${SERVER_MAX_CONCURRENCY}" \
-      --disable-overlap-schedule \
+      "${RADIX_ARGS[@]}" \
+      "${CUSTOM_AR_ARGS[@]}" \
+      "${overlap_args[@]}" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &
   SERVER_PID="$!"
 
   wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
   assert_server_capacity "${server_log}" "${SERVER_MAX_CONCURRENCY}"
-  run_benchmark_matrix "baseline"
+  assert_server_config \
+    "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${overlap_enabled}" "${DISABLE_RADIX_CACHE}"
+  run_benchmark_matrix "${label}"
   stop_process_group "${SERVER_PID}"
   SERVER_PID=""
 }
@@ -135,15 +173,15 @@ run_one_mode() {
       --model-path "${MODEL_PATH}" \
       --host 127.0.0.1 \
       --port "${PORT}" \
-      --tp-size 4 \
+      --tp-size "${TP_SIZE}" \
       --context-length 8192 \
       --max-total-tokens 6144 \
       --mem-fraction-static 0.9 \
       --max-running-requests "${SERVER_MAX_CONCURRENCY}" \
       --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}" \
-      --page-size 64 \
-      --attention-backend triton \
-      --linear-attn-backend triton \
+      --page-size "${PAGE_SIZE}" \
+      --attention-backend "${ATTENTION_BACKEND}" \
+      --linear-attn-backend "${LINEAR_ATTN_BACKEND}" \
       --sampling-backend pytorch \
       --enable-deterministic-inference \
       --speculative-algorithm DECODE_VERIFY_ROLLBACK \
@@ -151,6 +189,8 @@ run_one_mode() {
       --speculative-num-steps 15 \
       --cuda-graph-bs "${CUDA_GRAPH_BS[@]}" \
       --cuda-graph-max-bs "${SERVER_MAX_CONCURRENCY}" \
+      "${RADIX_ARGS[@]}" \
+      "${CUSTOM_AR_ARGS[@]}" \
       "${overlap_args[@]}" \
       "$@" \
       --skip-server-warmup \
@@ -159,6 +199,8 @@ run_one_mode() {
 
   wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
   assert_server_capacity "${server_log}" "${SERVER_MAX_CONCURRENCY}"
+  assert_server_config \
+    "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
 
   run_benchmark_matrix "${label}"
 
@@ -190,6 +232,31 @@ for path in sorted(glob.glob(os.path.join(base, "results", "80b_*.jsonl"))):
             row.get("duration"),
         )
     )
+
+rows = {}
+for path in glob.glob(os.path.join(base, "results", "80b_*.jsonl")):
+    with open(path) as f:
+        records = [line for line in f if line.strip()]
+    if records:
+        rows[os.path.basename(path)] = json.loads(records[-1])
+
+for dataset in ("sharegpt", "longbench"):
+    for logprob in ("false", "true"):
+        for mode, baseline_mode in (("v1", "baseline_sync"), ("v2", "baseline_overlap")):
+            baseline = rows.get(f"80b_{baseline_mode}_{dataset}_logprob_{logprob}.jsonl")
+            row = rows.get(f"80b_{mode}_{dataset}_logprob_{logprob}.jsonl")
+            if baseline is None or row is None:
+                continue
+            acceptance = min(1.0, (row.get("accept_length") or 0.0) / 16.0)
+            target = baseline["output_throughput"] * acceptance
+            efficiency = row["output_throughput"] / target if target else float("nan")
+            print(
+                f"TARGET {mode} dataset={dataset} logprob={logprob} "
+                f"actual={row['output_throughput']:.2f} "
+                f"acceptance_x_baseline={target:.2f} "
+                f"dvr_ratio={row['output_throughput'] / baseline['output_throughput']:.3f} "
+                f"target_efficiency={efficiency:.3f}"
+            )
 PY
 }
 
@@ -198,13 +265,16 @@ require_file "${SHAREGPT_DATASET}"
 require_file "${LONGBENCH_CUSTOM_DATASET}"
 
 # Fixed reproduced口径:
-# - baseline: normal no-DVR decode, overlap disabled.
+# - baseline_sync/v1 and baseline_overlap/v2 use matching scheduler modes.
 # - v1: compatibility scheduler, overlap disabled.
 # - v2: spec-v2 worker with overlap enabled.
 # - server/graph concurrency is the maximum requested by either dataset.
 # - max_mamba_cache_size must cover that concurrency without a runtime reduction.
-if [[ "${RUN_BASELINE}" == "1" ]]; then
-  run_baseline
+if [[ "${RUN_BASELINE_SYNC}" == "1" ]]; then
+  run_baseline_mode baseline_sync 0
+fi
+if [[ "${RUN_BASELINE_OVERLAP}" == "1" ]]; then
+  run_baseline_mode baseline_overlap 1
 fi
 if [[ "${RUN_DVR}" == "1" ]]; then
   run_one_mode "v1" "0"

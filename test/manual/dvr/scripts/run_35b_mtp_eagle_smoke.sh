@@ -18,8 +18,11 @@ MTP_REALDATA_MIN_ACCEPT_RATE="${MTP_REALDATA_MIN_ACCEPT_RATE:-0.70}"
 MTP_REALDATA_NUM_PROMPTS="${MTP_REALDATA_NUM_PROMPTS:-8}"
 MTP_REALDATA_MAX_NEW="${MTP_REALDATA_MAX_NEW:-64}"
 MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-}"
+TP_SIZE="${TP_SIZE:-4}"
+PAGE_SIZE="${PAGE_SIZE:-64}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
-DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
+LINEAR_ATTN_BACKEND="${LINEAR_ATTN_BACKEND:-triton}"
+DISABLE_RADIX_CACHE="$(resolve_radix_setting "${ATTENTION_BACKEND}" "${DISABLE_RADIX_CACHE:-auto}")"
 RUN_SYNC="${RUN_SYNC:-1}"
 RUN_OVERLAP="${RUN_OVERLAP:-1}"
 BASE_URL="http://127.0.0.1:${PORT}"
@@ -27,6 +30,14 @@ RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/
 SERVER_PID=""
 
 mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
+write_run_metadata "${RESULT_ROOT}"
+append_run_config "${RESULT_ROOT}" \
+  "script=$(basename "$0")" "model=${MODEL_PATH}" "draft_model=${DRAFT_MODEL_PATH}" \
+  "tp=${TP_SIZE}" "page_size=${PAGE_SIZE}" \
+  "attention_backend=${ATTENTION_BACKEND}" \
+  "linear_attn_backend=${LINEAR_ATTN_BACKEND}" \
+  "disable_radix_cache=${DISABLE_RADIX_CACHE}" \
+  "draft_tokens=${SPEC_DRAFT_TOKENS}" "draft_steps=${SPEC_STEPS}"
 
 cleanup() {
   stop_process_group "${SERVER_PID}"
@@ -64,18 +75,18 @@ run_one_mode() {
       --model-path "${MODEL_PATH}" \
       --host 127.0.0.1 \
       --port "${PORT}" \
-      --tp-size 4 \
+      --tp-size "${TP_SIZE}" \
       --speculative-algorithm DECODE_VERIFY_ROLLBACK_EAGLE \
       --speculative-draft-model-path "${DRAFT_MODEL_PATH}" \
       --speculative-num-draft-tokens "${SPEC_DRAFT_TOKENS}" \
       --speculative-num-steps "${SPEC_STEPS}" \
       --speculative-eagle-topk 1 \
-      --page-size 1 \
+      --page-size "${PAGE_SIZE}" \
       --context-length 4096 \
       --max-total-tokens 8192 \
       --mem-fraction-static 0.72 \
       --attention-backend "${ATTENTION_BACKEND}" \
-      --linear-attn-backend triton \
+      --linear-attn-backend "${LINEAR_ATTN_BACKEND}" \
       --sampling-backend pytorch \
       --enable-deterministic-inference \
       --cuda-graph-bs 1 2 4 \
@@ -89,6 +100,9 @@ run_one_mode() {
   SERVER_PID="$!"
 
   wait_for_server "${BASE_URL}" 600 "${SERVER_PID}" "${server_log}"
+  assert_server_capacity "${server_log}" 4
+  assert_server_config \
+    "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
 
   echo "==> Running ${label} returned-logprob KL smoke"
   # Acceptance is used here as a hidden/state consistency oracle.  Keep it

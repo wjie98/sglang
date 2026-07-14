@@ -59,7 +59,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.laun
   --host 127.0.0.1 --port 30124 \
   --speculative-algorithm DECODE_VERIFY_ROLLBACK \
   --speculative-num-draft-tokens 16 \
-  --page-size 1 \
+  --page-size 64 \
   --mem-fraction-static 0.45 \
   --attention-backend triton \
   --linear-attn-backend triton \
@@ -115,11 +115,11 @@ Fixed no-DVR/self-DVR/DVR-EAGLE throughput comparison:
 test/manual/dvr/scripts/run_35b_dvr_throughput.sh
 ```
 
-It uses 8 ShareGPT requests, 512 generated tokens, concurrency 4, and runs both
+It uses 8 ShareGPT requests, 512 generated tokens, concurrency 3, and runs both
 returned-logprob modes.  Self-v1/v2 also run the TP=4 boundary KL client before
 the benchmark.  EAGLE correctness and per-prompt acceptance remain the
 responsibility of `run_35b_mtp_eagle_smoke.sh`; the throughput script measures
-the five matching server modes without duplicating that matrix.
+the six matching server modes without duplicating that matrix.
 
 Self-DVR server:
 
@@ -131,7 +131,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.laun
   --tp-size 4 \
   --speculative-algorithm DECODE_VERIFY_ROLLBACK \
   --speculative-num-draft-tokens 16 \
-  --page-size 1 \
+  --page-size 64 \
   --context-length 4096 \
   --max-total-tokens 8192 \
   --mem-fraction-static 0.72 \
@@ -161,7 +161,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.laun
   --speculative-num-draft-tokens 2 \
   --speculative-num-steps 1 \
   --speculative-eagle-topk 1 \
-  --page-size 1 \
+  --page-size 64 \
   --context-length 4096 \
   --max-total-tokens 8192 \
   --mem-fraction-static 0.72 \
@@ -230,23 +230,54 @@ the source of truth for this matrix:
 test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh
 ```
 
-The reproduced口径 is 16 requests, 1024 generated tokens, ShareGPT
+The reproduced setup is 16 requests, 1024 generated tokens, ShareGPT
 `max_concurrency=3`, and fixed LongBench custom-cache input with
 `max_concurrency=2`.  The server command pins `--max-mamba-cache-size 16`; do
 not omit it when comparing against the reference numbers.  The default script
 run includes the matching normal no-DVR baseline before DVR v1 and v2.
 
-Compare every DVR run with a no-DVR baseline launched with the same backend, TP
-size, context length, request rate, request count, and output length.  Report:
+Compare every DVR run with a no-DVR baseline launched with the same scheduler
+mode, page size, backend, radix setting, TP size, context length, request rate,
+request count, output length, and returned-logprob mode. Report:
 
 ```text
-effective_dvr_throughput = output_throughput * accept_rate
-dvr_ratio = effective_dvr_throughput / no_dvr_output_throughput
+acceptance_fraction = accept_length / speculative_num_draft_tokens
+target_tps = matching_baseline_tps * acceptance_fraction
+dvr_ratio = dvr_output_throughput / matching_baseline_tps
+target_efficiency = dvr_output_throughput / target_tps
 ```
 
-For every throughput run, keep the raw benchmark JSONL and server log.  The
+The DVR output throughput already includes accepted-token acceleration; do not
+multiply it by acceptance again. For every throughput run, keep the raw
+benchmark JSONL and server log. The
 server log is the source of DVR accept rate and verifies whether draft decode
 uses CUDA graph and non-deterministic decode performance knobs.
+
+## NVLink and attention-backend qualification
+
+The H20 qualification matrix runs full-attention backends `triton`, `fa3`, and
+`flashinfer`; GDN linear-attention prefill remains Triton because exact chunk
+boundary export is a separate requirement. FlashInfer runs both baseline and
+DVR with radix disabled. No DVR backend-specific cache workaround is allowed.
+
+Run 35B at batch sizes 1, 4, and 8 to expose launch-bound and throughput-bound
+behavior. Run 80B ShareGPT and LongBench with at least 1024 generated tokens.
+For each backend keep separate sync and overlap baselines and both
+`return_logprob` modes. Record `nvidia-smi topo -m`; a PCIe-only run is not an
+NVLink custom-all-reduce result.
+
+The release goal is `target_efficiency >= 0.95` on H20/NVLink without reducing
+accepted length or server concurrency. Current A40 results are diagnostic only:
+custom all-reduce is expected to remain disabled on four PCIe-only GPUs.
+
+## Development and release tests
+
+The full 0.8B/35B/80B matrix is a development qualification suite and may rely
+on local model and dataset paths supplied through environment variables. The
+release patch should retain only parameterized DVR unit contracts, one compact
+gated-linear integration smoke, one reusable server launcher, and one KL/
+acceptance client. Do not copy benchmark scheduling or throughput calculations
+into Python clients; invoke SGLang's `bench_serving` and keep its raw JSONL.
 
 ## Regression note: returned logprobs
 

@@ -25,6 +25,57 @@ conda_python() {
   conda run --no-capture-output -n "${CONDA_ENV}" python "$@"
 }
 
+resolve_radix_setting() {
+  local attention_backend="$1"
+  local requested="${2:-auto}"
+
+  case "${requested}" in
+    0|1)
+      printf '%s\n' "${requested}"
+      ;;
+    auto)
+      if [[ "${attention_backend}" == "flashinfer" ]]; then
+        printf '1\n'
+      else
+        printf '0\n'
+      fi
+      ;;
+    *)
+      echo "DISABLE_RADIX_CACHE must be 0, 1, or auto; got ${requested}." >&2
+      return 1
+      ;;
+  esac
+}
+
+write_run_metadata() {
+  local result_root="$1"
+  local metadata_file="${result_root}/run_metadata.txt"
+
+  {
+    printf 'timestamp=%s\n' "$(date --iso-8601=seconds)"
+    printf 'commit=%s\n' "$(git rev-parse HEAD)"
+    printf 'branch=%s\n' "$(git branch --show-current)"
+    printf 'conda_env=%s\n' "${CONDA_ENV}"
+    printf 'pythonpath=%s\n' "${PYTHONPATH}"
+    printf 'cuda_visible_devices=%s\n' "${CUDA_VISIBLE_DEVICES:-all}"
+    printf '\n[gpus]\n'
+    nvidia-smi \
+      --query-gpu=index,name,memory.total,driver_version,pci.bus_id \
+      --format=csv,noheader 2>/dev/null || true
+    printf '\n[topology]\n'
+    nvidia-smi topo -m 2>/dev/null || true
+  } >"${metadata_file}"
+}
+
+append_run_config() {
+  local result_root="$1"
+  shift
+  {
+    printf '\n[run_config]\n'
+    printf '%s\n' "$@"
+  } >>"${result_root}/run_metadata.txt"
+}
+
 wait_for_server() {
   local base_url="$1"
   local timeout_sec="$2"
@@ -62,6 +113,35 @@ assert_server_capacity() {
     tail -120 "${server_log}" >&2 || true
     return 1
   fi
+}
+
+assert_server_config() {
+  local server_log="$1"
+  local attention_backend="$2"
+  local page_size="$3"
+  local overlap_enabled="$4"
+  local radix_disabled="$5"
+
+  local overlap_value="True"
+  if [[ "${overlap_enabled}" == "1" ]]; then
+    overlap_value="False"
+  fi
+  local radix_value="False"
+  if [[ "${radix_disabled}" == "1" ]]; then
+    radix_value="True"
+  fi
+
+  for expected in \
+    "attention_backend='${attention_backend}'" \
+    "page_size=${page_size}" \
+    "disable_overlap_schedule=${overlap_value}" \
+    "disable_radix_cache=${radix_value}"; do
+    if ! grep -q "${expected}" "${server_log}"; then
+      echo "Server did not resolve expected config: ${expected}" >&2
+      tail -120 "${server_log}" >&2 || true
+      return 1
+    fi
+  done
 }
 
 stop_process_group() {

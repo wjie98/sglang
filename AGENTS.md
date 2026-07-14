@@ -38,15 +38,17 @@ Use these entry points:
   - covers ShareGPT and fixed LongBench custom-cache inputs
   - covers `return_logprob=True/False`
 
-The scripts accept the common overrides `CONDA_ENV`, `MODEL_PATH`, `PORT`, and
-`RESULT_ROOT`; the 35B/80B scripts also expose dataset/model-specific override
-variables near the top of each file.  When reporting a run, include the script
-path, commit, key override variables, result directory, and whether the server
-log confirms the expected CUDA graph and effective concurrency.
+The scripts accept the common overrides `CONDA_ENV`, `MODEL_PATH`, `PORT`,
+`RESULT_ROOT`, `TP_SIZE`, `PAGE_SIZE`, `ATTENTION_BACKEND`, and
+`LINEAR_ATTN_BACKEND`; the 35B/80B scripts also expose dataset/model-specific
+variables near the top of each file. Every run writes commit, GPU, and topology
+metadata under `RESULT_ROOT`. When reporting a run, include the script path,
+key overrides, result directory, and whether the server log confirms the
+expected backend, radix mode, CUDA graph, and effective concurrency.
 
-The 0.8B and 35B scripts also accept `DISABLE_RADIX_CACHE=1`. Use this fixed
-variant to validate deterministic attention backends such as FlashInfer that
-disable prefix matching; DVR must still preserve request-local GDN checkpoints.
+`DISABLE_RADIX_CACHE` accepts `0`, `1`, or `auto`. `auto` disables radix for
+FlashInfer and keeps it for Triton/FA3. DVR must preserve request-local GDN
+checkpoints in both cases; do not add a FlashInfer-specific correctness path.
 
 Do not use the removed `SGLANG_ENABLE_SPEC_V2` environment variable.  The fixed
 scripts select the self-DVR v1 compatibility worker with
@@ -60,10 +62,19 @@ script or clearly mark it as a new baseline and keep the fixed scripts intact.
 The throughput scripts pin `--max-mamba-cache-size 16` and fail if the runtime
 reduces the requested concurrency or omits its largest CUDA graph batch.
 Their concurrency knobs must be overridden together with enough Mamba cache
-capacity; otherwise the run is not a valid comparison.  The 80B default run
-includes baseline, v1, and v2;
+capacity; otherwise the run is not a valid comparison. The throughput scripts
+launch separate no-DVR sync and overlap baselines. Compare v1/sync only with
+`baseline_sync`, and v2/overlap only with `baseline_overlap`; all sides use the
+same page size, backend, radix mode, TP, and returned-logprob setting. The 80B
+default run includes both baselines, v1, and v2;
 `RUN_BASELINE=0` or `RUN_DVR=0` may be used only to resume an interrupted
 matrix in the same `RESULT_ROOT`.
+
+Throughput reported by `bench_serving` already includes the speculative
+acceptance benefit. Compute `acceptance_fraction = accept_length / draft_tokens`,
+`target_tps = matching_baseline_tps * acceptance_fraction`, and
+`target_efficiency = dvr_tps / target_tps`. Never multiply DVR throughput by
+acceptance a second time.
 
 The 35B script exposes `CONTEXT_LENGTH` and `MAX_TOTAL_TOKENS` for separately
 reported large-batch EAGLE runs. Keep its defaults for the fixed BS=3 matrix;
