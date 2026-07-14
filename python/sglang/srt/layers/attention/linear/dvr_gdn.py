@@ -5,7 +5,6 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (
@@ -18,35 +17,11 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
 )
 from sglang.srt.utils import is_cpu
 
-__all__ = ["DVRGDNStateAdapter", "create_gdn_state_input_cache"]
+__all__ = ["DVRGDNStateAdapter"]
 
 if not is_cpu():
     import triton
     import triton.language as tl
-
-
-def _infer_gdn_state_input_shapes(
-    state_shape: Mamba2StateShape,
-) -> Tuple[int, int, int, int]:
-    """Infer local q/k and v dimensions from existing Mamba2 metadata."""
-
-    local_value_heads, value_head_dim, key_head_dim = state_shape.temporal
-    key_group_width = 2 * state_shape.state_size
-    assert key_group_width > 0
-    assert state_shape.conv_dim >= state_shape.intermediate_size
-    assert (
-        state_shape.conv_dim - state_shape.intermediate_size
-    ) % key_group_width == 0
-
-    padded_num_key_groups = (
-        state_shape.conv_dim - state_shape.intermediate_size
-    ) // key_group_width
-    assert local_value_heads > 0
-    assert state_shape.num_heads % local_value_heads == 0
-    tp_world_size = state_shape.num_heads // local_value_heads
-    assert padded_num_key_groups % tp_world_size == 0
-    local_key_heads = padded_num_key_groups // tp_world_size
-    return local_key_heads, key_head_dim, local_value_heads, value_head_dim
 
 
 if not is_cpu():
@@ -156,58 +131,6 @@ def _rebuild_gdn_state_for_self_draft(
     return final_state
 
 
-def create_gdn_state_input_cache(
-    *,
-    num_layers: int,
-    num_slots: int,
-    num_draft_tokens: int,
-    state_shape: Mamba2StateShape,
-    dtype: torch.dtype,
-    device: str,
-) -> DVRStateInputCache:
-    """Allocate the q/k/v/g/beta rolling window used by GDN DVR."""
-
-    local_key_heads, key_dim, local_value_heads, value_dim = (
-        _infer_gdn_state_input_shapes(state_shape)
-    )
-    window_len = FLA_CHUNK_SIZE + num_draft_tokens
-    q = torch.zeros(
-        num_layers,
-        num_slots,
-        window_len,
-        local_key_heads,
-        key_dim,
-        dtype=dtype,
-        device=device,
-    )
-    v = torch.zeros(
-        num_layers,
-        num_slots,
-        window_len,
-        local_value_heads,
-        value_dim,
-        dtype=dtype,
-        device=device,
-    )
-    gate = torch.zeros(
-        num_layers,
-        num_slots,
-        window_len,
-        local_value_heads,
-        dtype=torch.float32,
-        device=device,
-    )
-    return DVRStateInputCache(
-        tensors=(q, torch.zeros_like(q), v, gate, torch.zeros_like(gate)),
-        tail_lens=torch.zeros(
-            num_layers,
-            num_slots,
-            dtype=torch.int32,
-            device=device,
-        ),
-    )
-
-
 @dataclass
 class DVRGDNStateAdapter:
     """Adapter for DVR state replay in gated linear-state layers.
@@ -245,17 +168,64 @@ class DVRGDNStateAdapter:
         if num_draft_tokens is None:
             raise RuntimeError("DVR requires speculative_num_draft_tokens.")
 
+        state_shape = mamba_cache_params.shape
+        local_value_heads, value_dim, key_dim = state_shape.temporal
+        key_group_width = 2 * state_shape.state_size
+        assert key_group_width > 0
+        assert state_shape.conv_dim >= state_shape.intermediate_size
+        assert (
+            state_shape.conv_dim - state_shape.intermediate_size
+        ) % key_group_width == 0
+        padded_key_groups = (
+            state_shape.conv_dim - state_shape.intermediate_size
+        ) // key_group_width
+        assert local_value_heads > 0
+        assert state_shape.num_heads % local_value_heads == 0
+        tp_world_size = state_shape.num_heads // local_value_heads
+        assert padded_key_groups % tp_world_size == 0
+        local_key_heads = padded_key_groups // tp_world_size
+
+        num_slots = spec_state_size + 2
+        window_len = FLA_CHUNK_SIZE + num_draft_tokens
+        q = torch.zeros(
+            num_layers,
+            num_slots,
+            window_len,
+            local_key_heads,
+            key_dim,
+            dtype=mamba_cache_params.dtype.conv,
+            device=model_runner.device,
+        )
+        v = torch.zeros(
+            num_layers,
+            num_slots,
+            window_len,
+            local_value_heads,
+            value_dim,
+            dtype=mamba_cache_params.dtype.conv,
+            device=model_runner.device,
+        )
+        gate = torch.zeros(
+            num_layers,
+            num_slots,
+            window_len,
+            local_value_heads,
+            dtype=torch.float32,
+            device=model_runner.device,
+        )
+
         return cls(
             kernel_dispatcher,
             draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
-            state_input_cache=create_gdn_state_input_cache(
-                num_layers=num_layers,
-                # Slot 0 is the padded-row dummy; real DVR rows use req_pool_idx + 1.
-                num_slots=spec_state_size + 2,
-                num_draft_tokens=num_draft_tokens,
-                state_shape=mamba_cache_params.shape,
-                dtype=mamba_cache_params.dtype.conv,
-                device=model_runner.device,
+            state_input_cache=DVRStateInputCache(
+                tensors=(q, torch.zeros_like(q), v, gate, torch.zeros_like(gate)),
+                # Slot 0 is the padded-row dummy; real rows use req_pool_idx + 1.
+                tail_lens=torch.zeros(
+                    num_layers,
+                    num_slots,
+                    dtype=torch.int32,
+                    device=model_runner.device,
+                ),
             ),
         )
 

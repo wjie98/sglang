@@ -7,8 +7,39 @@ from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.linear.dvr_gdn import (
     DVRGDNStateAdapter,
-    create_gdn_state_input_cache,
 )
+
+
+def create_gdn_state_input_cache(
+    *, num_layers, num_slots, num_draft_tokens, state_shape, dtype, device
+):
+    state_cache = SimpleNamespace(
+        temporal=torch.empty(num_layers, 1, dtype=torch.float32),
+        intermediate_ssm=torch.empty(
+            num_layers, num_slots - 1, 1, dtype=torch.float32
+        ),
+    )
+    req_to_token_pool = SimpleNamespace(
+        get_speculative_mamba2_params_all_layers=lambda: state_cache
+    )
+    adapter = DVRGDNStateAdapter.for_gdn(
+        None,
+        model_runner=SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    shape=state_shape,
+                    dtype=SimpleNamespace(conv=dtype),
+                )
+            ),
+            req_to_token_pool=req_to_token_pool,
+            server_args=SimpleNamespace(
+                speculative_num_draft_tokens=num_draft_tokens
+            ),
+            spec_algorithm=SimpleNamespace(is_dvr_self_draft=lambda: False),
+            device=device,
+        ),
+    )
+    return adapter.state_input_cache
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
