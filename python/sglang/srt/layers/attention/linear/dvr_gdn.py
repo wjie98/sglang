@@ -6,7 +6,6 @@ from typing import Any, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
-from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (
@@ -103,56 +102,6 @@ if not is_cpu():
 
         p_ht = final_state + state_offset + o_v[:, None] * K + o_k[None, :]
         tl.store(p_ht, state.to(p_ht.dtype.element_ty), mask=mask_h)
-
-
-def _zero_gdn_rows_after_token_count(
-    tensor: torch.Tensor, token_count: torch.Tensor
-) -> torch.Tensor:
-    token_count = token_count.to(device=tensor.device, dtype=torch.long).clamp(
-        min=0, max=tensor.shape[1]
-    )
-    rows = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0)
-    keep = rows < token_count.unsqueeze(1)
-    view_shape = keep.shape + (1,) * (tensor.dim() - 2)
-    return torch.where(keep.view(view_shape), tensor, torch.zeros_like(tensor))
-
-
-def _rebuild_gdn_state_from_qkvg_beta_chunkwise(
-    state_inputs: Tuple[torch.Tensor, ...],
-    *,
-    initial_state: torch.Tensor,
-    token_count: Optional[Union[int, torch.Tensor]] = None,
-) -> torch.Tensor:
-    """Rebuild partial acceptance with the deterministic prefill kernel."""
-
-    q, k, v, g, beta = state_inputs
-    if token_count is None:
-        token_count = q.shape[1]
-    if isinstance(token_count, int):
-        token_count = torch.full(
-            (q.shape[0],), token_count, dtype=torch.long, device=q.device
-        )
-
-    q = _zero_gdn_rows_after_token_count(q, token_count)
-    k = _zero_gdn_rows_after_token_count(k, token_count)
-    v = _zero_gdn_rows_after_token_count(v, token_count)
-    g = _zero_gdn_rows_after_token_count(g, token_count)
-    beta = _zero_gdn_rows_after_token_count(beta, token_count)
-
-    # FLA exports the final boundary in h rather than updating initial_state.
-    cache_indices = torch.arange(q.shape[0], dtype=torch.int32, device=q.device)
-    _, _, h = chunk_gated_delta_rule(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        initial_state=initial_state.clone(),
-        initial_state_indices=cache_indices,
-        head_first=False,
-        use_qk_l2norm_in_kernel=True,
-    )
-    return h[:, -1]
 
 
 def _rebuild_gdn_state_for_self_draft(
@@ -268,7 +217,6 @@ class DVRGDNStateAdapter:
     chunk_size: int = FLA_CHUNK_SIZE
     draft_reuses_target_state: bool = False
     state_input_cache: Optional[DVRStateInputCache] = None
-    _verify_exports_boundary_state: Optional[bool] = None
 
     @classmethod
     def for_gdn(
@@ -586,15 +534,15 @@ class DVRGDNStateAdapter:
             cache_indices=dvr_indices,
             query_start_loc=None,
         )
-        exports_boundary_state = h is not None
-        if self._verify_exports_boundary_state is None:
-            self._verify_exports_boundary_state = exports_boundary_state
-        elif self._verify_exports_boundary_state != exports_boundary_state:
-            raise RuntimeError("GDN verify backend changed its boundary-state contract.")
-        if exports_boundary_state and h.shape[1] > 1:
-            state_cache.intermediate_ssm[
-                intermediate_state_indices[:batch_size].to(torch.long), 0
-            ] = h[:batch_size, 1].to(state_cache.intermediate_ssm.dtype)
+        if h is None or h.shape[1] <= 1:
+            raise RuntimeError(
+                "DVR GDN verify requires a linear-attention prefill backend "
+                "that exports exact chunk-boundary states; use Triton for "
+                "linear-attention prefill."
+            )
+        state_cache.intermediate_ssm[
+            intermediate_state_indices[:batch_size].to(torch.long), 0
+        ] = h[:batch_size, 1].to(state_cache.intermediate_ssm.dtype)
 
         value_shape = core_attn_out.shape[-2:]
         core_attn_out = core_attn_out.view(
@@ -642,40 +590,17 @@ class DVRGDNStateAdapter:
             accepted_steps,
         )
 
-        if self._verify_exports_boundary_state is None:
-            raise RuntimeError("GDN verify committed before its state scan completed.")
-        if self._verify_exports_boundary_state:
-            # Target verify stores the first crossed boundary in step 0 when
-            # the selected linear backend exports FLA's `h`.
-            self._scatter_state(
-                state_cache.temporal,
-                state_cache.intermediate_ssm,
-                boundary_indices,
-                torch.where(
-                    crosses_chunk_boundary,
-                    torch.zeros_like(tail_lens_before),
-                    no_commit_step,
-                ),
-            )
-        else:
-            # Some linear backends return only final state. Keep this fallback
-            # shape-static: zero-token rows reproduce their initial boundary,
-            # while crossed rows replay exactly one chunk. Dynamic nonzero()
-            # compaction would synchronize the host before every fallback.
-            rebuild_dvr_live_state_grouped(
-                state_input_cache=state_window,
-                temporal_state=state_cache.temporal,
-                state_input_indices=state_input_indices,
-                live_indices=boundary_indices,
-                boundary_indices=boundary_indices,
-                req_indices=req_indices,
-                token_count=torch.where(
-                    crosses_chunk_boundary,
-                    torch.full_like(tail_lens_before, self.chunk_size),
-                    torch.zeros_like(tail_lens_before),
-                ),
-                rebuild_fn=_rebuild_gdn_state_from_qkvg_beta_chunkwise,
-            )
+        # Target verify exports the first crossed boundary in step 0.
+        self._scatter_state(
+            state_cache.temporal,
+            state_cache.intermediate_ssm,
+            boundary_indices,
+            torch.where(
+                crosses_chunk_boundary,
+                torch.zeros_like(tail_lens_before),
+                no_commit_step,
+            ),
+        )
         self._scatter_state(
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],

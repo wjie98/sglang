@@ -231,6 +231,52 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
         assert torch.all(tensor[1, 2:] == 1)
 
 
+def test_gdn_verify_rejects_backend_without_boundary_states():
+    state_shape = Mamba2StateShape.create(
+        tp_world_size=2,
+        intermediate_size=32 * 128,
+        n_groups=16,
+        num_heads=32,
+        head_dim=128,
+        state_size=128,
+        conv_kernel=4,
+    )
+    cache = create_gdn_state_input_cache(
+        num_layers=1,
+        num_slots=3,
+        num_draft_tokens=2,
+        state_shape=state_shape,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    dispatcher = SimpleNamespace(
+        extend=lambda **kwargs: (torch.empty(0), None, None)
+    )
+    adapter = DVRGDNStateAdapter(
+        kernel_dispatcher=dispatcher,
+        state_input_cache=cache,
+    )
+    state_cache = SimpleNamespace(
+        temporal=torch.zeros(3, 16, 128, 128),
+        intermediate_ssm=torch.zeros(3, 1, 16, 128, 128),
+    )
+
+    with pytest.raises(RuntimeError, match="exact chunk-boundary states"):
+        adapter.forward_target_verify(
+            query=torch.zeros(1, 2, 8, 128),
+            key=torch.zeros(1, 2, 8, 128),
+            value=torch.zeros(1, 2, 16, 128),
+            g=torch.zeros(1, 2, 16),
+            beta=torch.zeros(1, 2, 16),
+            state_cache=state_cache,
+            dvr_indices=torch.tensor([0]),
+            state_input_indices=torch.tensor([1]),
+            valid_mask=torch.tensor([True]),
+            intermediate_state_indices=torch.tensor([0]),
+            layer_idx=0,
+        )
+
+
 def test_gdn_extend_preserves_cached_prefix_boundary_in_request_slot():
     conv = torch.arange(12, dtype=torch.float32).view(4, 3)
     temporal = torch.arange(20, dtype=torch.float32).view(4, 5)
