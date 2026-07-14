@@ -37,6 +37,10 @@ Use these entry points:
   - Qwen3-Next 80B no-DVR baseline and self-DVR spec v1/v2 long-output throughput
   - covers ShareGPT and fixed LongBench custom-cache inputs
   - covers `return_logprob=True/False`
+- `test/manual/dvr/scripts/profile_dvr_server.sh`
+  - profiles an already running DVR server through SGLang's standard profiler
+  - emits the coarse DVR stage spans and extracts graph-memory startup logs
+  - is development-only and must not be mixed with throughput measurements
 
 The scripts accept the common overrides `CONDA_ENV`, `MODEL_PATH`, `PORT`,
 `RESULT_ROOT`, `TP_SIZE`, `PAGE_SIZE`, `ATTENTION_BACKEND`, and

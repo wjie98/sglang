@@ -43,12 +43,14 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     record_stream_each,
     record_stream_for_v2_verify,
+    spec_stage_span,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.async_probe import maybe_detect_nan
 from sglang.srt.utils.async_probe import maybe_detect_inf
+from sglang.srt.utils.common import get_available_gpu_memory
 
 if is_cuda():
     from sgl_kernel import (
@@ -258,12 +260,28 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             and not self.server_args.disable_cuda_graph
             and not self.server_args.disable_draft_cuda_graph
         ):
+            before_mem = get_available_gpu_memory(
+                self.device, self.model_runner.gpu_id
+            )
+            logger.info(
+                "Capture DVR self-draft CUDA graph begin. avail mem=%.2f GB",
+                before_mem,
+            )
             with dvr_draft_decode_context(
                 self.model_runner, capture=True, self_draft=True
             ):
                 self.cuda_graph_runner_for_draft_decode = DecodeCudaGraphRunner(
                     self.model_runner
                 )
+            after_mem = get_available_gpu_memory(
+                self.device, self.model_runner.gpu_id
+            )
+            logger.info(
+                "Capture DVR self-draft CUDA graph end. mem usage=%.2f GB, "
+                "avail mem=%.2f GB",
+                before_mem - after_mem,
+                after_mem,
+            )
 
     def alloc_memory_pool(
         self,
@@ -628,8 +646,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     "hits the seq_len<=2 state-input boundary. Use a normal "
                     "chat-template prompt or disable DVR for this tiny prompt test."
                 )
-        self._prepare_dvr_boundary_for_verify(batch)
-        with self._draft_context():
+        with spec_stage_span("dvr_prepare"):
+            self._prepare_dvr_boundary_for_verify(batch)
+        with self._draft_context(), spec_stage_span("draft"):
             verify_input = (
                 self._draft_worker.draft(batch)
                 if self.is_dvr_eagle
@@ -639,7 +658,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         batch.spec_info = verify_input
         batch_result = self.verify(batch, verify_input, on_publish=on_publish)
         if self.is_dvr_eagle:
-            with self._draft_context():
+            with self._draft_context(), spec_stage_span("draft_extend"):
                 self.draft_worker._draft_extend_for_decode(batch, batch_result)
         return batch_result
 
@@ -677,7 +696,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         need_return_logprob = batch.return_logprob
         batch.return_logprob = False
         try:
-            with self.plan_stream_ctx:
+            with self.plan_stream_ctx, spec_stage_span("verify_prepare"):
                 verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                     spec_info,
                     self.req_to_token_pool,
@@ -708,12 +727,14 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 except NotImplementedError:
                     continue
 
-        linear_state_ctx = self.linear_state.restore_for_verify(batch)
-        forward_output = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-        )
+        with spec_stage_span("dvr_state_restore"):
+            linear_state_ctx = self.linear_state.restore_for_verify(batch)
+        with spec_stage_span("verify"):
+            forward_output = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+            )
 
         if not self.is_dvr_eagle:
             # The provisional decode graphs deliberately discard their
@@ -765,9 +786,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 penalizer.apply(
                     logits_output.next_token_logits, repeat=self.num_draft_tokens
                 )
-        predict, accept_lens, accept_index = eagle_sample(
-            spec_info, batch, logits_output, vocab_mask
-        )
+        with spec_stage_span("verify_sample"):
+            predict, accept_lens, accept_index = eagle_sample(
+                spec_info, batch, logits_output, vocab_mask
+            )
         new_seq_lens = scheduler_seq_lens + accept_lens
         if on_publish is not None:
             # Publish as soon as acceptance determines the next scheduler
@@ -780,13 +802,14 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         )
 
         if has_verify_tokens and batch.return_logprob:
-            compute_spec_v2_logprobs(
-                batch,
-                logits_output,
-                predict,
-                accept_index,
-                self.num_draft_steps,
-            )
+            with spec_stage_span("verify_logprob"):
+                compute_spec_v2_logprobs(
+                    batch,
+                    logits_output,
+                    predict,
+                    accept_index,
+                    self.num_draft_steps,
+                )
 
         if has_verify_tokens:
             accept_tokens = predict[accept_index]
@@ -805,6 +828,13 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         else:
             next_draft_input = self._self_draft_input(bonus_tokens)
 
+        with spec_stage_span("dvr_rollback"):
+            rollback_actions = self.linear_state.rollback_after_verify(
+                batch=batch,
+                ctx=linear_state_ctx,
+                accept_lens=accept_lens,
+            )
+
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -813,11 +843,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
-            dvr_rollback_actions=self.linear_state.rollback_after_verify(
-                batch=batch,
-                ctx=linear_state_ctx,
-                accept_lens=accept_lens,
-            ),
+            dvr_rollback_actions=rollback_actions,
             routed_experts_output=forward_output.routed_experts_output,
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
@@ -827,9 +853,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             # before the next overlap iteration. Keep the just-committed target
             # state authoritative and restore it into whichever physical slot
             # owns that logical boundary on the next verify.
-            self.linear_state.backup_boundary_state(
-                batch, preserve_existing=False, ctx=linear_state_ctx
-            )
+            with spec_stage_span("dvr_checkpoint"):
+                self.linear_state.backup_boundary_state(
+                    batch, preserve_existing=False, ctx=linear_state_ctx
+                )
         elif self.is_dvr_eagle:
             commit_mamba_states_after_verify(
                 self.target_worker,
