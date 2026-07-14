@@ -61,7 +61,7 @@ for event in events:
     name = event.get("name")
     if name == "cudaGraphLaunch":
         graph_launches += 1
-    if name in stage_names:
+    if name in stage_names and event.get("cat") == "user_annotation":
         durations[name].append(event["dur"] / 1000.0)
 
 print(f"cuda_graph_launches={graph_launches}")
@@ -69,6 +69,79 @@ for name, values in sorted(durations.items()):
     print(
         f"{name}: count={len(values)} mean_ms={statistics.mean(values):.3f} "
         f"median_ms={statistics.median(values):.3f} total_ms={sum(values):.3f}"
+    )
+
+# Estimate the best possible gain from replacing the per-step self-draft graphs
+# with one chain graph. Pick the GPU annotation stream that covers the widest
+# draft span, then union all kernels in each span. The uncovered fraction is a
+# conservative ceiling: a chain graph cannot remove model compute and will not
+# eliminate every dependency gap counted here.
+gpu_drafts_by_tid = collections.defaultdict(list)
+for event in events:
+    if (
+        event.get("ph") == "X"
+        and event.get("name") == "draft"
+        and event.get("cat") == "gpu_user_annotation"
+    ):
+        gpu_drafts_by_tid[event.get("tid")].append(event)
+
+if gpu_drafts_by_tid:
+    draft_spans = max(
+        gpu_drafts_by_tid.values(),
+        key=lambda group: statistics.mean(event["dur"] for event in group),
+    )
+    kernels = [
+        event
+        for event in events
+        if event.get("ph") == "X" and event.get("cat") == "kernel"
+    ]
+    total_span_us = 0.0
+    total_busy_us = 0.0
+    for draft in draft_spans:
+        start = draft["ts"]
+        end = start + draft["dur"]
+        intervals = sorted(
+            (max(start, event["ts"]), min(end, event["ts"] + event["dur"]))
+            for event in kernels
+            if event["ts"] < end and event["ts"] + event["dur"] > start
+        )
+        merged = []
+        for interval_start, interval_end in intervals:
+            if merged and interval_start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], interval_end))
+            else:
+                merged.append((interval_start, interval_end))
+        total_span_us += draft["dur"]
+        total_busy_us += sum(end - start for start, end in merged)
+
+    cpu_drafts = [
+        event
+        for event in events
+        if event.get("ph") == "X"
+        and event.get("name") == "draft"
+        and event.get("cat") == "user_annotation"
+    ]
+    draft_graph_launches = []
+    for draft in cpu_drafts:
+        start = draft["ts"]
+        end = start + draft["dur"]
+        draft_graph_launches.append(
+            sum(
+                event.get("ph") == "X"
+                and event.get("name") == "cudaGraphLaunch"
+                and start <= event.get("ts", 0) < end
+                for event in events
+            )
+        )
+
+    utilization = total_busy_us / total_span_us if total_span_us else 0.0
+    speedup_ceiling = total_span_us / total_busy_us if total_busy_us else 0.0
+    print(
+        "self_draft_chain_gate: "
+        f"iterations={len(draft_spans)} "
+        f"graph_launches_per_iteration={statistics.mean(draft_graph_launches):.1f} "
+        f"gpu_kernel_busy_fraction={utilization:.4f} "
+        f"perfect_chain_speedup_ceiling={speedup_ceiling:.4f}x"
     )
 PY
 

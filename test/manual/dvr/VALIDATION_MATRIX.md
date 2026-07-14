@@ -270,6 +270,27 @@ The release goal is `target_efficiency >= 0.95` on H20/NVLink without reducing
 accepted length or server concurrency. Current A40 results are diagnostic only:
 custom all-reduce is expected to remain disabled on four PCIe-only GPUs.
 
+## Self-draft chain CUDA graph gate
+
+Use `scripts/profile_dvr_server.sh` before replacing the per-step self-draft
+graph with a graph that captures the entire decode/sampling chain. The script
+reports the number of graph launches per draft iteration, GPU kernel busy
+fraction, and a conservative perfect-chain speedup ceiling. A chain graph is
+eligible only if a prototype preserves all sampling modes and Triton/FA3/
+FlashInfer plus Hybrid/GDN metadata semantics, does not reduce token-pool or
+request capacity, and demonstrates a stable end-to-end gain of at least 5%.
+
+The A40 0.8B measurement on 2026-07-14 rejected this optimization. The current
+15-step path launched 15 graphs per iteration, but draft GPU kernel utilization
+was already about 96.4%, limiting an ideal chain to roughly 1.04x before its own
+overhead. A capture-only probe over 15 consecutive full target forwards grew
+the self-draft graph from about 0.10 GB to 0.26 GB for capture batches
+`[1,2,4,8]`. That probe did not yet include capture-safe sampling or correct
+multi-step Hybrid/GDN metadata, so a production implementation could only add
+cost and backend-specific complexity. Keep the existing one-step graph unless
+an H20/NVLink profile crosses the gate; do not carry an unmeasured chain graph
+or an eager fallback in production.
+
 ## Development and release tests
 
 The full 0.8B/35B/80B matrix is a development qualification suite and may rely
