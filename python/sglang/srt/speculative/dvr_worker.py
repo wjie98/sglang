@@ -189,29 +189,37 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             yield
 
     def _idle_draft_input(self) -> EagleDraftInput:
+        if not self.is_dvr_eagle:
+            return EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=None,
+                dtype=None,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
         return EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=(
-                EagleDraftInput.hidden_size_for(self._draft_worker)
-                if self.is_dvr_eagle
-                else None
-            ),
-            dtype=(
-                EagleDraftInput.dtype_for(self._draft_worker)
-                if self.is_dvr_eagle
-                else None
-            ),
+            hidden_size=EagleDraftInput.hidden_size_for(self._draft_worker),
+            dtype=EagleDraftInput.dtype_for(self._draft_worker),
             topk=self.topk,
-            capture_hidden_mode=(
-                CaptureHiddenMode.LAST
-                if self.is_dvr_eagle
-                else CaptureHiddenMode.NULL
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            vocab_size=self.target_worker.model_config.vocab_size,
+        )
+
+    @staticmethod
+    def _self_draft_input(bonus_tokens: torch.Tensor) -> EagleDraftInput:
+        return EagleDraftInput(
+            hidden_states=None,
+            bonus_tokens=bonus_tokens,
+            topk_p=torch.ones(
+                (bonus_tokens.shape[0], 1),
+                dtype=torch.float32,
+                device=bonus_tokens.device,
             ),
-            vocab_size=(
-                self.target_worker.model_config.vocab_size
-                if self.is_dvr_eagle
-                else 0
-            ),
+            topk_index=bonus_tokens.to(torch.long).unsqueeze(-1),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
 
     def _sample_target_verify(
@@ -329,10 +337,26 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 self.topk, self.num_draft_steps, self.num_draft_tokens
             )
 
-        self._draft_preprocess_decode_for_self_dvr(batch)
-
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
+        penalizer = batch.sampling_info.penalizer_orchestrator
+        if penalizer is not None and penalizer.is_required:
+            penalizer.cumulate_output_tokens(spec_info.bonus_tokens.to(torch.int64))
+
+        # ScheduleBatch.prepare_for_decode already reserved the speculative
+        # window. Self draft and target verify share it; allocating again would
+        # split KV ownership between two paths.
+        offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
+            self.num_draft_tokens, dtype=torch.long, device=batch.seq_lens.device
+        ).unsqueeze(0)
+        rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
+        batch.out_cache_loc = batch.req_to_token_pool.req_to_token[
+            rows, offsets
+        ].reshape(-1)
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
+        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         spec_info.num_tokens_per_req = 1
         spec_info.num_tokens_for_logprob_per_req = 1
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -635,9 +659,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             batch_result = self.target_worker.forward_batch_generation(batch)
             batch_result.new_seq_lens = batch.seq_lens
             self._prepare_dvr_boundary_for_verify(batch)
+            if on_publish is not None:
+                on_publish(batch_result.new_seq_lens)
             if self.is_dvr_eagle:
-                if on_publish is not None:
-                    on_publish(batch_result.new_seq_lens)
                 with self._draft_context():
                     batch_result.next_draft_input = (
                         self.draft_worker._draft_extend_for_prefill(
@@ -649,22 +673,8 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     )
             else:
                 next_token_ids = batch_result.next_token_ids
-                batch.spec_info = EagleDraftInput(
-                    hidden_states=None,
-                    bonus_tokens=next_token_ids,
-                    topk_p=torch.ones(
-                        (next_token_ids.shape[0], 1),
-                        dtype=torch.float32,
-                        device=next_token_ids.device,
-                    ),
-                    topk_index=next_token_ids.to(torch.long).unsqueeze(-1),
-                    num_tokens_per_req=1,
-                    num_tokens_for_logprob_per_req=1,
-                    capture_hidden_mode=CaptureHiddenMode.NULL,
-                )
+                batch.spec_info = self._self_draft_input(next_token_ids)
                 batch_result.next_draft_input = batch.spec_info
-                if on_publish is not None:
-                    on_publish(batch_result.new_seq_lens)
             return batch_result
 
         batch_result = self._run_decode_draft_verify_rollback(
@@ -674,32 +684,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             with self._draft_context():
                 self.draft_worker._draft_extend_for_decode(batch, batch_result)
         return batch_result
-
-    def _draft_preprocess_decode_for_self_dvr(self, batch: ScheduleBatch):
-        spec_info = batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
-
-        penalizer_orchestrator = batch.sampling_info.penalizer_orchestrator
-        if penalizer_orchestrator is not None and penalizer_orchestrator.is_required:
-            penalizer_orchestrator.cumulate_output_tokens(
-                spec_info.bonus_tokens.to(torch.int64)
-            )
-
-        # ScheduleBatch.prepare_for_decode already reserved the speculative
-        # decode window and wrote it into req_to_token. Self-DVR draft and verify
-        # share that window; allocating a second one leaks KV ownership.
-        offsets = batch.seq_lens.to(torch.long).unsqueeze(1) + torch.arange(
-            self.num_draft_tokens, dtype=torch.long, device=batch.seq_lens.device
-        ).unsqueeze(0)
-        rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
-        batch.out_cache_loc = batch.req_to_token_pool.req_to_token[
-            rows, offsets
-        ].reshape(-1)
-        batch.return_hidden_states = False
-        batch.mamba_track_indices = None
-        batch.mamba_track_mask = None
-        batch.mamba_track_seqlens = None
-        spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
     def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
         with self._draft_context():
@@ -715,7 +699,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         scheduler_seq_lens = batch.seq_lens
         vocab_mask = None
-        extra_keep_alive_refs = None
 
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
@@ -790,7 +773,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             forward_batch=verify_forward_batch,
             is_verify=True,
         )
-        extra_keep_alive_refs = [verify_forward_batch]
 
         if not self.is_dvr_eagle:
             # The provisional decode graphs deliberately discard their
@@ -867,19 +849,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         if self.is_dvr_eagle:
             next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
         else:
-            next_draft_input = EagleDraftInput(
-                hidden_states=None,
-                bonus_tokens=bonus_tokens,
-                topk_p=torch.ones(
-                    (bonus_tokens.shape[0], 1),
-                    dtype=torch.float32,
-                    device=bonus_tokens.device,
-                ),
-                topk_index=bonus_tokens.to(torch.long).unsqueeze(-1),
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_tokens_per_req=1,
-                num_tokens_for_logprob_per_req=1,
-            )
+            next_draft_input = self._self_draft_input(bonus_tokens)
 
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -897,7 +867,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             ),
             routed_experts_output=forward_output.routed_experts_output,
             indexer_topk_output=forward_output.indexer_topk_output,
-            extra_keep_alive_refs=extra_keep_alive_refs,
+            extra_keep_alive_refs=[verify_forward_batch],
         )
         if linear_state_ctx is not None:
             # Radix insertion may rebind a request's logical ping-pong slot
