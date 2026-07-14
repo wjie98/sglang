@@ -17,6 +17,14 @@ class DVRLinearStateContext:
 
 
 @dataclass
+class _DVRBoundaryCheckpoint:
+    rid: str
+    track_idx: int
+    seq_len: int
+    publish_pending: bool = False
+
+
+@dataclass
 class DVRRollbackActions:
     """DVR state/cache work deferred until verified tokens are materialized."""
 
@@ -101,10 +109,9 @@ class DVRLinearStateLifecycle:
         self.server_args = server_args
         self.model_runner = model_runner
         self._state_adapter = None
-        self.boundary_seqlen = {}
-        self.boundary_track_idx = {}
-        self.pending_boundary_publish = set()
-        self.slot_owner = {}
+        # Request-pool slots are bounded and reused. Pair each checkpoint with
+        # its rid so stale state cannot survive slot reuse.
+        self.boundaries: dict[int, _DVRBoundaryCheckpoint] = {}
         # (logical request/slot keys, boundary state, draft-start live state).
         # Keep the snapshot atomic when radix rebinds physical request slots.
         self.state_backup = None
@@ -130,11 +137,18 @@ class DVRLinearStateLifecycle:
             )
 
     def clear_cache_state(self):
-        self.boundary_seqlen.clear()
-        self.boundary_track_idx.clear()
-        self.pending_boundary_publish.clear()
-        self.slot_owner.clear()
+        self.boundaries.clear()
         self.state_backup = None
+
+    def _checkpoint(self, req) -> Optional[_DVRBoundaryCheckpoint]:
+        slot = req.req_pool_idx
+        if slot is None:
+            return None
+        checkpoint = self.boundaries.get(slot)
+        if checkpoint is not None and checkpoint.rid != req.rid:
+            del self.boundaries[slot]
+            return None
+        return checkpoint
 
     def prepare_for_draft(
         self,
@@ -147,51 +161,30 @@ class DVRLinearStateLifecycle:
         if self._state_adapter is None:
             return
         chunk_size = self._state_adapter.chunk_size
-        # Batches contain only a subset of running requests. Prune ownership
-        # when a bounded request-pool slot is reused, not merely when a request
-        # is absent from the current batch.
-        for req in batch.reqs:
-            slot = getattr(req, "req_pool_idx", None)
-            if slot is None:
-                continue
-            previous_rid = self.slot_owner.get(slot)
-            if previous_rid is not None and previous_rid != req.rid:
-                self.boundary_seqlen.pop(previous_rid, None)
-                self.boundary_track_idx.pop(previous_rid, None)
-                self.pending_boundary_publish.discard(previous_rid)
-            self.slot_owner[slot] = req.rid
-
         if not defer_request_publish:
             for req in batch.reqs:
-                if req.rid not in self.pending_boundary_publish:
+                checkpoint = self._checkpoint(req)
+                if checkpoint is None or not checkpoint.publish_pending:
                     continue
-                self._publish_boundary_checkpoint(batch, req)
-                self.pending_boundary_publish.remove(req.rid)
+                self._publish_boundary_checkpoint(batch, req, checkpoint)
+                checkpoint.publish_pending = False
 
         seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
         for i, req in enumerate(batch.reqs):
-            recorded_boundary = self.boundary_seqlen.get(req.rid)
-            if recorded_boundary is None:
+            checkpoint = self._checkpoint(req)
+            if checkpoint is None:
                 continue
             current_boundary, _ = self.boundary_and_tail_for_seq_len(
                 int(seq_lens_cpu[i])
             )
-            if (
-                req.rid in self.boundary_track_idx
-                and current_boundary == recorded_boundary + chunk_size
-            ):
+            if current_boundary == checkpoint.seq_len + chunk_size:
                 # The preceding target verify already committed this boundary
                 # into the same request-local slot. Advance host metadata from
                 # the scheduler's normal seq_lens mirror instead of synchronously
                 # copying accept_lens in the worker hot path.
-                self.boundary_seqlen[req.rid] = current_boundary
-            elif (
-                req.rid not in self.boundary_track_idx
-                or recorded_boundary != current_boundary
-                or recorded_boundary % chunk_size != 0
-            ):
-                self.boundary_seqlen.pop(req.rid, None)
-                self.boundary_track_idx.pop(req.rid, None)
+                checkpoint.seq_len = current_boundary
+            elif checkpoint.seq_len != current_boundary:
+                del self.boundaries[req.req_pool_idx]
 
         self.ensure_boundary_state(
             batch,
@@ -207,14 +200,22 @@ class DVRLinearStateLifecycle:
         preserve_existing: bool = False,
         ctx: Optional[DVRLinearStateContext] = None,
     ):
+        if (
+            not self._state_adapter.draft_reuses_target_state
+            and not batch.enable_overlap
+        ):
+            # A separate synchronous draft model cannot mutate or race the
+            # target checkpoint, so target verify can read the ping-pong slot
+            # directly without copying a recurrent snapshot every iteration.
+            self.state_backup = None
+            return
         # Host logical lengths advance after overlap result processing, while
         # the target verify has already updated the physical boundary slot.
         # Key the snapshot by request-local boundary ownership. The supplied
         # verify context pins the physical slot used by this commit, while the
         # key remains valid if radix later rebinds that logical ping-pong slot.
         backup_keys = [
-            (req.rid, int(self.boundary_track_idx.get(req.rid, -1)))
-            for req in batch.reqs
+            (req.rid, self._checkpoint(req).track_idx) for req in batch.reqs
         ]
         if (
             preserve_existing
@@ -270,46 +271,65 @@ class DVRLinearStateLifecycle:
         )
         return ctx
 
-    def commit_after_verify(
+    def rollback_after_verify(
         self,
         *,
         batch: ScheduleBatch,
-        accepted_token_counts: torch.Tensor,
-        accepted_steps: torch.Tensor,
-        ctx: DVRLinearStateContext,
-    ):
-        chunk_size = self._state_adapter.chunk_size
-        pending_checkpoints = [
-            (
-                self.boundary_track_idx[req.rid],
-                self.boundary_seqlen[req.rid]
-                if self.boundary_seqlen[req.rid]
-                > (req.mamba_last_track_seqlen or 0)
-                else self.boundary_seqlen[req.rid] + chunk_size,
-            )
-            for req in batch.reqs
-        ]
-        assert ctx.boundary_indices is not None
-        if accepted_token_counts.numel() == 0:
-            return pending_checkpoints
+        ctx: Optional[DVRLinearStateContext],
+        accept_lens: torch.Tensor,
+    ) -> DVRRollbackActions:
+        pending_checkpoints = None
+        if ctx is not None:
+            chunk_size = self._state_adapter.chunk_size
+            pending_checkpoints = []
+            for req in batch.reqs:
+                checkpoint = self._checkpoint(req)
+                if checkpoint is None:
+                    raise RuntimeError(
+                        f"DVR lost the boundary checkpoint for {req.rid}."
+                    )
+                seq_len = checkpoint.seq_len
+                if seq_len <= (req.mamba_last_track_seqlen or 0):
+                    seq_len += chunk_size
+                pending_checkpoints.append((checkpoint.track_idx, seq_len))
 
-        state_input_cache = self._state_adapter.state_input_window()
-        verified_tail_lens = state_input_cache.get_tail_lens(
-            indices=ctx.state_input_indices
+            assert ctx.boundary_indices is not None
+            if accept_lens.numel() > 0:
+                verified_tail_lens = self._state_adapter.state_input_window().get_tail_lens(
+                    indices=ctx.state_input_indices
+                )
+                self._state_adapter.commit_after_verify(
+                    state_cache=ctx.state_cache,
+                    state_input_indices=ctx.state_input_indices,
+                    live_indices=ctx.live_indices,
+                    boundary_indices=ctx.boundary_indices,
+                    verified_tail_lens=verified_tail_lens.to(
+                        device=ctx.live_indices.device, dtype=torch.long
+                    ),
+                    accepted_token_counts=accept_lens.to(torch.long),
+                    accepted_steps=(accept_lens - 1).to(torch.long),
+                )
+
+        deferred = batch.spec_algorithm.is_dvr_eagle() or batch.enable_overlap
+        cache_generated_prefix = None
+        if deferred and batch.decoding_reqs:
+            cache_generated_prefix = [
+                req in batch.decoding_reqs
+                and int(
+                    batch.extend_lens[i]
+                    if batch.extend_lens is not None
+                    else req.extend_input_len
+                )
+                > 1
+                for i, req in enumerate(batch.reqs)
+            ]
+            if not any(cache_generated_prefix):
+                cache_generated_prefix = None
+
+        return DVRRollbackActions(
+            pending_checkpoints=pending_checkpoints if deferred else None,
+            cache_generated_prefix=cache_generated_prefix,
         )
-        verified_tail_lens = verified_tail_lens.to(
-            device=ctx.live_indices.device, dtype=torch.long
-        )
-        self._state_adapter.commit_after_verify(
-            state_cache=ctx.state_cache,
-            state_input_indices=ctx.state_input_indices,
-            live_indices=ctx.live_indices,
-            boundary_indices=ctx.boundary_indices,
-            verified_tail_lens=verified_tail_lens,
-            accepted_token_counts=accepted_token_counts,
-            accepted_steps=accepted_steps,
-        )
-        return pending_checkpoints
 
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
@@ -329,12 +349,15 @@ class DVRLinearStateLifecycle:
         state_cache = state_adapter.get_state_cache(batch=batch)
         boundary_indices = None
         if require_boundary:
+            checkpoints = [self._checkpoint(req) for req in batch.reqs]
+            if any(checkpoint is None for checkpoint in checkpoints):
+                raise RuntimeError("DVR target verify is missing a boundary checkpoint.")
             boundary_indices = torch.stack(
                 [
-                    req.mamba_ping_pong_track_buffer[
-                        self.boundary_track_idx[req.rid]
-                    ]
-                    for req in batch.reqs
+                    req.mamba_ping_pong_track_buffer[checkpoint.track_idx]
+                    for req, checkpoint in zip(
+                        batch.reqs, checkpoints, strict=True
+                    )
                 ]
             ).to(device=live_indices.device, dtype=torch.long)
         return DVRLinearStateContext(
@@ -364,19 +387,27 @@ class DVRLinearStateLifecycle:
         boundary_seqlen: int,
         publish_to_request: bool,
     ):
-        self.boundary_track_idx[req.rid] = track_idx
-        self.boundary_seqlen[req.rid] = boundary_seqlen
-        if not publish_to_request:
-            self.pending_boundary_publish.add(req.rid)
+        slot = req.req_pool_idx
+        if slot is None:
+            raise RuntimeError("DVR cannot own a checkpoint without a request slot.")
+        checkpoint = _DVRBoundaryCheckpoint(
+            rid=req.rid,
+            track_idx=track_idx,
+            seq_len=boundary_seqlen,
+            publish_pending=not publish_to_request,
+        )
+        self.boundaries[slot] = checkpoint
+        if checkpoint.publish_pending:
             return
-        self._publish_boundary_checkpoint(batch, req)
+        self._publish_boundary_checkpoint(batch, req, checkpoint)
 
-    def _publish_boundary_checkpoint(self, batch: ScheduleBatch, req) -> None:
-        track_idx = self.boundary_track_idx[req.rid]
-        boundary_seqlen = self.boundary_seqlen[req.rid]
-        req.mamba_last_track_seqlen = boundary_seqlen
+    @staticmethod
+    def _publish_boundary_checkpoint(
+        batch: ScheduleBatch, req, checkpoint: _DVRBoundaryCheckpoint
+    ) -> None:
+        req.mamba_last_track_seqlen = checkpoint.seq_len
         req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-            track_idx
+            checkpoint.track_idx
         )
 
     def init_boundary_for_req(
@@ -471,7 +502,7 @@ class DVRLinearStateLifecycle:
         reset_pos_values = []
         seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
         for i, req in enumerate(batch.reqs):
-            if req.rid not in self.boundary_seqlen:
+            if self._checkpoint(req) is None:
                 boundary_seqlen, verified_tail_len = (
                     self.boundary_and_tail_for_seq_len(int(seq_lens_cpu[i]))
                 )
@@ -502,41 +533,3 @@ class DVRLinearStateLifecycle:
                 indices=torch.stack(reset_pos_indices),
                 value=torch.tensor(reset_pos_values, device=ctx.live_indices.device),
             )
-
-
-def rollback_dvr_verify(
-    *,
-    batch,
-    linear_state: DVRLinearStateLifecycle,
-    linear_state_ctx: Optional[DVRLinearStateContext],
-    accept_lens: torch.Tensor,
-) -> DVRRollbackActions:
-    pending_checkpoints = None
-    if linear_state_ctx is not None:
-        pending_checkpoints = linear_state.commit_after_verify(
-            batch=batch,
-            accepted_token_counts=accept_lens.to(torch.long),
-            accepted_steps=(accept_lens - 1).to(torch.long),
-            ctx=linear_state_ctx,
-        )
-
-    deferred = batch.spec_algorithm.is_dvr_eagle() or batch.enable_overlap
-    cache_generated_prefix = None
-    if deferred and batch.decoding_reqs:
-        cache_generated_prefix = [
-            req in batch.decoding_reqs
-            and int(
-                batch.extend_lens[i]
-                if batch.extend_lens is not None
-                else req.extend_input_len
-            )
-            > 1
-            for i, req in enumerate(batch.reqs)
-        ]
-        if not any(cache_generated_prefix):
-            cache_generated_prefix = None
-
-    return DVRRollbackActions(
-        pending_checkpoints=pending_checkpoints if deferred else None,
-        cache_generated_prefix=cache_generated_prefix,
-    )

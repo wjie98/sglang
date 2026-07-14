@@ -329,16 +329,24 @@ def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
 def test_dvr_boundary_metadata_advances_from_next_scheduler_length():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle._state_adapter = SimpleNamespace(chunk_size=64)
-    lifecycle.boundary_seqlen = {"r0": 64}
-    lifecycle.boundary_track_idx = {"r0": 1}
-    lifecycle.pending_boundary_publish = set()
+    lifecycle.boundaries = {
+        0: SimpleNamespace(
+            rid="r0", track_idx=1, seq_len=64, publish_pending=False
+        )
+    }
     lifecycle.ensure_boundary_state = lambda *_args, **_kwargs: None
-    batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
+    batch = SimpleNamespace(
+        reqs=[SimpleNamespace(rid="r0", req_pool_idx=0)], enable_overlap=True
+    )
 
     lifecycle.prepare_for_draft(batch, seq_lens_cpu=[128])
 
-    assert lifecycle.boundary_seqlen == {"r0": 128}
-    assert lifecycle.boundary_track_idx == {"r0": 1}
+    checkpoint = lifecycle.boundaries[0]
+    assert (checkpoint.rid, checkpoint.track_idx, checkpoint.seq_len) == (
+        "r0",
+        1,
+        128,
+    )
 
 
 def test_dvr_prefill_boundary_uses_request_local_track_slot():
@@ -349,11 +357,10 @@ def test_dvr_prefill_boundary_uses_request_local_track_slot():
 
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle._state_adapter = SimpleNamespace(chunk_size=64)
-    lifecycle.boundary_seqlen = {}
-    lifecycle.boundary_track_idx = {}
-    lifecycle.pending_boundary_publish = set()
+    lifecycle.boundaries = {}
     req = SimpleNamespace(
         rid="r0",
+        req_pool_idx=0,
         mamba_last_track_seqlen=None,
         mamba_next_track_idx=0,
         mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
@@ -361,12 +368,16 @@ def test_dvr_prefill_boundary_uses_request_local_track_slot():
     batch = SimpleNamespace(req_to_token_pool=Pool())
 
     assert lifecycle.init_boundary_for_req(batch, req, 64, 64, False) is None
-    assert lifecycle.boundary_seqlen == {"r0": 64}
-    assert lifecycle.boundary_track_idx == {"r0": 0}
-    assert lifecycle.pending_boundary_publish == {"r0"}
+    checkpoint = lifecycle.boundaries[0]
+    assert (checkpoint.rid, checkpoint.track_idx, checkpoint.seq_len) == (
+        "r0",
+        0,
+        64,
+    )
+    assert checkpoint.publish_pending
     assert req.mamba_next_track_idx == 0
 
-    lifecycle._publish_boundary_checkpoint(batch, req)
+    lifecycle._publish_boundary_checkpoint(batch, req, checkpoint)
     assert req.mamba_next_track_idx == 1
 
     req.mamba_last_track_seqlen = None
@@ -387,8 +398,10 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
             return len(self.backup_indices)
 
     lifecycle = object.__new__(DVRLinearStateLifecycle)
-    lifecycle.boundary_seqlen = {"r0": 64}
-    lifecycle.boundary_track_idx = {"r0": 1}
+    checkpoint = SimpleNamespace(
+        rid="r0", track_idx=1, seq_len=64, publish_pending=False
+    )
+    lifecycle.boundaries = {0: checkpoint}
     lifecycle.state_backup = None
     adapter = Adapter()
     lifecycle._state_adapter = adapter
@@ -409,7 +422,9 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
         return rebound_context if len(state_context_calls) > 1 else context
 
     lifecycle.state_context = state_context
-    batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
+    batch = SimpleNamespace(
+        reqs=[SimpleNamespace(rid="r0", req_pool_idx=0)], enable_overlap=True
+    )
 
     lifecycle.backup_boundary_state(batch)
     assert adapter.backup_indices == [([11], True), ([12], False)]
@@ -418,7 +433,7 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     # Radix may rebind the physical slot while the logical ping-pong owner is
     # unchanged. Preserve the authoritative verify snapshot before resolving
     # that mutable request mapping again.
-    lifecycle.boundary_seqlen["r0"] = 128
+    checkpoint.seq_len = 128
     lifecycle.backup_boundary_state(batch, preserve_existing=True)
     assert adapter.backup_indices == [([11], True), ([12], False)]
     assert len(state_context_calls) == 1
@@ -436,7 +451,7 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     ]
     assert len(state_context_calls) == 1
 
-    lifecycle.boundary_track_idx["r0"] = 0
+    checkpoint.track_idx = 0
     lifecycle.backup_boundary_state(batch, preserve_existing=True)
     assert adapter.backup_indices == [
         ([11], True),

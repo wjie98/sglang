@@ -27,10 +27,7 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dvr_state_flow import (
-    DVRLinearStateLifecycle,
-    rollback_dvr_verify,
-)
+from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -859,10 +856,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
-            dvr_rollback_actions=rollback_dvr_verify(
+            dvr_rollback_actions=self.linear_state.rollback_after_verify(
                 batch=batch,
-                linear_state=self.linear_state,
-                linear_state_ctx=linear_state_ctx,
+                ctx=linear_state_ctx,
                 accept_lens=accept_lens,
             ),
             routed_experts_output=forward_output.routed_experts_output,
