@@ -219,37 +219,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             num_tokens_for_logprob_per_req=1,
         )
 
-    def _sample_target_verify(
-        self,
-        *,
-        batch: ScheduleBatch,
-        spec_info: EagleVerifyInput,
-        logits_output: LogitsProcessorOutput,
-        vocab_mask: Optional[torch.Tensor] = None,
-    ):
-        if not self.is_dvr_eagle:
-            # Upstream EAGLE applies the shared penalties, bias, grammar, and
-            # accept kernel. Self-DVR only needs to add processors that its
-            # target-only forward does not run before entering that common path.
-            sampling_info = batch.sampling_info
-            if sampling_info.has_custom_logit_processor:
-                apply_custom_logit_processor(
-                    logits_output.next_token_logits,
-                    sampling_info,
-                    num_tokens_in_batch=self.num_draft_tokens,
-                )
-            penalizer = sampling_info.penalizer_orchestrator
-            if penalizer is not None and penalizer.is_required:
-                penalizer.apply(
-                    logits_output.next_token_logits, repeat=self.num_draft_tokens
-                )
-        return eagle_sample(
-            spec_info,
-            batch,
-            logits_output,
-            vocab_mask,
-        )
-
     @property
     def target_worker(self):
         return self._target_worker
@@ -619,30 +588,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         self.linear_state.clear_cache_state()
 
-    def _run_decode_draft_verify_rollback(
-        self,
-        batch: ScheduleBatch,
-        on_publish=None,
-    ) -> GenerationBatchResult:
-        """Run one decode step through DVR's core draft -> verify -> rollback path."""
-
-        if batch.spec_info is None:
-            batch.spec_info = self._idle_draft_input()
-        for req in batch.reqs:
-            if len(req.origin_input_ids) <= 1:
-                raise RuntimeError(
-                    "DVR does not support one-token synthetic prompts on gated "
-                    "linear-state models because the first draft/verify graph step "
-                    "hits the seq_len<=2 state-input boundary. Use a normal "
-                    "chat-template prompt or disable DVR for this tiny prompt test."
-                )
-        self._prepare_dvr_boundary_for_verify(batch)
-
-        verify_input = self.draft(batch)
-        assert verify_input.is_verify_input()
-        batch.spec_info = verify_input
-        return self.verify(batch, verify_input, on_publish=on_publish)
-
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:
@@ -674,19 +619,31 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 batch_result.next_draft_input = batch.spec_info
             return batch_result
 
-        batch_result = self._run_decode_draft_verify_rollback(
-            batch, on_publish=on_publish
-        )
+        # DVR decode has one shared core: draft -> target verify -> rollback.
+        if batch.spec_info is None:
+            batch.spec_info = self._idle_draft_input()
+        for req in batch.reqs:
+            if len(req.origin_input_ids) <= 1:
+                raise RuntimeError(
+                    "DVR does not support one-token synthetic prompts on gated "
+                    "linear-state models because the first draft/verify graph step "
+                    "hits the seq_len<=2 state-input boundary. Use a normal "
+                    "chat-template prompt or disable DVR for this tiny prompt test."
+                )
+        self._prepare_dvr_boundary_for_verify(batch)
+        with self._draft_context():
+            verify_input = (
+                self._draft_worker.draft(batch)
+                if self.is_dvr_eagle
+                else self._draft_self(batch)
+            )
+        assert verify_input.is_verify_input()
+        batch.spec_info = verify_input
+        batch_result = self.verify(batch, verify_input, on_publish=on_publish)
         if self.is_dvr_eagle:
             with self._draft_context():
                 self.draft_worker._draft_extend_for_decode(batch, batch_result)
         return batch_result
-
-    def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
-        with self._draft_context():
-            if self.is_dvr_eagle:
-                return self._draft_worker.draft(batch)
-            return self._draft_self(batch)
 
     def verify(
         self,
@@ -805,11 +762,24 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
         maybe_detect_nan(logits_output.next_token_logits, "DVR target verify")
         maybe_detect_inf(logits_output.next_token_logits, "DVR target verify")
-        predict, accept_lens, accept_index = self._sample_target_verify(
-            batch=batch,
-            spec_info=spec_info,
-            logits_output=logits_output,
-            vocab_mask=vocab_mask,
+        if not self.is_dvr_eagle:
+            # EAGLE draft already applied request processors. Self draft uses a
+            # target-only forward, so apply the same processors before entering
+            # the shared EAGLE accept kernel.
+            sampling_info = batch.sampling_info
+            if sampling_info.has_custom_logit_processor:
+                apply_custom_logit_processor(
+                    logits_output.next_token_logits,
+                    sampling_info,
+                    num_tokens_in_batch=self.num_draft_tokens,
+                )
+            penalizer = sampling_info.penalizer_orchestrator
+            if penalizer is not None and penalizer.is_required:
+                penalizer.apply(
+                    logits_output.next_token_logits, repeat=self.num_draft_tokens
+                )
+        predict, accept_lens, accept_index = eagle_sample(
+            spec_info, batch, logits_output, vocab_mask
         )
         new_seq_lens = scheduler_seq_lens + accept_lens
         if on_publish is not None:

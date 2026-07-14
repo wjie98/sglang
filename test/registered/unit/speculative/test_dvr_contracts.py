@@ -301,8 +301,10 @@ def test_dvr_draft_reaches_nested_hybrid_attention_backends():
 def test_dvr_self_draft_rejects_one_token_prompt_at_core_entry():
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
     with pytest.raises(RuntimeError, match="one-token synthetic prompts"):
-        worker._run_decode_draft_verify_rollback(
+        worker.forward_batch_generation(
             SimpleNamespace(
+                forward_mode=SimpleNamespace(is_extend=lambda: False),
+                is_extend_in_batch=False,
                 spec_info=object(),
                 reqs=[SimpleNamespace(origin_input_ids=[1])],
             )
