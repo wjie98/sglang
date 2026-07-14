@@ -11,7 +11,6 @@ from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (
     DVRRecurrentStateBackup,
     DVRStateInputCache,
-    rebuild_dvr_live_state_grouped,
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
@@ -560,11 +559,6 @@ class DVRGDNStateAdapter:
         tail_lens_after = tail_lens_before + accepted_token_counts
         crosses_chunk_boundary = tail_lens_after >= self.chunk_size
         no_commit_step = torch.full_like(tail_lens_before, -1)
-        req_indices = torch.arange(
-            live_indices.shape[0],
-            dtype=torch.long,
-            device=live_indices.device,
-        )
         # accept_lens includes the bonus token, so every non-idle request has a
         # valid accepted step. The fused scatter already handles the empty batch.
         fused_conv_window_scatter_with_mask(
@@ -608,15 +602,31 @@ class DVRGDNStateAdapter:
         if self.draft_reuses_target_state:
             # Self draft consumes the target model's live recurrent slot. Keep
             # this path host-sync free and rebuild every accepted suffix.
-            rebuild_dvr_live_state_grouped(
-                state_input_cache=state_window,
-                temporal_state=state_cache.temporal,
-                state_input_indices=state_input_indices,
-                live_indices=live_indices,
-                boundary_indices=boundary_indices,
-                req_indices=req_indices,
-                token_count=tail_lens_after,
-                rebuild_fn=_rebuild_gdn_state_for_self_draft,
+            num_layers = state_cache.temporal.shape[0]
+            num_reqs = live_indices.numel()
+            flat_dim = num_layers * num_reqs
+            window_inputs = tuple(
+                tensor[:, state_input_indices].reshape(
+                    flat_dim, *tensor.shape[2:]
+                )
+                for tensor in state_window.tensors
+            )
+            initial_state = state_cache.temporal[:, boundary_indices].reshape(
+                flat_dim, *state_cache.temporal.shape[2:]
+            )
+            token_count = (
+                tail_lens_after.unsqueeze(0)
+                .expand(num_layers, -1)
+                .reshape(-1)
+                .contiguous()
+            )
+            rebuilt_state = _rebuild_gdn_state_for_self_draft(
+                window_inputs,
+                initial_state=initial_state,
+                token_count=token_count,
+            )
+            state_cache.temporal[:, live_indices] = rebuilt_state.reshape(
+                num_layers, num_reqs, *rebuilt_state.shape[1:]
             )
         # EAGLE/MTP owns a separate draft recurrent cache. Its next target
         # verify restores target temporal state from boundary_indices, so

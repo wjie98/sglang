@@ -49,7 +49,6 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.async_probe import maybe_detect_nan
 from sglang.srt.utils.async_probe import maybe_detect_inf
-from sglang.srt.utils.common import is_npu
 
 if is_cuda():
     from sgl_kernel import (
@@ -58,7 +57,6 @@ if is_cuda():
     )
 
 logger = logging.getLogger(__name__)
-_is_npu = is_npu()
 
 
 class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
@@ -696,17 +694,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
-            if (
-                _is_npu
-                and self.target_worker.model_runner.model_is_mrope
-                and batch.spec_info is not None
-                and getattr(batch.spec_info, "positions", None) is not None
-                and not batch.forward_mode.is_idle()
-            ):
-                verify_forward_batch.compute_spec_mrope_positions(
-                    self.target_worker.model_runner, batch
-                )
-
             runner = self.target_worker.model_runner.decode_cuda_graph_runner
             cuda_graph_bs = (
                 None if not can_run_cuda_graph or runner is None else runner.bs
