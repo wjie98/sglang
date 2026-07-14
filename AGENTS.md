@@ -7,6 +7,10 @@ DVR validation must use the checked-in scripts under
 is to keep KL, acceptance, and throughput results comparable across code
 changes and machines.
 
+Use `test/manual/dvr/H20_RELEASE_VALIDATION.md` for the final H20/NVLink
+qualification and release gates. It defines the backend matrix, upstream A/B,
+custom all-reduce ownership check, result layout, and pass/fail thresholds.
+
 Use these entry points:
 
 - `test/manual/dvr/scripts/run_static_unit_checks.sh`
