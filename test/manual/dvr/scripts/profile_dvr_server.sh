@@ -71,6 +71,37 @@ for name, values in sorted(durations.items()):
         f"median_ms={statistics.median(values):.3f} total_ms={sum(values):.3f}"
     )
 
+cpu_stage_events = collections.defaultdict(list)
+for event in events:
+    if (
+        event.get("ph") == "X"
+        and event.get("cat") == "user_annotation"
+        and event.get("name") in {"dvr_prepare", "draft", "verify_prepare"}
+    ):
+        cpu_stage_events[event["name"]].append(event)
+for group in cpu_stage_events.values():
+    group.sort(key=lambda event: event["ts"])
+if all(cpu_stage_events.get(name) for name in ("dvr_prepare", "draft", "verify_prepare")):
+    context_entry_us = []
+    context_exit_and_glue_us = []
+    for prepare, draft, verify_prepare in zip(
+        cpu_stage_events["dvr_prepare"],
+        cpu_stage_events["draft"],
+        cpu_stage_events["verify_prepare"],
+    ):
+        context_entry_us.append(
+            draft["ts"] - (prepare["ts"] + prepare["dur"])
+        )
+        context_exit_and_glue_us.append(
+            verify_prepare["ts"] - (draft["ts"] + draft["dur"])
+        )
+    print(
+        "draft_context_gate: "
+        f"entry_upper_mean_us={statistics.mean(context_entry_us):.1f} "
+        "exit_and_verify_glue_upper_mean_us="
+        f"{statistics.mean(context_exit_and_glue_us):.1f}"
+    )
+
 # Estimate the best possible gain from replacing the per-step self-draft graphs
 # with one chain graph. Pick the GPU annotation stream that covers the widest
 # draft span, then union all kernels in each span. The uncovered fraction is a

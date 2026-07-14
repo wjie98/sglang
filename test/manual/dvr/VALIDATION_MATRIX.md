@@ -291,6 +291,14 @@ cost and backend-specific complexity. Keep the existing one-step graph unless
 an H20/NVLink profile crosses the gate; do not carry an unmeasured chain graph
 or an eager fallback in production.
 
+The same trace bounds the current one-per-chain draft performance context at
+about 78 microseconds to enter and 37 microseconds for exit plus intervening
+verify glue. This is below 0.2% of an iteration. Do not replace it with a
+separately allocated full-attention/Hybrid backend merely to avoid temporary
+field restoration: that would duplicate CUDA graph workspaces and complicate
+GDN adapter ownership for a smaller gain. Reconsider only if
+`draft_context_gate` is materially larger on the target server.
+
 ## Development and release tests
 
 The full 0.8B/35B/80B matrix is a development qualification suite and may rely
