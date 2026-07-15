@@ -529,6 +529,15 @@ trace, custom all-reduce kernels may occur in `draft`, but not in prefill or
 `verify`. Also record draft, verify, rollback, graph launch count, graph memory,
 and GPU kernel busy fraction before proposing another optimization.
 
+Collect matching normal-sync, normal-overlap, DVR-v1, and DVR-v2 traces. Compare
+`decode_timeline` and `dvr_iteration_timeline`, using `gpu_*` rather than
+`host_*` stage durations. Overlap is working when v2 removes roughly the same
+absolute inter-iteration scheduling gap as normal overlap. It is not expected
+to hide target verify itself. If `draft_ms / speculative_num_steps` matches the
+normal-overlap decode duration and `unaccounted_gap_ms` is near zero, focus on
+target-verify kernels or a longer draft block instead of scheduler hooks,
+additional streams, or whole-chain CUDA graph capture.
+
 For the current synchronization fix, also inspect the steady-state trace for
 device-to-host sequence-length copies. A D2H is allowed when a request first
 binds a GDN checkpoint or enters target prefill. Repeated D2H copies between

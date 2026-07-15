@@ -300,6 +300,33 @@ field restoration: that would duplicate CUDA graph workspaces and complicate
 GDN adapter ownership for a smaller gain. Reconsider only if
 `draft_context_gate` is materially larger on the target server.
 
+## Scheduler-overlap gate
+
+SGLang overlap scheduling hides CPU scheduling/result work behind the current
+GPU forward. It does not execute one request's draft and target verify in
+parallel: verify consumes the draft tokens, and the next draft consumes the
+accepted bonus token and committed recurrent state from verify. The profiler
+therefore reports host enqueue spans as `host_*` and actual device spans as
+`gpu_*`; only the latter may be used to attribute model work.
+
+On the fixed A40 0.8B trace, normal decode moved from a 5.67 ms start-to-start
+period in sync mode to 3.58 ms with overlap, hiding about 2.10 ms. Self-DVR
+moved from 72.15 ms to 69.87 ms, hiding the same absolute 2.28 ms. The relative
+gain is only about 3.2% because one DVR iteration contains 15 draft decodes and
+one target verify. The v2 device timeline had a 53.21 ms draft span, a 15.78 ms
+target-verify span, and less than 0.8 ms of state/sample maintenance. Its
+inter-iteration gap was effectively zero. Each self-draft decode was about
+3.55 ms, matching the 3.57 ms normal-overlap decode, so this trace shows neither
+a scheduler bubble nor deterministic decode knobs leaking into self draft.
+
+Repeat this four-way normal-sync/normal-overlap/DVR-v1/DVR-v2 comparison on the
+target machine. A regression exists if v2 fails to remove the same absolute
+scheduler gap as normal overlap, or if `draft_ms / num_draft_steps` exceeds the
+matching normal-overlap `gpu_decode_mean_ms`. A large
+`target_verify_fraction`, with a near-zero `unaccounted_gap_ms`, is a verify
+kernel/amortization problem and cannot be fixed by more scheduler overlap or by
+capturing the draft chain again.
+
 ## Self-draft state rebuild and synchronization gate
 
 The A40 profile also justified one narrower GDN optimization. Rebuilding the

@@ -51,7 +51,8 @@ Use these entry points:
   - covers `return_logprob=True/False`
 - `test/manual/dvr/scripts/profile_dvr_server.sh`
   - profiles an already running DVR server through SGLang's standard profiler
-  - emits the coarse DVR stage spans and extracts graph-memory startup logs
+  - distinguishes host enqueue spans (`host_*`) from real GPU spans (`gpu_*`)
+  - emits decode/DVR iteration timelines and extracts graph-memory startup logs
   - is development-only and must not be mixed with throughput measurements
 
 The scripts accept the common overrides `CONDA_ENV`, `MODEL_PATH`, `PORT`,

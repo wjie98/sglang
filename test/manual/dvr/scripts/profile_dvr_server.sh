@@ -46,7 +46,8 @@ import statistics
 paths = glob.glob(os.path.join(os.environ["PROFILE_DIR"], "*.trace.json.gz"))
 if not paths:
     raise SystemExit("No torch profiler trace was produced.")
-with gzip.open(paths[0], "rt") as f:
+trace_path = max(paths, key=os.path.getmtime)
+with gzip.open(trace_path, "rt") as f:
     events = json.load(f)["traceEvents"]
 
 stage_names = {
@@ -65,11 +66,105 @@ for event in events:
     if name in stage_names and event.get("cat") == "user_annotation":
         durations[name].append(event["dur"] / 1000.0)
 
+print(f"trace={os.path.basename(trace_path)}")
 print(f"cuda_graph_launches={graph_launches}")
 for name, values in sorted(durations.items()):
     print(
-        f"{name}: count={len(values)} mean_ms={statistics.mean(values):.3f} "
+        f"host_{name}: count={len(values)} "
+        f"mean_ms={statistics.mean(values):.3f} "
         f"median_ms={statistics.median(values):.3f} total_ms={sum(values):.3f}"
+    )
+
+# Host annotations measure enqueue time. GPU annotations carry the actual stage
+# duration and may appear on more than one stream when a graph uses child
+# streams. Select the stream with the largest total span for each stage.
+gpu_stage_names = stage_names | {
+    "scheduler.run_batch",
+    "scheduler.get_next_batch_to_run",
+}
+gpu_stage_groups = collections.defaultdict(lambda: collections.defaultdict(list))
+for event in events:
+    if (
+        event.get("ph") == "X"
+        and event.get("cat") == "gpu_user_annotation"
+        and (
+            event.get("name") in gpu_stage_names
+            or event.get("name", "").startswith("step[DECODE ")
+            or event.get("name", "").startswith("step[TARGET_VERIFY ")
+        )
+    ):
+        gpu_stage_groups[event["name"]][event.get("tid")].append(event)
+
+gpu_stages = {}
+for name, by_stream in gpu_stage_groups.items():
+    stream, selected = max(
+        by_stream.items(), key=lambda item: sum(event["dur"] for event in item[1])
+    )
+    selected.sort(key=lambda event: event["ts"])
+    gpu_stages[name] = selected
+    values = [event["dur"] / 1000.0 for event in selected]
+    print(
+        f"gpu_{name}: stream={stream} count={len(values)} "
+        f"mean_ms={statistics.mean(values):.3f} "
+        f"median_ms={statistics.median(values):.3f} total_ms={sum(values):.3f}"
+    )
+
+
+def start_period_ms(stage_events):
+    return [
+        (cur["ts"] - prev["ts"]) / 1000.0
+        for prev, cur in zip(stage_events, stage_events[1:])
+    ]
+
+
+decode_name = next(
+    (name for name in gpu_stages if name.startswith("step[DECODE ")), None
+)
+if decode_name is not None and len(gpu_stages[decode_name]) > 1:
+    decode_events = gpu_stages[decode_name]
+    periods = start_period_ms(decode_events)
+    decode_ms = statistics.mean(event["dur"] for event in decode_events) / 1000.0
+    period_ms = statistics.median(periods)
+    print(
+        "decode_timeline: "
+        f"gpu_decode_mean_ms={decode_ms:.3f} "
+        f"start_period_median_ms={period_ms:.3f} "
+        f"inter_iteration_gap_ms={max(0.0, period_ms - decode_ms):.3f}"
+    )
+
+draft_events = gpu_stages.get("draft")
+verify_name = next(
+    (name for name in gpu_stages if name.startswith("step[TARGET_VERIFY ")), None
+)
+if draft_events and len(draft_events) > 1 and verify_name is not None:
+    periods = start_period_ms(draft_events)
+    period_ms = statistics.median(periods)
+    draft_ms = statistics.mean(event["dur"] for event in draft_events) / 1000.0
+    verify_ms = (
+        statistics.mean(event["dur"] for event in gpu_stages[verify_name]) / 1000.0
+    )
+    maintenance_names = (
+        "verify_prepare",
+        "dvr_state_restore",
+        "verify_sample",
+        "verify_logprob",
+        "dvr_rollback",
+        "dvr_checkpoint",
+        "draft_extend",
+    )
+    maintenance_ms = sum(
+        statistics.mean(event["dur"] for event in gpu_stages[name]) / 1000.0
+        for name in maintenance_names
+        if name in gpu_stages
+    )
+    accounted_ms = draft_ms + verify_ms + maintenance_ms
+    print(
+        "dvr_iteration_timeline: "
+        f"start_period_median_ms={period_ms:.3f} "
+        f"draft_ms={draft_ms:.3f} target_verify_ms={verify_ms:.3f} "
+        f"maintenance_ms={maintenance_ms:.3f} "
+        f"unaccounted_gap_ms={max(0.0, period_ms - accounted_ms):.3f} "
+        f"target_verify_fraction={verify_ms / period_ms:.4f}"
     )
 
 # CUDA graph children are not reliably nested under the host annotation that
