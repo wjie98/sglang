@@ -5,7 +5,7 @@ from contextlib import contextmanager, nullcontext
 from typing import List, Optional
 
 import torch
-
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -16,15 +16,15 @@ from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     dvr_draft_decode_context,
     iter_dvr_attention_backends,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -34,11 +34,12 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.eagle_utils import (
     eagle_prepare_for_verify,
     eagle_sample,
 )
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     generate_token_bitmask,
@@ -46,11 +47,8 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     spec_stage_span,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
-from sglang.srt.utils.async_probe import maybe_detect_nan
-from sglang.srt.utils.async_probe import maybe_detect_inf
+from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import get_available_gpu_memory
 
 if is_cuda():
@@ -465,6 +463,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         if can_cuda_graph:
             return self.cuda_graph_runner_for_draft_decode.execute(forward_batch)
 
+        # Plain transformers can safely overwrite provisional attention KV in
+        # target verify. Linear-state self-draft also mutates recurrent state,
+        # so it must stay on the captured path that restores that state exactly.
+        if not self.linear_state.has_state_adapter:
+            return self.model_runner.forward(forward_batch).logits_output
+
         seq_lens = forward_batch.seq_lens_cpu
         min_seq_len = (
             int(seq_lens.min()) if seq_lens is not None else "GPU-only"
@@ -528,11 +532,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             batch,
             seq_lens_cpu=seq_lens_cpu,
             prefill_prefix_lens=prefill_prefix_lens,
-            defer_request_publish=prefill_prefix_lens is not None,
         )
         # EAGLE/MTP draft can run before the next target verify in overlap mode.
         # Preserve the target checkpoint authority across draft-side mutations.
-        self.linear_state.backup_boundary_state(batch, preserve_existing=True)
+        self.linear_state.backup_boundary_state(batch)
 
     @property
     def draft_worker(self):
@@ -621,22 +624,28 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # DVR decode has one shared core: draft -> target verify -> rollback.
         if batch.spec_info is None:
             batch.spec_info = self._idle_draft_input()
-        for req in batch.reqs:
-            if len(req.origin_input_ids) <= 1:
-                raise RuntimeError(
-                    "DVR does not support one-token synthetic prompts on gated "
-                    "linear-state models because the first draft/verify graph step "
-                    "hits the seq_len<=2 state-input boundary. Use a normal "
-                    "chat-template prompt or disable DVR for this tiny prompt test."
-                )
+        seq_lens_cpu = batch.seq_lens_cpu
+        if seq_lens_cpu is not None:
+            needs_one_root_verify = any(
+                int(seq_len) <= 1 for seq_len in seq_lens_cpu
+            )
+        else:
+            # Spec decode pre-claims the bonus slot before model execution, so
+            # a committed length of two still represents a one-token prefix.
+            needs_one_root_verify = any(
+                req.kv_committed_len <= 2 for req in batch.reqs
+            )
         with spec_stage_span("dvr_prepare"):
             self._prepare_dvr_boundary_for_verify(batch)
-        with self._draft_context(), spec_stage_span("draft"):
-            verify_input = (
-                self._draft_worker.draft(batch)
-                if self.is_dvr_eagle
-                else self._draft_self(batch)
-            )
+        if needs_one_root_verify:
+            verify_input = self._build_one_root_verify_input(batch)
+        else:
+            with self._draft_context(), spec_stage_span("draft"):
+                verify_input = (
+                    self._draft_worker.draft(batch)
+                    if self.is_dvr_eagle
+                    else self._draft_self(batch)
+                )
         assert verify_input.is_verify_input()
         batch.spec_info = verify_input
         batch_result = self.verify(batch, verify_input, on_publish=on_publish)
@@ -644,6 +653,45 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             with self._draft_context(), spec_stage_span("draft_extend"):
                 self.draft_worker._draft_extend_for_decode(batch, batch_result)
         return batch_result
+
+    def _build_one_root_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        """Build a fixed-width verify input whose logical tree is only the root."""
+
+        draft_input = batch.spec_info
+        assert isinstance(draft_input, EagleDraftInput)
+        batch_size = batch.seq_lens.shape[0]
+        width = self.num_draft_tokens
+        retrieve_index = torch.arange(
+            batch_size * width, dtype=torch.long, device=self.device
+        ).view(batch_size, width)
+        terminal = torch.full_like(retrieve_index, -1)
+        # Keep the physical verify shape identical to the captured DVR graph.
+        # spec_steps=0 makes every padded node unreachable, so sampling accepts
+        # only the root while attention/GDN retain their fixed-shape contract.
+        return EagleVerifyInput(
+            draft_token=(
+                draft_input.bonus_tokens.to(torch.long).repeat_interleave(width)
+            ),
+            custom_mask=None,
+            positions=(
+                batch.seq_lens[:, None]
+                + torch.arange(width, dtype=torch.long, device=self.device)[None, :]
+            ).reshape(-1),
+            retrieve_index=retrieve_index,
+            retrieve_next_token=terminal,
+            retrieve_next_sibling=terminal,
+            retrieve_cum_len=None,
+            spec_steps=0,
+            topk=1,
+            draft_token_num=width,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.is_dvr_eagle
+                else CaptureHiddenMode.NULL
+            ),
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
+        )
 
     def verify(
         self,
@@ -666,7 +714,8 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # backend's native causal mask. Both draft backends therefore enter the
         # same target-verify preparation and forward path.
         spec_info.custom_mask = None
-        spec_info.num_tokens_per_req = self.num_draft_tokens
+        verify_tokens = spec_info.draft_token_num
+        spec_info.num_tokens_per_req = verify_tokens
         if self.is_dvr_eagle:
             fwd_stream = torch.get_device_module(self.device).current_stream()
             record_stream_for_v2_verify(batch, spec_info, fwd_stream)
@@ -753,12 +802,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 apply_custom_logit_processor(
                     logits_output.next_token_logits,
                     sampling_info,
-                    num_tokens_in_batch=self.num_draft_tokens,
+                    num_tokens_in_batch=verify_tokens,
                 )
             penalizer = sampling_info.penalizer_orchestrator
             if penalizer is not None and penalizer.is_required:
                 penalizer.apply(
-                    logits_output.next_token_logits, repeat=self.num_draft_tokens
+                    logits_output.next_token_logits, repeat=verify_tokens
                 )
         with spec_stage_span("verify_sample"):
             predict, accept_lens, accept_index = eagle_sample(
@@ -802,16 +851,14 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             # FutureMap readiness must cover the state consumed by the next
             # overlap forward, not only accepted sequence lengths.
             with spec_stage_span("dvr_checkpoint"):
-                self.linear_state.backup_boundary_state(
-                    batch, preserve_existing=False, ctx=linear_state_ctx
-                )
+                self.linear_state.backup_boundary_state(batch, ctx=linear_state_ctx)
         elif self.is_dvr_eagle:
             commit_mamba_states_after_verify(
                 self.target_worker,
                 batch,
                 accept_lens,
                 accept_index,
-                self.num_draft_tokens,
+                verify_tokens,
             )
         # FutureMap intentionally publishes accepted lengths before this tail.
         # Fence the target state consumed by the next DVR iteration separately;
@@ -820,7 +867,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # The overlap scheduler may process the preceding result as soon as
         # this worker returns. Defer its shared-pool writes until the current
         # target rollback/checkpoint has finished reading those pools.
-        rollback_actions.result_process_ready_event = self._rollback_ready_event
         if not self.is_dvr_eagle:
             self.model_runner.war_fastpath_read_done_event = self._rollback_ready_event
         if has_verify_tokens and batch.return_logprob:
@@ -830,7 +876,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     logits_output,
                     predict,
                     accept_index,
-                    self.num_draft_steps,
+                    spec_info.spec_steps,
                 )
 
         batch_result = GenerationBatchResult(
@@ -842,6 +888,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
             dvr_rollback_actions=rollback_actions,
+            result_process_ready_event=self._rollback_ready_event,
             routed_experts_output=forward_output.routed_experts_output,
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

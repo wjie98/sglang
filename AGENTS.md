@@ -24,6 +24,9 @@ Use these entry points:
     a globally disabled DeepGEMM run as a release throughput result
 - `test/manual/dvr/scripts/run_0p8b_self_dvr_kl.sh`
   - 0.8B self-DVR spec v1/v2 KL=0 and boundary smoke
+  - includes one-token prompts in concurrent and batch modes; their first DVR
+    iteration uses a zero-step, one-root target-verify sentinel and must pass
+    the same strict full-prefill KL oracle
   - includes concurrent and batch 512-token strict KL checks
   - `ATTENTION_BACKEND` may select a separately reported Triton/FlashInfer/FA3
     compatibility run; the fixed default remains `triton`
@@ -66,6 +69,10 @@ checkpoints in both cases; do not add a FlashInfer-specific correctness path.
 Do not use the removed `SGLANG_ENABLE_SPEC_V2` environment variable.  The fixed
 scripts select the self-DVR v1 compatibility worker with
 `--disable-overlap-schedule`; omitting that flag uses the spec-v2 overlap worker.
+
+Do not invoke `pytest` from an activated environment without setting this
+worktree's `PYTHONPATH`; the editable install may point at another DVR worktree.
+The fixed scripts set `PYTHONPATH` to the repository under test.
 
 Do not silently change benchmark knobs such as request count, output length,
 max concurrency, `--max-mamba-cache-size`, overlap mode, backend, or returned

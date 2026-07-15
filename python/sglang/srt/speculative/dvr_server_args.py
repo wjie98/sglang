@@ -33,6 +33,13 @@ def handle_dvr_defaults(server_args):
         not server_args.disable_custom_all_reduce
     )
 
+    # DVR only permits provisional draft decode to be non-deterministic. Target
+    # prefill and verify define the output contract and must use the ordinary
+    # deterministic-inference configuration from server initialization onward.
+    if not server_args.enable_deterministic_inference:
+        logger.warning("Deterministic inference is enabled for DVR target execution.")
+        server_args.enable_deterministic_inference = True
+
     if not _is_dvr_gated_linear_state_model(server_args):
         return
 

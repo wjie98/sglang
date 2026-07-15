@@ -82,8 +82,14 @@ intentional shared semantic changes:
 Current deliberate restrictions are CUDA-only execution, no DP attention, no
 PDMux, no disaggregation, chain mode with topk=1, Triton linear-attention
 prefill for exact GDN boundary export, at most one 64-token GDN chunk per
-verify, and no one-token synthetic prompts. FlashInfer may disable radix cache;
-DVR correctness must come from request-local checkpoints rather than radix.
+verify, and mandatory draft graphs for self-draft models with linear state.
+Plain transformers may use eager self-draft when graphs are disabled. FlashInfer
+may disable radix cache; DVR correctness must come from request-local checkpoints
+rather than radix.
+
+The minimum effective prompt length is one token. SGLang rejects an empty
+`input_ids` request before scheduling; an entrypoint that accepts empty text must
+first normalize it to a model-valid BOS or template token.
 
 ## 1. Release gates
 
@@ -94,7 +100,9 @@ Do not prepare the release branch until all applicable gates pass.
 1. `run_static_unit_checks.sh` passes.
 2. 0.8B self-DVR v1 and v2 pass TP=1 and TP=4 for every available required
    full-attention backend. All boundary, batch, concurrent, and 512-token cases
-   report `ALL_OK True`.
+   report `ALL_OK True`; this includes one-token prompts whose first iteration
+   uses a zero-step, one-root target-verify sentinel before normal drafting.
+   These cases use the same strict full-prefill KL oracle.
 3. 35B DVR-EAGLE sync and overlap report `kl_failed: 0` and
    `accept_failed: 0` with both returned-logprob modes.
 4. The seeded 35B MTP boundary acceptance remains at least 0.96, and fixed
@@ -152,7 +160,6 @@ GPUs used by another process. Replace paths only through environment variables.
 export DVR_REPO=/path/to/sglang-dvr-v6-performance-opt
 export CONDA_ENV=dvr_dev
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false
 
 export MODEL_0P8B=/mnt/data/hwj/Qwen3.5-0.8B
 export MODEL_35B=/mnt/data/hwj/Qwen3.5-35B-A3B
@@ -170,9 +177,9 @@ mkdir -p "${RESULT_BASE}"
 export SGLANG_DG_CACHE_DIR=/mnt/data/hwj/deep-gemm-cache/${RUN_ID}
 ```
 
-The health environment variable is required because upstream's generating
-health probe uses a one-token synthetic prompt, which DVR intentionally rejects
-on gated linear-state models. The fixed scripts use `/v1/models` for readiness.
+The fixed scripts use `/v1/models` for readiness so health generation is not
+part of benchmark timing. DVR nevertheless supports the upstream one-token
+generating health probe through its one-root target-verify sentinel.
 
 Before running tests, save the machine and source state:
 
@@ -359,7 +366,6 @@ machine. It uses Qwen3.5-9B and may require downloading that additional model.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
-SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false \
 PYTHONPATH="${DVR_REPO}/python" \
   conda run --no-capture-output -n "${CONDA_ENV}" \
   python test/registered/spec/eagle/test_eagle_reject_sampling.py \

@@ -83,12 +83,22 @@ run_one_mode() {
   conda_python test/manual/dvr/test_dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \
+    --prompt-token-lengths 1 \
+    --max-new 2,8 \
+    --limit-cases 4 \
+    --concurrent-workers 2 \
+    --ignore-eos \
+    2>&1 | tee "${client_log}"
+
+  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    --base-url "${BASE_URL}" \
+    --request-modes concurrent,batch \
     --prompt-token-lengths 2,63,64,65 \
     --max-new 1,8,16,17,63,64,65 \
     --limit-cases 12 \
     --concurrent-workers 4 \
     --ignore-eos \
-    2>&1 | tee "${client_log}"
+    2>&1 | tee -a "${client_log}"
 
   echo "==> Running ${label} cross-chunk KL cases"
   conda_python test/manual/dvr/test_dvr_batch_kl.py \

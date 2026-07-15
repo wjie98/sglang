@@ -1,10 +1,10 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
-
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
+import torch
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
+from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     _ensure_decode_custom_all_reduce_comm,
@@ -12,12 +12,12 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     iter_dvr_attention_backends,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dvr_worker import (
-    DecodeVerifyRollbackWorkerV2,
-)
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
     DVRRollbackActions,
+)
+from sglang.srt.speculative.dvr_worker import (
+    DecodeVerifyRollbackWorkerV2,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -37,6 +37,16 @@ def test_dvr_spec_algorithm_contracts():
 def test_dvr_worker_uses_base_spec_worker_contract():
     assert issubclass(DecodeVerifyRollbackWorkerV2, BaseSpecWorker)
     assert not DecodeVerifyRollbackWorkerV2.__abstractmethods__
+
+
+def test_overlap_batch_results_default_to_no_result_process_fence():
+    assert GenerationBatchResult().result_process_ready_event is None
+    assert (
+        EmbeddingBatchResult(
+            embeddings=torch.empty((0,), dtype=torch.float32)
+        ).result_process_ready_event
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -299,33 +309,85 @@ def test_dvr_draft_reaches_nested_hybrid_attention_backends():
     ) == backends
 
 
-def test_dvr_self_draft_rejects_one_token_prompt_at_core_entry():
+@pytest.mark.parametrize("is_dvr_eagle", [False, True])
+def test_dvr_short_prefix_uses_one_root_verify_sentinel(is_dvr_eagle):
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
-    with pytest.raises(RuntimeError, match="one-token synthetic prompts"):
-        worker.forward_batch_generation(
-            SimpleNamespace(
-                forward_mode=SimpleNamespace(is_extend=lambda: False),
-                is_extend_in_batch=False,
-                spec_info=object(),
-                reqs=[SimpleNamespace(origin_input_ids=[1])],
-            )
-        )
+    worker.is_dvr_eagle = is_dvr_eagle
+    worker.device = "cpu"
+    worker.num_draft_tokens = 4
+    batch = SimpleNamespace(
+        spec_info=dvr_worker_module.EagleDraftInput(
+            bonus_tokens=torch.tensor([6, 7])
+        ),
+        seq_lens=torch.tensor([1, 65]),
+        seq_lens_cpu=torch.tensor([1, 65]),
+        seq_lens_sum=66,
+    )
 
+    verify_input = worker._build_one_root_verify_input(batch)
 
-def test_dvr_self_draft_rejects_short_boundary_without_eager_fallback():
+    assert verify_input.draft_token.tolist() == [6, 6, 6, 6, 7, 7, 7, 7]
+    assert verify_input.draft_token.dtype == torch.long
+    assert verify_input.draft_token.is_contiguous()
+    assert verify_input.draft_token_num == 4
+    assert verify_input.spec_steps == 0
+    assert verify_input.retrieve_index.tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert verify_input.retrieve_next_token.tolist() == [
+        [-1, -1, -1, -1],
+        [-1, -1, -1, -1],
+    ]
+    assert verify_input.positions.tolist() == [1, 2, 3, 4, 65, 66, 67, 68]
+    assert verify_input.capture_hidden_mode == (
+        dvr_worker_module.CaptureHiddenMode.FULL
+        if is_dvr_eagle
+        else dvr_worker_module.CaptureHiddenMode.NULL
+    )
+
+def test_dvr_plain_transformer_self_draft_allows_eager_decode():
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
     worker.cuda_graph_runner_for_draft_decode = None
+    logits_output = object()
+    worker.linear_state = SimpleNamespace(has_state_adapter=False)
+    worker.model_runner = SimpleNamespace(
+        forward=lambda _forward_batch: SimpleNamespace(logits_output=logits_output)
+    )
 
-    with pytest.raises(RuntimeError, match="no eager fallback"):
+    assert (
         worker._draft_decode_forward(
             SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
         )
+        is logits_output
+    )
+
+
+def test_dvr_linear_state_is_optional_for_plain_transformers():
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle._state_adapter = None
+    lifecycle.state_backup = object()
+
+    lifecycle.backup_boundary_state(SimpleNamespace())
+
+    assert not lifecycle.has_state_adapter
+    assert lifecycle.state_backup is None
+
+    assert (
+        lifecycle.rollback_after_verify(
+            batch=SimpleNamespace(
+                spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+                enable_overlap=False,
+                decoding_reqs=None,
+            ),
+            ctx=None,
+            accept_lens=torch.empty(0, dtype=torch.int32),
+        )
+        is None
+    )
 
 
 def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
     worker.cuda_graph_runner_for_draft_decode = None
-    worker.model_runner = SimpleNamespace(hybrid_gdn_config=object())
+    worker.linear_state = SimpleNamespace(has_state_adapter=True)
 
     with pytest.raises(RuntimeError, match="requires the dedicated CUDA graph"):
         worker._draft_decode_forward(
@@ -510,15 +572,13 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     # unchanged. Preserve the authoritative verify snapshot before resolving
     # that mutable request mapping again.
     checkpoint.seq_len = 128
-    lifecycle.backup_boundary_state(batch, preserve_existing=True)
+    lifecycle.backup_boundary_state(batch)
     assert adapter.backup_indices == [([11], True), ([12], False)]
     assert len(state_context_calls) == 1
 
     # Post-verify commit supplies the exact physical context used by target
     # verify, independent of the request mapping currently visible to radix.
-    lifecycle.backup_boundary_state(
-        batch, preserve_existing=False, ctx=rebound_context
-    )
+    lifecycle.backup_boundary_state(batch, ctx=rebound_context)
     assert adapter.backup_indices == [
         ([11], True),
         ([12], False),
@@ -528,7 +588,7 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     assert len(state_context_calls) == 1
 
     checkpoint.track_idx = 0
-    lifecycle.backup_boundary_state(batch, preserve_existing=True)
+    lifecycle.backup_boundary_state(batch)
     assert adapter.backup_indices == [
         ([11], True),
         ([12], False),

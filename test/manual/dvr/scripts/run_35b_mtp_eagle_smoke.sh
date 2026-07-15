@@ -50,6 +50,7 @@ run_one_mode() {
   local label="$1"
   local spec_v2="$2"
   local server_log="${RESULT_ROOT}/logs/${label}_server.log"
+  local short_prompt_log="${RESULT_ROOT}/results/${label}_short_prompt.log"
   local kl_log="${RESULT_ROOT}/results/${label}_return_logprob_true.log"
   local no_logprob_log="${RESULT_ROOT}/results/${label}_return_logprob_false.log"
   local prefix_cache_kl_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_true.log"
@@ -105,6 +106,18 @@ run_one_mode() {
   assert_server_capacity "${server_log}" 4
   assert_server_config \
     "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
+
+  echo "==> Running ${label} one-token verify-sentinel KL smoke"
+  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    --base-url "${BASE_URL}" \
+    --request-modes concurrent,batch \
+    --prompt-token-lengths 1 \
+    --max-new 2,8 \
+    --limit-cases 4 \
+    --concurrent-workers 2 \
+    --ignore-eos \
+    2>&1 | tee "${short_prompt_log}"
+  grep -q "ALL_OK True" "${short_prompt_log}"
 
   echo "==> Running ${label} returned-logprob KL smoke"
   # Acceptance is used here as a hidden/state consistency oracle.  Keep it

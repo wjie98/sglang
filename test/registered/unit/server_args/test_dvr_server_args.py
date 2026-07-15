@@ -2,14 +2,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dvr_server_args import (
     DVR_EAGLE_SPECULATIVE_ALGORITHM,
     DVR_SPECULATIVE_ALGORITHM,
     handle_dvr_defaults,
     handle_dvr_speculative_decoding,
 )
-from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.server_args import ServerArgs
 
 
 class _Args:
@@ -31,6 +31,7 @@ class _Args:
     disable_cuda_graph_padding = False
     disable_radix_cache = False
     disable_custom_all_reduce = False
+    enable_deterministic_inference = False
     mamba_radix_cache_strategy = "auto"
     mamba_track_interval = 1
     mamba_ssm_dtype = "float32"
@@ -125,6 +126,18 @@ class TestDVRServerArgs(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
                 handle_dvr_speculative_decoding(args)
 
+    def test_dvr_self_draft_plain_transformer_allows_disabled_graphs(self):
+        args = _Args()
+        args.disable_draft_cuda_graph = True
+        args.cuda_graph_config.decode.backend = Backend.DISABLED
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=False,
+        ):
+            handle_dvr_speculative_decoding(args)
+
     def test_dvr_eagle_keeps_radix_cache(self):
         args = _Args()
         args.speculative_algorithm = DVR_EAGLE_SPECULATIVE_ALGORITHM
@@ -189,6 +202,18 @@ class TestDVRServerArgs(unittest.TestCase):
             handle_dvr_defaults(args)
 
         self.assertFalse(args._dvr_enable_draft_custom_all_reduce)
+
+    def test_dvr_enables_deterministic_target_execution(self):
+        args = _Args()
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=False,
+        ):
+            handle_dvr_defaults(args)
+
+        self.assertTrue(args.enable_deterministic_inference)
+        self.assertTrue(args._dvr_enable_draft_custom_all_reduce)
 
     def test_dvr_defaults_normalize_algorithm_before_generic_spec_handling(self):
         args = _Args()

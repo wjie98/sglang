@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import torch
-
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
@@ -30,7 +29,6 @@ class DVRRollbackActions:
 
     pending_checkpoints: Optional[list[tuple[int, int]]] = None
     cache_generated_prefix: Optional[list[bool]] = None
-    result_process_ready_event: Optional[torch.cuda.Event] = None
 
     def cache_prefill_after_rollback(
         self,
@@ -137,6 +135,10 @@ class DVRLinearStateLifecycle:
                 "only one tracked prefill checkpoint."
             )
 
+    @property
+    def has_state_adapter(self) -> bool:
+        return self._state_adapter is not None
+
     def clear_cache_state(self):
         self.boundaries.clear()
         self.state_backup = None
@@ -157,12 +159,12 @@ class DVRLinearStateLifecycle:
         *,
         seq_lens_cpu: Optional[List[int]] = None,
         prefill_prefix_lens: Optional[List[int]] = None,
-        defer_request_publish: bool = False,
     ) -> None:
         if self._state_adapter is None:
             return
         chunk_size = self._state_adapter.chunk_size
-        if not defer_request_publish:
+        publish_to_request = prefill_prefix_lens is None
+        if publish_to_request:
             for req in batch.reqs:
                 checkpoint = self._checkpoint(req)
                 if checkpoint is None or not checkpoint.publish_pending:
@@ -207,16 +209,18 @@ class DVRLinearStateLifecycle:
             batch,
             seq_lens_cpu=seq_lens_cpu,
             prefill_prefix_lens=prefill_prefix_lens,
-            publish_to_request=not defer_request_publish,
+            publish_to_request=publish_to_request,
         )
 
     def backup_boundary_state(
         self,
         batch: ScheduleBatch,
         *,
-        preserve_existing: bool = False,
         ctx: Optional[DVRLinearStateContext] = None,
     ):
+        if self._state_adapter is None:
+            self.state_backup = None
+            return
         if (
             not self._state_adapter.draft_reuses_target_state
             and not batch.enable_overlap
@@ -234,8 +238,10 @@ class DVRLinearStateLifecycle:
         backup_keys = [
             (req.rid, self._checkpoint(req).track_idx) for req in batch.reqs
         ]
+        # No context means draft preparation: retain the snapshot for the same
+        # logical owner. Verify supplies its exact physical context to refresh it.
         if (
-            preserve_existing
+            ctx is None
             and self.state_backup is not None
             and self.state_backup[0] == backup_keys
         ):
@@ -292,7 +298,7 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         ctx: Optional[DVRLinearStateContext],
         accept_lens: torch.Tensor,
-    ) -> DVRRollbackActions:
+    ) -> Optional[DVRRollbackActions]:
         pending_checkpoints = None
         if ctx is not None:
             chunk_size = self._state_adapter.chunk_size
@@ -341,6 +347,8 @@ class DVRLinearStateLifecycle:
             if not any(cache_generated_prefix):
                 cache_generated_prefix = None
 
+        if pending_checkpoints is None and cache_generated_prefix is None:
+            return None
         return DVRRollbackActions(
             pending_checkpoints=pending_checkpoints if deferred else None,
             cache_generated_prefix=cache_generated_prefix,

@@ -16,6 +16,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.speculative.dvr_state_flow import DVRRollbackActions
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -42,6 +43,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # Fence result-processor writes behind forward phases that still read shared
+    # request pools. Most workers leave this unset and use the normal WAR path.
+    result_process_ready_event: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -62,7 +66,7 @@ class GenerationBatchResult:
     extra_keep_alive_refs: Optional[List[Any]] = None
 
     # DVR-owned metadata consumed after result processing materializes outputs.
-    dvr_rollback_actions: Optional[Any] = None
+    dvr_rollback_actions: Optional[DVRRollbackActions] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
@@ -236,11 +240,14 @@ class EmbeddingBatchResult:
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
         copy_done: CUDA event recorded after the async CPU copy completes.
+        result_process_ready_event: Optional fence before result processing may
+            write shared request pools.
     """
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
+    result_process_ready_event: Optional[torch.cuda.Event] = None
 
     @property
     def can_run_cuda_graph(self) -> bool:

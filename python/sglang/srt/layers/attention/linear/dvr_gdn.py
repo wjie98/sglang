@@ -1,10 +1,9 @@
 """GDN-specific DVR state allocation, replay kernels, and lifecycle adapter."""
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
-
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.dvr_state import (

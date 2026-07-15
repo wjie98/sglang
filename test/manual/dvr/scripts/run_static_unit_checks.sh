@@ -13,6 +13,7 @@ DVR_PY_FILES=(
   python/sglang/srt/layers/attention/linear/dvr_gdn.py
   python/sglang/srt/layers/attention/linear/dvr_state.py
   python/sglang/srt/layers/attention/linear/gdn_backend.py
+  python/sglang/srt/managers/scheduler.py
   python/sglang/srt/managers/scheduler_components/batch_result_processor.py
   python/sglang/srt/managers/tokenizer_manager.py
   python/sglang/srt/managers/utils.py
