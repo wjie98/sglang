@@ -317,19 +317,12 @@ class DVRLinearStateLifecycle:
 
             assert ctx.boundary_indices is not None
             if accept_lens.numel() > 0:
-                verified_tail_lens = self._state_adapter.state_input_window().get_tail_lens(
-                    indices=ctx.state_input_indices
-                )
                 self._state_adapter.commit_after_verify(
                     state_cache=ctx.state_cache,
                     state_input_indices=ctx.state_input_indices,
                     live_indices=ctx.live_indices,
                     boundary_indices=ctx.boundary_indices,
-                    verified_tail_lens=verified_tail_lens.to(
-                        device=ctx.live_indices.device, dtype=torch.long
-                    ),
                     accepted_token_counts=accept_lens.to(torch.long),
-                    accepted_steps=(accept_lens - 1).to(torch.long),
                 )
 
         deferred = batch.spec_algorithm.is_dvr_eagle() or batch.enable_overlap

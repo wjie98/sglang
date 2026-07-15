@@ -541,12 +541,15 @@ class DVRGDNStateAdapter:
         state_input_indices: torch.Tensor,
         live_indices: torch.Tensor,
         boundary_indices: torch.Tensor,
-        verified_tail_lens: torch.Tensor,
         accepted_token_counts: torch.Tensor,
-        accepted_steps: torch.Tensor,
     ) -> None:
         state_window = self.state_input_window()
-        tail_lens_before = verified_tail_lens.to(
+        tail_lens_before = state_window.get_tail_lens(
+            indices=state_input_indices
+        ).to(
+            device=live_indices.device, dtype=torch.long
+        )
+        accepted_token_counts = accepted_token_counts.to(
             device=live_indices.device, dtype=torch.long
         )
         tail_lens_after = tail_lens_before + accepted_token_counts
@@ -558,7 +561,7 @@ class DVRGDNStateAdapter:
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
             live_indices,
-            accepted_steps,
+            accepted_token_counts - 1,
         )
 
         # Target verify exports the first crossed boundary in step 0.
