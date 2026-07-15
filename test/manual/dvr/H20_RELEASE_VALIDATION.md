@@ -54,8 +54,8 @@ Interpret the comparison before changing code again:
 
 ## Implementation audit snapshot
 
-At the upstream base used by this branch, the production runtime delta is 21
-files, 2,947 added lines, 60 deleted lines, and 2,887 net lines. Most code is in
+At the upstream base used by this branch, the production runtime delta is 22
+files, 3,050 added lines, 61 deleted lines, and 2,989 net lines. Most code is in
 six DVR-owned modules:
 
 - `dvr_worker.py`: shared draft, target verify, and rollback execution
