@@ -35,6 +35,7 @@ DVR_PY_FILES=(
   python/sglang/srt/speculative/eagle_utils.py
   python/sglang/srt/speculative/spec_info.py
   python/sglang/srt/speculative/spec_registry.py
+  python/sglang/srt/speculative/spec_utils.py
   test/manual/dvr/test_dvr_batch_kl.py
   test/manual/dvr/test_dvr_eagle_acceptance.py
 )

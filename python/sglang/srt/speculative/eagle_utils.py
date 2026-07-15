@@ -451,7 +451,11 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
     else:
-        from sgl_kernel import tree_speculative_sampling_target_only
+        from sgl_kernel import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+            tree_speculative_sampling_target_only,
+        )
 
         from sglang.srt.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
@@ -461,11 +465,8 @@ def eagle_sample(
         configured_rejection_sampling = (
             get_global_server_args().speculative_use_rejection_sampling
         )
-        # draft_probs is the authoritative proposal distribution. Standard
-        # EAGLE only publishes it when rejection sampling is configured, while
-        # DVR self-draft publishes it whenever stochastic target sampling needs
-        # an exact proposal q. Keeping the contract on the verify input avoids
-        # algorithm-specific sampling branches here.
+        # draft_probs is the authoritative proposal distribution. DVR self-draft
+        # also publishes it when stochastic target sampling needs an exact q.
         use_rejection_sampling = verify_input.draft_probs is not None
         if configured_rejection_sampling and not use_rejection_sampling:
             raise ValueError(
@@ -482,9 +483,26 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        target_probs = renorm_sampling_probs(
-            target_probs, sampling_info, repeat=verify_input.draft_token_num
-        )
+        if use_rejection_sampling:
+            target_probs = renorm_sampling_probs(
+                target_probs, sampling_info, repeat=verify_input.draft_token_num
+            )
+        else:
+            # Preserve the standard EAGLE target-only sampling path. The shared
+            # helper additionally applies min-p and is needed only when p/q
+            # rejection sampling must use the exact request distribution.
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after sampling filters")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
