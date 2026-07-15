@@ -18,6 +18,9 @@ MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-8192}"
 RUN_BASELINE="${RUN_BASELINE:-1}"
 RUN_BASELINE_SYNC="${RUN_BASELINE_SYNC:-${RUN_BASELINE}}"
 RUN_BASELINE_OVERLAP="${RUN_BASELINE_OVERLAP:-${RUN_BASELINE}}"
+RUN_DETERMINISTIC_BASELINE="${RUN_DETERMINISTIC_BASELINE:-${RUN_BASELINE}}"
+RUN_DET_SYNC="${RUN_DET_SYNC:-${RUN_DETERMINISTIC_BASELINE}}"
+RUN_DET_OVERLAP="${RUN_DET_OVERLAP:-${RUN_DETERMINISTIC_BASELINE}}"
 RUN_SELF="${RUN_SELF:-1}"
 RUN_EAGLE="${RUN_EAGLE:-1}"
 TP_SIZE="${TP_SIZE:-4}"
@@ -55,7 +58,11 @@ append_run_config "${RESULT_ROOT}" \
   "disable_radix_cache=${DISABLE_RADIX_CACHE}" \
   "disable_custom_all_reduce=${DISABLE_CUSTOM_ALL_REDUCE}" \
   "num_prompts=${NUM_PROMPTS}" "output_len=${OUTPUT_LEN}" \
-  "max_concurrency=${MAX_CONCURRENCY}"
+  "max_concurrency=${MAX_CONCURRENCY}" \
+  "run_baseline_sync=${RUN_BASELINE_SYNC}" \
+  "run_baseline_overlap=${RUN_BASELINE_OVERLAP}" \
+  "run_det_sync=${RUN_DET_SYNC}" "run_det_overlap=${RUN_DET_OVERLAP}" \
+  "run_self=${RUN_SELF}" "run_eagle=${RUN_EAGLE}"
 
 cleanup() {
   stop_process_group "${SERVER_PID}"
@@ -160,16 +167,50 @@ run_self_kl() {
     --ignore-eos \
     2>&1 | tee "${output_log}"
   grep -q "ALL_OK True" "${output_log}"
+  printf 'true\n' >"${RESULT_ROOT}/results/${label}_gdn_kl_zero.txt"
 }
 
 run_baseline_mode() {
   local label="$1"
   local overlap_enabled="$2"
+  local deterministic="$3"
   local overlap_arg=()
+  local deterministic_arg=()
   if [[ "${overlap_enabled}" == "0" ]]; then
     overlap_arg=(--disable-overlap-schedule)
   fi
-  start_server "35b_${label}" "${overlap_enabled}" "${overlap_arg[@]}"
+  if [[ "${deterministic}" == "1" ]]; then
+    deterministic_arg=(--enable-deterministic-inference)
+  fi
+  start_server "35b_${label}" "${overlap_enabled}" \
+    "${deterministic_arg[@]}" "${overlap_arg[@]}"
+  local server_log="${RESULT_ROOT}/logs/35b_${label}_server.log"
+  assert_baseline_server_config "${server_log}" "${deterministic}" "${TP_SIZE}"
+
+  # One ordinary deterministic probe is enough to document whether this GDN
+  # model happens to match a full-prefill oracle. A mismatch is expected to be
+  # reportable; a client/server failure remains fatal.
+  if [[ "${label}" == "det_overlap" ]]; then
+    local kl_log="${RESULT_ROOT}/results/35b_${label}_kl.log"
+    conda_python test/manual/dvr/test_dvr_batch_kl.py \
+      --base-url "${BASE_URL}" \
+      --request-modes concurrent \
+      --prompt-token-lengths 65 \
+      --max-new 65 \
+      --limit-cases 1 \
+      --concurrent-workers 1 \
+      --ignore-eos \
+      --allow-mismatch \
+      2>&1 | tee "${kl_log}"
+    if grep -q "ALL_OK True" "${kl_log}"; then
+      printf 'true\n' >"${RESULT_ROOT}/results/35b_${label}_gdn_kl_zero.txt"
+    elif grep -q "ALL_OK False" "${kl_log}"; then
+      printf 'false\n' >"${RESULT_ROOT}/results/35b_${label}_gdn_kl_zero.txt"
+    else
+      echo "Ordinary deterministic GDN oracle probe did not complete." >&2
+      return 1
+    fi
+  fi
   run_benchmark_pair "${label}"
   stop_server
 }
@@ -236,15 +277,23 @@ for name, row in rows.items():
         f"duration={row['duration']:.2f}"
     )
 
-for suffix in ("false.jsonl", "true.jsonl"):
+for mode in ("det_overlap", "self_v1", "self_v2"):
+    path = os.path.join(base, "results", f"35b_{mode}_gdn_kl_zero.txt")
+    if os.path.exists(path):
+        with open(path) as f:
+            exact = f.read().strip()
+        print(f"GDN_KL mode={mode} exact_kl_zero={exact}")
+
+product_speedups = []
+for logprob in ("false", "true"):
     for mode, draft_tokens, baseline_mode in (
         ("self_v1", 16, "baseline_sync"),
         ("self_v2", 16, "baseline_overlap"),
         ("eagle_sync", 2, "baseline_sync"),
         ("eagle_overlap", 2, "baseline_overlap"),
     ):
-        baseline = rows.get(f"35b_{baseline_mode}_sharegpt_logprob_{suffix}")
-        row = rows.get(f"35b_{mode}_sharegpt_logprob_{suffix}")
+        baseline = rows.get(f"35b_{baseline_mode}_sharegpt_logprob_{logprob}.jsonl")
+        row = rows.get(f"35b_{mode}_sharegpt_logprob_{logprob}.jsonl")
         if baseline is None or row is None:
             continue
         baseline_tps = baseline["output_throughput"]
@@ -252,12 +301,35 @@ for suffix in ("false.jsonl", "true.jsonl"):
         target = baseline_tps * acceptance
         target_efficiency = row["output_throughput"] / target if target else float("nan")
         print(
-            f"TARGET {mode} logprob={suffix.removesuffix('.jsonl')} "
+            f"TARGET {mode} logprob={logprob} "
             f"actual={row['output_throughput']:.2f} "
             f"acceptance_x_baseline={target:.2f} "
             f"dvr_ratio={row['output_throughput'] / baseline_tps:.3f} "
             f"target_efficiency={target_efficiency:.3f}"
         )
+
+    for mode, det_mode in (("self_v1", "det_sync"), ("self_v2", "det_overlap")):
+        det = rows.get(f"35b_{det_mode}_sharegpt_logprob_{logprob}.jsonl")
+        row = rows.get(f"35b_{mode}_sharegpt_logprob_{logprob}.jsonl")
+        if det is None or row is None:
+            continue
+        speedup = row["output_throughput"] / det["output_throughput"]
+        if mode == "self_v2":
+            product_speedups.append(speedup)
+        print(
+            f"DET_SPEEDUP {mode} logprob={logprob} "
+            f"dvr={row['output_throughput']:.2f} "
+            f"ordinary_det={det['output_throughput']:.2f} "
+            f"speedup={speedup:.3f} faster={str(speedup > 1.0).lower()}"
+        )
+
+if product_speedups:
+    print(
+        "PRODUCT_GATE mode=self_v2 "
+        f"comparisons={len(product_speedups)} "
+        f"min_speedup={min(product_speedups):.3f} "
+        f"faster_than_ordinary_det={str(min(product_speedups) > 1.0).lower()}"
+    )
 PY
 }
 
@@ -265,10 +337,16 @@ require_file "${MODEL_PATH}/config.json"
 require_file "${SHAREGPT_DATASET}"
 
 if [[ "${RUN_BASELINE_SYNC}" == "1" ]]; then
-  run_baseline_mode baseline_sync 0
+  run_baseline_mode baseline_sync 0 0
 fi
 if [[ "${RUN_BASELINE_OVERLAP}" == "1" ]]; then
-  run_baseline_mode baseline_overlap 1
+  run_baseline_mode baseline_overlap 1 0
+fi
+if [[ "${RUN_DET_SYNC}" == "1" ]]; then
+  run_baseline_mode det_sync 0 1
+fi
+if [[ "${RUN_DET_OVERLAP}" == "1" ]]; then
+  run_baseline_mode det_overlap 1 1
 fi
 if [[ "${RUN_SELF}" == "1" ]]; then
   run_self_mode self_v1
@@ -278,4 +356,4 @@ if [[ "${RUN_EAGLE}" == "1" ]]; then
   run_eagle_mode eagle_sync
   run_eagle_mode eagle_overlap
 fi
-summarize_results
+summarize_results | tee "${RESULT_ROOT}/summary.txt"

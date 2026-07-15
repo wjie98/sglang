@@ -41,12 +41,16 @@ Use these entry points:
     MTP baseline; this catches routing regressions without pretending real-data
     acceptance should be nearly one
 - `test/manual/dvr/scripts/run_35b_dvr_throughput.sh`
-  - matching 35B no-DVR, self-v1/v2, and EAGLE sync/overlap ShareGPT runs
+  - matching 35B non-deterministic normal, ordinary deterministic,
+    self-v1/v2, and EAGLE sync/overlap ShareGPT runs
   - runs TP=4 self-DVR KL boundary checks before its throughput pair
+  - records one ordinary-deterministic GDN oracle probe without treating an
+    observed nonzero mismatch as a DVR test failure
   - fixes 8 requests, 512 output tokens, concurrency 3, and covers
     `return_logprob=True/False`
 - `test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh`
-  - Qwen3-Next 80B no-DVR baseline and self-DVR spec v1/v2 long-output throughput
+  - Qwen3-Next 80B non-deterministic normal, ordinary deterministic, and
+    self-DVR spec v1/v2 long-output throughput
   - covers ShareGPT and fixed LongBench custom-cache inputs
   - covers `return_logprob=True/False`
 - `test/manual/dvr/scripts/profile_dvr_server.sh`
@@ -84,18 +88,27 @@ The throughput scripts pin `--max-mamba-cache-size 16` and fail if the runtime
 reduces the requested concurrency or omits its largest CUDA graph batch.
 Their concurrency knobs must be overridden together with enough Mamba cache
 capacity; otherwise the run is not a valid comparison. The throughput scripts
-launch separate no-DVR sync and overlap baselines. Compare v1/sync only with
-`baseline_sync`, and v2/overlap only with `baseline_overlap`; all sides use the
-same page size, backend, radix mode, TP, and returned-logprob setting. The 80B
-default run includes both baselines, v1, and v2;
-`RUN_BASELINE=0` or `RUN_DVR=0` may be used only to resume an interrupted
-matrix in the same `RESULT_ROOT`.
+launch two no-DVR baseline classes in matching sync and overlap modes.
+`baseline_sync/baseline_overlap` are non-deterministic normal serving and are
+used only for acceptance-weighted implementation efficiency.
+`det_sync/det_overlap` are ordinary no-DVR serving with
+`--enable-deterministic-inference` and are used only for the user-facing DVR
+speedup. Compare v1 only with sync and v2 only with overlap; all sides use the
+same page size, backend, radix mode, TP, and returned-logprob setting. Never use
+ordinary det as the denominator of `acceptance_x_baseline`, and never use
+non-deterministic normal to claim DVR is faster than deterministic serving.
+`RUN_BASELINE=0` disables both baseline classes by default;
+`RUN_DETERMINISTIC_BASELINE`, `RUN_DET_SYNC`, and `RUN_DET_OVERLAP` may override
+that behavior only when resuming an interrupted matrix in the same
+`RESULT_ROOT`.
 
 Throughput reported by `bench_serving` already includes the speculative
 acceptance benefit. Compute `acceptance_fraction = accept_length / draft_tokens`,
 `target_tps = matching_baseline_tps * acceptance_fraction`, and
 `target_efficiency = dvr_tps / target_tps`. Never multiply DVR throughput by
-acceptance a second time.
+acceptance a second time. Separately compute
+`det_speedup = dvr_tps / matching_ordinary_det_tps`. The fixed scripts emit
+both metrics and write them to `summary.txt`.
 
 The 35B script exposes `CONTEXT_LENGTH` and `MAX_TOTAL_TOKENS` for separately
 reported large-batch EAGLE runs. Keep its defaults for the fixed BS=3 matrix;

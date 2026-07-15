@@ -90,13 +90,9 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
 
 The fixed script also runs concurrent and batch `prompt_len=65`, `max_new=512`
 cases. Add a separate fixed case for 513 tokens when a change specifically
-touches end-of-chunk termination behavior.
-
-One-token synthetic prompts are intentionally not part of the positive DVR
-smoke matrix. The first self-draft graph step reaches the internal
-`seq_len<=2` GDN state-input boundary for that case, so DVR now rejects it
-explicitly instead of running a slow eager path. Normal chat-template prompts
-are much longer and do not hit this edge.
+touches end-of-chunk termination behavior. One-token prompts are part of the
+positive matrix: their first iteration uses the target-verify sentinel and
+then joins the normal self-draft path.
 
 ## 35B self-DVR and DVR-EAGLE
 
@@ -109,17 +105,19 @@ Fixed EAGLE/MTP smoke script:
 test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
 ```
 
-Fixed no-DVR/self-DVR/DVR-EAGLE throughput comparison:
+Fixed non-deterministic normal/ordinary deterministic/self-DVR/DVR-EAGLE
+throughput comparison:
 
 ```bash
 test/manual/dvr/scripts/run_35b_dvr_throughput.sh
 ```
 
 It uses 8 ShareGPT requests, 512 generated tokens, concurrency 3, and runs both
-returned-logprob modes.  Self-v1/v2 also run the TP=4 boundary KL client before
-the benchmark.  EAGLE correctness and per-prompt acceptance remain the
-responsibility of `run_35b_mtp_eagle_smoke.sh`; the throughput script measures
-the six matching server modes without duplicating that matrix.
+returned-logprob modes. Self-v1/v2 also run the TP=4 boundary KL client before
+the benchmark. The ordinary deterministic overlap server runs one
+`prompt_len=65,max_new=65` full-prefill GDN oracle probe and records its result;
+only DVR is required to report strict `KL=0`. EAGLE correctness and per-prompt
+acceptance remain the responsibility of `run_35b_mtp_eagle_smoke.sh`.
 
 Self-DVR server:
 
@@ -232,24 +230,30 @@ test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh
 
 The reproduced setup is 16 requests, 1024 generated tokens, ShareGPT
 `max_concurrency=3`, and fixed LongBench custom-cache input with
-`max_concurrency=2`.  The server command pins `--max-mamba-cache-size 16`; do
-not omit it when comparing against the reference numbers.  The default script
-run includes the matching normal no-DVR baseline before DVR v1 and v2.
+`max_concurrency=2`. The server command pins `--max-mamba-cache-size 16`; do
+not omit it when comparing against the reference numbers. The default script
+run includes matching sync/overlap instances of both non-deterministic normal
+and ordinary deterministic no-DVR serving before DVR v1 and v2.
 
-Compare every DVR run with a no-DVR baseline launched with the same scheduler
-mode, page size, backend, radix setting, TP size, context length, request rate,
-request count, output length, and returned-logprob mode. Report:
+The two baselines answer different questions and must not be mixed. Compare
+every DVR run with baselines launched with the same scheduler mode, page size,
+backend, radix setting, TP size, context length, request rate, request count,
+output length, and returned-logprob mode. Report:
 
 ```text
 acceptance_fraction = accept_length / speculative_num_draft_tokens
 target_tps = matching_baseline_tps * acceptance_fraction
 dvr_ratio = dvr_output_throughput / matching_baseline_tps
 target_efficiency = dvr_output_throughput / target_tps
+
+det_speedup = dvr_output_throughput / matching_ordinary_det_throughput
 ```
 
 The DVR output throughput already includes accepted-token acceleration; do not
-multiply it by acceptance again. For every throughput run, keep the raw
-benchmark JSONL and server log. The
+multiply it by acceptance again. `target_efficiency` uses only the
+non-deterministic normal baseline. `det_speedup` uses only the ordinary
+deterministic baseline and is the product-value comparison. For every
+throughput run, keep the raw benchmark JSONL and server log. The
 server log is the source of DVR accept rate and verifies whether draft decode
 uses CUDA graph and non-deterministic decode performance knobs.
 
@@ -266,9 +270,12 @@ For each backend keep separate sync and overlap baselines and both
 `return_logprob` modes. Record `nvidia-smi topo -m`; a PCIe-only run is not an
 NVLink custom-all-reduce result.
 
-The release goal is `target_efficiency >= 0.95` on H20/NVLink without reducing
-accepted length or server concurrency. Current A40 results are diagnostic only:
-custom all-reduce is expected to remain disabled on four PCIe-only GPUs.
+The release goals on H20/NVLink are `target_efficiency >= 0.95` and self-DVR v2
+faster than matching ordinary deterministic inference on ShareGPT/LongBench
+with both returned-logprob modes. Require median `det_speedup > 1.0`; values
+below 1.05 need repetition because they are close to measurement noise. Current
+A40 results are diagnostic only: custom all-reduce is expected to remain
+disabled on four PCIe-only GPUs.
 
 ## Self-draft chain CUDA graph gate
 

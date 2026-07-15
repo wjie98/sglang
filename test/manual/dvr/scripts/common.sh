@@ -177,6 +177,36 @@ assert_server_config() {
   done
 }
 
+assert_baseline_server_config() {
+  local server_log="$1"
+  local deterministic="$2"
+  local tp_size="$3"
+  local deterministic_value="False"
+
+  if [[ "${deterministic}" == "1" ]]; then
+    deterministic_value="True"
+  fi
+
+  for expected in \
+    "speculative_algorithm=None" \
+    "enable_deterministic_inference=${deterministic_value}"; do
+    if ! grep -q "${expected}" "${server_log}"; then
+      echo "Baseline server did not resolve expected config: ${expected}" >&2
+      tail -120 "${server_log}" >&2 || true
+      return 1
+    fi
+  done
+
+  # Ordinary TP deterministic inference uses the upstream deterministic
+  # collective policy. DVR may override collectives only inside draft graphs.
+  if [[ "${deterministic}" == "1" ]] && ((tp_size > 1)) && \
+     ! grep -q "disable_custom_all_reduce=True" "${server_log}"; then
+    echo "Ordinary deterministic TP baseline did not disable custom all-reduce." >&2
+    tail -120 "${server_log}" >&2 || true
+    return 1
+  fi
+}
+
 stop_process_group() {
   local server_pid="${1:-}"
   if [[ -z "${server_pid}" ]]; then

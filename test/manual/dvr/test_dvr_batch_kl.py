@@ -538,6 +538,14 @@ def main():
         help="Do not flush before full-prefill oracle scoring.",
     )
     parser.add_argument("--dump-failure-json", action="store_true")
+    parser.add_argument(
+        "--allow-mismatch",
+        action="store_true",
+        help=(
+            "Report ALL_OK False without a nonzero exit status. Intended for "
+            "a non-DVR comparison baseline; request failures still fail."
+        ),
+    )
     args = parser.parse_args()
 
     modes = parse_modes(args.request_modes)
@@ -585,7 +593,8 @@ def main():
             raise AssertionError(mode)
 
     results.sort(key=lambda x: x.case.case_id)
-    if not evaluate_results(args.base_url, args, results, prompt_ids):
+    all_ok = evaluate_results(args.base_url, args, results, prompt_ids)
+    if not all_ok and not args.allow_mismatch:
         raise SystemExit(1)
 
 

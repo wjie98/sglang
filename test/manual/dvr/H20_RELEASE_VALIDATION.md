@@ -7,7 +7,9 @@ parameter variation in a separate result directory.
 
 The qualification covers:
 
-- normal no-DVR inference
+- non-deterministic normal no-DVR inference as the implementation-efficiency
+  baseline
+- ordinary deterministic no-DVR inference as the product-speed baseline
 - self-DVR synchronous/spec-v1 compatibility and overlap/spec-v2
 - DVR-EAGLE with the Qwen3.5 MTP weights
 - exact returned-logprob replay (`KL=0` in the DVR test terminology)
@@ -30,9 +32,9 @@ reuse results from a server launched before the DeepGEMM cache was prepared.
 4. Run static checks, then the 0.8B and 35B correctness matrices. Stop if any
    graph capture, KL, boundary, or acceptance check fails.
 5. Run 80B Triton and FA3 dvr16, followed by dvr32 in separate result roots.
-   Each script launches its own matching sync/overlap baseline; never reuse a
-   baseline from another backend, draft length, TP size, or returned-logprob
-   setting.
+   Each script launches matching sync/overlap non-deterministic normal and
+   ordinary deterministic baselines. Never reuse a baseline from another
+   backend, TP size, scheduler mode, or returned-logprob setting.
 6. Repeat the two best complete matrices three times and report the median.
 7. Only if a prewarmed DeepGEMM server still fails graph capture, preserve that
    log and run a separate diagnostic with
@@ -116,10 +118,13 @@ Do not prepare the release branch until all applicable gates pass.
    introduce a different GDN state lifecycle.
 8. No server log contains an illegal memory access, device-side assertion,
    missing checkpoint, CUDA graph fallback, or reduced requested concurrency.
+9. The 35B ordinary deterministic GDN probe completes and its observed oracle
+   status is reported. It is a comparison datum, not an expectation of
+   `KL!=0`; only DVR carries the strict GDN `KL=0` release guarantee.
 
 ### Performance
 
-Always compare like with like:
+There are two independent comparisons. Always compare like with like:
 
 - self-v1 against `baseline_sync`
 - self-v2 against `baseline_overlap`
@@ -128,7 +133,8 @@ Always compare like with like:
 - identical backend, radix setting, TP size, page size, dataset, concurrency,
   output length, and returned-logprob mode
 
-Use:
+The `baseline_*` rows are non-deterministic normal serving. They measure how
+closely DVR approaches its acceptance-weighted ideal:
 
 ```text
 acceptance_fraction = accept_length / speculative_num_draft_tokens
@@ -139,6 +145,26 @@ target_efficiency = dvr_tps / target_tps
 The H20/NVLink release target is `target_efficiency >= 0.95`. Any result below
 0.90 is a failed performance gate, not measurement noise. Values from 0.90 to
 0.95 require a profile and an explained follow-up result.
+
+The `det_*` rows are ordinary no-DVR serving with
+`--enable-deterministic-inference`. They measure the product advantage:
+
+```text
+det_speedup = dvr_tps / matching_ordinary_det_tps
+```
+
+For the selected self-DVR v2 backend, the median `det_speedup` must be greater
+than 1.0 on ShareGPT and LongBench with `return_logprob=True/False`. A minimum
+speedup of 1.05 is the robust release target; 1.0-1.05 is inconclusive until
+three repetitions have CV at most 3%. Do not use the non-deterministic normal
+baseline to make this speed claim, and do not use ordinary det to calculate
+`target_efficiency`.
+
+Strict GDN determinism is a separate correctness advantage. Self-DVR must
+return exact decode logprobs matching a fresh full-prefill oracle. Ordinary
+deterministic serving has no batch-invariant GDN recurrence guarantee; its
+measured probe may match on a particular case, but that does not replace the
+DVR boundary and long-sequence KL matrix.
 
 For the final selected backend, run three complete repetitions. Report the
 median and coefficient of variation; CV should be at most 3%. Spec-v2 absolute
@@ -377,8 +403,10 @@ non-DVR regression gate and must not be replaced by the DVR-EAGLE smoke above.
 
 ## 6. 35B fixed throughput matrix
 
-Run the fixed BS=3 matrix once for all backends. It covers matching no-DVR
-sync/overlap baselines, self-v1/v2, EAGLE sync/overlap, and both logprob modes.
+Run the fixed BS=3 matrix once for all backends. It covers matching
+non-deterministic normal and ordinary deterministic sync/overlap baselines,
+self-v1/v2, EAGLE sync/overlap, and both logprob modes. The summary emits
+`TARGET`, `DET_SPEEDUP`, `PRODUCT_GATE`, and the 35B GDN oracle status.
 
 ```bash
 for backend in triton fa3 flashinfer; do
@@ -392,6 +420,7 @@ for backend in triton fa3 flashinfer; do
   LINEAR_ATTN_BACKEND=triton \
   DISABLE_RADIX_CACHE=auto \
   DISABLE_CUSTOM_ALL_REDUCE=0 \
+  RUN_DETERMINISTIC_BASELINE=1 \
   RESULT_ROOT="${result}" \
     bash test/manual/dvr/scripts/run_35b_dvr_throughput.sh
 done
@@ -439,7 +468,9 @@ result directory; never report a silently reduced BS=8 run.
 
 The 80B matrix is the release performance gate. It runs 16 ShareGPT requests
 at concurrency 3 and 16 fixed LongBench requests at concurrency 2, with 1024
-generated tokens and both returned-logprob modes.
+generated tokens and both returned-logprob modes. Every result root contains
+normal sync/overlap, ordinary deterministic sync/overlap, DVR v1/v2, and a
+`summary.txt` with both efficiency and deterministic-speed comparisons.
 
 ```bash
 for backend in triton fa3 flashinfer; do
@@ -453,6 +484,7 @@ for backend in triton fa3 flashinfer; do
   LINEAR_ATTN_BACKEND=triton \
   DISABLE_RADIX_CACHE=auto \
   DISABLE_CUSTOM_ALL_REDUCE=0 \
+  RUN_DETERMINISTIC_BASELINE=1 \
   RESULT_ROOT="${result}" \
     bash test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh
 done
@@ -474,6 +506,7 @@ for backend in triton fa3; do
   LINEAR_ATTN_BACKEND=triton \
   DISABLE_RADIX_CACHE=auto \
   DISABLE_CUSTOM_ALL_REDUCE=0 \
+  RUN_DETERMINISTIC_BASELINE=1 \
   DRAFT_TOKENS=32 \
   DRAFT_STEPS=31 \
   RESULT_ROOT="${result}" \
@@ -488,7 +521,8 @@ Historical H20 numbers from an earlier implementation were approximately
 398 tok/s for Triton and 370 tok/s for FA3 on ShareGPT, and 298.45 tok/s for
 Triton and 225.32 tok/s for FA3 on LongBench. They are only a gross sanity
 check because the code and baseline have changed. The matching baseline and
-`target_efficiency` from this run are authoritative.
+`target_efficiency`, plus the matching ordinary-det `det_speedup`, from this
+run are authoritative.
 
 ## 8. Custom all-reduce ownership check
 
@@ -514,6 +548,7 @@ ATTENTION_BACKEND=triton \
 LINEAR_ATTN_BACKEND=triton \
 DISABLE_CUSTOM_ALL_REDUCE=1 \
 RUN_BASELINE=0 \
+RUN_DETERMINISTIC_BASELINE=0 \
 RUN_DVR=1 \
 RESULT_ROOT="${RESULT_BASE}/80b-triton-custom-ar-disabled" \
   bash test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh
@@ -572,6 +607,7 @@ TP_SIZE=4 \
 ATTENTION_BACKEND=triton \
 LINEAR_ATTN_BACKEND=triton \
 RUN_BASELINE=1 \
+RUN_DETERMINISTIC_BASELINE=0 \
 RUN_DVR=0 \
 RESULT_ROOT="${RESULT_BASE}/80b-upstream-baseline-triton" \
   bash test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh
@@ -625,17 +661,20 @@ GPU topology
 backend and radix mode
 mode and scheduler mode
 return_logprob
-baseline tok/s
+non-deterministic normal tok/s
+ordinary deterministic tok/s
 DVR tok/s
 accept length and fraction
 acceptance_x_baseline
 target_efficiency
+det_speedup and faster-than-det verdict
 median/CV for repeated runs
-KL failures
+ordinary-det GDN oracle observation and DVR KL failures
 server/log result paths
 ```
 
 Release is ready only when correctness passes on all required backends, the
-selected production backend reaches the H20 target, no-DVR A/B is neutral, and
-all remaining exceptions are documented as explicit unsupported configurations
-rather than silent fallbacks.
+selected production backend reaches both the acceptance-weighted efficiency
+target and the ordinary-deterministic speed target, DVR demonstrates strict GDN
+KL=0, no-DVR A/B is neutral, and all remaining exceptions are documented as
+explicit unsupported configurations rather than silent fallbacks.

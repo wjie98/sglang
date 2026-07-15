@@ -14,6 +14,9 @@ RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/
 RUN_BASELINE="${RUN_BASELINE:-1}"
 RUN_BASELINE_SYNC="${RUN_BASELINE_SYNC:-${RUN_BASELINE}}"
 RUN_BASELINE_OVERLAP="${RUN_BASELINE_OVERLAP:-${RUN_BASELINE}}"
+RUN_DETERMINISTIC_BASELINE="${RUN_DETERMINISTIC_BASELINE:-${RUN_BASELINE}}"
+RUN_DET_SYNC="${RUN_DET_SYNC:-${RUN_DETERMINISTIC_BASELINE}}"
+RUN_DET_OVERLAP="${RUN_DET_OVERLAP:-${RUN_DETERMINISTIC_BASELINE}}"
 RUN_DVR="${RUN_DVR:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-16}"
 OUTPUT_LEN="${OUTPUT_LEN:-1024}"
@@ -69,7 +72,11 @@ append_run_config "${RESULT_ROOT}" \
   "warmup_requests=${WARMUP_REQUESTS}" \
   "draft_tokens=${DRAFT_TOKENS}" "draft_steps=${DRAFT_STEPS}" \
   "sharegpt_concurrency=${SHAREGPT_MAX_CONCURRENCY}" \
-  "longbench_concurrency=${LONGBENCH_MAX_CONCURRENCY}"
+  "longbench_concurrency=${LONGBENCH_MAX_CONCURRENCY}" \
+  "run_baseline_sync=${RUN_BASELINE_SYNC}" \
+  "run_baseline_overlap=${RUN_BASELINE_OVERLAP}" \
+  "run_det_sync=${RUN_DET_SYNC}" "run_det_overlap=${RUN_DET_OVERLAP}" \
+  "run_dvr=${RUN_DVR}"
 
 cleanup() {
   stop_process_group "${SERVER_PID}"
@@ -129,13 +136,18 @@ run_benchmark_matrix() {
 run_baseline_mode() {
   local label="$1"
   local overlap_enabled="$2"
+  local deterministic="$3"
   local server_log="${RESULT_ROOT}/logs/80b_${label}_server.log"
   local overlap_args=()
+  local deterministic_args=()
   if [[ "${overlap_enabled}" == "0" ]]; then
     overlap_args=(--disable-overlap-schedule)
   fi
+  if [[ "${deterministic}" == "1" ]]; then
+    deterministic_args=(--enable-deterministic-inference)
+  fi
 
-  echo "==> Starting 80B no-DVR ${label} server on ${BASE_URL}"
+  echo "==> Starting 80B ${label} server on ${BASE_URL}"
   setsid env \
     PYTHONPATH="${PYTHONPATH}" \
     conda run --no-capture-output -n "${CONDA_ENV}" python -m sglang.launch_server \
@@ -156,6 +168,7 @@ run_baseline_mode() {
       --cuda-graph-max-bs "${SERVER_MAX_CONCURRENCY}" \
       "${RADIX_ARGS[@]}" \
       "${CUSTOM_AR_ARGS[@]}" \
+      "${deterministic_args[@]}" \
       "${overlap_args[@]}" \
       --skip-server-warmup \
       >"${server_log}" 2>&1 &
@@ -165,6 +178,7 @@ run_baseline_mode() {
   assert_server_capacity "${server_log}" "${SERVER_MAX_CONCURRENCY}"
   assert_server_config \
     "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${overlap_enabled}" "${DISABLE_RADIX_CACHE}"
+  assert_baseline_server_config "${server_log}" "${deterministic}" "${TP_SIZE}"
   run_benchmark_matrix "${label}"
   stop_process_group "${SERVER_PID}"
   SERVER_PID=""
@@ -256,6 +270,7 @@ for path in glob.glob(os.path.join(base, "results", "80b_*.jsonl")):
     if records:
         rows[os.path.basename(path)] = json.loads(records[-1])
 
+product_speedups = []
 for dataset in ("sharegpt", "longbench"):
     for logprob in ("false", "true"):
         for mode, baseline_mode in (("v1", "baseline_sync"), ("v2", "baseline_overlap")):
@@ -276,6 +291,29 @@ for dataset in ("sharegpt", "longbench"):
                 f"target_efficiency={efficiency:.3f} "
                 f"mean_tpot_ms={row.get('mean_tpot_ms', float('nan')):.3f}"
             )
+
+        for mode, det_mode in (("v1", "det_sync"), ("v2", "det_overlap")):
+            det = rows.get(f"80b_{det_mode}_{dataset}_logprob_{logprob}.jsonl")
+            row = rows.get(f"80b_{mode}_{dataset}_logprob_{logprob}.jsonl")
+            if det is None or row is None:
+                continue
+            speedup = row["output_throughput"] / det["output_throughput"]
+            if mode == "v2":
+                product_speedups.append(speedup)
+            print(
+                f"DET_SPEEDUP {mode} dataset={dataset} logprob={logprob} "
+                f"dvr={row['output_throughput']:.2f} "
+                f"ordinary_det={det['output_throughput']:.2f} "
+                f"speedup={speedup:.3f} faster={str(speedup > 1.0).lower()}"
+            )
+
+if product_speedups:
+    print(
+        "PRODUCT_GATE mode=v2 "
+        f"comparisons={len(product_speedups)} "
+        f"min_speedup={min(product_speedups):.3f} "
+        f"faster_than_ordinary_det={str(min(product_speedups) > 1.0).lower()}"
+    )
 PY
 }
 
@@ -284,19 +322,27 @@ require_file "${SHAREGPT_DATASET}"
 require_file "${LONGBENCH_CUSTOM_DATASET}"
 
 # Fixed reproduced口径:
-# - baseline_sync/v1 and baseline_overlap/v2 use matching scheduler modes.
+# - normal and ordinary-deterministic baselines match each DVR scheduler mode.
+# - normal baselines measure acceptance-weighted implementation efficiency.
+# - deterministic baselines measure the user-facing deterministic speedup.
 # - v1: compatibility scheduler, overlap disabled.
 # - v2: spec-v2 worker with overlap enabled.
 # - server/graph concurrency is the maximum requested by either dataset.
 # - max_mamba_cache_size must cover that concurrency without a runtime reduction.
 if [[ "${RUN_BASELINE_SYNC}" == "1" ]]; then
-  run_baseline_mode baseline_sync 0
+  run_baseline_mode baseline_sync 0 0
 fi
 if [[ "${RUN_BASELINE_OVERLAP}" == "1" ]]; then
-  run_baseline_mode baseline_overlap 1
+  run_baseline_mode baseline_overlap 1 0
+fi
+if [[ "${RUN_DET_SYNC}" == "1" ]]; then
+  run_baseline_mode det_sync 0 1
+fi
+if [[ "${RUN_DET_OVERLAP}" == "1" ]]; then
+  run_baseline_mode det_overlap 1 1
 fi
 if [[ "${RUN_DVR}" == "1" ]]; then
   run_one_mode "v1" "0"
   run_one_mode "v2" "1"
 fi
-summarize_results
+summarize_results | tee "${RESULT_ROOT}/summary.txt"
