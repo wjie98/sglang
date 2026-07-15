@@ -164,11 +164,14 @@ class DVRLinearStateLifecycle:
             return
         chunk_size = self._state_adapter.chunk_size
         publish_to_request = prefill_prefix_lens is None
-        if publish_to_request:
-            for req in batch.reqs:
-                checkpoint = self._checkpoint(req)
-                if checkpoint is None or not checkpoint.publish_pending:
-                    continue
+        missing = []
+        for i, req in enumerate(batch.reqs):
+            checkpoint = self._checkpoint(req)
+            if checkpoint is None:
+                missing.append(i)
+                continue
+
+            if publish_to_request and checkpoint.publish_pending:
                 req.mamba_last_track_seqlen = checkpoint.seq_len
                 req.mamba_next_track_idx = (
                     batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
@@ -177,16 +180,13 @@ class DVRLinearStateLifecycle:
                 )
                 checkpoint.publish_pending = False
 
-        for i, req in enumerate(batch.reqs):
-            checkpoint = self._checkpoint(req)
-            if checkpoint is None:
-                continue
             if seq_lens_cpu is not None:
                 current_boundary = int(seq_lens_cpu[i]) // chunk_size * chunk_size
                 if current_boundary == checkpoint.seq_len + chunk_size:
                     checkpoint.seq_len = current_boundary
                 elif checkpoint.seq_len != current_boundary:
                     del self.boundaries[req.req_pool_idx]
+                    missing.append(i)
                 continue
 
             # The overlap result processor publishes committed checkpoint
@@ -207,6 +207,7 @@ class DVRLinearStateLifecycle:
 
         self._ensure_boundary_state(
             batch,
+            missing=missing,
             seq_lens_cpu=seq_lens_cpu,
             prefill_prefix_lens=prefill_prefix_lens,
             publish_to_request=publish_to_request,
@@ -401,13 +402,15 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         ctx: Optional[DVRLinearStateContext] = None,
         *,
+        missing: Optional[List[int]] = None,
         seq_lens_cpu: Optional[List[int]] = None,
         prefill_prefix_lens: Optional[List[int]] = None,
         publish_to_request: bool = True,
     ) -> None:
-        missing = [
-            i for i, req in enumerate(batch.reqs) if self._checkpoint(req) is None
-        ]
+        if missing is None:
+            missing = [
+                i for i, req in enumerate(batch.reqs) if self._checkpoint(req) is None
+            ]
         if not missing:
             return
         ctx = ctx or self.state_context(batch)
