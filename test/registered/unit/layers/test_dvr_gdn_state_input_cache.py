@@ -7,6 +7,7 @@ from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUN
 from sglang.srt.layers.attention.linear.dvr_gdn import (
     DVRGDNStateAdapter,
 )
+from sglang.srt.layers.attention.linear.dvr_state import DVRRecurrentStateBackup
 
 
 def create_gdn_state_input_cache(
@@ -347,3 +348,27 @@ def test_gdn_extend_preserves_cached_prefix_boundary_in_request_slot():
     # The normal prefill tracker owns requests whose extend reaches a new chunk.
     assert not torch.equal(conv[3], conv[1])
     assert not torch.equal(temporal[3], temporal[1])
+
+
+def test_gdn_self_draft_restores_from_stable_boundary_without_snapshot():
+    conv = torch.zeros(1, 3, 2)
+    temporal = torch.zeros(1, 3, 2)
+    temporal[:, 1] = torch.tensor([3.0, 4.0])
+    state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
+    live_backup = DVRRecurrentStateBackup(
+        conv=(torch.tensor([[[5.0, 6.0]]]),), temporal=None
+    )
+    adapter = DVRGDNStateAdapter(
+        kernel_dispatcher=None, draft_reuses_target_state=True
+    )
+
+    adapter.prepare_recurrent_state_for_verify(
+        state_cache=state_cache,
+        live_indices=torch.tensor([2]),
+        boundary_indices=torch.tensor([1]),
+        boundary_backup=None,
+        live_backup=live_backup,
+    )
+
+    assert torch.equal(temporal[:, 2], temporal[:, 1])
+    assert torch.equal(conv[:, [2]], live_backup.conv[0])

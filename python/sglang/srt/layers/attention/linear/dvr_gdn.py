@@ -322,29 +322,23 @@ class DVRGDNStateAdapter:
         live_backup: Optional[DVRRecurrentStateBackup],
     ):
         if boundary_backup is None:
-            if self.draft_reuses_target_state:
-                raise RuntimeError(
-                    "DVR self-draft target verify is missing its recurrent-state snapshot."
-                )
             state_cache.temporal[:, live_indices] = state_cache.temporal[
                 :, boundary_indices
             ]
-            return
-
-        # Draft decode mutates the live recurrent slot. DVR target verify needs
-        # the chunk-boundary SSM state for chunkwise scan, but the draft-start
-        # conv state for producing the draft suffix inputs.
-        assert boundary_backup.temporal is not None
-        for conv, saved_conv in zip(
-            state_cache.conv, boundary_backup.conv, strict=True
-        ):
-            conv[:, boundary_indices] = saved_conv.to(conv.dtype, copy=False)
-        state_cache.temporal[:, boundary_indices] = boundary_backup.temporal.to(
-            state_cache.temporal.dtype, copy=False
-        )
-        state_cache.temporal[:, live_indices] = boundary_backup.temporal.to(
-            state_cache.temporal.dtype, copy=False
-        )
+        else:
+            # Overlap radix may donate and rebind the physical checkpoint slot.
+            # Restore the snapshot into both the rebound boundary and live slots.
+            assert boundary_backup.temporal is not None
+            for conv, saved_conv in zip(
+                state_cache.conv, boundary_backup.conv, strict=True
+            ):
+                conv[:, boundary_indices] = saved_conv.to(conv.dtype, copy=False)
+            state_cache.temporal[:, boundary_indices] = boundary_backup.temporal.to(
+                state_cache.temporal.dtype, copy=False
+            )
+            state_cache.temporal[:, live_indices] = boundary_backup.temporal.to(
+                state_cache.temporal.dtype, copy=False
+            )
         if live_backup is not None:
             for conv, saved_conv in zip(state_cache.conv, live_backup.conv, strict=True):
                 conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)

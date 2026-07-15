@@ -177,14 +177,15 @@ class ModelRunnerKVCacheMixin:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = server_args.max_running_requests // (
+            request_capacity = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
+            )
+            server_args.max_mamba_cache_size = request_capacity * (
+                self._calculate_mamba_ratio() if self.spec_algorithm.is_dvr() else 1
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
-                intermediate_size = (
-                    intermediate_per_req * server_args.max_mamba_cache_size
-                )
+                intermediate_size = intermediate_per_req * request_capacity
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory

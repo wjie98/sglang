@@ -222,13 +222,14 @@ class DVRLinearStateLifecycle:
         if self._state_adapter is None:
             self.state_backup = None
             return
-        if (
-            not self._state_adapter.draft_reuses_target_state
-            and not batch.enable_overlap
-        ):
-            # A separate synchronous draft model cannot mutate or race the
-            # target checkpoint, so target verify can read the ping-pong slot
-            # directly without copying a recurrent snapshot every iteration.
+        backup_boundary = (
+            batch.enable_overlap and not self.server_args.disable_radix_cache
+        )
+        backup_live = self._state_adapter.draft_reuses_target_state
+        if not backup_boundary and not backup_live:
+            # Without overlap radix cannot rebind the checkpoint before the next
+            # verify; with radix disabled there is no donation at all. A separate
+            # draft model also cannot mutate the target live slot.
             self.state_backup = None
             return
         # Host logical lengths advance after overlap result processing, while
@@ -255,15 +256,17 @@ class DVRLinearStateLifecycle:
         existing_boundary = existing_live = None
         if self.state_backup is not None and self.state_backup[0] == backup_keys:
             _, existing_boundary, existing_live = self.state_backup
-        boundary_backup = self._state_adapter.backup_recurrent_state(
-            state_cache=ctx.state_cache,
-            indices=ctx.boundary_indices,
-            out=existing_boundary,
-        )
+        boundary_backup = None
+        if backup_boundary:
+            boundary_backup = self._state_adapter.backup_recurrent_state(
+                state_cache=ctx.state_cache,
+                indices=ctx.boundary_indices,
+                out=existing_boundary,
+            )
         # Only self-draft mutates the target live slot. Its temporal state is
         # rebuilt from the boundary oracle, so preserve only convolution state.
         live_backup = None
-        if self._state_adapter.draft_reuses_target_state:
+        if backup_live:
             live_backup = self._state_adapter.backup_recurrent_state(
                 state_cache=ctx.state_cache,
                 indices=ctx.live_indices,

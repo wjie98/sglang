@@ -9,6 +9,7 @@ MODEL_PATH="${MODEL_PATH:-/mnt/data/hwj/Qwen3.5-0.8B}"
 PORT="${PORT:-30124}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.50}"
 TP_SIZE="${TP_SIZE:-1}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-8192}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 LINEAR_ATTN_BACKEND="${LINEAR_ATTN_BACKEND:-triton}"
@@ -25,6 +26,7 @@ mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
 write_run_metadata "${RESULT_ROOT}"
 append_run_config "${RESULT_ROOT}" \
   "script=$(basename "$0")" "model=${MODEL_PATH}" "tp=${TP_SIZE}" \
+  "context_length=${CONTEXT_LENGTH}" \
   "page_size=${PAGE_SIZE}" "attention_backend=${ATTENTION_BACKEND}" \
   "linear_attn_backend=${LINEAR_ATTN_BACKEND}" \
   "disable_radix_cache=${DISABLE_RADIX_CACHE}"
@@ -57,6 +59,7 @@ run_one_mode() {
       --host 127.0.0.1 \
       --port "${PORT}" \
       --tp-size "${TP_SIZE}" \
+      --context-length "${CONTEXT_LENGTH}" \
       --speculative-algorithm DECODE_VERIFY_ROLLBACK \
       --speculative-num-draft-tokens 16 \
       --page-size "${PAGE_SIZE}" \

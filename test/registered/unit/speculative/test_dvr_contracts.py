@@ -15,6 +15,9 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _ensure_decode_custom_all_reduce_comm,
     iter_dvr_attention_backends,
 )
+from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    ModelRunnerKVCacheMixin,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_state_flow import (
     DVRLinearStateLifecycle,
@@ -46,6 +49,38 @@ def test_dvr_worker_uses_base_spec_worker_contract():
 
 def test_dvr_target_graph_keeps_verify_deterministic_for_both_draft_backends():
     assert DVRTargetVerifyCudaGraphRunner.dvr_target_verify_cuda_graph
+
+
+def test_dvr_without_radix_allocates_recurrent_slots_per_request():
+    server_args = SimpleNamespace(
+        speculative_num_draft_tokens=16,
+        speculative_eagle_topk=1,
+        max_running_requests=8,
+        max_mamba_cache_size=None,
+        disable_radix_cache=True,
+        dp_size=1,
+        enable_dp_attention=False,
+        enable_mamba_extra_buffer=lambda: True,
+    )
+    params = SimpleNamespace(
+        mamba_cache_per_req=1024,
+        layers=(0,),
+        shape=SimpleNamespace(conv=((2, 4),), temporal=(2, 2)),
+        dtype=SimpleNamespace(conv=torch.float32, temporal=torch.float32),
+    )
+    runner = SimpleNamespace(
+        server_args=server_args,
+        mambaish_config=SimpleNamespace(mamba2_cache_params=params),
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+        dp_size=1,
+    )
+    runner._calculate_mamba_ratio = lambda: (
+        ModelRunnerKVCacheMixin._calculate_mamba_ratio(runner)
+    )
+
+    ModelRunnerKVCacheMixin.handle_max_mamba_cache(runner, total_rest_memory=1.0)
+
+    assert server_args.max_mamba_cache_size == 8 * runner._calculate_mamba_ratio()
 
 
 def test_overlap_batch_results_default_to_no_result_process_fence():
@@ -527,6 +562,7 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     )
     lifecycle.boundaries = {0: checkpoint}
     lifecycle.state_backup = None
+    lifecycle.server_args = SimpleNamespace(disable_radix_cache=False)
     adapter = Adapter()
     lifecycle._state_adapter = adapter
     context = SimpleNamespace(
@@ -591,3 +627,48 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
     lifecycle.backup_boundary_state(batch, ctx=context)
     assert adapter.backup_indices[-1] == ([11], True)
     assert len(adapter.backup_indices) == 7
+
+
+@pytest.mark.parametrize(
+    ("reuse_target", "overlap", "disable_radix", "expected"),
+    [
+        (True, False, False, [([12], False)]),
+        (True, True, True, [([12], False)]),
+        (False, False, False, []),
+        (False, True, True, []),
+    ],
+)
+def test_dvr_boundary_backup_only_covers_mutation_or_overlap_rebind(
+    reuse_target, overlap, disable_radix, expected
+):
+    class Adapter:
+        draft_reuses_target_state = reuse_target
+
+        def __init__(self):
+            self.backup_indices = []
+
+        def backup_recurrent_state(self, *, indices, include_temporal=True, **_kwargs):
+            self.backup_indices.append((indices.tolist(), include_temporal))
+            return object()
+
+    adapter = Adapter()
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle.server_args = SimpleNamespace(disable_radix_cache=disable_radix)
+    lifecycle._state_adapter = adapter
+    lifecycle.boundaries = {
+        0: SimpleNamespace(rid="r0", track_idx=0, seq_len=64)
+    }
+    lifecycle.state_backup = None
+    lifecycle.state_context = lambda *_args, **_kwargs: SimpleNamespace(
+        state_cache=object(),
+        boundary_indices=torch.tensor([11]),
+        live_indices=torch.tensor([12]),
+    )
+    batch = SimpleNamespace(
+        reqs=[SimpleNamespace(rid="r0", req_pool_idx=0)],
+        enable_overlap=overlap,
+    )
+
+    lifecycle.backup_boundary_state(batch)
+
+    assert adapter.backup_indices == expected
