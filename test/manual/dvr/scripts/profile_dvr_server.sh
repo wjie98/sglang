@@ -72,6 +72,45 @@ for name, values in sorted(durations.items()):
         f"median_ms={statistics.median(values):.3f} total_ms={sum(values):.3f}"
     )
 
+# CUDA graph children are not reliably nested under the host annotation that
+# launched them. Coarse kernel totals still show whether GDN output or DVR state
+# maintenance is worth a more invasive backend change on this machine.
+kernel_groups = {
+    "gdn_verify_recurrence": (
+        "chunk_gated_delta_rule_fwd_kkt_solve_kernel",
+        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "recompute_w_u_fwd_kernel",
+    ),
+    "gdn_verify_output": ("chunk_fwd_kernel_o",),
+    "dvr_state_rebuild": ("_dvr_gdn_rebuild_live_state_kernel",),
+    "dvr_state_scatter": (
+        "_fused_mamba_state_scatter_with_mask_kernel",
+        "_fused_conv_window_scatter_with_mask_kernel",
+    ),
+}
+kernels = [
+    event
+    for event in events
+    if event.get("ph") == "X" and event.get("cat") == "kernel"
+]
+for group, names in kernel_groups.items():
+    matched = [event for event in kernels if event.get("name") in names]
+    print(
+        f"{group}: launches={len(matched)} "
+        f"total_ms={sum(event['dur'] for event in matched) / 1000.0:.3f}"
+    )
+
+memcpy = collections.defaultdict(lambda: [0, 0, 0.0])
+for event in events:
+    if event.get("ph") != "X" or event.get("cat") != "gpu_memcpy":
+        continue
+    name = event.get("name", "unknown")
+    memcpy[name][0] += 1
+    memcpy[name][1] += int(event.get("args", {}).get("bytes", 0))
+    memcpy[name][2] += event["dur"] / 1000.0
+for name, (count, num_bytes, total_ms) in sorted(memcpy.items()):
+    print(f"{name}: count={count} bytes={num_bytes} total_ms={total_ms:.3f}")
+
 cpu_stage_events = collections.defaultdict(list)
 for event in events:
     if (
@@ -122,11 +161,6 @@ if gpu_drafts_by_tid:
         gpu_drafts_by_tid.values(),
         key=lambda group: statistics.mean(event["dur"] for event in group),
     )
-    kernels = [
-        event
-        for event in events
-        if event.get("ph") == "X" and event.get("cat") == "kernel"
-    ]
     total_span_us = 0.0
     total_busy_us = 0.0
     for draft in draft_spans:

@@ -280,10 +280,11 @@ eligible only if a prototype preserves all sampling modes and Triton/FA3/
 FlashInfer plus Hybrid/GDN metadata semantics, does not reduce token-pool or
 request capacity, and demonstrates a stable end-to-end gain of at least 5%.
 
-The A40 0.8B measurement on 2026-07-14 rejected this optimization. The current
-15-step path launched 15 graphs per iteration, but draft GPU kernel utilization
-was already about 96.4%, limiting an ideal chain to roughly 1.04x before its own
-overhead. A capture-only probe over 15 consecutive full target forwards grew
+The A40 0.8B measurements on 2026-07-14 and 2026-07-16 rejected this
+optimization. After the state-input and graph-ownership cleanup, the current
+15-step path still launches 15 graphs per iteration, but draft GPU kernel
+utilization reached 98.5%, limiting an ideal chain to roughly 1.015x before its
+own overhead. A capture-only probe over 15 consecutive full target forwards grew
 the self-draft graph from about 0.10 GB to 0.26 GB for capture batches
 `[1,2,4,8]`. That probe did not yet include capture-safe sampling or correct
 multi-step Hybrid/GDN metadata, so a production implementation could only add
@@ -292,7 +293,7 @@ an H20/NVLink profile crosses the gate; do not carry an unmeasured chain graph
 or an eager fallback in production.
 
 The same trace bounds the current one-per-chain draft performance context at
-about 78 microseconds to enter and 37 microseconds for exit plus intervening
+about 69 microseconds to enter and 33 microseconds for exit plus intervening
 verify glue. This is below 0.2% of an iteration. Do not replace it with a
 separately allocated full-attention/Hybrid backend merely to avoid temporary
 field restoration: that would duplicate CUDA graph workspaces and complicate
@@ -307,6 +308,12 @@ materializing per-layer gathered inputs and a separate final-state tensor. On
 the fixed 0.8B trace, rollback CPU time fell from about 1.86 ms to 1.57 ms and
 rollback GPU time from about 0.70 ms to 0.41 ms. Keep this fused write because
 it reduces real work without changing the draft/verify/rollback contract.
+
+The 2026-07-16 profile also rejects a DVR-only suffix-output fork in FLA. Across
+the 512-token trace, the full GDN verify output kernel consumed about 4 ms in
+total, while recurrence kernels consumed about 18 ms and cannot skip the cached
+tail. Avoiding unused output chunks therefore has a sub-0.1-ms per-iteration
+ceiling on this model and does not justify another public FLA kernel contract.
 
 Do not remove the GPU-length resolution at the start of target state restore
 merely because self draft already has a host length mirror. CUDA graph replay
