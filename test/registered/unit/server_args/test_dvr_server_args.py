@@ -8,6 +8,7 @@ from sglang.srt.speculative.dvr_server_args import (
     handle_dvr_defaults,
     handle_dvr_speculative_decoding,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import ServerArgs
 
 
@@ -38,7 +39,7 @@ class _Args:
 
     def __init__(self):
         self.cuda_graph_config = SimpleNamespace(
-            decode=SimpleNamespace(bs=[1, 2], max_bs=2)
+            decode=SimpleNamespace(backend=Backend.FULL, bs=[1, 2], max_bs=2)
         )
 
     def get_model_config(self):
@@ -71,7 +72,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args = _Args()
         args.disable_cuda_graph_padding = True
         args.cuda_graph_config = SimpleNamespace(
-            decode=SimpleNamespace(bs=[1, 4], max_bs=4)
+            decode=SimpleNamespace(backend=Backend.FULL, bs=[1, 4], max_bs=4)
         )
 
         with patch(
@@ -87,7 +88,7 @@ class TestDVRServerArgs(unittest.TestCase):
     def test_dvr_self_draft_extends_cuda_graph_max_before_default_bs(self):
         args = _Args()
         args.cuda_graph_config = SimpleNamespace(
-            decode=SimpleNamespace(bs=None, max_bs=2)
+            decode=SimpleNamespace(backend=Backend.FULL, bs=None, max_bs=2)
         )
 
         with patch(
@@ -103,6 +104,18 @@ class TestDVRServerArgs(unittest.TestCase):
     def test_dvr_self_draft_gdn_requires_draft_cuda_graph(self):
         args = _Args()
         args.disable_draft_cuda_graph = True
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
+                handle_dvr_speculative_decoding(args)
+
+    def test_dvr_self_draft_gdn_uses_phase_graph_config(self):
+        args = _Args()
+        args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         with patch(
             "sglang.srt.speculative.dvr_server_args."

@@ -20,11 +20,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+    DVRDraftDecodeCudaGraphRunner,
     dvr_draft_decode_context,
     iter_dvr_attention_backends,
 )
-from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
@@ -94,6 +95,8 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
         self.is_dvr_eagle = self.speculative_algorithm.is_dvr_eagle()
+        device_module = torch.get_device_module(self.device)
+        self._rollback_ready_event = device_module.Event()
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
@@ -257,7 +260,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # backends exist. This matches upstream's separated init order.
         if (
             self.cuda_graph_runner_for_draft_decode is None
-            and not self.server_args.disable_cuda_graph
+            and self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self.server_args.disable_draft_cuda_graph
         ):
             before_mem = get_available_gpu_memory(
@@ -270,7 +273,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             with dvr_draft_decode_context(
                 self.model_runner, capture=True, self_draft=True
             ):
-                self.cuda_graph_runner_for_draft_decode = DecodeCudaGraphRunner(
+                self.cuda_graph_runner_for_draft_decode = DVRDraftDecodeCudaGraphRunner(
                     self.model_runner
                 )
             after_mem = get_available_gpu_memory(
@@ -348,13 +351,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         batch.return_logprob = False
         try:
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
-            if forward_batch.seq_lens_cpu is None:
-                forward_batch.seq_lens_cpu = torch.tensor(
-                    batch.seq_lens.detach().cpu().tolist(),
-                    dtype=torch.int64,
-                    device="cpu",
-                )
-            elif not torch.is_tensor(forward_batch.seq_lens_cpu):
+            if forward_batch.seq_lens_cpu is not None and not torch.is_tensor(
+                forward_batch.seq_lens_cpu
+            ):
                 forward_batch.seq_lens_cpu = torch.tensor(
                     forward_batch.seq_lens_cpu, dtype=torch.int64, device="cpu"
                 )
@@ -464,14 +463,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             and self.cuda_graph_runner_for_draft_decode.can_run_graph(forward_batch)
         )
         if can_cuda_graph:
-            output = self.cuda_graph_runner_for_draft_decode.execute(forward_batch)
-            # DecodeCudaGraphRunner treats an ordinary decode graph as the
-            # step's last shared-pool reader. A self-draft graph is only a
-            # provisional phase; target verify still reads req_to_token/state
-            # pools. Do not let Scheduler's WAR barrier consume this early
-            # event after the DVR worker returns.
-            self.model_runner.war_fastpath_read_done_event = None
-            return output
+            return self.cuda_graph_runner_for_draft_decode.execute(forward_batch)
 
         seq_lens = forward_batch.seq_lens_cpu
         min_seq_len = (
@@ -528,13 +520,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             return
 
         prefill_prefix_lens = None
+        seq_lens_cpu = None
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             prefill_prefix_lens = [int(x) for x in batch.prefix_lens]
-        seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        if not self.is_dvr_eagle and prefill_prefix_lens is None:
-            batch.seq_lens_cpu_cache = torch.tensor(
-                seq_lens_cpu, dtype=torch.int64, device="cpu"
-            )
+            seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
         self.linear_state.prepare_for_draft(
             batch,
             seq_lens_cpu=seq_lens_cpu,
@@ -722,6 +711,8 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     continue
 
         with spec_stage_span("dvr_state_restore"):
+            # Self-draft graph replay and target verify are both enqueued on
+            # Scheduler's forward stream, so CUDA stream order is their fence.
             linear_state_ctx = self.linear_state.restore_for_verify(batch)
         with spec_stage_span("verify"):
             forward_output = self.target_worker.forward_batch_generation(
@@ -822,13 +813,16 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 accept_index,
                 self.num_draft_tokens,
             )
+        # FutureMap intentionally publishes accepted lengths before this tail.
+        # Fence the target state consumed by the next DVR iteration separately;
+        # for self-draft the same event is Scheduler's final shared-pool reader.
+        self._rollback_ready_event.record()
+        # The overlap scheduler may process the preceding result as soon as
+        # this worker returns. Defer its shared-pool writes until the current
+        # target rollback/checkpoint has finished reading those pools.
+        rollback_actions.result_process_ready_event = self._rollback_ready_event
         if not self.is_dvr_eagle:
-            # Provisional draft graphs discard their ordinary-DECODE event.
-            # Rollback and checkpoint backup still touch shared request/state
-            # pools, so this is self-DVR's actual final-reader boundary.
-            read_done = torch.get_device_module(self.device).Event()
-            read_done.record()
-            self.model_runner.war_fastpath_read_done_event = read_done
+            self.model_runner.war_fastpath_read_done_event = self._rollback_ready_event
         if has_verify_tokens and batch.return_logprob:
             with spec_stage_span("verify_logprob"):
                 compute_spec_v2_logprobs(

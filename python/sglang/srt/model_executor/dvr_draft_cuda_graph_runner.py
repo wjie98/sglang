@@ -306,6 +306,15 @@ def dvr_draft_decode_context(
                 _clear_determinism_sensitive_kernel_caches()
 
 
+class DVRDraftDecodeCudaGraphRunner(DecodeCudaGraphRunner):
+    """Ordinary decode graph used only for provisional self-draft tokens."""
+
+    # Target verify remains the final shared-pool reader. Publishing an event
+    # after every provisional decode step allocates and records 15 events that
+    # the DVR worker must discard before returning to Scheduler.
+    record_war_fastpath_event = False
+
+
 class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     """Target-verify graph runner for DVR self-draft and DVR-EAGLE.
 

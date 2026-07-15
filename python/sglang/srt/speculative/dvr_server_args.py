@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.model_executor.cuda_graph_config import Backend
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,10 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(
     if not uses_gated_linear_state:
         return
 
-    if server_args.disable_cuda_graph or server_args.disable_draft_cuda_graph:
+    if (
+        server_args.cuda_graph_config.decode.backend == Backend.DISABLED
+        or server_args.disable_draft_cuda_graph
+    ):
         raise ValueError(
             "DVR self-draft for gated linear-state models requires draft CUDA "
             "graphs. Remove --disable-cuda-graph/--disable-draft-cuda-graph "

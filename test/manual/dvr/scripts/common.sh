@@ -58,6 +58,10 @@ write_run_metadata() {
     printf 'conda_env=%s\n' "${CONDA_ENV}"
     printf 'pythonpath=%s\n' "${PYTHONPATH}"
     printf 'cuda_visible_devices=%s\n' "${CUDA_VISIBLE_DEVICES:-all}"
+    printf 'sglang_enable_jit_deepgemm=%s\n' "${SGLANG_ENABLE_JIT_DEEPGEMM:-default}"
+    printf 'sglang_jit_deepgemm_precompile=%s\n' "${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-default}"
+    printf 'sglang_batch_invariant_deepgemm=%s\n' "${SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM:-default}"
+    printf 'sglang_dg_cache_dir=%s\n' "${SGLANG_DG_CACHE_DIR:-default}"
     printf '\n[gpus]\n'
     nvidia-smi \
       --query-gpu=index,name,memory.total,driver_version,pci.bus_id \
@@ -65,6 +69,25 @@ write_run_metadata() {
     printf '\n[topology]\n'
     nvidia-smi topo -m 2>/dev/null || true
   } >"${metadata_file}"
+}
+
+require_precompiled_deep_gemm() {
+  if [[ "${REQUIRE_PRECOMPILED_DEEPGEMM:-0}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "${SGLANG_ENABLE_JIT_DEEPGEMM:-}" != "1" ]] || \
+     [[ "${SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM:-}" != "1" ]] || \
+     [[ "${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-}" != "0" ]]; then
+    echo "H20 release runs require DeepGEMM enabled and runtime precompile disabled." >&2
+    echo "Run prepare_h20_deep_gemm.sh first, then export the environment from the guide." >&2
+    return 1
+  fi
+  if [[ -z "${SGLANG_DG_CACHE_DIR:-}" ]] || \
+     [[ ! -d "${SGLANG_DG_CACHE_DIR}" ]] || \
+     [[ -z "$(find "${SGLANG_DG_CACHE_DIR}" -mindepth 1 -print -quit)" ]]; then
+    echo "SGLANG_DG_CACHE_DIR is missing or empty: ${SGLANG_DG_CACHE_DIR:-unset}" >&2
+    return 1
+  fi
 }
 
 append_run_config() {
@@ -111,6 +134,16 @@ assert_server_capacity() {
   if ! grep -q "Capturing batches (bs=${expected_graph_bs}" "${server_log}"; then
     echo "CUDA graph batch size ${expected_graph_bs} was not captured." >&2
     tail -120 "${server_log}" >&2 || true
+    return 1
+  fi
+  if grep -Eqi "CUDA graph.*(failed|fallback)|failed.*CUDA graph|illegal memory access|device-side assert" "${server_log}"; then
+    echo "CUDA graph capture/replay failed; benchmark results are invalid." >&2
+    grep -Ei "CUDA graph.*(failed|fallback)|failed.*CUDA graph|illegal memory access|device-side assert" "${server_log}" >&2 || true
+    return 1
+  fi
+  if [[ "${REQUIRE_PRECOMPILED_DEEPGEMM:-0}" == "1" ]] && \
+     grep -q "Entering DeepGEMM JIT Pre-Compile session" "${server_log}"; then
+    echo "DeepGEMM re-entered exhaustive JIT during graph startup; prewarm cache is incomplete." >&2
     return 1
   fi
 }

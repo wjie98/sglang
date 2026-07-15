@@ -17,6 +17,41 @@ The qualification covers:
 - custom all-reduce ownership on an NVLink topology
 - throughput against the matching scheduler/backend baseline
 
+## H20 performance regression retest
+
+For the current v5-versus-v6 throughput investigation, use this order. Do not
+reuse results from a server launched before the DeepGEMM cache was prepared.
+
+1. Record the commit, topology, datasets, and toolchain from section 2.
+2. Remove the run-specific DeepGEMM cache and run all three graph-disabled
+   prewarm commands in section 2. Wait for every `PREWARM_COMPLETE` marker.
+3. Export the four frozen DeepGEMM variables exactly as shown. Keep DeepGEMM
+   enabled for both correctness and throughput servers.
+4. Run static checks, then the 0.8B and 35B correctness matrices. Stop if any
+   graph capture, KL, boundary, or acceptance check fails.
+5. Run 80B Triton and FA3 dvr16, followed by dvr32 in separate result roots.
+   Each script launches its own matching sync/overlap baseline; never reuse a
+   baseline from another backend, draft length, TP size, or returned-logprob
+   setting.
+6. Repeat the two best complete matrices three times and report the median.
+7. Only if a prewarmed DeepGEMM server still fails graph capture, preserve that
+   log and run a separate diagnostic with
+   `SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0`. A disabled-DeepGEMM run
+   is diagnostic evidence, not a release throughput result.
+
+Interpret the comparison before changing code again:
+
+- normal acceptance with low target efficiency means execution overhead, not a
+  draft-quality problem;
+- dvr32 recovering while dvr16 remains low points to fixed verify/scheduling
+  cost that the longer draft amortizes;
+- runtime `DeepGEMM JIT Pre-Compile`, a new cache artifact during graph startup,
+  or a graph fallback invalidates the measurement;
+- a steady-state D2H sequence-length copy between `dvr_prepare` and verify is a
+  regression; initial prefill/checkpoint binding D2H is allowed;
+- custom all-reduce must appear only in provisional self-draft, never target
+  prefill or target verify.
+
 ## Implementation audit snapshot
 
 At the upstream base used by this branch, the production runtime delta is 21
@@ -129,6 +164,10 @@ cd "${DVR_REPO}"
 export RUN_ID="$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
 export RESULT_BASE=/mnt/data/hwj/dvr-h20-validation/${RUN_ID}
 mkdir -p "${RESULT_BASE}"
+
+# Use a cache dedicated to this source/driver qualification run. Do not reuse
+# an unknown cache from an earlier SGLang or DeepGEMM build.
+export SGLANG_DG_CACHE_DIR=/mnt/data/hwj/deep-gemm-cache/${RUN_ID}
 ```
 
 The health environment variable is required because upstream's generating
@@ -163,6 +202,67 @@ warning followed by a fallback backend is a failure; do not relabel that run as
 FA3 or FlashInfer. Transfer the exact fixed LongBench custom JSONL from the
 development machine; regenerating a different 16-request sample invalidates the
 comparison.
+
+### DeepGEMM before CUDA graph capture
+
+Do not globally disable DeepGEMM for the release measurement. In deterministic
+mode, target prefill/verify uses batch-invariant `bf16_gemm_nn`; disabling it can
+penalize DVR verify more than normal decode and invalidates the comparison.
+
+DeepGEMM JIT must also not start for the first time inside CUDA graph startup.
+The official wrapper precompiler does not by itself prove that every direct
+batch-invariant NN shape has been exercised. Run the checked-in graph-disabled
+shape sweep once per model and cache. It uses ordinary deterministic EXTEND with
+`M = graph_bs * draft_tokens`, which matches target verify's linear/MoE token
+counts without invoking DVR or capturing a graph.
+
+```bash
+rm -rf "${SGLANG_DG_CACHE_DIR}"
+mkdir -p "${SGLANG_DG_CACHE_DIR}"
+
+CONDA_ENV="${CONDA_ENV}" MODEL_PATH="${MODEL_0P8B}" TP_SIZE=4 \
+MAX_GRAPH_BS=4 DRAFT_TOKEN_COUNTS="16" \
+RESULT_ROOT="${RESULT_BASE}/deepgemm-prewarm-0p8b" \
+  bash test/manual/dvr/scripts/prepare_h20_deep_gemm.sh
+
+CONDA_ENV="${CONDA_ENV}" MODEL_PATH="${MODEL_35B}" TP_SIZE=4 \
+MAX_GRAPH_BS=8 DRAFT_TOKEN_COUNTS="2 16" \
+RESULT_ROOT="${RESULT_BASE}/deepgemm-prewarm-35b" \
+  bash test/manual/dvr/scripts/prepare_h20_deep_gemm.sh
+
+CONDA_ENV="${CONDA_ENV}" MODEL_PATH="${MODEL_80B}" TP_SIZE=4 \
+MAX_GRAPH_BS=3 DRAFT_TOKEN_COUNTS="16 32" \
+RESULT_ROOT="${RESULT_BASE}/deepgemm-prewarm-80b" \
+  bash test/manual/dvr/scripts/prepare_h20_deep_gemm.sh
+
+test -f "${RESULT_BASE}/deepgemm-prewarm-0p8b/PREWARM_COMPLETE"
+test -f "${RESULT_BASE}/deepgemm-prewarm-35b/PREWARM_COMPLETE"
+test -f "${RESULT_BASE}/deepgemm-prewarm-80b/PREWARM_COMPLETE"
+```
+
+Compilation can take tens of minutes on a fresh cache. Wait for each command;
+do not kill it because GPU utilization temporarily drops. Each result directory
+must contain `PREWARM_COMPLETE`, and its server log must be free of traceback or
+CUDA errors.
+
+After all prewarm runs finish, freeze the serving environment:
+
+```bash
+export SGLANG_ENABLE_JIT_DEEPGEMM=1
+export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=1
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+export REQUIRE_PRECOMPILED_DEEPGEMM=1
+
+find "${SGLANG_DG_CACHE_DIR}" -type f -printf '%P %s\n' | sort \
+  >"${RESULT_BASE}/deepgemm-cache-before-serving.txt"
+```
+
+The fixed scripts now reject an empty cache, a CUDA graph capture/fallback
+error, or a serving process that re-enters `DeepGEMM JIT Pre-Compile`. If graph
+capture still fails after this exact prewarm, preserve the server log and run a
+separate diagnostic with only
+`SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0`; do not report that diagnostic
+throughput as the release result.
 
 ## 3. Static validation
 
@@ -352,6 +452,29 @@ for backend in triton fa3 flashinfer; do
 done
 ```
 
+Then repeat the fastest two backends with the v5 high-efficiency dvr32
+configuration. Keep a separate result directory and do not mix dvr16/dvr32
+acceptance denominators:
+
+```bash
+for backend in triton fa3; do
+  result="${RESULT_BASE}/80b-throughput-${backend}-dvr32"
+  CONDA_ENV="${CONDA_ENV}" \
+  MODEL_PATH="${MODEL_80B}" \
+  SHAREGPT_DATASET="${SHAREGPT_DATASET}" \
+  LONGBENCH_CUSTOM_DATASET="${LONGBENCH_DATASET}" \
+  TP_SIZE=4 \
+  ATTENTION_BACKEND="${backend}" \
+  LINEAR_ATTN_BACKEND=triton \
+  DISABLE_RADIX_CACHE=auto \
+  DISABLE_CUSTOM_ALL_REDUCE=0 \
+  DRAFT_TOKENS=32 \
+  DRAFT_STEPS=31 \
+  RESULT_ROOT="${result}" \
+    bash test/manual/dvr/scripts/run_80b_self_dvr_throughput.sh
+done
+```
+
 For the fastest backend and its runner-up, repeat the full matrix twice more in
 new `-r2` and `-r3` result directories. Use the median, not the best run.
 
@@ -400,6 +523,13 @@ trace, custom all-reduce kernels may occur in `draft`, but not in prefill or
 `verify`. Also record draft, verify, rollback, graph launch count, graph memory,
 and GPU kernel busy fraction before proposing another optimization.
 
+For the current synchronization fix, also inspect the steady-state trace for
+device-to-host sequence-length copies. A D2H is allowed when a request first
+binds a GDN checkpoint or enters target prefill. Repeated D2H copies between
+`dvr_prepare`, self-draft, and `dvr_state_restore` are a regression. CUDA event
+waits between draft/verify and rollback/next-iteration are expected and must not
+appear as host synchronizations.
+
 ## 9. Non-DVR upstream A/B
 
 The runtime delta is DVR-guarded except for the recurrent-state dtype
@@ -444,8 +574,17 @@ smoke on both trees and compare greedy output token IDs.
 Run the following audit after all servers have stopped:
 
 ```bash
-rg -n "Traceback|illegal memory access|device-side assert|missing a boundary checkpoint|DVR self-draft decode requires|custom all-reduce setup failed|max_running_requests was reduced" \
-  "${RESULT_BASE}" | tee "${RESULT_BASE}/error-audit.txt"
+# The prewarm server is expected to compile kernels. Audit only the formal
+# serving logs, where any new DeepGEMM precompile session invalidates the run.
+rg -n "Traceback|illegal memory access|device-side assert|missing a boundary checkpoint|DVR self-draft decode requires|custom all-reduce setup failed|max_running_requests was reduced|Entering DeepGEMM JIT Pre-Compile session" \
+  "${RESULT_BASE}" --glob '**/logs/*server.log' \
+  | tee "${RESULT_BASE}/error-audit.txt"
+
+find "${SGLANG_DG_CACHE_DIR}" -type f -printf '%P %s\n' | sort \
+  >"${RESULT_BASE}/deepgemm-cache-after-serving.txt"
+diff -u "${RESULT_BASE}/deepgemm-cache-before-serving.txt" \
+  "${RESULT_BASE}/deepgemm-cache-after-serving.txt" \
+  | tee "${RESULT_BASE}/deepgemm-cache-serving-diff.txt"
 
 pgrep -af 'sglang.launch_server|sglang::scheduler|sglang::tokenizer' \
   | tee "${RESULT_BASE}/remaining-processes.txt" || true

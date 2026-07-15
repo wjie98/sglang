@@ -33,6 +33,8 @@ CUDA_GRAPH_BS=()
 RADIX_ARGS=()
 CUSTOM_AR_ARGS=()
 
+require_precompiled_deep_gemm
+
 for ((bs = 1; bs <= MAX_CONCURRENCY; bs++)); do
   CUDA_GRAPH_BS+=("${bs}")
 done

@@ -171,6 +171,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    record_war_fastpath_event = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -999,7 +1001,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # those are NOT the step's last shared-buffer-reading phase (eagle
             # publishes from draft_extend; ngram/dflash must not publish here),
             # and some verify graphs may read beyond the snapshot in replay.
-            if forward_batch.forward_mode.is_decode():
+            if (
+                self.record_war_fastpath_event
+                and forward_batch.forward_mode.is_decode()
+            ):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done

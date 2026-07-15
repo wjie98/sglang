@@ -17,6 +17,11 @@ Use these entry points:
   - `git diff --check`
   - DVR-focused `py_compile`
   - DVR unit tests
+- `test/manual/dvr/scripts/prepare_h20_deep_gemm.sh`
+  - graph-disabled deterministic forwards that precompile the exact
+    `batch_size * draft_tokens` target-verify GEMM shapes
+  - run once per H20 model/cache before enabling CUDA graph serving; do not use
+    a globally disabled DeepGEMM run as a release throughput result
 - `test/manual/dvr/scripts/run_0p8b_self_dvr_kl.sh`
   - 0.8B self-DVR spec v1/v2 KL=0 and boundary smoke
   - includes concurrent and batch 512-token strict KL checks

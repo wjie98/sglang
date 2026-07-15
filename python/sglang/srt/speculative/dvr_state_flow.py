@@ -30,6 +30,7 @@ class DVRRollbackActions:
 
     pending_checkpoints: Optional[list[tuple[int, int]]] = None
     cache_generated_prefix: Optional[list[bool]] = None
+    result_process_ready_event: Optional[torch.cuda.Event] = None
 
     def cache_prefill_after_rollback(
         self,
@@ -174,20 +175,33 @@ class DVRLinearStateLifecycle:
                 )
                 checkpoint.publish_pending = False
 
-        seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
         for i, req in enumerate(batch.reqs):
             checkpoint = self._checkpoint(req)
             if checkpoint is None:
                 continue
-            current_boundary = int(seq_lens_cpu[i]) // chunk_size * chunk_size
-            if current_boundary == checkpoint.seq_len + chunk_size:
-                # The preceding target verify already committed this boundary
-                # into the same request-local slot. Advance host metadata from
-                # the scheduler's normal seq_lens mirror instead of synchronously
-                # copying accept_lens in the worker hot path.
-                checkpoint.seq_len = current_boundary
-            elif checkpoint.seq_len != current_boundary:
-                del self.boundaries[req.req_pool_idx]
+            if seq_lens_cpu is not None:
+                current_boundary = int(seq_lens_cpu[i]) // chunk_size * chunk_size
+                if current_boundary == checkpoint.seq_len + chunk_size:
+                    checkpoint.seq_len = current_boundary
+                elif checkpoint.seq_len != current_boundary:
+                    del self.boundaries[req.req_pool_idx]
+                continue
+
+            # The overlap result processor publishes committed checkpoint
+            # ownership one iteration behind GPU execution. Consume that host
+            # authority without pulling accepted lengths back in the draft path.
+            published_boundary = req.mamba_last_track_seqlen
+            if (
+                published_boundary is None
+                or published_boundary <= checkpoint.seq_len
+            ):
+                continue
+            if published_boundary % chunk_size != 0:
+                raise RuntimeError(
+                    "DVR received a non-chunk-boundary checkpoint from result "
+                    f"processing: rid={req.rid}, boundary={published_boundary}."
+                )
+            checkpoint.seq_len = published_boundary
 
         self._ensure_boundary_state(
             batch,
@@ -255,10 +269,6 @@ class DVRLinearStateLifecycle:
         self,
         batch,
     ) -> Optional[DVRLinearStateContext]:
-        # Overlap result processing may rebind a logical request checkpoint
-        # after draft preparation but before target verify reaches this stream.
-        # Resolving the current GPU lengths also waits for asynchronous
-        # self-draft graph writes before target state is restored in place.
         self._ensure_boundary_state(batch)
         ctx = self.state_context(batch, require_boundary=True)
         if ctx is None:
@@ -387,6 +397,11 @@ class DVRLinearStateLifecycle:
         prefill_prefix_lens: Optional[List[int]] = None,
         publish_to_request: bool = True,
     ) -> None:
+        missing = [
+            i for i, req in enumerate(batch.reqs) if self._checkpoint(req) is None
+        ]
+        if not missing:
+            return
         ctx = ctx or self.state_context(batch)
         if ctx is None:
             return
@@ -395,7 +410,8 @@ class DVRLinearStateLifecycle:
         reset_pos_indices = []
         reset_pos_values = []
         seq_lens_cpu = seq_lens_cpu or self.batch_seq_lens_cpu(batch)
-        for i, req in enumerate(batch.reqs):
+        for i in missing:
+            req = batch.reqs[i]
             if self._checkpoint(req) is None:
                 seq_len = int(seq_lens_cpu[i])
                 boundary_seqlen = seq_len // chunk_size * chunk_size

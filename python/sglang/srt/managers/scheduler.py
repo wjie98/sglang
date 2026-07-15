@@ -1591,6 +1591,17 @@ class Scheduler(
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+                dvr_actions = getattr(batch_result, "dvr_rollback_actions", None)
+                if (
+                    dvr_actions is not None
+                    and dvr_actions.result_process_ready_event is not None
+                ):
+                    # DVR target verify reads shared pools after FutureMap
+                    # publishes; queue the preceding result's writes behind
+                    # its rollback without blocking CPU result processing.
+                    self.schedule_stream.wait_event(
+                        dvr_actions.result_process_ready_event
+                    )
             else:
                 batch_result = None
 

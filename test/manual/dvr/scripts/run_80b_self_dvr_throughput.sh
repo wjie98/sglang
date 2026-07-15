@@ -15,6 +15,11 @@ RUN_BASELINE="${RUN_BASELINE:-1}"
 RUN_BASELINE_SYNC="${RUN_BASELINE_SYNC:-${RUN_BASELINE}}"
 RUN_BASELINE_OVERLAP="${RUN_BASELINE_OVERLAP:-${RUN_BASELINE}}"
 RUN_DVR="${RUN_DVR:-1}"
+NUM_PROMPTS="${NUM_PROMPTS:-16}"
+OUTPUT_LEN="${OUTPUT_LEN:-1024}"
+WARMUP_REQUESTS="${WARMUP_REQUESTS:-2}"
+DRAFT_TOKENS="${DRAFT_TOKENS:-16}"
+DRAFT_STEPS="${DRAFT_STEPS:-$((DRAFT_TOKENS - 1))}"
 SHAREGPT_MAX_CONCURRENCY="${SHAREGPT_MAX_CONCURRENCY:-3}"
 LONGBENCH_MAX_CONCURRENCY="${LONGBENCH_MAX_CONCURRENCY:-2}"
 MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-16}"
@@ -29,6 +34,12 @@ SERVER_MAX_CONCURRENCY="${SHAREGPT_MAX_CONCURRENCY}"
 CUDA_GRAPH_BS=()
 RADIX_ARGS=()
 CUSTOM_AR_ARGS=()
+
+if ((DRAFT_TOKENS < 2)) || ((DRAFT_STEPS + 1 != DRAFT_TOKENS)); then
+  echo "DVR chain mode requires DRAFT_TOKENS >= 2 and DRAFT_STEPS + 1 == DRAFT_TOKENS." >&2
+  exit 1
+fi
+require_precompiled_deep_gemm
 
 if ((LONGBENCH_MAX_CONCURRENCY > SERVER_MAX_CONCURRENCY)); then
   SERVER_MAX_CONCURRENCY="${LONGBENCH_MAX_CONCURRENCY}"
@@ -54,6 +65,9 @@ append_run_config "${RESULT_ROOT}" \
   "linear_attn_backend=${LINEAR_ATTN_BACKEND}" \
   "disable_radix_cache=${DISABLE_RADIX_CACHE}" \
   "disable_custom_all_reduce=${DISABLE_CUSTOM_ALL_REDUCE}" \
+  "num_prompts=${NUM_PROMPTS}" "output_len=${OUTPUT_LEN}" \
+  "warmup_requests=${WARMUP_REQUESTS}" \
+  "draft_tokens=${DRAFT_TOKENS}" "draft_steps=${DRAFT_STEPS}" \
   "sharegpt_concurrency=${SHAREGPT_MAX_CONCURRENCY}" \
   "longbench_concurrency=${LONGBENCH_MAX_CONCURRENCY}"
 
@@ -91,8 +105,9 @@ run_bench() {
     --dataset-name "${dataset_name}" \
     --dataset-path "${dataset}" \
     --tokenizer "${MODEL_PATH}" \
-    --num-prompts 16 \
-    --sharegpt-output-len 1024 \
+    --num-prompts "${NUM_PROMPTS}" \
+    --sharegpt-output-len "${OUTPUT_LEN}" \
+    --warmup-requests "${WARMUP_REQUESTS}" \
     --request-rate inf \
     --max-concurrency "${max_concurrency}" \
     --disable-tqdm \
@@ -185,8 +200,8 @@ run_one_mode() {
       --sampling-backend pytorch \
       --enable-deterministic-inference \
       --speculative-algorithm DECODE_VERIFY_ROLLBACK \
-      --speculative-num-draft-tokens 16 \
-      --speculative-num-steps 15 \
+      --speculative-num-draft-tokens "${DRAFT_TOKENS}" \
+      --speculative-num-steps "${DRAFT_STEPS}" \
       --cuda-graph-bs "${CUDA_GRAPH_BS[@]}" \
       --cuda-graph-max-bs "${SERVER_MAX_CONCURRENCY}" \
       "${RADIX_ARGS[@]}" \
@@ -209,12 +224,13 @@ run_one_mode() {
 }
 
 summarize_results() {
-  RESULT_ROOT="${RESULT_ROOT}" conda_python - <<'PY'
+  RESULT_ROOT="${RESULT_ROOT}" DRAFT_TOKENS="${DRAFT_TOKENS}" conda_python - <<'PY'
 import glob
 import json
 import os
 
 base = os.environ["RESULT_ROOT"]
+draft_tokens = int(os.environ["DRAFT_TOKENS"])
 for path in sorted(glob.glob(os.path.join(base, "results", "80b_*.jsonl"))):
     with open(path) as f:
         rows = [line for line in f if line.strip()]
@@ -247,7 +263,9 @@ for dataset in ("sharegpt", "longbench"):
             row = rows.get(f"80b_{mode}_{dataset}_logprob_{logprob}.jsonl")
             if baseline is None or row is None:
                 continue
-            acceptance = min(1.0, (row.get("accept_length") or 0.0) / 16.0)
+            acceptance = min(
+                1.0, (row.get("accept_length") or 0.0) / draft_tokens
+            )
             target = baseline["output_throughput"] * acceptance
             efficiency = row["output_throughput"] / target if target else float("nan")
             print(
@@ -255,7 +273,8 @@ for dataset in ("sharegpt", "longbench"):
                 f"actual={row['output_throughput']:.2f} "
                 f"acceptance_x_baseline={target:.2f} "
                 f"dvr_ratio={row['output_throughput'] / baseline['output_throughput']:.3f} "
-                f"target_efficiency={efficiency:.3f}"
+                f"target_efficiency={efficiency:.3f} "
+                f"mean_tpot_ms={row.get('mean_tpot_ms', float('nan')):.3f}"
             )
 PY
 }

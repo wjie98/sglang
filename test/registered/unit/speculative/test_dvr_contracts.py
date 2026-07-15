@@ -6,6 +6,7 @@ import torch
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+    DVRDraftDecodeCudaGraphRunner,
     _ensure_decode_custom_all_reduce_comm,
     _patch_draft_decode_backend_defaults,
     iter_dvr_attention_backends,
@@ -332,7 +333,7 @@ def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
         )
 
 
-def test_dvr_boundary_metadata_advances_from_next_scheduler_length():
+def test_dvr_boundary_metadata_advances_from_published_checkpoint():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle._state_adapter = SimpleNamespace(chunk_size=64)
     lifecycle.boundaries = {
@@ -342,10 +343,15 @@ def test_dvr_boundary_metadata_advances_from_next_scheduler_length():
     }
     lifecycle._ensure_boundary_state = lambda *_args, **_kwargs: None
     batch = SimpleNamespace(
-        reqs=[SimpleNamespace(rid="r0", req_pool_idx=0)], enable_overlap=True
+        reqs=[
+            SimpleNamespace(
+                rid="r0", req_pool_idx=0, mamba_last_track_seqlen=128
+            )
+        ],
+        enable_overlap=True,
     )
 
-    lifecycle.prepare_for_draft(batch, seq_lens_cpu=[128])
+    lifecycle.prepare_for_draft(batch)
 
     checkpoint = lifecycle.boundaries[0]
     assert (checkpoint.rid, checkpoint.track_idx, checkpoint.seq_len) == (
@@ -353,6 +359,33 @@ def test_dvr_boundary_metadata_advances_from_next_scheduler_length():
         1,
         128,
     )
+
+
+def test_dvr_existing_boundary_does_not_resolve_gpu_lengths():
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle._state_adapter = SimpleNamespace(chunk_size=64)
+    lifecycle.boundaries = {
+        0: SimpleNamespace(
+            rid="r0", track_idx=1, seq_len=64, publish_pending=False
+        )
+    }
+    lifecycle.batch_seq_lens_cpu = lambda _batch: pytest.fail(
+        "steady decode must not copy seq_lens to the host"
+    )
+    batch = SimpleNamespace(
+        reqs=[
+            SimpleNamespace(
+                rid="r0", req_pool_idx=0, mamba_last_track_seqlen=64
+            )
+        ],
+        enable_overlap=True,
+    )
+
+    lifecycle.prepare_for_draft(batch)
+
+
+def test_dvr_self_draft_graph_does_not_publish_intermediate_war_event():
+    assert not DVRDraftDecodeCudaGraphRunner.record_war_fastpath_event
 
 
 def test_dvr_prefill_boundary_uses_request_local_track_slot():

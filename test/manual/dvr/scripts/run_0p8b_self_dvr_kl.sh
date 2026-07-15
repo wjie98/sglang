@@ -19,6 +19,8 @@ BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/0p8b-self-dvr-kl}"
 SERVER_PID=""
 
+require_precompiled_deep_gemm
+
 mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
 write_run_metadata "${RESULT_ROOT}"
 append_run_config "${RESULT_ROOT}" \
