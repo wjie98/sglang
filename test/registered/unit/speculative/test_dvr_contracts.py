@@ -20,6 +20,7 @@ from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorkerV2,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import renorm_sampling_probs
 
 
 def test_dvr_spec_algorithm_contracts():
@@ -66,30 +67,15 @@ def test_dvr_future_map_respects_backend_cpu_seq_lens_policy(algorithm):
     assert not decide_needs_cpu_seq_lens(server_args, [backend])
 
 
-def test_dvr_draft_proposal_applies_min_p(monkeypatch):
-    monkeypatch.setattr(
-        dvr_worker_module, "top_k_renorm_prob", lambda probs, _top_ks: probs, raising=False
+def test_dvr_draft_proposal_applies_min_p():
+    sampling_info = SimpleNamespace(
+        top_ks=torch.tensor([3]),
+        top_ps=torch.tensor([1.0]),
+        min_ps=torch.tensor([0.5]),
+        need_min_p_sampling=True,
     )
-    monkeypatch.setattr(
-        dvr_worker_module, "top_p_renorm_prob", lambda probs, _top_ps: probs, raising=False
-    )
-    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
-    worker.model_runner = SimpleNamespace(
-        sampler=SimpleNamespace(use_log_softmax_logprob=False)
-    )
-    forward_batch = SimpleNamespace(
-        sampling_info=SimpleNamespace(
-            top_ks=torch.tensor([3]),
-            top_ps=torch.tensor([1.0]),
-            min_ps=torch.tensor([0.5]),
-            need_top_k_sampling=False,
-            need_top_p_sampling=False,
-            need_min_p_sampling=True,
-        )
-    )
-
-    proposal = worker.get_draft_sampling_probs(
-        forward_batch, torch.tensor([[0.6, 0.3, 0.1]])
+    proposal = renorm_sampling_probs(
+        torch.tensor([[0.6, 0.3, 0.1]]), sampling_info
     )
 
     torch.testing.assert_close(proposal, torch.tensor([[2 / 3, 1 / 3, 0.0]]))

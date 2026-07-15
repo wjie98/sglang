@@ -62,9 +62,11 @@ if TYPE_CHECKING:
 
 
 if _is_cuda:
-    from sgl_kernel import fast_topk
+    from sgl_kernel import fast_topk, top_k_renorm_prob, top_p_renorm_prob
 elif _is_hip:
     from sgl_kernel import fast_topk
+elif _is_musa:
+    from sgl_kernel import fast_topk, top_k_renorm_prob, top_p_renorm_prob
 else:
     from sglang.srt.utils.common import fast_topk
 
@@ -76,6 +78,36 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     sample_index = torch.multinomial(probs, num_samples=num_samples)
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
+
+
+def renorm_sampling_probs(probs: torch.Tensor, sampling_info, repeat: int = 1):
+    """Apply request sampling filters to an already normalized distribution."""
+
+    def expand(values):
+        return values if repeat == 1 else torch.repeat_interleave(values, repeat, dim=0)
+
+    top_ks = expand(sampling_info.top_ks)
+    top_ps = expand(sampling_info.top_ps)
+    min_ps = expand(sampling_info.min_ps)
+    use_kernel = (_is_cuda and probs.is_cuda) or (
+        _is_musa and probs.device.type == "musa"
+    )
+    if use_kernel:
+        probs = top_k_renorm_prob(probs, top_ks)
+        probs = top_p_renorm_prob(probs, top_ps)
+    else:
+        sorted_probs, indices = probs.sort(dim=-1, descending=True)
+        ranks = torch.arange(probs.shape[-1], device=probs.device).unsqueeze(0)
+        sorted_probs.masked_fill_(ranks >= top_ks.unsqueeze(1), 0)
+        cumulative = sorted_probs.cumsum(dim=-1)
+        sorted_probs.masked_fill_(cumulative - sorted_probs > top_ps.unsqueeze(1), 0)
+        probs = torch.zeros_like(probs).scatter_(-1, indices, sorted_probs)
+        probs /= probs.sum(dim=-1, keepdim=True)
+    if sampling_info.need_min_p_sampling:
+        thresholds = probs.amax(dim=-1, keepdim=True) * min_ps.unsqueeze(1)
+        probs = torch.where(probs >= thresholds, probs, torch.zeros_like(probs))
+        probs /= probs.sum(dim=-1, keepdim=True)
+    return probs
 
 
 def renorm_draft_probs(
@@ -91,7 +123,8 @@ def renorm_draft_probs(
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
-    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+    probs = torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+    return renorm_sampling_probs(probs, sampling_info)
 
 
 # Simulate acceptance length for benchmarking purposes

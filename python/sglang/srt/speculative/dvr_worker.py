@@ -45,17 +45,11 @@ from sglang.srt.speculative.spec_utils import (
     generate_token_bitmask,
     record_stream_each,
     record_stream_for_v2_verify,
+    renorm_sampling_probs,
     spec_stage_span,
 )
-from sglang.srt.utils import is_cuda
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 from sglang.srt.utils.common import get_available_gpu_memory
-
-if is_cuda():
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -436,10 +430,17 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     logits_output, forward_batch
                 )
                 if not forward_batch.sampling_info.is_all_greedy:
+                    sampling_probs = logits_output.next_token_logits
+                    sampling_info = forward_batch.sampling_info
+                    if (
+                        self.model_runner.sampler.use_log_softmax_logprob
+                        and not sampling_info.need_top_p_sampling
+                        and not sampling_info.need_top_k_sampling
+                        and not sampling_info.need_min_p_sampling
+                    ):
+                        sampling_probs = torch.softmax(sampling_probs, dim=-1)
                     draft_probs_list.append(
-                        self.get_draft_sampling_probs(
-                            forward_batch, logits_output.next_token_logits
-                        )
+                        renorm_sampling_probs(sampling_probs, sampling_info)
                     )
                 draft_tokens.append(next_token_ids.to(torch.long))
         finally:
@@ -484,37 +485,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             "CUDA graph batch sizes or include the running batch size "
             "in --cuda-graph-bs/--cuda-graph-max-bs."
         )
-
-    def get_draft_sampling_probs(
-        self, forward_batch: ForwardBatch, sampling_probs: torch.Tensor
-    ) -> torch.Tensor:
-        # model_runner.sample() mutates next_token_logits into the probability
-        # tensor used by the sampler. Build draft_probs from that tensor so
-        # logit bias, grammar/custom processors, temperature, and draft
-        # sampling stay on the same distribution.
-        sampling_info = forward_batch.sampling_info
-        if (
-            self.model_runner.sampler.use_log_softmax_logprob
-            and not sampling_info.need_top_p_sampling
-            and not sampling_info.need_top_k_sampling
-            and not sampling_info.need_min_p_sampling
-        ):
-            sampling_probs = torch.softmax(sampling_probs, dim=-1)
-        sampling_probs = top_k_renorm_prob(sampling_probs, sampling_info.top_ks)
-        if sampling_info.need_top_p_sampling:
-            sampling_probs = top_p_renorm_prob(sampling_probs, sampling_info.top_ps)
-        if sampling_info.need_min_p_sampling:
-            min_p_thresholds = (
-                sampling_probs.amax(dim=-1, keepdim=True)
-                * sampling_info.min_ps.unsqueeze(-1)
-            )
-            sampling_probs = torch.where(
-                sampling_probs >= min_p_thresholds,
-                sampling_probs,
-                torch.zeros_like(sampling_probs),
-            )
-            sampling_probs /= sampling_probs.sum(dim=-1, keepdim=True)
-        return sampling_probs
 
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
