@@ -327,11 +327,10 @@ gated-linear integration smoke, one reusable server launcher, and one KL/
 acceptance client. Do not copy benchmark scheduling or throughput calculations
 into Python clients; invoke SGLang's `bench_serving` and keep its raw JSONL.
 
-DVR deliberately rejects one-token synthetic prompts on gated linear-state
-models. Upstream's generation-based `/health` probe uses `[0]` as its prompt,
-so DVR deployments should set `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false`
-and use the resulting non-generating `/health` endpoint. The fixed scripts poll
-`/v1/models` for readiness and must not use `/health_generate`.
+DVR accepts one-token prompts through a fixed-width, zero-step target-verify
+sentinel. The first iteration verifies only the root token while retaining the
+same CUDA graph and GDN window shapes; later iterations use the ordinary draft
+path. The fixed scripts cover this boundary and poll `/v1/models` for readiness.
 
 ## Regression note: returned logprobs
 

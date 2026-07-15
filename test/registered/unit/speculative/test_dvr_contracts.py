@@ -11,6 +11,7 @@ from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
+    DVRTargetVerifyCudaGraphRunner,
     _ensure_decode_custom_all_reduce_comm,
     iter_dvr_attention_backends,
 )
@@ -41,6 +42,10 @@ def test_dvr_spec_algorithm_contracts():
 def test_dvr_worker_uses_base_spec_worker_contract():
     assert issubclass(DecodeVerifyRollbackWorkerV2, BaseSpecWorker)
     assert not DecodeVerifyRollbackWorkerV2.__abstractmethods__
+
+
+def test_dvr_target_graph_keeps_verify_deterministic_for_both_draft_backends():
+    assert DVRTargetVerifyCudaGraphRunner.dvr_target_verify_cuda_graph
 
 
 def test_overlap_batch_results_default_to_no_result_process_fence():
@@ -345,21 +350,14 @@ def test_dvr_short_prefix_uses_one_root_verify_sentinel(is_dvr_eagle):
     )
 
 
-def test_dvr_plain_transformer_self_draft_allows_eager_decode():
+def test_dvr_plain_transformer_self_draft_rejects_eager_decode():
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
     worker.cuda_graph_runner_for_draft_decode = None
-    logits_output = object()
-    worker.linear_state = SimpleNamespace(has_state_adapter=False)
-    worker.model_runner = SimpleNamespace(
-        forward=lambda _forward_batch: SimpleNamespace(logits_output=logits_output)
-    )
 
-    assert (
+    with pytest.raises(RuntimeError, match="requires the dedicated CUDA graph"):
         worker._draft_decode_forward(
             SimpleNamespace(seq_lens_cpu=torch.tensor([2]), batch_size=1)
         )
-        is logits_output
-    )
 
 
 def test_dvr_linear_state_is_optional_for_plain_transformers():

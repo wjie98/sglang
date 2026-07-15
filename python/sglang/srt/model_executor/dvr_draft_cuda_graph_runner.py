@@ -238,11 +238,10 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     spec_info data object.
     """
 
-    def __init__(self, model_runner):
-        # Keep this capture policy on the dedicated runner rather than adding
-        # transient DVR state to the shared ModelRunner.
-        self.dvr_target_verify_cuda_graph = model_runner.spec_algorithm.is_dvr_eagle()
-        super().__init__(model_runner)
+    # Both self-draft and EAGLE use deterministic target verification. Prevent
+    # prefill-only determinism from restoring ordinary decode split heuristics
+    # while this dedicated graph is captured.
+    dvr_target_verify_cuda_graph = True
 
     def get_spec_info(self, num_tokens: int):
         capture_hidden_mode = (
@@ -272,11 +271,3 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
                 device=self.model_runner.device,
             )
         return spec_info
-
-    def load_batch(self, forward_batch, pp_proxy_tensors=None):
-        # The generic num_token_non_padded slot is enabled only for EP. GDN DVR
-        # verify also needs the raw token count to mask padded graph rows.
-        self.buffers.num_token_non_padded.fill_(
-            forward_batch.batch_size * self.num_tokens_per_bs
-        )
-        return super().load_batch(forward_batch, pp_proxy_tensors)

@@ -15,7 +15,7 @@ def create_gdn_state_input_cache(
     state_cache = SimpleNamespace(
         temporal=torch.empty(num_layers, 1, dtype=torch.float32),
         intermediate_ssm=torch.empty(
-            num_layers, num_slots - 1, 1, dtype=torch.float32
+            num_layers, num_slots, 1, dtype=torch.float32
         ),
     )
     req_to_token_pool = SimpleNamespace(
@@ -194,7 +194,7 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
     assert adapter.state_input_cache is not None
     window = adapter.state_input_window(layer_idx=0)
     assert window.capacity == FLA_CHUNK_SIZE + 4
-    assert window.tensors[0].shape == (4, FLA_CHUNK_SIZE + 4, 8, 128)
+    assert window.tensors[0].shape == (3, FLA_CHUNK_SIZE + 4, 8, 128)
 
     # The adapter owns the side cache without mutating upstream pool/cache objects.
     assert not hasattr(req_to_token_pool, "_dvr_linear_state_input_cache")
@@ -235,7 +235,7 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
     target_batch = SimpleNamespace(
         extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
         extend_seq_lens_cpu=[2],
-        req_pool_indices=torch.tensor([0]),
+        req_pool_indices=torch.tensor([1]),
     )
     adapter.cache_extend_tail(
         forward_batch=target_batch,
@@ -258,6 +258,24 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
     # them untouched avoids clearing the full q/k/v/g/beta window per verify.
     for tensor in layer_cache.tensors:
         assert torch.all(tensor[1, 2:] == 1)
+
+
+def test_gdn_verify_uses_request_pool_dummy_row_directly():
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
+    forward_batch = SimpleNamespace(
+        input_ids=torch.zeros(4, dtype=torch.long),
+        req_pool_indices=torch.tensor([2, 0]),
+        spec_info=SimpleNamespace(draft_token_num=2),
+    )
+
+    dvr_indices, state_input_indices, valid_mask = adapter.target_verify_indices(
+        forward_batch=forward_batch,
+        cache_indices=torch.tensor([7, 9]),
+    )
+
+    assert torch.equal(dvr_indices, torch.tensor([7, 0]))
+    assert torch.equal(state_input_indices, torch.tensor([2, 0]))
+    assert torch.equal(valid_mask, torch.tensor([True, False]))
 
 
 def test_gdn_verify_rejects_backend_without_boundary_states():

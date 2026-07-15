@@ -126,7 +126,7 @@ class TestDVRServerArgs(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
                 handle_dvr_speculative_decoding(args)
 
-    def test_dvr_self_draft_plain_transformer_allows_disabled_graphs(self):
+    def test_dvr_self_draft_plain_transformer_requires_draft_cuda_graph(self):
         args = _Args()
         args.disable_draft_cuda_graph = True
         args.cuda_graph_config.decode.backend = Backend.DISABLED
@@ -136,7 +136,8 @@ class TestDVRServerArgs(unittest.TestCase):
             "_is_dvr_gated_linear_state_model",
             return_value=False,
         ):
-            handle_dvr_speculative_decoding(args)
+            with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
+                handle_dvr_speculative_decoding(args)
 
     def test_dvr_eagle_keeps_radix_cache(self):
         args = _Args()

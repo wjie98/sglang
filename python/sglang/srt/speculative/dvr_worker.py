@@ -464,12 +464,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         if can_cuda_graph:
             return self.cuda_graph_runner_for_draft_decode.execute(forward_batch)
 
-        # Plain transformers can safely overwrite provisional attention KV in
-        # target verify. Linear-state self-draft also mutates recurrent state,
-        # so it must stay on the captured path that restores that state exactly.
-        if not self.linear_state.has_state_adapter:
-            return self.model_runner.forward(forward_batch).logits_output
-
         seq_lens = forward_batch.seq_lens_cpu
         min_seq_len = (
             int(seq_lens.min()) if seq_lens is not None else "GPU-only"

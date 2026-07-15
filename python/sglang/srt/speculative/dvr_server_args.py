@@ -150,9 +150,7 @@ def handle_dvr_speculative_decoding(server_args):
     elif server_args.speculative_eagle_topk != 1:
         raise ValueError("DVR currently supports only chain mode with topk == 1.")
 
-    _ensure_dvr_self_draft_cuda_graph_coverage(
-        server_args, uses_gated_linear_state=uses_gated_linear_state
-    )
+    _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
 
     if server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM:
         if server_args.disable_overlap_schedule:
@@ -171,29 +169,23 @@ def handle_dvr_speculative_decoding(server_args):
     logger.warning("Mixed chunked prefill is disabled for DVR.")
 
 
-def _ensure_dvr_self_draft_cuda_graph_coverage(
-    server_args, *, uses_gated_linear_state: bool
-):
-    """Keep GDN self-draft on the existing CUDA graph decode contract.
+def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
+    """Keep self-draft on the existing CUDA graph decode contract.
 
-    DVR self-draft for gated linear-state models must use the dedicated draft
-    decode graph for normal prompts.  With CUDA graph padding enabled, SGLang
-    only needs a captured max batch size; with padding disabled, every exact
-    batch size must be captured.  Reuse those existing semantics instead of
-    adding a DVR-specific server argument.
+    DVR self-draft must use the dedicated fast decode graph. With CUDA graph
+    padding enabled, SGLang only needs a captured max batch size; with padding
+    disabled, every exact batch size must be captured. Reuse those existing
+    semantics instead of adding a DVR-specific server argument.
     """
 
     if server_args.speculative_algorithm != DVR_SPECULATIVE_ALGORITHM:
         return
-    if not uses_gated_linear_state:
-        return
-
     if (
         server_args.cuda_graph_config.decode.backend == Backend.DISABLED
         or server_args.disable_draft_cuda_graph
     ):
         raise ValueError(
-            "DVR self-draft for gated linear-state models requires draft CUDA "
+            "DVR self-draft requires draft CUDA "
             "graphs. Remove --disable-cuda-graph/--disable-draft-cuda-graph "
             "or use a non-self-draft DVR mode."
         )

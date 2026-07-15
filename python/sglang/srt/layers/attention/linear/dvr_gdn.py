@@ -186,7 +186,6 @@ class DVRGDNStateAdapter:
                 "DVR GDN verify requires fp32 recurrent and intermediate states."
             )
         num_layers = state_cache.intermediate_ssm.shape[0]
-        spec_state_size = state_cache.intermediate_ssm.shape[1] - 1
         num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         if num_draft_tokens is None:
             raise RuntimeError("DVR requires speculative_num_draft_tokens.")
@@ -208,7 +207,9 @@ class DVRGDNStateAdapter:
         assert padded_key_groups % tp_world_size == 0
         local_key_heads = padded_key_groups // tp_world_size
 
-        num_slots = spec_state_size + 2
+        # ReqToTokenPool already reserves row 0 for padded CUDA graph requests.
+        # Mirror that indexing directly instead of maintaining a second offset.
+        num_slots = state_cache.intermediate_ssm.shape[1]
         window_len = FLA_CHUNK_SIZE + num_draft_tokens
         q = torch.zeros(
             num_layers,
@@ -242,7 +243,7 @@ class DVRGDNStateAdapter:
             draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
             state_input_cache=DVRStateInputCache(
                 tensors=(q, torch.zeros_like(q), v, gate, torch.zeros_like(gate)),
-                # Slot 0 is the padded-row dummy; real rows use req_pool_idx + 1.
+                # Slot 0 is the padded-row dummy; real rows use req_pool_idx.
                 tail_lens=torch.zeros(
                     num_layers,
                     num_slots,
@@ -273,7 +274,7 @@ class DVRGDNStateAdapter:
     def get_state_input_indices(
         self, *, batch, device: torch.device
     ) -> torch.Tensor:
-        return batch.req_pool_indices.to(device=device, dtype=torch.long) + 1
+        return batch.req_pool_indices.to(device=device, dtype=torch.long)
 
     def zero_recurrent_state(self, *, state_cache, indices: torch.Tensor):
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
@@ -410,7 +411,7 @@ class DVRGDNStateAdapter:
         )
         state_window.write_extend_tail(
             values=state_inputs,
-            indices=state_input_indices + 1,
+            indices=state_input_indices,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             chunk_size=self.chunk_size,
@@ -421,29 +422,13 @@ class DVRGDNStateAdapter:
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = forward_batch.input_ids.shape[0] // draft_token_num
-        rows = torch.arange(batch_size, dtype=torch.long, device=cache_indices.device)
-        num_token_non_padded = forward_batch.num_token_non_padded
-        if num_token_non_padded is None:
-            valid_mask = torch.ones(
-                batch_size, dtype=torch.bool, device=cache_indices.device
-            )
-        else:
-            if torch.is_tensor(num_token_non_padded):
-                num_token_non_padded = num_token_non_padded.to(
-                    device=cache_indices.device, dtype=torch.long
-                )
-            valid_mask = rows * draft_token_num < num_token_non_padded
-
         # Slot 0 is the shared dummy row used by padded CUDA graph requests.
-        dvr_indices = cache_indices[:batch_size].to(torch.long)
-        dvr_indices = torch.where(valid_mask, dvr_indices, torch.zeros_like(dvr_indices))
         state_input_indices = forward_batch.req_pool_indices[:batch_size].to(
             device=cache_indices.device, dtype=torch.long
         )
-        state_input_indices = state_input_indices + 1
-        state_input_indices = torch.where(
-            valid_mask, state_input_indices, torch.zeros_like(state_input_indices)
-        )
+        valid_mask = state_input_indices != 0
+        dvr_indices = cache_indices[:batch_size].to(torch.long)
+        dvr_indices = torch.where(valid_mask, dvr_indices, torch.zeros_like(dvr_indices))
         return dvr_indices, state_input_indices, valid_mask
 
     def forward_target_verify(
