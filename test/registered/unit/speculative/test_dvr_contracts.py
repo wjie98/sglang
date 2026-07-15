@@ -1,14 +1,17 @@
 from types import SimpleNamespace
 
 import pytest
-import sglang.srt.speculative.dvr_worker as dvr_worker_module
 import torch
+
+import sglang.srt.speculative.dvr_worker as dvr_worker_module
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     _ensure_decode_custom_all_reduce_comm,
-    _patch_draft_decode_backend_defaults,
     iter_dvr_attention_backends,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -20,8 +23,7 @@ from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorkerV2,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import renorm_sampling_probs
-from sglang.srt.speculative.spec_utils import renorm_draft_probs
+from sglang.srt.speculative.spec_utils import renorm_draft_probs, renorm_sampling_probs
 
 
 def test_dvr_spec_algorithm_contracts():
@@ -75,9 +77,7 @@ def test_dvr_draft_proposal_applies_min_p():
         min_ps=torch.tensor([0.5]),
         need_min_p_sampling=True,
     )
-    proposal = renorm_sampling_probs(
-        torch.tensor([[0.6, 0.3, 0.1]]), sampling_info
-    )
+    proposal = renorm_sampling_probs(torch.tensor([[0.6, 0.3, 0.1]]), sampling_info)
 
     torch.testing.assert_close(proposal, torch.tensor([[2 / 3, 1 / 3, 0.0]]))
 
@@ -230,8 +230,7 @@ def test_dvr_custom_all_reduce_uses_current_dispatch_contract(monkeypatch):
     assert ca_comm.original_disabled
 
 
-def test_dvr_draft_restores_backend_decode_defaults(monkeypatch):
-    monkeypatch.delenv("SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", raising=False)
+def test_dvr_draft_restores_backend_decode_defaults():
     model_runner = SimpleNamespace(
         server_args=SimpleNamespace(
             triton_attention_split_tile_size=None,
@@ -245,41 +244,41 @@ def test_dvr_draft_restores_backend_decode_defaults(monkeypatch):
         ),
     )
 
-    def patch_attr(obj, name, value):
-        if hasattr(obj, name):
-            setattr(obj, name, value)
+    def apply_overrides(backend, method):
+        for name, value in method(backend, model_runner):
+            setattr(backend, name, value)
 
-    FlashAttentionBackend = type("FlashAttentionBackend", (), {})
-    fa3 = FlashAttentionBackend()
+    fa3 = SimpleNamespace()
     fa3.fa_impl_ver = 3
     fa3.num_splits = 1
-    _patch_draft_decode_backend_defaults(fa3, model_runner, patch_attr)
+    apply_overrides(fa3, FlashAttentionBackend.get_nondeterministic_decode_overrides)
     assert fa3.num_splits == 0
 
-    FlashInferAttnBackend = type("FlashInferAttnBackend", (), {})
-    flashinfer = FlashInferAttnBackend()
+    flashinfer = SimpleNamespace()
     flashinfer.decode_split_tile_size = 2048
     flashinfer.disable_cuda_graph_kv_split = True
     flashinfer.decode_use_tensor_cores = True
-    monkeypatch.setenv("SGLANG_FLASHINFER_USE_TENSOR_CORE", "false")
-    _patch_draft_decode_backend_defaults(flashinfer, model_runner, patch_attr)
+    flashinfer._nondeterministic_decode_use_tensor_cores = False
+    apply_overrides(
+        flashinfer, FlashInferAttnBackend.get_nondeterministic_decode_overrides
+    )
     assert flashinfer.decode_split_tile_size is None
     assert not flashinfer.disable_cuda_graph_kv_split
     assert not flashinfer.decode_use_tensor_cores
 
-    TritonAttnBackend = type("TritonAttnBackend", (), {})
-    triton_backend = TritonAttnBackend()
+    triton_backend = SimpleNamespace()
     triton_backend.max_context_len = 8192
     triton_backend.max_kv_splits = 32
+    triton_backend._nondeterministic_decode_config = (False, None, 8)
     triton_backend.split_tile_size = 256
     triton_backend.static_kv_splits = False
     triton_backend.cuda_graph_attn_logits = torch.zeros(4, 2, 32, 8)
     triton_backend.cuda_graph_attn_lse = torch.zeros(4, 2, 32)
     triton_backend.cuda_graph_swa_attn_logits = None
-    triton_backend.cuda_graph_num_kv_splits = torch.full(
-        (4,), 32, dtype=torch.int32
+    triton_backend.cuda_graph_num_kv_splits = torch.full((4,), 32, dtype=torch.int32)
+    apply_overrides(
+        triton_backend, TritonAttnBackend.get_nondeterministic_decode_overrides
     )
-    _patch_draft_decode_backend_defaults(triton_backend, model_runner, patch_attr)
     assert triton_backend.max_kv_splits == 8
     assert triton_backend.split_tile_size is None
     assert not triton_backend.static_kv_splits
@@ -307,9 +306,10 @@ def test_dvr_draft_reaches_nested_hybrid_attention_backends():
         id(linear_attention),
     }
 
-    assert list(
-        iter_dvr_attention_backends(hybrid, full_attention, linear_attention)
-    ) == backends
+    assert (
+        list(iter_dvr_attention_backends(hybrid, full_attention, linear_attention))
+        == backends
+    )
 
 
 @pytest.mark.parametrize("is_dvr_eagle", [False, True])
@@ -319,9 +319,7 @@ def test_dvr_short_prefix_uses_one_root_verify_sentinel(is_dvr_eagle):
     worker.device = "cpu"
     worker.num_draft_tokens = 4
     batch = SimpleNamespace(
-        spec_info=dvr_worker_module.EagleDraftInput(
-            bonus_tokens=torch.tensor([6, 7])
-        ),
+        spec_info=dvr_worker_module.EagleDraftInput(bonus_tokens=torch.tensor([6, 7])),
         seq_lens=torch.tensor([1, 65]),
         seq_lens_cpu=torch.tensor([1, 65]),
         seq_lens_sum=66,
@@ -345,6 +343,7 @@ def test_dvr_short_prefix_uses_one_root_verify_sentinel(is_dvr_eagle):
         if is_dvr_eagle
         else dvr_worker_module.CaptureHiddenMode.NULL
     )
+
 
 def test_dvr_plain_transformer_self_draft_allows_eager_decode():
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
@@ -402,17 +401,11 @@ def test_dvr_boundary_metadata_advances_from_published_checkpoint():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle._state_adapter = SimpleNamespace(chunk_size=64)
     lifecycle.boundaries = {
-        0: SimpleNamespace(
-            rid="r0", track_idx=1, seq_len=64, publish_pending=False
-        )
+        0: SimpleNamespace(rid="r0", track_idx=1, seq_len=64, publish_pending=False)
     }
     lifecycle._ensure_boundary_state = lambda *_args, **_kwargs: None
     batch = SimpleNamespace(
-        reqs=[
-            SimpleNamespace(
-                rid="r0", req_pool_idx=0, mamba_last_track_seqlen=128
-            )
-        ],
+        reqs=[SimpleNamespace(rid="r0", req_pool_idx=0, mamba_last_track_seqlen=128)],
         enable_overlap=True,
     )
 
@@ -430,19 +423,13 @@ def test_dvr_existing_boundary_does_not_resolve_gpu_lengths():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle._state_adapter = SimpleNamespace(chunk_size=64)
     lifecycle.boundaries = {
-        0: SimpleNamespace(
-            rid="r0", track_idx=1, seq_len=64, publish_pending=False
-        )
+        0: SimpleNamespace(rid="r0", track_idx=1, seq_len=64, publish_pending=False)
     }
     lifecycle.batch_seq_lens_cpu = lambda _batch: pytest.fail(
         "steady decode must not copy seq_lens to the host"
     )
     batch = SimpleNamespace(
-        reqs=[
-            SimpleNamespace(
-                rid="r0", req_pool_idx=0, mamba_last_track_seqlen=64
-            )
-        ],
+        reqs=[SimpleNamespace(rid="r0", req_pool_idx=0, mamba_last_track_seqlen=64)],
         enable_overlap=True,
     )
 
@@ -532,9 +519,7 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
             self.backup_indices = []
             self.draft_reuses_target_state = True
 
-        def backup_recurrent_state(
-            self, *, indices, include_temporal=True, **_kwargs
-        ):
+        def backup_recurrent_state(self, *, indices, include_temporal=True, **_kwargs):
             self.backup_indices.append((indices.tolist(), include_temporal))
             return len(self.backup_indices)
 

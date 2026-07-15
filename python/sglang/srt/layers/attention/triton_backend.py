@@ -220,6 +220,19 @@ class TritonAttnBackend(AttentionBackend):
         self.enable_deterministic = (
             model_runner.server_args.enable_deterministic_inference
         )
+        nondeterministic_split_tile_size = (
+            model_runner.server_args.triton_attention_split_tile_size
+        )
+        nondeterministic_max_kv_splits = self.max_kv_splits
+        if nondeterministic_split_tile_size is not None:
+            nondeterministic_max_kv_splits = (
+                self.max_context_len + nondeterministic_split_tile_size - 1
+            ) // nondeterministic_split_tile_size
+        self._nondeterministic_decode_config = (
+            self.static_kv_splits,
+            nondeterministic_split_tile_size,
+            nondeterministic_max_kv_splits,
+        )
 
         # Configure deterministic inference settings
         if self.enable_deterministic:
@@ -279,6 +292,46 @@ class TritonAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
+
+    def get_nondeterministic_decode_overrides(self, model_runner):
+        static_kv_splits, split_tile_size, max_kv_splits = (
+            self._nondeterministic_decode_config
+        )
+
+        # Deterministic initialization owns the allocation. A narrower view
+        # recovers normal decode planning without a second graph workspace.
+        max_kv_splits = min(self.max_kv_splits, max_kv_splits)
+        overrides = []
+        for name in (
+            "cuda_graph_attn_logits",
+            "cuda_graph_attn_lse",
+            "cuda_graph_swa_attn_logits",
+        ):
+            buffer = getattr(self, name, None)
+            if buffer is not None:
+                overrides.append((name, buffer[:, :, :max_kv_splits]))
+        for name in (
+            "cuda_graph_num_kv_splits",
+            "cuda_graph_window_num_kv_splits",
+        ):
+            buffer = getattr(self, name, None)
+            if buffer is not None:
+                buffers = getattr(self, "_nondeterministic_decode_buffers", None)
+                if buffers is None:
+                    buffers = self._nondeterministic_decode_buffers = {}
+                draft_buffer = buffers.get(name)
+                if draft_buffer is None:
+                    draft_buffer = torch.full_like(buffer, max_kv_splits)
+                    buffers[name] = draft_buffer
+                overrides.append((name, draft_buffer))
+        overrides.extend(
+            (
+                ("max_kv_splits", max_kv_splits),
+                ("split_tile_size", split_tile_size),
+                ("static_kv_splits", static_kv_splits),
+            )
+        )
+        return overrides
 
     def get_num_kv_splits(
         self,

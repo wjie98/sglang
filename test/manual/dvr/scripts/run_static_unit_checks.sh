@@ -8,11 +8,16 @@ source "${SCRIPT_DIR}/common.sh"
 # Keep this list explicit: adding a DVR touchpoint in a shared module must also
 # extend the static guard instead of being hidden by a broad directory scan.
 DVR_PY_FILES=(
+  python/sglang/srt/layers/attention/base_attn_backend.py
+  python/sglang/srt/layers/attention/dsa_backend.py
+  python/sglang/srt/layers/attention/flashattention_backend.py
+  python/sglang/srt/layers/attention/flashinfer_backend.py
   python/sglang/srt/layers/attention/fla/chunk_delta_h.py
   python/sglang/srt/layers/attention/fla/chunk_o.py
   python/sglang/srt/layers/attention/linear/dvr_gdn.py
   python/sglang/srt/layers/attention/linear/dvr_state.py
   python/sglang/srt/layers/attention/linear/gdn_backend.py
+  python/sglang/srt/layers/attention/triton_backend.py
   python/sglang/srt/managers/scheduler.py
   python/sglang/srt/managers/scheduler_components/batch_result_processor.py
   python/sglang/srt/managers/tokenizer_manager.py

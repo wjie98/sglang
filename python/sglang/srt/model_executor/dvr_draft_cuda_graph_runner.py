@@ -4,6 +4,7 @@ import logging
 from contextlib import contextmanager, nullcontext
 
 import torch
+
 from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -11,7 +12,6 @@ from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -72,96 +72,6 @@ def _clear_determinism_sensitive_kernel_caches():
 
     get_moe_configs.cache_clear()
     should_enable_swap_ab.cache_clear()
-
-
-def _patch_draft_decode_backend_defaults(backend, model_runner, patch_attr):
-    """Undo init-time deterministic decode knobs for DVR self-draft only.
-
-    Prefill and verify still run through the deterministic target path. The
-    self-draft decode graph is provisional and verified afterwards, so it should
-    use the same decode heuristics as normal non-deterministic serving whenever
-    the deterministic choice was baked into a backend field at init time.
-    """
-
-    server_args = model_runner.server_args
-
-    # FA3 and NSA store deterministic split policy at backend init time. FA4 is
-    # excluded because its CUDA graph does not support num_splits=0.
-    if (
-        getattr(backend, "fa_impl_ver", None) == 3
-        or backend.__class__.__name__ == "NativeSparseAttnBackend"
-    ):
-        patch_attr(backend, "num_splits", 0)
-
-    if hasattr(backend, "decode_split_tile_size"):
-        # FlashInfer deterministic mode fixes decode split size and disables
-        # CUDA graph KV split. Restore normal decode planning for self-draft.
-        patch_attr(backend, "decode_split_tile_size", None)
-        patch_attr(backend, "disable_cuda_graph_kv_split", False)
-        if hasattr(backend, "decode_use_tensor_cores"):
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                should_use_tensor_core,
-            )
-
-            patch_attr(
-                backend,
-                "decode_use_tensor_cores",
-                should_use_tensor_core(
-                    kv_cache_dtype=model_runner.kv_cache_dtype,
-                    num_attention_heads=(
-                        model_runner.model_config.num_attention_heads
-                        // model_runner.tp_size
-                    ),
-                    num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                        model_runner.tp_size
-                    ),
-                ),
-            )
-
-    if backend.__class__.__name__ == "TritonAttnBackend":
-        split_tile_size = server_args.triton_attention_split_tile_size
-        normal_max_splits = server_args.triton_attention_num_kv_splits
-        if split_tile_size is not None:
-            normal_max_splits = (
-                backend.max_context_len + split_tile_size - 1
-            ) // split_tile_size
-        # The kernel requires max_kv_splits to exactly match its scratch view.
-        # Reuse the deterministic allocation through a narrower view instead of
-        # allocating a second graph workspace for draft decode.
-        normal_max_splits = min(backend.max_kv_splits, normal_max_splits)
-        for name in (
-            "cuda_graph_attn_logits",
-            "cuda_graph_attn_lse",
-            "cuda_graph_swa_attn_logits",
-        ):
-            buffer = getattr(backend, name, None)
-            if buffer is not None:
-                patch_attr(backend, name, buffer[:, :, :normal_max_splits])
-        for name in (
-            "cuda_graph_num_kv_splits",
-            "cuda_graph_window_num_kv_splits",
-        ):
-            buffer = getattr(backend, name, None)
-            if buffer is not None:
-                draft_name = f"_dvr_draft_{name}"
-                draft_buffer = getattr(backend, draft_name, None)
-                if draft_buffer is None:
-                    draft_buffer = torch.full_like(buffer, normal_max_splits)
-                    setattr(backend, draft_name, draft_buffer)
-                patch_attr(backend, name, draft_buffer)
-        patch_attr(
-            backend,
-            "max_kv_splits",
-            normal_max_splits,
-        )
-        patch_attr(backend, "split_tile_size", split_tile_size)
-        patch_attr(
-            backend,
-            "static_kv_splits",
-            get_bool_env_var(
-                "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
-            ),
-        )
 
 
 def _ensure_decode_custom_all_reduce_comm(group):
@@ -265,7 +175,12 @@ def dvr_draft_decode_context(
                 *(extra_attn_backends or ()),
             ):
                 patch_attr(backend, "enable_deterministic", False)
-                _patch_draft_decode_backend_defaults(backend, model_runner, patch_attr)
+                get_overrides = getattr(
+                    backend, "get_nondeterministic_decode_overrides", None
+                )
+                if get_overrides is not None:
+                    for name, value in get_overrides(model_runner):
+                        patch_attr(backend, name, value)
 
             if capture:
                 # Deterministic target prefill/verify keeps custom all-reduce
@@ -326,9 +241,7 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     def __init__(self, model_runner):
         # Keep this capture policy on the dedicated runner rather than adding
         # transient DVR state to the shared ModelRunner.
-        self.dvr_target_verify_cuda_graph = (
-            model_runner.spec_algorithm.is_dvr_eagle()
-        )
+        self.dvr_target_verify_cuda_graph = model_runner.spec_algorithm.is_dvr_eagle()
         super().__init__(model_runner)
 
     def get_spec_info(self, num_tokens: int):

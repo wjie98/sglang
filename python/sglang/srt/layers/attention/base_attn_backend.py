@@ -136,6 +136,10 @@ class AttentionBackend(ABC):
         """
         pass
 
+    def get_nondeterministic_decode_overrides(self, model_runner):
+        """Return init-time deterministic fields to restore for fast decode."""
+        return ()
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers of verify attention kernels that needs to be filled after draft.
