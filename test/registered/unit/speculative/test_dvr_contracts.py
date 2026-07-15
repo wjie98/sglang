@@ -21,6 +21,7 @@ from sglang.srt.speculative.dvr_worker import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import renorm_sampling_probs
+from sglang.srt.speculative.spec_utils import renorm_draft_probs
 
 
 def test_dvr_spec_algorithm_contracts():
@@ -79,6 +80,22 @@ def test_dvr_draft_proposal_applies_min_p():
     )
 
     torch.testing.assert_close(proposal, torch.tensor([[2 / 3, 1 / 3, 0.0]]))
+
+
+def test_upstream_eagle_draft_proposal_keeps_unfiltered_distribution():
+    logits = torch.tensor([[2.0, 1.0, 0.0]])
+    sampling_info = SimpleNamespace(
+        temperatures=torch.tensor([[0.5]]),
+        top_ks=torch.tensor([1]),
+        top_ps=torch.tensor([0.1]),
+        min_ps=torch.tensor([0.9]),
+    )
+
+    proposal = renorm_draft_probs(logits, sampling_info, True)
+
+    torch.testing.assert_close(
+        proposal, torch.softmax(logits / sampling_info.temperatures, dim=-1)
+    )
 
 
 def test_dvr_seq_lens_uses_current_batch_when_host_mirror_is_absent():

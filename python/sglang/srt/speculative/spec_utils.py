@@ -123,8 +123,7 @@ def renorm_draft_probs(
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
-    probs = torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
-    return renorm_sampling_probs(probs, sampling_info)
+    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
 # Simulate acceptance length for benchmarking purposes
