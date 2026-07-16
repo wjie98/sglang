@@ -287,60 +287,42 @@ class DVRGDNStateAdapter:
         *,
         state_cache,
         indices: torch.Tensor,
+        backup_indices: torch.Tensor,
+        backup_size: int,
         include_temporal: bool = True,
         out: Optional[DVRRecurrentStateBackup] = None,
     ) -> DVRRecurrentStateBackup:
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
-        if out is not None:
-            for conv, saved_conv in zip(
-                state_cache.conv, out.conv, strict=True
-            ):
-                torch.index_select(conv, 1, indices, out=saved_conv)
-            if include_temporal:
-                if out.temporal is None:
-                    raise RuntimeError("DVR boundary backup has no temporal storage.")
-                torch.index_select(
-                    state_cache.temporal, 1, indices, out=out.temporal
-                )
-            return out
-        return DVRRecurrentStateBackup(
-            conv=tuple(conv[:, indices].clone() for conv in state_cache.conv),
-            temporal=(
-                state_cache.temporal[:, indices].clone()
-                if include_temporal
-                else None
-            ),
+        backup_indices = backup_indices.to(
+            device=state_cache.temporal.device, dtype=torch.long
         )
-
-    def batch_recurrent_state_backups(
-        self, rows: list[tuple[DVRRecurrentStateBackup, int]]
-    ) -> DVRRecurrentStateBackup:
-        """Return rows as one backup, reusing an already matching owner."""
-
-        first = rows[0][0]
-        if (
-            first.temporal is not None
-            and first.temporal.shape[1] == len(rows)
-            and all(
-                backup is first and row == i for i, (backup, row) in enumerate(rows)
+        if out is None:
+            out = DVRRecurrentStateBackup(
+                conv=tuple(
+                    tensor.new_empty(
+                        (tensor.shape[0], backup_size, *tensor.shape[2:])
+                    )
+                    for tensor in state_cache.conv
+                ),
+                temporal=(
+                    state_cache.temporal.new_empty(
+                        (
+                            state_cache.temporal.shape[0],
+                            backup_size,
+                            *state_cache.temporal.shape[2:],
+                        )
+                    )
+                    if include_temporal
+                    else None
+                )
             )
-        ):
-            return first
-        if any(backup.temporal is None for backup, _ in rows):
-            raise RuntimeError("DVR boundary snapshot has no temporal state.")
-        return DVRRecurrentStateBackup(
-            conv=tuple(
-                torch.cat(
-                    [backup.conv[j][:, row : row + 1] for backup, row in rows],
-                    dim=1,
-                )
-                for j in range(len(first.conv))
-            ),
-            temporal=torch.cat(
-                [backup.temporal[:, row : row + 1] for backup, row in rows],
-                dim=1,
-            ),
-        )
+        for tensor, saved_tensor in zip(state_cache.conv, out.conv, strict=True):
+            saved_tensor[:, backup_indices] = tensor[:, indices]
+        if include_temporal:
+            if out.temporal is None:
+                raise RuntimeError("DVR boundary backup has no temporal storage.")
+            out.temporal[:, backup_indices] = state_cache.temporal[:, indices]
+        return out
 
     def prepare_recurrent_state_for_verify(
         self,
@@ -350,7 +332,16 @@ class DVRGDNStateAdapter:
         boundary_indices: torch.Tensor,
         boundary_backup: Optional[DVRRecurrentStateBackup],
         live_backup: Optional[DVRRecurrentStateBackup],
+        backup_indices: Optional[torch.Tensor] = None,
     ):
+        if backup_indices is not None:
+            backup_indices = backup_indices.to(
+                device=state_cache.temporal.device, dtype=torch.long
+            )
+
+        def select_backup(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor if backup_indices is None else tensor[:, backup_indices]
+
         if boundary_backup is None:
             state_cache.temporal[:, live_indices] = state_cache.temporal[
                 :, boundary_indices
@@ -362,16 +353,41 @@ class DVRGDNStateAdapter:
             for conv, saved_conv in zip(
                 state_cache.conv, boundary_backup.conv, strict=True
             ):
-                conv[:, boundary_indices] = saved_conv.to(conv.dtype, copy=False)
-            state_cache.temporal[:, boundary_indices] = boundary_backup.temporal.to(
+                conv[:, boundary_indices] = select_backup(saved_conv).to(
+                    conv.dtype, copy=False
+                )
+            saved_temporal = select_backup(boundary_backup.temporal).to(
                 state_cache.temporal.dtype, copy=False
             )
-            state_cache.temporal[:, live_indices] = boundary_backup.temporal.to(
-                state_cache.temporal.dtype, copy=False
-            )
+            state_cache.temporal[:, boundary_indices] = saved_temporal
+            state_cache.temporal[:, live_indices] = saved_temporal
         if live_backup is not None:
             for conv, saved_conv in zip(state_cache.conv, live_backup.conv, strict=True):
-                conv[:, live_indices] = saved_conv.to(conv.dtype, copy=False)
+                conv[:, live_indices] = select_backup(saved_conv).to(
+                    conv.dtype, copy=False
+                )
+
+    def restore_recurrent_state_backup(
+        self,
+        *,
+        state_cache,
+        indices: torch.Tensor,
+        backup: DVRRecurrentStateBackup,
+        backup_indices: torch.Tensor,
+    ) -> None:
+        indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
+        backup_indices = backup_indices.to(
+            device=state_cache.temporal.device, dtype=torch.long
+        )
+        for conv, saved_conv in zip(state_cache.conv, backup.conv, strict=True):
+            conv[:, indices] = saved_conv[:, backup_indices].to(
+                conv.dtype, copy=False
+            )
+        if backup.temporal is None:
+            raise RuntimeError("DVR cache release requires a temporal backup.")
+        state_cache.temporal[:, indices] = backup.temporal[:, backup_indices].to(
+            state_cache.temporal.dtype, copy=False
+        )
 
     def capture_extend_prefix_boundary(
         self,

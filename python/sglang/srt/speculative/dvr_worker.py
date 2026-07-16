@@ -555,7 +555,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         self.linear_state.clear_cache_state()
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        self.linear_state.release_request(req)
+        # Finished-request radix insertion donates this physical slot. Restore
+        # the request's exact target checkpoint before ownership is transferred.
+        self.linear_state.restore_for_cache_release(
+            req,
+            self.req_to_token_pool,
+        )
 
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None

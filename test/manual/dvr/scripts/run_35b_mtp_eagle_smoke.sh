@@ -200,6 +200,20 @@ run_one_mode() {
     2>&1 | tee "${interleaved_kl_log}"
   grep -q "ALL_OK True" "${interleaved_kl_log}"
 
+  echo "==> Running ${label} generated-prefix radix reuse KL smoke"
+  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    --base-url "${BASE_URL}" \
+    --request-modes concurrent \
+    --prompt-token-lengths 65 \
+    --reuse-generated-prefix-tokens 128 \
+    --min-cached-tokens 192 \
+    --max-new 128 \
+    --limit-cases 1 \
+    --concurrent-workers 1 \
+    --ignore-eos \
+    2>&1 | tee -a "${interleaved_kl_log}"
+  grep -q "ALL_OK True" "${interleaved_kl_log}"
+
   echo "==> Running ${label} ShareGPT real-data returned-logprob acceptance/KL smoke"
   conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \

@@ -30,6 +30,9 @@ Use these entry points:
   - includes an interleaved shared-prefix request pair that exercises radix
     donation while another request owns the worker, plus concurrent and batch
     512-token strict KL checks
+  - includes a completed-generation reuse case: a 65-token prompt generates
+    128 tokens, the next request must reuse 192 cached tokens, and its returned
+    logprobs must still match the flushed full-prefill oracle exactly
   - `ATTENTION_BACKEND` may select a separately reported Triton/FlashInfer/FA3
     compatibility run; the fixed default remains `triton`
   - `RUN_V1=0` or `RUN_V2=0` may resume one half of an interrupted run in the
@@ -41,6 +44,8 @@ Use these entry points:
     regression and fails if reported accept rate drops below `0.96`
   - includes a staggered shared-prefix KL case so request-local GDN boundary
     ownership is checked with radix enabled
+  - applies the same 192-token generated-prefix reuse check to both sync and
+    overlap DVR-EAGLE
   - ShareGPT cases use a separate `0.70` floor based on the fixed two-token
     MTP baseline; this catches routing regressions without pretending real-data
     acceptance should be nearly one

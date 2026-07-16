@@ -21,9 +21,13 @@ class _DVRBoundaryCheckpoint:
     track_idx: int
     seq_len: int
     publish_pending: bool = False
-    state_backup: Any = None
-    state_backup_row: int = 0
-    state_backup_track_idx: Optional[int] = None
+
+
+@dataclass
+class _DVRStateBackupStore:
+    slot_owners: dict[int, tuple[str, int]]
+    boundary: Any = None
+    live: Any = None
 
 
 @dataclass
@@ -70,13 +74,6 @@ class DVRRollbackActions:
         track_idx, seqlen = self.pending_checkpoints[req_index]
         if seqlen <= 0:
             raise RuntimeError(f"DVR produced invalid checkpoint length {seqlen}.")
-        if req.mamba_last_track_seqlen is not None and (
-            seqlen <= req.mamba_last_track_seqlen
-        ):
-            return True
-        if seqlen > req.kv_committed_len:
-            return True
-
         buffer = req.mamba_ping_pong_track_buffer
         if buffer is None or track_idx < 0 or track_idx >= buffer.numel():
             raise RuntimeError(
@@ -92,10 +89,20 @@ class DVRRollbackActions:
                 f"DVR checkpoint is not page aligned: {seqlen=}, {page_size=}."
             )
 
-        req.mamba_last_track_seqlen = seqlen
+        # Track ownership is known when verify commits the GPU state, even when
+        # result processing has not advanced the host-visible boundary length.
+        # Publish it independently so radix always keeps the committed slot.
         req.mamba_next_track_idx = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
             track_idx
         )
+        if req.mamba_last_track_seqlen is not None and (
+            seqlen <= req.mamba_last_track_seqlen
+        ):
+            return True
+        if seqlen > req.kv_committed_len:
+            return True
+
+        req.mamba_last_track_seqlen = seqlen
         return True
 
 
@@ -114,10 +121,10 @@ class DVRLinearStateLifecycle:
         # Request-pool slots are bounded and reused. Pair each checkpoint with
         # its rid so stale state cannot survive slot reuse.
         self.boundaries: dict[int, _DVRBoundaryCheckpoint] = {}
-        # Self draft mutates target live convolution state only between this
-        # prepare/verify pair. Boundary snapshots live on each checkpoint
-        # because radix may rebind them while another request is scheduled.
-        self.live_backup = None
+        # Radix may rebind a request's physical ping-pong slot while its logical
+        # checkpoint remains live. Store snapshots by request-pool slot so an
+        # interleaved batch cannot overwrite another request's state.
+        self.state_backup: Optional[_DVRStateBackupStore] = None
 
     def bind_state_adapter(self, state_adapter) -> None:
         self._state_adapter = state_adapter
@@ -145,12 +152,57 @@ class DVRLinearStateLifecycle:
 
     def clear_cache_state(self):
         self.boundaries.clear()
-        self.live_backup = None
+        self.state_backup = None
 
-    def release_request(self, req) -> None:
+    def restore_for_cache_release(self, req, req_to_token_pool) -> None:
+        if self._state_adapter is None:
+            return
         checkpoint = self._checkpoint(req)
-        if checkpoint is not None:
-            del self.boundaries[req.req_pool_idx]
+        request_slot = req.req_pool_idx
+        if checkpoint is None:
+            raise RuntimeError(
+                f"DVR cache release is missing the checkpoint for {req.rid}."
+            )
+        if self.server_args.disable_radix_cache:
+            self.boundaries.pop(request_slot, None)
+            if self.state_backup is not None:
+                self.state_backup.slot_owners.pop(int(request_slot), None)
+            return
+        if self.state_backup is None or self.state_backup.boundary is None:
+            raise RuntimeError(
+                f"DVR cache release is missing the boundary snapshot for {req.rid}."
+            )
+        request_slot = int(request_slot)
+        owner = (req.rid, checkpoint.track_idx)
+        if self.state_backup.slot_owners.get(request_slot) != owner:
+            raise RuntimeError(
+                "DVR cache release is missing the request-local checkpoint "
+                f"snapshot for {req.rid}."
+            )
+
+        checkpoint_index = req.mamba_ping_pong_track_buffer[
+            checkpoint.track_idx
+        ].reshape(1)
+        backup_index = torch.tensor(
+            [request_slot],
+            device=checkpoint_index.device,
+            dtype=torch.long,
+        )
+        self._state_adapter.restore_recurrent_state_backup(
+            state_cache=req_to_token_pool.get_speculative_mamba2_params_all_layers(),
+            indices=checkpoint_index,
+            backup=self.state_backup.boundary,
+            backup_indices=backup_index,
+        )
+        req.mamba_next_track_idx = (
+            req_to_token_pool.get_mamba_ping_pong_other_idx(checkpoint.track_idx)
+        )
+        self.boundaries.pop(request_slot, None)
+        self.state_backup.slot_owners.pop(request_slot, None)
+
+    def _invalidate_backup(self, slot: int) -> None:
+        if self.state_backup is not None:
+            self.state_backup.slot_owners.pop(slot, None)
 
     def _checkpoint(self, req) -> Optional[_DVRBoundaryCheckpoint]:
         slot = req.req_pool_idx
@@ -159,6 +211,7 @@ class DVRLinearStateLifecycle:
         checkpoint = self.boundaries.get(slot)
         if checkpoint is not None and checkpoint.rid != req.rid:
             del self.boundaries[slot]
+            self._invalidate_backup(slot)
             return None
         return checkpoint
 
@@ -193,8 +246,12 @@ class DVRLinearStateLifecycle:
                 current_boundary = int(seq_lens_cpu[i]) // chunk_size * chunk_size
                 if current_boundary == checkpoint.seq_len + chunk_size:
                     checkpoint.seq_len = current_boundary
+                    # Target EXTEND replaced this boundary without passing a
+                    # post-verify context, so the prior snapshot is obsolete.
+                    self._invalidate_backup(req.req_pool_idx)
                 elif checkpoint.seq_len != current_boundary:
                     del self.boundaries[req.req_pool_idx]
+                    self._invalidate_backup(req.req_pool_idx)
                     missing.append(i)
                 continue
 
@@ -229,90 +286,85 @@ class DVRLinearStateLifecycle:
         ctx: Optional[DVRLinearStateContext] = None,
     ):
         if self._state_adapter is None:
-            self.live_backup = None
+            self.state_backup = None
             return
         backup_boundary = not self.server_args.disable_radix_cache
         backup_live = self._state_adapter.draft_reuses_target_state
         if not backup_boundary and not backup_live:
-            self.live_backup = None
+            # With radix disabled there is no checkpoint donation. A separate
+            # draft model also cannot mutate the target live slot.
+            self.state_backup = None
             return
+
         checkpoints = [self._checkpoint(req) for req in batch.reqs]
         if any(checkpoint is None for checkpoint in checkpoints):
             raise RuntimeError("DVR cannot back up a missing boundary checkpoint.")
-        backup_keys = [
+        owner_keys = [
             (req.rid, checkpoint.track_idx)
             for req, checkpoint in zip(batch.reqs, checkpoints, strict=True)
         ]
-        existing_live = None
-        if self.live_backup is not None and self.live_backup[0] == backup_keys:
-            existing_live = self.live_backup[1]
+        request_slots = [int(req.req_pool_idx) for req in batch.reqs]
+        if self.state_backup is None:
+            self.state_backup = _DVRStateBackupStore(slot_owners={})
 
-        # Before draft, preserve snapshots captured by the previous target
-        # verify: radix donation may already have replaced their physical slots.
-        # Post-verify ctx identifies the exact slots to refresh for every request.
-        boundary_rows = []
-        if backup_boundary:
-            boundary_rows = (
-                list(range(len(checkpoints)))
-                if ctx is not None
-                else [
-                    i
-                    for i, checkpoint in enumerate(checkpoints)
-                    if checkpoint.state_backup is None
-                    or checkpoint.state_backup_track_idx != checkpoint.track_idx
-                ]
-            )
-        refresh_live = backup_live and (ctx is not None or existing_live is None)
-        if not boundary_rows and not refresh_live:
+        # Draft preparation must preserve a prior snapshot when radix has
+        # rebound the physical slot. Post-verify supplies ctx and refreshes all
+        # participating requests from the exact slots used by target verify.
+        update_positions = (
+            list(range(len(batch.reqs)))
+            if ctx is not None
+            else [
+                i
+                for i, (slot, owner) in enumerate(
+                    zip(request_slots, owner_keys, strict=True)
+                )
+                if self.state_backup.slot_owners.get(slot) != owner
+            ]
+        )
+        if not update_positions:
             return
 
         ctx = ctx or self.state_context(batch, require_boundary=True)
         if ctx is None:
-            self.live_backup = None
             return
         assert ctx.boundary_indices is not None
-
-        if backup_boundary and boundary_rows:
-            selected = [checkpoints[i] for i in boundary_rows]
-            existing_boundary = self._boundary_backup(selected)
-            boundary_backup = self._state_adapter.backup_recurrent_state(
-                state_cache=ctx.state_cache,
-                indices=ctx.boundary_indices[boundary_rows],
-                out=existing_boundary,
+        if len(update_positions) == len(batch.reqs):
+            boundary_indices = ctx.boundary_indices
+            live_indices = ctx.live_indices
+            backup_indices = ctx.state_input_indices
+        else:
+            positions = torch.tensor(
+                update_positions, device=ctx.live_indices.device, dtype=torch.long
             )
-            for row, checkpoint in enumerate(selected):
-                checkpoint.state_backup = boundary_backup
-                checkpoint.state_backup_row = row
-                checkpoint.state_backup_track_idx = checkpoint.track_idx
-
+            boundary_indices = ctx.boundary_indices[positions]
+            live_indices = ctx.live_indices[positions]
+            backup_indices = ctx.state_input_indices[positions]
+        # Match ReqToTokenPool directly: row 0 is the existing graph-padding
+        # dummy, and real request slots retain their native indices.
+        backup_size = int(batch.req_to_token_pool.req_to_token.shape[0])
+        if backup_boundary:
+            self.state_backup.boundary = self._state_adapter.backup_recurrent_state(
+                state_cache=ctx.state_cache,
+                indices=boundary_indices,
+                backup_indices=backup_indices,
+                backup_size=backup_size,
+                out=self.state_backup.boundary,
+            )
         # Only self-draft mutates the target live slot. Its temporal state is
         # rebuilt from the boundary oracle, so preserve only convolution state.
-        if refresh_live:
-            live_backup = self._state_adapter.backup_recurrent_state(
+        if backup_live:
+            self.state_backup.live = self._state_adapter.backup_recurrent_state(
                 state_cache=ctx.state_cache,
-                indices=ctx.live_indices,
+                indices=live_indices,
+                backup_indices=backup_indices,
+                backup_size=backup_size,
                 include_temporal=False,
-                out=existing_live,
+                out=self.state_backup.live,
             )
-            self.live_backup = (backup_keys, live_backup)
-        elif not backup_live:
-            self.live_backup = None
-
-    def _boundary_backup(self, checkpoints):
-        rows = []
-        for checkpoint in checkpoints:
-            if (
-                checkpoint.state_backup is None
-                or checkpoint.state_backup_track_idx != checkpoint.track_idx
-            ):
-                return None
-            rows.append((checkpoint.state_backup, checkpoint.state_backup_row))
-        backup = self._state_adapter.batch_recurrent_state_backups(rows)
-        for row, checkpoint in enumerate(checkpoints):
-            checkpoint.state_backup = backup
-            checkpoint.state_backup_row = row
-            checkpoint.state_backup_track_idx = checkpoint.track_idx
-        return backup
+        for position in update_positions:
+            self.state_backup.slot_owners[request_slots[position]] = owner_keys[
+                position
+            ]
 
     def restore_for_verify(
         self,
@@ -326,27 +378,44 @@ class DVRLinearStateLifecycle:
         checkpoints = [self._checkpoint(req) for req in batch.reqs]
         if any(checkpoint is None for checkpoint in checkpoints):
             raise RuntimeError("DVR target verify is missing a boundary checkpoint.")
-        boundary_backup = None
-        if not self.server_args.disable_radix_cache:
-            boundary_backup = self._boundary_backup(checkpoints)
-            if boundary_backup is None:
-                raise RuntimeError("DVR target verify is missing a boundary snapshot.")
-
-        live_backup = None
-        backup_keys = [
-            (req.rid, checkpoint.track_idx)
-            for req, checkpoint in zip(batch.reqs, checkpoints, strict=True)
-        ]
-        if self.live_backup is not None and self.live_backup[0] == backup_keys:
-            live_backup = self.live_backup[1]
-        if self._state_adapter.draft_reuses_target_state and live_backup is None:
-            raise RuntimeError("DVR self draft is missing its live-state snapshot.")
+        needs_boundary = not self.server_args.disable_radix_cache
+        needs_live = self._state_adapter.draft_reuses_target_state
+        boundary_backup = live_backup = None
+        backup_indices = None
+        if needs_boundary or needs_live:
+            if self.state_backup is None:
+                raise RuntimeError("DVR target verify is missing state backups.")
+            missing = [
+                req.rid
+                for req, checkpoint in zip(batch.reqs, checkpoints, strict=True)
+                if self.state_backup.slot_owners.get(int(req.req_pool_idx))
+                != (req.rid, checkpoint.track_idx)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "DVR request-local state backup is missing for "
+                    f"requests {missing}."
+                )
+            if needs_boundary:
+                boundary_backup = self.state_backup.boundary
+                if boundary_backup is None:
+                    raise RuntimeError(
+                        "DVR target verify is missing boundary-state backups."
+                    )
+            if needs_live:
+                live_backup = self.state_backup.live
+                if live_backup is None:
+                    raise RuntimeError(
+                        "DVR self draft is missing live-state backups."
+                    )
+            backup_indices = ctx.state_input_indices
         self._state_adapter.prepare_recurrent_state_for_verify(
             state_cache=ctx.state_cache,
             live_indices=ctx.live_indices,
             boundary_indices=ctx.boundary_indices,
             boundary_backup=boundary_backup,
             live_backup=live_backup,
+            backup_indices=backup_indices,
         )
         return ctx
 
@@ -401,7 +470,7 @@ class DVRLinearStateLifecycle:
         if pending_checkpoints is None and cache_generated_prefix is None:
             return None
         return DVRRollbackActions(
-            pending_checkpoints=pending_checkpoints if deferred else None,
+            pending_checkpoints=pending_checkpoints,
             cache_generated_prefix=cache_generated_prefix,
         )
 
@@ -527,6 +596,7 @@ class DVRLinearStateLifecycle:
                     seq_len=boundary_seqlen,
                     publish_pending=not publish_to_request,
                 )
+                self._invalidate_backup(slot)
                 self.boundaries[slot] = checkpoint
                 if publish_to_request:
                     req.mamba_last_track_seqlen = boundary_seqlen

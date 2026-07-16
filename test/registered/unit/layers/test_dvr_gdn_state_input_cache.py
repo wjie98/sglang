@@ -374,19 +374,30 @@ def test_gdn_self_draft_restores_from_stable_boundary_without_snapshot():
     assert torch.equal(conv[:, [2]], live_backup.conv[0])
 
 
-def test_gdn_rebatches_request_local_boundary_snapshots():
-    first = DVRRecurrentStateBackup(
-        conv=(torch.tensor([[[1.0], [2.0]]]),),
-        temporal=torch.tensor([[[3.0], [4.0]]]),
-    )
-    second = DVRRecurrentStateBackup(
-        conv=(torch.tensor([[[5.0]]]),),
-        temporal=torch.tensor([[[6.0]]]),
-    )
+def test_gdn_backup_uses_request_pool_rows():
+    conv = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+    temporal = torch.arange(18, dtype=torch.float32).reshape(1, 3, 6)
+    state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
     adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
 
-    assert adapter.batch_recurrent_state_backups([(first, 0), (first, 1)]) is first
+    backup = adapter.backup_recurrent_state(
+        state_cache=state_cache,
+        indices=torch.tensor([0, 2]),
+        backup_indices=torch.tensor([1, 3]),
+        backup_size=4,
+    )
+    torch.testing.assert_close(backup.conv[0][:, 1], conv[:, 0])
+    torch.testing.assert_close(backup.conv[0][:, 3], conv[:, 2])
+    torch.testing.assert_close(backup.temporal[:, 1], temporal[:, 0])
+    torch.testing.assert_close(backup.temporal[:, 3], temporal[:, 2])
 
-    merged = adapter.batch_recurrent_state_backups([(first, 1), (second, 0)])
-    assert merged.conv[0].flatten().tolist() == [2.0, 5.0]
-    assert merged.temporal.flatten().tolist() == [4.0, 6.0]
+    conv[:, 1].fill_(99)
+    updated = adapter.backup_recurrent_state(
+        state_cache=state_cache,
+        indices=torch.tensor([1]),
+        backup_indices=torch.tensor([2]),
+        backup_size=4,
+        out=backup,
+    )
+    assert updated is backup
+    torch.testing.assert_close(backup.conv[0][:, 2], conv[:, 1])

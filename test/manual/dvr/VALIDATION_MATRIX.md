@@ -90,12 +90,15 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
 
 The fixed script also runs a staggered shared-prefix pair at prompt lengths 65
 and 129 with 128 generated tokens. This catches request-local boundary-state
-ownership errors when radix donation rebinds a physical ping-pong slot. It then
-runs concurrent and batch `prompt_len=65`, `max_new=512` cases. Add a separate
-fixed case for 513 tokens when a change specifically touches end-of-chunk
-termination behavior. One-token prompts are part of the positive matrix: their
-first iteration uses the target-verify sentinel and then joins the normal
-self-draft path.
+ownership errors when radix donation rebinds a physical ping-pong slot. A
+separate case generates 128 tokens from a 65-token prompt, reuses the resulting
+193-token sequence as a new prompt, requires `cached=192`, and checks that
+returned logprobs still match a flushed full-prefill oracle. It then runs
+concurrent and batch `prompt_len=65`, `max_new=512` cases. Add a separate fixed
+case for 513 tokens when a change specifically touches end-of-chunk termination
+behavior. One-token prompts are part of the positive matrix: their first
+iteration uses the target-verify sentinel and then joins the normal self-draft
+path.
 
 ## 35B self-DVR and DVR-EAGLE
 

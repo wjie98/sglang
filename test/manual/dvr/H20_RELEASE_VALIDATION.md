@@ -54,18 +54,20 @@ Interpret the comparison before changing code again:
 - custom all-reduce must appear only in provisional self-draft, never target
   prefill or target verify.
 
-Radix correctness is a release invariant, not a benchmark option. Prefix-cache
-donation replaces a request's physical ping-pong slot, so DVR must retain the
-request's boundary-state snapshot and restore it into the rebound slot. A
-worker-global batch snapshot is invalid because another request can overwrite
-it between donation and target verify. The fixed 0.8B and 35B matrices include
-staggered shared-prefix requests for this ownership transition. Disabling radix
-to make KL pass is a failed Triton/FA3 run, not an accepted workaround.
+Radix correctness is a release invariant, not a benchmark option. DVR stores
+recurrent snapshots by request-pool slot, while `(rid, logical track index)`
+guards slot reuse. Target verify refreshes those rows before result processing;
+sync and overlap both publish physical checkpoint ownership even when the new
+boundary length cannot yet be materialized on the host. Before a finished
+request donates its physical ping-pong slot to radix, DVR restores the exact
+snapshot into that slot. The fixed 0.8B and 35B matrices cover both interleaved
+requests and reuse of a 192-token prefix containing generated tokens. Disabling
+radix to make KL pass is a failed Triton/FA3 run, not an accepted workaround.
 
 ## Implementation audit snapshot
 
-At the upstream base used by this branch, the production runtime delta is 22
-files, 3,050 added lines, 61 deleted lines, and 2,989 net lines. Most code is in
+At the upstream base used by this branch, the production runtime delta is 28
+files, 3,187 added lines, 79 deleted lines, and 3,108 net lines. Most code is in
 six DVR-owned modules:
 
 - `dvr_worker.py`: shared draft, target verify, and rollback execution
@@ -113,7 +115,8 @@ Do not prepare the release branch until all applicable gates pass.
    report `ALL_OK True`; this includes one-token prompts whose first iteration
    uses a zero-step, one-root target-verify sentinel before normal drafting.
    These cases use the same strict full-prefill KL oracle. Triton/FA3 runs must
-   also pass the staggered shared-prefix case with radix enabled.
+   also pass the staggered shared-prefix case with radix enabled and report
+   `cached=192` with KL=0 for completed-generation prefix reuse.
 3. 35B DVR-EAGLE sync and overlap report `kl_failed: 0` and
    `accept_failed: 0` with both returned-logprob modes.
 4. The seeded 35B MTP boundary acceptance remains at least 0.96, and fixed
@@ -340,9 +343,10 @@ done
 ```
 
 Check every `spec_v1_kl.log` and `spec_v2_kl.log` for `ALL_OK True`, including
-the `prompt_len=65/129`, `max_new=128` interleaved block. The server logs must
-show the requested attention backend, page size 64, expected radix mode, and
-captured graph batch 4.
+the `prompt_len=65/129`, `max_new=128` interleaved block. The generated-prefix
+case must use a 193-token input, report `cached=192`, and remain KL=0. The server
+logs must show the requested attention backend, page size 64, expected radix
+mode, and captured graph batch 4.
 
 ## 5. 35B MTP/EAGLE correctness matrix
 

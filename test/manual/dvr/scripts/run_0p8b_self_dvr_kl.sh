@@ -126,6 +126,19 @@ run_one_mode() {
     --ignore-eos \
     2>&1 | tee -a "${client_log}"
 
+  echo "==> Running ${label} generated-prefix radix reuse KL case"
+  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    --base-url "${BASE_URL}" \
+    --request-modes concurrent \
+    --prompt-token-lengths 65 \
+    --reuse-generated-prefix-tokens 128 \
+    --min-cached-tokens 192 \
+    --max-new 128 \
+    --limit-cases 1 \
+    --concurrent-workers 1 \
+    --ignore-eos \
+    2>&1 | tee -a "${client_log}"
+
   echo "==> Running ${label} 512-token KL cases"
   conda_python test/manual/dvr/test_dvr_batch_kl.py \
     --base-url "${BASE_URL}" \

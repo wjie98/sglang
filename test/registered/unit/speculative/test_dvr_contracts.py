@@ -6,6 +6,7 @@ import torch
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.linear.dvr_gdn import DVRGDNStateAdapter
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
@@ -199,9 +200,9 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
         tree_cache=tree_cache,
     )
     assert req.mamba_last_track_seqlen == 128
-    assert req.mamba_next_track_idx == 1
+    assert req.mamba_next_track_idx == 0
 
-    dvr_rollback_actions.pending_checkpoints = [(2, 192)]
+    dvr_rollback_actions.pending_checkpoints = [(0, 192)]
     req.kv_committed_len = 127
     assert dvr_rollback_actions.commit_checkpoint_after_decode(
         req=req,
@@ -210,6 +211,7 @@ def test_dvr_pending_mamba_checkpoint_commit_guards():
         tree_cache=tree_cache,
     )
     assert req.mamba_last_track_seqlen == 128
+    assert req.mamba_next_track_idx == 1
     req.kv_committed_len = 128
 
     dvr_rollback_actions.pending_checkpoints = None
@@ -398,12 +400,12 @@ def test_dvr_plain_transformer_self_draft_rejects_eager_decode():
 def test_dvr_linear_state_is_optional_for_plain_transformers():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle._state_adapter = None
-    lifecycle.live_backup = object()
+    lifecycle.state_backup = object()
 
     lifecycle.backup_boundary_state(SimpleNamespace())
 
     assert not lifecycle.has_state_adapter
-    assert lifecycle.live_backup is None
+    assert lifecycle.state_backup is None
 
     assert (
         lifecycle.rollback_after_verify(
@@ -419,16 +421,38 @@ def test_dvr_linear_state_is_optional_for_plain_transformers():
     )
 
 
-def test_dvr_request_release_drops_owned_boundary_snapshot():
+def test_dvr_sync_rollback_keeps_authoritative_checkpoint_action():
+    class Adapter:
+        chunk_size = 64
+
+        def commit_after_verify(self, **_kwargs):
+            pass
+
     lifecycle = object.__new__(DVRLinearStateLifecycle)
-    lifecycle.boundaries = {
-        3: SimpleNamespace(rid="finished", state_backup=object())
-    }
-    req = SimpleNamespace(rid="finished", req_pool_idx=3)
+    lifecycle._state_adapter = Adapter()
+    lifecycle.boundaries = {1: SimpleNamespace(rid="r0", track_idx=0, seq_len=64)}
+    req = SimpleNamespace(rid="r0", req_pool_idx=1, mamba_last_track_seqlen=64)
+    batch = SimpleNamespace(
+        reqs=[req],
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+        enable_overlap=False,
+        decoding_reqs=None,
+    )
+    ctx = SimpleNamespace(
+        state_cache=object(),
+        state_input_indices=torch.tensor([1]),
+        live_indices=torch.tensor([2]),
+        boundary_indices=torch.tensor([3]),
+    )
 
-    lifecycle.release_request(req)
+    actions = lifecycle.rollback_after_verify(
+        batch=batch,
+        ctx=ctx,
+        accept_lens=torch.tensor([1], dtype=torch.int32),
+    )
 
-    assert lifecycle.boundaries == {}
+    assert actions is not None
+    assert actions.pending_checkpoints == [(0, 128)]
 
 
 def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
@@ -511,6 +535,7 @@ def test_dvr_prefill_boundary_uses_request_local_track_slot():
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle._state_adapter = Adapter()
     lifecycle.boundaries = {}
+    lifecycle.state_backup = None
     req = SimpleNamespace(
         rid="r0",
         req_pool_idx=0,
@@ -564,39 +589,28 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
             self.backup_indices = []
             self.draft_reuses_target_state = True
 
-        @staticmethod
-        def batch_recurrent_state_backups(rows):
-            assert len(rows) == 1 and rows[0][1] == 0
-            return rows[0][0]
-
-        def backup_recurrent_state(
-            self, *, indices, include_temporal=True, out=None, **_kwargs
-        ):
+        def backup_recurrent_state(self, *, indices, include_temporal=True, **_kwargs):
             self.backup_indices.append((indices.tolist(), include_temporal))
-            return out if out is not None else object()
+            return len(self.backup_indices)
 
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     checkpoint = SimpleNamespace(
-        rid="r0",
-        track_idx=1,
-        seq_len=64,
-        publish_pending=False,
-        state_backup=None,
-        state_backup_row=0,
-        state_backup_track_idx=None,
+        rid="r0", track_idx=1, seq_len=64, publish_pending=False
     )
-    lifecycle.boundaries = {0: checkpoint}
-    lifecycle.live_backup = None
+    lifecycle.boundaries = {1: checkpoint}
+    lifecycle.state_backup = None
     lifecycle.server_args = SimpleNamespace(disable_radix_cache=False)
     adapter = Adapter()
     lifecycle._state_adapter = adapter
     context = SimpleNamespace(
         state_cache=object(),
+        state_input_indices=torch.tensor([1]),
         boundary_indices=torch.tensor([11]),
         live_indices=torch.tensor([12]),
     )
     rebound_context = SimpleNamespace(
         state_cache=object(),
+        state_input_indices=torch.tensor([1]),
         boundary_indices=torch.tensor([21]),
         live_indices=torch.tensor([22]),
     )
@@ -608,7 +622,9 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
 
     lifecycle.state_context = state_context
     batch = SimpleNamespace(
-        reqs=[SimpleNamespace(rid="r0", req_pool_idx=0)], enable_overlap=True
+        reqs=[SimpleNamespace(rid="r0", req_pool_idx=1)],
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.empty(3, 0)),
+        enable_overlap=True,
     )
 
     lifecycle.backup_boundary_state(batch)
@@ -648,10 +664,187 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
 
     # A separate EAGLE/MTP draft model cannot mutate the target live slot.
     adapter.draft_reuses_target_state = False
-    lifecycle.live_backup = None
+    lifecycle.state_backup = None
     lifecycle.backup_boundary_state(batch, ctx=context)
     assert adapter.backup_indices[-1] == ([11], True)
     assert len(adapter.backup_indices) == 7
+
+
+def test_dvr_target_extend_invalidates_prior_boundary_snapshot():
+    class Adapter:
+        draft_reuses_target_state = False
+        chunk_size = 64
+
+        def __init__(self):
+            self.backup_indices = []
+
+        def backup_recurrent_state(self, *, indices, **_kwargs):
+            self.backup_indices.append(indices.tolist())
+            return object()
+
+    adapter = Adapter()
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle.server_args = SimpleNamespace(disable_radix_cache=False)
+    lifecycle._state_adapter = adapter
+    lifecycle.boundaries = {
+        1: SimpleNamespace(
+            rid="r0", track_idx=0, seq_len=64, publish_pending=False
+        )
+    }
+    lifecycle.state_backup = None
+    lifecycle._ensure_boundary_state = lambda *_args, **_kwargs: None
+    contexts = iter(
+        [
+            SimpleNamespace(
+                state_cache=object(),
+                state_input_indices=torch.tensor([1]),
+                boundary_indices=torch.tensor([11]),
+                live_indices=torch.tensor([12]),
+            ),
+            SimpleNamespace(
+                state_cache=object(),
+                state_input_indices=torch.tensor([1]),
+                boundary_indices=torch.tensor([21]),
+                live_indices=torch.tensor([22]),
+            ),
+        ]
+    )
+    lifecycle.state_context = lambda *_args, **_kwargs: next(contexts)
+    batch = SimpleNamespace(
+        reqs=[
+            SimpleNamespace(
+                rid="r0",
+                req_pool_idx=1,
+                mamba_last_track_seqlen=64,
+            )
+        ],
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.empty(3, 0)),
+    )
+
+    lifecycle.backup_boundary_state(batch)
+    lifecycle.prepare_for_draft(
+        batch,
+        seq_lens_cpu=[128],
+        prefill_prefix_lens=[64],
+    )
+    lifecycle.backup_boundary_state(batch)
+
+    assert adapter.backup_indices == [[11], [21]]
+
+
+def test_dvr_request_local_backup_survives_interleaved_batch_and_rebind():
+    conv = torch.zeros(1, 6, 2)
+    temporal = torch.zeros(1, 6, 2)
+    conv[:, 0] = torch.tensor([1.0, 2.0])
+    temporal[:, 0] = torch.tensor([3.0, 4.0])
+    conv[:, 3] = torch.tensor([5.0, 6.0])
+    conv[:, 1] = torch.tensor([11.0, 12.0])
+    temporal[:, 1] = torch.tensor([13.0, 14.0])
+    conv[:, 4] = torch.tensor([15.0, 16.0])
+    state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, draft_reuses_target_state=True)
+
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle.server_args = SimpleNamespace(disable_radix_cache=False)
+    lifecycle._state_adapter = adapter
+    lifecycle.boundaries = {
+        1: SimpleNamespace(rid="r0", track_idx=0, seq_len=64),
+        2: SimpleNamespace(rid="r1", track_idx=0, seq_len=64),
+    }
+    lifecycle.state_backup = None
+    lifecycle._ensure_boundary_state = lambda *_args, **_kwargs: None
+
+    req0 = SimpleNamespace(rid="r0", req_pool_idx=1)
+    req1 = SimpleNamespace(rid="r1", req_pool_idx=2)
+    pool = SimpleNamespace(req_to_token=torch.empty(3, 0))
+    batch0 = SimpleNamespace(reqs=[req0], req_to_token_pool=pool)
+    batch1 = SimpleNamespace(reqs=[req1], req_to_token_pool=pool)
+    r0_contexts = iter(
+        [
+            SimpleNamespace(
+                state_cache=state_cache,
+                state_input_indices=torch.tensor([1]),
+                boundary_indices=torch.tensor([0]),
+                live_indices=torch.tensor([3]),
+            ),
+            SimpleNamespace(
+                state_cache=state_cache,
+                state_input_indices=torch.tensor([1]),
+                boundary_indices=torch.tensor([2]),
+                live_indices=torch.tensor([5]),
+            ),
+        ]
+    )
+    r1_context = SimpleNamespace(
+        state_cache=state_cache,
+        state_input_indices=torch.tensor([2]),
+        boundary_indices=torch.tensor([1]),
+        live_indices=torch.tensor([4]),
+    )
+    lifecycle.state_context = lambda batch, **_kwargs: (
+        next(r0_contexts) if batch is batch0 else r1_context
+    )
+
+    lifecycle.backup_boundary_state(batch0)
+    lifecycle.backup_boundary_state(batch1)
+    conv[:, 0].zero_()
+    temporal[:, 0].zero_()
+    conv[:, 3].zero_()
+
+    # The same logical owner now points at rebound physical slots. Draft
+    # preparation must retain r0's old snapshot instead of reading those slots.
+    lifecycle.backup_boundary_state(batch0)
+    lifecycle.restore_for_verify(batch0)
+
+    torch.testing.assert_close(conv[:, 2], torch.tensor([[1.0, 2.0]]))
+    torch.testing.assert_close(temporal[:, 2], torch.tensor([[3.0, 4.0]]))
+    torch.testing.assert_close(conv[:, 5], torch.tensor([[5.0, 6.0]]))
+    torch.testing.assert_close(temporal[:, 5], torch.tensor([[3.0, 4.0]]))
+
+
+def test_dvr_cache_release_restores_committed_request_snapshot():
+    conv = torch.zeros(1, 4, 2)
+    temporal = torch.zeros(1, 4, 2)
+    conv[:, 2] = torch.tensor([1.0, 2.0])
+    temporal[:, 2] = torch.tensor([3.0, 4.0])
+    conv[:, 3] = torch.tensor([5.0, 6.0])
+    state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, draft_reuses_target_state=True)
+
+    lifecycle = object.__new__(DVRLinearStateLifecycle)
+    lifecycle.server_args = SimpleNamespace(disable_radix_cache=False)
+    lifecycle._state_adapter = adapter
+    lifecycle.boundaries = {1: SimpleNamespace(rid="r0", track_idx=0, seq_len=64)}
+    lifecycle.state_backup = None
+    req = SimpleNamespace(
+        rid="r0",
+        req_pool_idx=1,
+        mamba_next_track_idx=0,
+        mamba_ping_pong_track_buffer=torch.tensor([2, 1]),
+    )
+    pool = SimpleNamespace(
+        req_to_token=torch.empty(2, 0),
+        get_speculative_mamba2_params_all_layers=lambda: state_cache,
+        get_mamba_ping_pong_other_idx=lambda track_idx: 1 - track_idx,
+    )
+    batch = SimpleNamespace(reqs=[req], req_to_token_pool=pool)
+    ctx = SimpleNamespace(
+        state_cache=state_cache,
+        state_input_indices=torch.tensor([1]),
+        boundary_indices=torch.tensor([2]),
+        live_indices=torch.tensor([3]),
+    )
+
+    lifecycle.backup_boundary_state(batch, ctx=ctx)
+    conv[:, 2].zero_()
+    temporal[:, 2].zero_()
+    lifecycle.restore_for_cache_release(req, pool)
+
+    torch.testing.assert_close(conv[:, 2], torch.tensor([[1.0, 2.0]]))
+    torch.testing.assert_close(temporal[:, 2], torch.tensor([[3.0, 4.0]]))
+    assert req.mamba_next_track_idx == 1
+    assert lifecycle.boundaries == {}
+    assert lifecycle.state_backup.slot_owners == {}
 
 
 @pytest.mark.parametrize(
@@ -663,7 +856,7 @@ def test_dvr_boundary_backup_tracks_logical_slot_across_physical_rebind():
         (False, True, True, []),
     ],
 )
-def test_dvr_boundary_backup_covers_radix_rebind_or_self_mutation(
+def test_dvr_boundary_backup_covers_radix_or_self_draft_mutation(
     reuse_target, overlap, disable_radix, expected
 ):
     class Adapter:
@@ -680,116 +873,20 @@ def test_dvr_boundary_backup_covers_radix_rebind_or_self_mutation(
     lifecycle = object.__new__(DVRLinearStateLifecycle)
     lifecycle.server_args = SimpleNamespace(disable_radix_cache=disable_radix)
     lifecycle._state_adapter = adapter
-    lifecycle.boundaries = {
-        0: SimpleNamespace(
-            rid="r0",
-            track_idx=0,
-            seq_len=64,
-            state_backup=None,
-            state_backup_row=0,
-            state_backup_track_idx=None,
-        )
-    }
-    lifecycle.live_backup = None
+    lifecycle.boundaries = {1: SimpleNamespace(rid="r0", track_idx=0, seq_len=64)}
+    lifecycle.state_backup = None
     lifecycle.state_context = lambda *_args, **_kwargs: SimpleNamespace(
         state_cache=object(),
+        state_input_indices=torch.tensor([1]),
         boundary_indices=torch.tensor([11]),
         live_indices=torch.tensor([12]),
     )
     batch = SimpleNamespace(
-        reqs=[SimpleNamespace(rid="r0", req_pool_idx=0)],
+        reqs=[SimpleNamespace(rid="r0", req_pool_idx=1)],
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.empty(3, 0)),
         enable_overlap=overlap,
     )
 
     lifecycle.backup_boundary_state(batch)
 
     assert adapter.backup_indices == expected
-
-
-@pytest.mark.parametrize("overlap", [False, True])
-def test_dvr_boundary_snapshot_survives_interleaved_radix_rebind(overlap):
-    class Adapter:
-        draft_reuses_target_state = True
-
-        def __init__(self):
-            self.backups = []
-            self.restores = []
-
-        @staticmethod
-        def batch_recurrent_state_backups(rows):
-            assert len(rows) == 1 and rows[0][1] == 0
-            return rows[0][0]
-
-        def backup_recurrent_state(
-            self, *, indices, include_temporal=True, out=None, **_kwargs
-        ):
-            self.backups.append((indices.tolist(), include_temporal))
-            return out if out is not None else object()
-
-        def prepare_recurrent_state_for_verify(self, **kwargs):
-            self.restores.append(kwargs)
-
-    def checkpoint(rid):
-        return SimpleNamespace(
-            rid=rid,
-            track_idx=0,
-            seq_len=64,
-            state_backup=None,
-            state_backup_row=0,
-            state_backup_track_idx=None,
-        )
-
-    req_a = SimpleNamespace(
-        rid="a",
-        req_pool_idx=0,
-        mamba_ping_pong_track_buffer=torch.tensor([11, 12]),
-    )
-    req_b = SimpleNamespace(
-        rid="b",
-        req_pool_idx=1,
-        mamba_ping_pong_track_buffer=torch.tensor([31, 32]),
-    )
-    contexts = {
-        "a": SimpleNamespace(
-            state_cache=object(),
-            state_input_indices=torch.tensor([0]),
-            boundary_indices=torch.tensor([11]),
-            live_indices=torch.tensor([12]),
-        ),
-        "b": SimpleNamespace(
-            state_cache=object(),
-            state_input_indices=torch.tensor([1]),
-            boundary_indices=torch.tensor([31]),
-            live_indices=torch.tensor([32]),
-        ),
-    }
-    adapter = Adapter()
-    lifecycle = object.__new__(DVRLinearStateLifecycle)
-    lifecycle.server_args = SimpleNamespace(
-        disable_radix_cache=False, mamba_track_interval=64
-    )
-    lifecycle._state_adapter = adapter
-    lifecycle.boundaries = {0: checkpoint("a"), 1: checkpoint("b")}
-    lifecycle.live_backup = None
-    lifecycle._ensure_boundary_state = lambda *_args, **_kwargs: None
-    lifecycle.state_context = lambda batch, **_kwargs: contexts[batch.reqs[0].rid]
-    batch_a = SimpleNamespace(reqs=[req_a], enable_overlap=overlap)
-    batch_b = SimpleNamespace(reqs=[req_b], enable_overlap=overlap)
-
-    lifecycle.backup_boundary_state(batch_a)
-    boundary_a = lifecycle.boundaries[0].state_backup
-    lifecycle.backup_boundary_state(batch_b)
-
-    # Donation replaces A's physical logical slot while B owns the worker's
-    # transient live snapshot. A must retain its pre-donation boundary state.
-    req_a.mamba_ping_pong_track_buffer[0] = 21
-    contexts["a"].boundary_indices = torch.tensor([21])
-    contexts["a"].live_indices = torch.tensor([22])
-    lifecycle.backup_boundary_state(batch_a)
-    assert lifecycle.boundaries[0].state_backup is boundary_a
-    assert adapter.backups[-1] == ([22], False)
-
-    lifecycle.restore_for_verify(batch_a)
-    restored = adapter.restores[-1]
-    assert restored["boundary_indices"].tolist() == [21]
-    assert restored["boundary_backup"] is boundary_a

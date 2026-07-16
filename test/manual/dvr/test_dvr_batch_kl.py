@@ -433,6 +433,12 @@ def evaluate_results(
         failure = first_failure(
             output_ids, oracle_ids, output_lps, oracle_lps, args.max_diff_tol
         )
+        cached_tokens = int(meta.get("cached_tokens") or 0)
+        if failure is None and cached_tokens < args.min_cached_tokens:
+            failure = (
+                f"cached token count {cached_tokens} is below required "
+                f"{args.min_cached_tokens}"
+            )
         ok = (
             failure is None
             and maxdiff <= args.max_diff_tol
@@ -457,7 +463,7 @@ def evaluate_results(
                 accept=meta.get("spec_accept_rate"),
                 accepted=meta.get("spec_accept_token_num"),
                 verify_ct=meta.get("spec_verify_ct"),
-                cached=meta.get("cached_tokens"),
+                cached=cached_tokens,
             ),
             flush=True,
         )
@@ -537,6 +543,21 @@ def main():
         help="Prefill prompts before generation to exercise radix-cache hits.",
     )
     parser.add_argument(
+        "--reuse-generated-prefix-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Generate this many seed tokens, then use prompt + seed output as "
+            "the tested request prefix without flushing radix cache."
+        ),
+    )
+    parser.add_argument(
+        "--min-cached-tokens",
+        type=int,
+        default=0,
+        help="Require every tested generation request to report at least this cache hit.",
+    )
+    parser.add_argument(
         "--no-flush-start",
         action="store_true",
         help="Do not flush cache before generation.",
@@ -579,6 +600,33 @@ def main():
 
     if not args.no_flush_start:
         flush_cache(args.base_url)
+    if args.reuse_generated_prefix_tokens:
+        if len(prompt_ids) != 1:
+            raise ValueError(
+                "--reuse-generated-prefix-tokens requires exactly one prompt"
+            )
+        seed_case = Case(
+            case_id=-1,
+            mode="concurrent",
+            prompt_index=0,
+            max_new=args.reuse_generated_prefix_tokens,
+            seed=args.seed - 1,
+            input_ids=list(prompt_ids[0]),
+        )
+        seed_result = generate_one(args.base_url, args, seed_case)
+        seed_output_ids = token_ids(
+            seed_result.response.get("meta_info", {}).get(
+                "output_token_logprobs", []
+            )
+        )
+        if len(seed_output_ids) != args.reuse_generated_prefix_tokens:
+            raise RuntimeError(
+                "Generated-prefix seed length mismatch: "
+                f"expected={args.reuse_generated_prefix_tokens}, "
+                f"actual={len(seed_output_ids)}"
+            )
+        input_ids = [list(prompt_ids[0]) + seed_output_ids]
+        prompt_ids = [list(input_ids[0])]
     if args.warm_cache:
         prefill_prompts(args.base_url, prompt_ids)
 
