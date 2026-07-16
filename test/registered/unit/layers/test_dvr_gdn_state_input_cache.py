@@ -372,3 +372,21 @@ def test_gdn_self_draft_restores_from_stable_boundary_without_snapshot():
 
     assert torch.equal(temporal[:, 2], temporal[:, 1])
     assert torch.equal(conv[:, [2]], live_backup.conv[0])
+
+
+def test_gdn_rebatches_request_local_boundary_snapshots():
+    first = DVRRecurrentStateBackup(
+        conv=(torch.tensor([[[1.0], [2.0]]]),),
+        temporal=torch.tensor([[[3.0], [4.0]]]),
+    )
+    second = DVRRecurrentStateBackup(
+        conv=(torch.tensor([[[5.0]]]),),
+        temporal=torch.tensor([[[6.0]]]),
+    )
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
+
+    assert adapter.batch_recurrent_state_backups([(first, 0), (first, 1)]) is first
+
+    merged = adapter.batch_recurrent_state_backups([(first, 1), (second, 0)])
+    assert merged.conv[0].flatten().tolist() == [2.0, 5.0]
+    assert merged.temporal.flatten().tolist() == [4.0, 6.0]

@@ -27,7 +27,9 @@ Use these entry points:
   - includes one-token prompts in concurrent and batch modes; their first DVR
     iteration uses a zero-step, one-root target-verify sentinel and must pass
     the same strict full-prefill KL oracle
-  - includes concurrent and batch 512-token strict KL checks
+  - includes an interleaved shared-prefix request pair that exercises radix
+    donation while another request owns the worker, plus concurrent and batch
+    512-token strict KL checks
   - `ATTENTION_BACKEND` may select a separately reported Triton/FlashInfer/FA3
     compatibility run; the fixed default remains `triton`
   - `RUN_V1=0` or `RUN_V2=0` may resume one half of an interrupted run in the
@@ -37,6 +39,8 @@ Use these entry points:
   - covers `return_logprob=True` KL and `return_logprob=False` output path
   - includes the seeded `prompt_len=65`, `max_new=65` boundary acceptance
     regression and fails if reported accept rate drops below `0.96`
+  - includes a staggered shared-prefix KL case so request-local GDN boundary
+    ownership is checked with radix enabled
   - ShareGPT cases use a separate `0.70` floor based on the fixed two-token
     MTP baseline; this catches routing regressions without pretending real-data
     acceptance should be nearly one

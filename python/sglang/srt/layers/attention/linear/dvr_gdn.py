@@ -312,6 +312,36 @@ class DVRGDNStateAdapter:
             ),
         )
 
+    def batch_recurrent_state_backups(
+        self, rows: list[tuple[DVRRecurrentStateBackup, int]]
+    ) -> DVRRecurrentStateBackup:
+        """Return rows as one backup, reusing an already matching owner."""
+
+        first = rows[0][0]
+        if (
+            first.temporal is not None
+            and first.temporal.shape[1] == len(rows)
+            and all(
+                backup is first and row == i for i, (backup, row) in enumerate(rows)
+            )
+        ):
+            return first
+        if any(backup.temporal is None for backup, _ in rows):
+            raise RuntimeError("DVR boundary snapshot has no temporal state.")
+        return DVRRecurrentStateBackup(
+            conv=tuple(
+                torch.cat(
+                    [backup.conv[j][:, row : row + 1] for backup, row in rows],
+                    dim=1,
+                )
+                for j in range(len(first.conv))
+            ),
+            temporal=torch.cat(
+                [backup.temporal[:, row : row + 1] for backup, row in rows],
+                dim=1,
+            ),
+        )
+
     def prepare_recurrent_state_for_verify(
         self,
         *,

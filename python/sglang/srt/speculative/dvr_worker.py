@@ -554,6 +554,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         self.linear_state.clear_cache_state()
 
+    def prepare_for_kv_cache_release(self, req) -> None:
+        self.linear_state.release_request(req)
+
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
     ) -> GenerationBatchResult:

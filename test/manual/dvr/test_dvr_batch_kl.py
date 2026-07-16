@@ -76,6 +76,7 @@ import dataclasses
 import json
 import math
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
@@ -289,6 +290,8 @@ def generate_concurrent(
 
     def run(case: Case) -> CaseResult:
         start.wait()
+        if args.concurrent_stagger_ms:
+            time.sleep(case.case_id * args.concurrent_stagger_ms / 1000)
         return generate_one(base_url, args, case)
 
     max_workers = min(args.concurrent_workers, len(cases))
@@ -495,6 +498,12 @@ def main():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--concurrent-workers", type=int, default=16)
+    parser.add_argument(
+        "--concurrent-stagger-ms",
+        type=int,
+        default=0,
+        help="Delay each concurrent case by case_id * milliseconds.",
+    )
     parser.add_argument("--max-diff-tol", type=float, default=0.0)
     parser.add_argument("--kl-tol", type=float, default=0.0)
     parser.add_argument(

@@ -114,6 +114,18 @@ run_one_mode() {
     --ignore-eos \
     2>&1 | tee -a "${client_log}"
 
+  echo "==> Running ${label} interleaved radix-donation KL case"
+  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    --base-url "${BASE_URL}" \
+    --request-modes concurrent \
+    --prompt-token-lengths 65,129 \
+    --max-new 128 \
+    --limit-cases 2 \
+    --concurrent-workers 2 \
+    --concurrent-stagger-ms 50 \
+    --ignore-eos \
+    2>&1 | tee -a "${client_log}"
+
   echo "==> Running ${label} 512-token KL cases"
   conda_python test/manual/dvr/test_dvr_batch_kl.py \
     --base-url "${BASE_URL}" \

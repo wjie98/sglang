@@ -55,6 +55,7 @@ run_one_mode() {
   local no_logprob_log="${RESULT_ROOT}/results/${label}_return_logprob_false.log"
   local prefix_cache_kl_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_true.log"
   local prefix_cache_no_logprob_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_false.log"
+  local interleaved_kl_log="${RESULT_ROOT}/results/${label}_interleaved_radix_kl.log"
   local realdata_kl_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_true.log"
   local realdata_no_logprob_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_false.log"
   local overlap_args=()
@@ -185,6 +186,19 @@ run_one_mode() {
     --seed 3032 \
     2>&1 | tee "${prefix_cache_no_logprob_log}"
   grep -q '"accept_failed": 0' "${prefix_cache_no_logprob_log}"
+
+  echo "==> Running ${label} interleaved radix-donation KL smoke"
+  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    --base-url "${BASE_URL}" \
+    --request-modes concurrent \
+    --prompt-token-lengths 65,129 \
+    --max-new 128 \
+    --limit-cases 2 \
+    --concurrent-workers 2 \
+    --concurrent-stagger-ms 50 \
+    --ignore-eos \
+    2>&1 | tee "${interleaved_kl_log}"
+  grep -q "ALL_OK True" "${interleaved_kl_log}"
 
   echo "==> Running ${label} ShareGPT real-data returned-logprob acceptance/KL smoke"
   conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \

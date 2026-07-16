@@ -21,6 +21,9 @@ class _DVRBoundaryCheckpoint:
     track_idx: int
     seq_len: int
     publish_pending: bool = False
+    state_backup: Any = None
+    state_backup_row: int = 0
+    state_backup_track_idx: Optional[int] = None
 
 
 @dataclass
@@ -111,9 +114,10 @@ class DVRLinearStateLifecycle:
         # Request-pool slots are bounded and reused. Pair each checkpoint with
         # its rid so stale state cannot survive slot reuse.
         self.boundaries: dict[int, _DVRBoundaryCheckpoint] = {}
-        # (logical request/slot keys, boundary state, draft-start live state).
-        # Keep the snapshot atomic when radix rebinds physical request slots.
-        self.state_backup = None
+        # Self draft mutates target live convolution state only between this
+        # prepare/verify pair. Boundary snapshots live on each checkpoint
+        # because radix may rebind them while another request is scheduled.
+        self.live_backup = None
 
     def bind_state_adapter(self, state_adapter) -> None:
         self._state_adapter = state_adapter
@@ -141,7 +145,12 @@ class DVRLinearStateLifecycle:
 
     def clear_cache_state(self):
         self.boundaries.clear()
-        self.state_backup = None
+        self.live_backup = None
+
+    def release_request(self, req) -> None:
+        checkpoint = self._checkpoint(req)
+        if checkpoint is not None:
+            del self.boundaries[req.req_pool_idx]
 
     def _checkpoint(self, req) -> Optional[_DVRBoundaryCheckpoint]:
         slot = req.req_pool_idx
@@ -220,60 +229,90 @@ class DVRLinearStateLifecycle:
         ctx: Optional[DVRLinearStateContext] = None,
     ):
         if self._state_adapter is None:
-            self.state_backup = None
+            self.live_backup = None
             return
-        backup_boundary = (
-            batch.enable_overlap and not self.server_args.disable_radix_cache
-        )
+        backup_boundary = not self.server_args.disable_radix_cache
         backup_live = self._state_adapter.draft_reuses_target_state
         if not backup_boundary and not backup_live:
-            # Without overlap radix cannot rebind the checkpoint before the next
-            # verify; with radix disabled there is no donation at all. A separate
-            # draft model also cannot mutate the target live slot.
-            self.state_backup = None
+            self.live_backup = None
             return
-        # Host logical lengths advance after overlap result processing, while
-        # the target verify has already updated the physical boundary slot.
-        # Key the snapshot by request-local boundary ownership. The supplied
-        # verify context pins the physical slot used by this commit, while the
-        # key remains valid if radix later rebinds that logical ping-pong slot.
+        checkpoints = [self._checkpoint(req) for req in batch.reqs]
+        if any(checkpoint is None for checkpoint in checkpoints):
+            raise RuntimeError("DVR cannot back up a missing boundary checkpoint.")
         backup_keys = [
-            (req.rid, self._checkpoint(req).track_idx) for req in batch.reqs
+            (req.rid, checkpoint.track_idx)
+            for req, checkpoint in zip(batch.reqs, checkpoints, strict=True)
         ]
-        # No context means draft preparation: retain the snapshot for the same
-        # logical owner. Verify supplies its exact physical context to refresh it.
-        if (
-            ctx is None
-            and self.state_backup is not None
-            and self.state_backup[0] == backup_keys
-        ):
+        existing_live = None
+        if self.live_backup is not None and self.live_backup[0] == backup_keys:
+            existing_live = self.live_backup[1]
+
+        # Before draft, preserve snapshots captured by the previous target
+        # verify: radix donation may already have replaced their physical slots.
+        # Post-verify ctx identifies the exact slots to refresh for every request.
+        boundary_rows = []
+        if backup_boundary:
+            boundary_rows = (
+                list(range(len(checkpoints)))
+                if ctx is not None
+                else [
+                    i
+                    for i, checkpoint in enumerate(checkpoints)
+                    if checkpoint.state_backup is None
+                    or checkpoint.state_backup_track_idx != checkpoint.track_idx
+                ]
+            )
+        refresh_live = backup_live and (ctx is not None or existing_live is None)
+        if not boundary_rows and not refresh_live:
             return
+
         ctx = ctx or self.state_context(batch, require_boundary=True)
         if ctx is None:
-            self.state_backup = None
+            self.live_backup = None
             return
         assert ctx.boundary_indices is not None
-        existing_boundary = existing_live = None
-        if self.state_backup is not None and self.state_backup[0] == backup_keys:
-            _, existing_boundary, existing_live = self.state_backup
-        boundary_backup = None
-        if backup_boundary:
+
+        if backup_boundary and boundary_rows:
+            selected = [checkpoints[i] for i in boundary_rows]
+            existing_boundary = self._boundary_backup(selected)
             boundary_backup = self._state_adapter.backup_recurrent_state(
                 state_cache=ctx.state_cache,
-                indices=ctx.boundary_indices,
+                indices=ctx.boundary_indices[boundary_rows],
                 out=existing_boundary,
             )
+            for row, checkpoint in enumerate(selected):
+                checkpoint.state_backup = boundary_backup
+                checkpoint.state_backup_row = row
+                checkpoint.state_backup_track_idx = checkpoint.track_idx
+
         # Only self-draft mutates the target live slot. Its temporal state is
         # rebuilt from the boundary oracle, so preserve only convolution state.
-        live_backup = None
-        if backup_live:
+        if refresh_live:
             live_backup = self._state_adapter.backup_recurrent_state(
                 state_cache=ctx.state_cache,
                 indices=ctx.live_indices,
                 include_temporal=False,
                 out=existing_live,
             )
-        self.state_backup = (backup_keys, boundary_backup, live_backup)
+            self.live_backup = (backup_keys, live_backup)
+        elif not backup_live:
+            self.live_backup = None
+
+    def _boundary_backup(self, checkpoints):
+        rows = []
+        for checkpoint in checkpoints:
+            if (
+                checkpoint.state_backup is None
+                or checkpoint.state_backup_track_idx != checkpoint.track_idx
+            ):
+                return None
+            rows.append((checkpoint.state_backup, checkpoint.state_backup_row))
+        backup = self._state_adapter.batch_recurrent_state_backups(rows)
+        for row, checkpoint in enumerate(checkpoints):
+            checkpoint.state_backup = backup
+            checkpoint.state_backup_row = row
+            checkpoint.state_backup_track_idx = checkpoint.track_idx
+        return backup
 
     def restore_for_verify(
         self,
@@ -284,9 +323,24 @@ class DVRLinearStateLifecycle:
         if ctx is None:
             return None
         assert ctx.boundary_indices is not None
-        boundary_backup = live_backup = None
-        if self.state_backup is not None:
-            _, boundary_backup, live_backup = self.state_backup
+        checkpoints = [self._checkpoint(req) for req in batch.reqs]
+        if any(checkpoint is None for checkpoint in checkpoints):
+            raise RuntimeError("DVR target verify is missing a boundary checkpoint.")
+        boundary_backup = None
+        if not self.server_args.disable_radix_cache:
+            boundary_backup = self._boundary_backup(checkpoints)
+            if boundary_backup is None:
+                raise RuntimeError("DVR target verify is missing a boundary snapshot.")
+
+        live_backup = None
+        backup_keys = [
+            (req.rid, checkpoint.track_idx)
+            for req, checkpoint in zip(batch.reqs, checkpoints, strict=True)
+        ]
+        if self.live_backup is not None and self.live_backup[0] == backup_keys:
+            live_backup = self.live_backup[1]
+        if self._state_adapter.draft_reuses_target_state and live_backup is None:
+            raise RuntimeError("DVR self draft is missing its live-state snapshot.")
         self._state_adapter.prepare_recurrent_state_for_verify(
             state_cache=ctx.state_cache,
             live_indices=ctx.live_indices,
