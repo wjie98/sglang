@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
@@ -24,9 +25,8 @@ class DVRLinearStateContext:
 class _DVRBoundaryCheckpoint:
     """Logical owner of one request's physical ping-pong boundary slot."""
 
-    request: Any = field(repr=False)
+    request_ref: weakref.ReferenceType = field(repr=False)
     retraction_count: int
-    track_idx: int
     seq_len: int
 
 
@@ -40,7 +40,7 @@ class DVRRollbackActions:
         # The verify kernel has already updated the physical boundary slot. The
         # CPU result only publishes its materialized length and prevents generic
         # speculative tracking from rotating that DVR-owned slot.
-        self.linear_state.publish_checkpoint(req, batch.req_to_token_pool)
+        self.linear_state.publish_checkpoint(req)
         return True
 
 
@@ -77,6 +77,12 @@ class DVRLinearStateLifecycle:
                 "DVR linear-state verify requires mamba_track_interval to match "
                 f"the adapter chunk size {state_adapter.chunk_size}, got "
                 f"{self.server_args.mamba_track_interval}."
+            )
+        if self.server_args.mamba_cache_chunk_size != state_adapter.chunk_size:
+            raise ValueError(
+                "DVR linear-state verify requires mamba_cache_chunk_size to "
+                f"match the adapter chunk size {state_adapter.chunk_size}, got "
+                f"{self.server_args.mamba_cache_chunk_size}."
             )
         tail_lens = state_adapter.state_input_window().tail_lens
         self.physical_boundary_lens = tail_lens.new_zeros(
@@ -123,14 +129,14 @@ class DVRLinearStateLifecycle:
         slot = int(req.req_pool_idx)
         checkpoint = self.boundaries.get(slot)
         if checkpoint is not None and (
-            checkpoint.request is not req
+            checkpoint.request_ref() is not req
             or checkpoint.retraction_count != self._request_retraction_count(req)
         ):
             self.boundaries.pop(slot, None)
             return None
         return checkpoint
 
-    def publish_checkpoint(self, req, req_to_token_pool) -> None:
+    def publish_checkpoint(self, req) -> None:
         checkpoint = self._checkpoint(req)
         if checkpoint is None:
             raise RuntimeError(f"DVR lost checkpoint ownership for {req.rid}.")
@@ -140,23 +146,9 @@ class DVRLinearStateLifecycle:
         # iteration; execution uses the slot directly, not this cache metadata.
         visible_len = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         committed_len = min(req.kv_committed_len, max(0, visible_len - 1))
-        next_seq_len = max(
+        checkpoint.seq_len = max(
             checkpoint.seq_len,
             committed_len // self.chunk_size * self.chunk_size,
-        )
-        steps, remainder = divmod(next_seq_len - checkpoint.seq_len, self.chunk_size)
-        if remainder:
-            raise RuntimeError(
-                f"DVR produced invalid checkpoint length {next_seq_len}."
-            )
-        if steps % 2:
-            checkpoint.track_idx = req_to_token_pool.get_mamba_ping_pong_other_idx(
-                checkpoint.track_idx
-            )
-        checkpoint.seq_len = next_seq_len
-        req.mamba_last_track_seqlen = checkpoint.seq_len
-        req.mamba_next_track_idx = req_to_token_pool.get_mamba_ping_pong_other_idx(
-            checkpoint.track_idx
         )
 
     def prepare_for_cache_release(self, req) -> None:
@@ -177,39 +169,33 @@ class DVRLinearStateLifecycle:
             forward_stream.synchronize()
         request_slot = int(req.req_pool_idx)
         physical_len = int(self.physical_boundary_lens[request_slot].item())
+        physical_track = int(self.boundary_track_indices[request_slot].item())
         committed_len = int(req._cache_commit_len())
         publish_len = min(
             checkpoint.seq_len,
             committed_len // self.chunk_size * self.chunk_size,
         )
-        published_steps, remainder = divmod(
-            checkpoint.seq_len - publish_len, self.chunk_size
-        )
-        if remainder or physical_len not in (
-            publish_len,
-            publish_len + self.chunk_size,
-        ):
+        pool = self.model_runner.req_to_token_pool
+        if physical_len == publish_len:
+            publish_track = physical_track
+        elif physical_len == publish_len + self.chunk_size:
+            publish_track = pool.get_mamba_ping_pong_other_idx(physical_track)
+        else:
             logger.warning(
                 "DVR cannot publish an exact finished radix checkpoint for %s "
-                "(publish=%s, physical=%s); retaining the previous cached prefix.",
+                "(publish=%s, physical=%s, track=%s); retaining the previous "
+                "cached prefix.",
                 req.rid,
                 publish_len,
                 physical_len,
+                physical_track,
             )
             req.skip_radix_cache_insert = True
-        else:
-            track_idx = checkpoint.track_idx
-            if published_steps % 2:
-                track_idx = (
-                    self.model_runner.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        track_idx
-                    )
-                )
+            publish_track = None
+        if publish_track is not None:
             req.mamba_last_track_seqlen = publish_len
-            req.mamba_next_track_idx = (
-                self.model_runner.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    track_idx
-                )
+            req.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(
+                publish_track
             )
         self._drop_checkpoint(req)
 
@@ -425,9 +411,8 @@ class DVRLinearStateLifecycle:
             # prefix state before target EXTEND consumed the unclosed tail.
 
             checkpoint = _DVRBoundaryCheckpoint(
-                request=req,
+                request_ref=weakref.ref(req),
                 retraction_count=self._request_retraction_count(req),
-                track_idx=int(track_idx),
                 seq_len=boundary_len,
             )
             self.boundaries[int(req.req_pool_idx)] = checkpoint

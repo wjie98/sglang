@@ -92,9 +92,9 @@ The fixed script also runs a staggered shared-prefix pair at prompt lengths 65
 and 129 with 128 generated tokens. This catches boundary ownership errors while
 prefill result processing and the first DVR iteration overlap. A separate case
 generates 128 tokens from a 65-token prompt, reuses the resulting 193-token
-sequence as a new prompt, requires the original 64-token prompt checkpoint,
-and verifies that ordinary EXTEND replay still matches a flushed full-prefill
-oracle. It then runs
+sequence as a new prompt, requires the 192-token committed checkpoint, and
+verifies that ordinary EXTEND of the unclosed tail still matches a flushed
+full-prefill oracle. It then runs
 concurrent and batch `prompt_len=65`, `max_new=512` cases. Add a separate fixed
 case for 513 tokens when a change specifically touches end-of-chunk termination
 behavior. One-token prompts are part of the positive matrix: their first
@@ -222,7 +222,9 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
 The sync and overlap DVR-EAGLE modes are both spec-v2 semantics.  In this tree
 `--disable-overlap-schedule` selects synchronous v2 execution for DVR-EAGLE, and
 the default overlap scheduler selects overlap v2 execution.  DVR-EAGLE v1 is not
-a supported matrix entry.
+a supported matrix entry. With radix enabled, the fixed script also runs the
+generated-prefix lifecycle matrix across current/previous ping-pong boundaries,
+slot reuse, early stop, and grammar termination.
 
 The `--seed 2032`, `prompt_len=65`, `max_new=65` entry is the fixed regression
 for seeded MTP boundary acceptance.  It crosses the GDN chunk boundary and must

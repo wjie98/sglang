@@ -124,6 +124,15 @@ def handle_dvr_speculative_decoding(server_args):
         )
 
     uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
+    if uses_gated_linear_state and server_args.enable_streaming_session:
+        raise ValueError(
+            "DVR gated linear-state models do not yet support streaming sessions."
+        )
+    if uses_gated_linear_state and server_args.enable_int8_mamba_checkpoint:
+        raise ValueError(
+            "DVR requires exact recurrent checkpoints and does not support "
+            "--enable-int8-mamba-checkpoint."
+        )
     for field in (
         "attention_backend",
         "prefill_attention_backend",

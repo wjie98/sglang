@@ -48,6 +48,8 @@ class _Args:
     speculative_accept_threshold_acc = 1.0
     enable_multi_layer_eagle = False
     sampling_backend = "flashinfer"
+    enable_streaming_session = False
+    enable_int8_mamba_checkpoint = False
 
     def __init__(self):
         self.cuda_graph_config = SimpleNamespace(
@@ -258,6 +260,42 @@ class TestDVRServerArgs(unittest.TestCase):
         args.enable_pdmux = True
 
         with self.assertRaisesRegex(ValueError, "PDMux"):
+            handle_dvr_speculative_decoding(args)
+
+    def test_dvr_gdn_rejects_streaming_session(self):
+        args = _Args()
+        args.enable_streaming_session = True
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "streaming sessions"):
+                handle_dvr_speculative_decoding(args)
+
+    def test_dvr_gdn_rejects_int8_recurrent_checkpoints(self):
+        args = _Args()
+        args.enable_int8_mamba_checkpoint = True
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "exact recurrent checkpoints"):
+                handle_dvr_speculative_decoding(args)
+
+    def test_plain_transformer_dvr_ignores_gdn_only_options(self):
+        args = _Args()
+        args.enable_streaming_session = True
+        args.enable_int8_mamba_checkpoint = True
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=False,
+        ):
             handle_dvr_speculative_decoding(args)
 
     def test_dvr_preserves_draft_custom_all_reduce_intent(self):

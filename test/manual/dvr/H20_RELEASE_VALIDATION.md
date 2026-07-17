@@ -58,11 +58,14 @@ Radix correctness is a release invariant, not a benchmark option. DVR keeps its
 active chunk boundary in the request's existing ping-pong slot; request identity
 and retraction count guard pool-slot reuse. Initial prefill may donate the
 upstream keep slot only after DVR has copied the boundary into its private
-ping-pong slot. Active decode does not publish an overlap-ahead generated-prefix
-checkpoint to radix. A later request reuses the older tree checkpoint and lets
-ordinary EXTEND rebuild the suffix. The fixed 0.8B and 35B matrices cover both
-interleaved requests and this nearest-checkpoint replay. Disabling radix to make
-KL pass is a failed Triton/FA3 run, not an accepted workaround.
+ping-pong slot. At request completion, DVR synchronizes the forward stream and
+publishes the client-visible aligned boundary from the device-authoritative
+current or previous ping-pong slot. Only the unclosed tail is rebuilt by ordinary
+EXTEND. If overlap has advanced beyond both slots, DVR keeps the older tree
+checkpoint instead of publishing an inexact state. The fixed 0.8B and 35B
+matrices cover interleaved requests, generated-prefix reuse, early stop, grammar
+termination, and this nearest-checkpoint fallback. Disabling radix to make KL
+pass is a failed Triton/FA3 run, not an accepted workaround.
 
 ## Implementation audit snapshot
 
@@ -95,7 +98,10 @@ intentional shared semantic changes:
 Current deliberate restrictions are CUDA-only execution, no DP attention, no
 PDMux, no disaggregation, chain mode with topk=1, Triton linear-attention
 prefill for exact GDN boundary export, at most one 64-token GDN chunk per
-verify, and mandatory self-draft graphs. DVR correctness comes from the
+verify, and mandatory self-draft graphs. GDN DVR additionally rejects streaming
+sessions and int8 Mamba checkpoints until those paths can preserve exact
+request-local recurrent state. The Mamba cache chunk, tracking interval, and
+linear-state adapter chunk must agree. DVR correctness comes from the
 living/ping-pong state lifecycle and must not depend on a radix hit.
 
 Exact rejection sampling is the production default. Run
@@ -349,10 +355,10 @@ done
 
 Check every `spec_v1_kl.log` and `spec_v2_kl.log` for `ALL_OK True`, including
 the `prompt_len=65/129`, `max_new=128` interleaved block. The replay case must
-use a 193-token input, report at least the original 64-token prompt checkpoint,
-rebuild the generated suffix with EXTEND, and remain KL=0. The server logs must
-show the requested attention backend, page size 64, expected radix mode, and
-captured graph batch 4.
+use a 193-token input, report the 192-token committed boundary, rebuild only the
+one-token unclosed tail with EXTEND, and remain KL=0. The server logs must show
+the requested attention backend, page size 64, expected radix mode, and captured
+graph batch 4.
 
 ## 5. 35B MTP/EAGLE correctness matrix
 

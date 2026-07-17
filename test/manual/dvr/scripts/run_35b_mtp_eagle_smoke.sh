@@ -56,6 +56,7 @@ run_one_mode() {
   local prefix_cache_kl_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_true.log"
   local prefix_cache_no_logprob_log="${RESULT_ROOT}/results/${label}_prefix_cache_safety_return_logprob_false.log"
   local interleaved_kl_log="${RESULT_ROOT}/results/${label}_interleaved_radix_kl.log"
+  local radix_lifecycle_log="${RESULT_ROOT}/results/${label}_radix_lifecycle.log"
   local realdata_kl_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_true.log"
   local realdata_no_logprob_log="${RESULT_ROOT}/results/${label}_sharegpt_return_logprob_false.log"
   local overlap_args=()
@@ -212,6 +213,15 @@ run_one_mode() {
       --ignore-eos \
       2>&1 | tee -a "${interleaved_kl_log}"
     grep -q "ALL_OK True" "${interleaved_kl_log}"
+
+    echo "==> Running ${label} generated-prefix radix lifecycle smoke"
+    conda_python test/manual/dvr/test_dvr_radix_lifecycle.py \
+      --base-url "${BASE_URL}" \
+      --slot-cycles 4 \
+      --prompt-lengths 63,64,65 \
+      --generated-lengths 1,63,64,65,127,128,129 \
+      2>&1 | tee "${radix_lifecycle_log}"
+    grep -q "ALL_OK True" "${radix_lifecycle_log}"
   fi
 
   echo "==> Running ${label} ShareGPT real-data returned-logprob acceptance/KL smoke"
