@@ -70,7 +70,7 @@ run_one_mode() {
       --enable-deterministic-inference \
       --cuda-graph-bs 1 2 4 \
       --cuda-graph-max-bs 4 \
-      --max-running-requests 8 \
+      --max-running-requests 4 \
       "${radix_args[@]}" \
       "${overlap_args[@]}" \
       --skip-server-warmup \

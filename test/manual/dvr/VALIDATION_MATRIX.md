@@ -67,7 +67,7 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python -m sglang.laun
   --enable-deterministic-inference \
   --cuda-graph-bs 1 2 4 \
   --cuda-graph-max-bs 4 \
-  --max-running-requests 8 \
+  --max-running-requests 4 \
   --skip-server-warmup
 ```
 
