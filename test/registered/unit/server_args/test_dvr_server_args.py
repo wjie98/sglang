@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.configs import get_hybrid_gdn_config
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.server_args import ServerArgs
@@ -64,6 +66,21 @@ class _Args:
 
 
 class TestDVRServerArgs(unittest.TestCase):
+    def test_gdn_capability_uses_normalized_text_config(self):
+        text_config = Qwen3NextConfig()
+
+        self.assertIs(
+            get_hybrid_gdn_config(
+                SimpleNamespace(get_text_config=lambda: text_config)
+            ),
+            text_config,
+        )
+        self.assertIsNone(
+            get_hybrid_gdn_config(
+                SimpleNamespace(get_text_config=lambda: object())
+            )
+        )
+
     def test_dvr_rejects_zero_step_chain_mode(self):
         args = _Args()
         args.speculative_num_draft_tokens = 1

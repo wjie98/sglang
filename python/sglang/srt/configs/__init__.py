@@ -41,6 +41,16 @@ from sglang.srt.configs.step3p5 import Step3p5Config
 from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.configs.zaya import ZayaConfig
 
+
+def get_hybrid_gdn_config(hf_config):
+    """Return the normalized text config for SGLang's GDN model families."""
+    config = hf_config.get_text_config()
+    return (
+        config
+        if isinstance(config, (Qwen3NextConfig, JetNemotronConfig))
+        else None
+    )
+
 __all__ = [
     "AfmoeConfig",
     "BailingHybridConfig",
@@ -82,4 +92,5 @@ __all__ = [
     "Step3p7Config",
     "Qwen3ASRConfig",
     "ZayaConfig",
+    "get_hybrid_gdn_config",
 ]

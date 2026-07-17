@@ -37,19 +37,15 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
-    InternS2PreviewConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
     KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
     Qwen3NextConfig,
     ZayaConfig,
+    get_hybrid_gdn_config,
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
@@ -2370,18 +2366,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def hybrid_gdn_config(self):
-        config = self.model_config.hf_config.get_text_config()
-        if isinstance(
-            config,
-            Qwen3NextConfig
-            | Qwen3_5Config
-            | Qwen3_5MoeConfig
-            | InternS2PreviewConfig
-            | JetNemotronConfig
-            | JetVLMConfig,
-        ):
-            return config
-        return None
+        return get_hybrid_gdn_config(self.model_config.hf_config)
 
     @property
     def mamba2_config(self):

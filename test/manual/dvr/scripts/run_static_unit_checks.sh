@@ -9,6 +9,7 @@ source "${SCRIPT_DIR}/common.sh"
 # extend the static guard instead of being hidden by a broad directory scan.
 DVR_PY_FILES=(
   python/sglang/srt/environ.py
+  python/sglang/srt/configs/__init__.py
   python/sglang/srt/distributed/parallel_state.py
   python/sglang/srt/layers/attention/base_attn_backend.py
   python/sglang/srt/layers/attention/flashattention_backend.py

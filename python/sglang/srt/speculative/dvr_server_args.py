@@ -321,9 +321,6 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
 
 
 def _is_dvr_gated_linear_state_model(server_args):
-    from sglang.srt.configs import JetNemotronConfig, Qwen3NextConfig
+    from sglang.srt.configs import get_hybrid_gdn_config
 
-    config = server_args.get_model_config().hf_config.get_text_config()
-    # Qwen3.5/InternS2 text configs inherit Qwen3NextConfig; JetVLM unwraps
-    # to JetNemotronConfig. Check the normalized text families, not wrappers.
-    return isinstance(config, Qwen3NextConfig | JetNemotronConfig)
+    return get_hybrid_gdn_config(server_args.get_model_config().hf_config) is not None
