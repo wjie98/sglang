@@ -1587,7 +1587,7 @@ class Scheduler(
             if (
                 self.last_batch
                 and self.result_queue
-                and self.last_batch.spec_algorithm.is_dvr()
+                and not self.last_batch.spec_algorithm.is_none()
                 and self.last_batch.has_grammar
             ):
                 pop_and_process()

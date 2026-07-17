@@ -6,7 +6,7 @@ import logging
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +264,9 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
 
     decode_graph = server_args.cuda_graph_config.decode
     cuda_graph_bs = decode_graph.bs
+    locked = getattr(server_args, "_cuda_graph_config_locked", set())
+    bs_locked = (Phase.DECODE, "bs") in locked
+    max_bs_locked = (Phase.DECODE, "max_bs") in locked
     max_running_requests = server_args.max_running_requests
     if max_running_requests is None:
         return
@@ -278,6 +281,11 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
             cuda_graph_max_bs is not None
             and int(cuda_graph_max_bs) < max_running_requests
         ):
+            if max_bs_locked:
+                raise ValueError(
+                    "Explicit cuda_graph_config[decode].max_bs does not cover "
+                    f"DVR self-draft max_running_requests={max_running_requests}."
+                )
             decode_graph.max_bs = max_running_requests
         return
 
@@ -285,12 +293,28 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
     if not graph_bs:
         return
 
-    if server_args.disable_cuda_graph_padding:
-        graph_bs.update(range(1, max_running_requests + 1))
-    elif max(graph_bs) < max_running_requests:
-        graph_bs.add(max_running_requests)
-    else:
+    required_bs = (
+        set(range(1, max_running_requests + 1))
+        if server_args.disable_cuda_graph_padding
+        else {max_running_requests}
+    )
+    missing_bs = required_bs - graph_bs
+    if not missing_bs or (
+        not server_args.disable_cuda_graph_padding
+        and max(graph_bs) >= max_running_requests
+    ):
         return
+    if bs_locked:
+        raise ValueError(
+            "Explicit cuda_graph_config[decode].bs does not cover DVR "
+            f"self-draft batch sizes {sorted(missing_bs)}."
+        )
+    if max_bs_locked and int(decode_graph.max_bs or 0) < max(missing_bs):
+        raise ValueError(
+            "Explicit cuda_graph_config[decode].max_bs does not cover DVR "
+            f"self-draft batch size {max(missing_bs)}."
+        )
+    graph_bs.update(missing_bs)
 
     decode_graph.bs = sorted(graph_bs)
     decode_graph.max_bs = max(decode_graph.bs)

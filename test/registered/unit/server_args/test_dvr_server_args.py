@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dvr_server_args import (
     DVR_EAGLE_SPECULATIVE_ALGORITHM,
@@ -55,6 +55,7 @@ class _Args:
         self.cuda_graph_config = SimpleNamespace(
             decode=SimpleNamespace(backend=Backend.FULL, bs=[1, 2], max_bs=2)
         )
+        self._cuda_graph_config_locked = set()
 
     def get_model_config(self):
         return SimpleNamespace(
@@ -121,6 +122,35 @@ class TestDVRServerArgs(unittest.TestCase):
 
         self.assertIsNone(args.cuda_graph_config.decode.bs)
         self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
+
+    def test_dvr_self_draft_does_not_mutate_explicit_cuda_graph_bs(self):
+        args = _Args()
+        args._cuda_graph_config_locked = {(Phase.DECODE, "bs")}
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "Explicit.*decode.*bs"):
+                handle_dvr_speculative_decoding(args)
+
+        self.assertEqual(args.cuda_graph_config.decode.bs, [1, 2])
+
+    def test_dvr_self_draft_does_not_mutate_explicit_cuda_graph_max_bs(self):
+        args = _Args()
+        args.cuda_graph_config.decode.bs = None
+        args._cuda_graph_config_locked = {(Phase.DECODE, "max_bs")}
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "Explicit.*decode.*max_bs"):
+                handle_dvr_speculative_decoding(args)
+
+        self.assertEqual(args.cuda_graph_config.decode.max_bs, 2)
 
     def test_dvr_self_draft_gdn_requires_draft_cuda_graph(self):
         args = _Args()
