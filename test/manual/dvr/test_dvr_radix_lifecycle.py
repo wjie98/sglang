@@ -155,10 +155,9 @@ def test_generated_prefix_boundaries(
                 rid=f"dvr-boundary-probe-{case_id}",
             )
             cached = int(response["meta_info"].get("cached_tokens") or 0)
-            # DVR retains the prompt checkpoint but does not publish an overlap
-            # decode slot that may be ahead of the result finishing the request.
-            # Standard EXTEND rebuilds the generated suffix on the probe.
-            expected = (len(prompt) - 1) // 64 * 64
+            # The unclosed tail is rebuilt, but every completed generated chunk
+            # must be reusable through the standard Mamba radix lifecycle.
+            expected = (len(prefix) - 1) // 64 * 64
             if cached < expected:
                 raise AssertionError(
                     f"nearest checkpoint miss: prompt={len(prompt)}, "
@@ -248,7 +247,7 @@ def test_grammar_boundary(base_url: str) -> None:
         rid=f"dvr-grammar-probe-{uuid.uuid4().hex}",
     )
     cached = int(probe["meta_info"].get("cached_tokens") or 0)
-    expected = (len(prompt) - 1) // 64 * 64
+    expected = (len(prefix) - 1) // 64 * 64
     if cached < expected:
         raise AssertionError(
             f"grammar checkpoint miss: expected={expected}, actual={cached}"

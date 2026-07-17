@@ -530,8 +530,9 @@ class DVRGDNStateAdapter:
         state_input_indices: torch.Tensor,
         live_indices: torch.Tensor,
         boundary_indices: torch.Tensor,
+        previous_boundary_indices: torch.Tensor,
         accepted_token_counts: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         state_window = self.state_input_window()
         tail_lens_before = state_window.get_tail_lens(indices=state_input_indices).to(
             device=live_indices.device, dtype=torch.long
@@ -551,11 +552,13 @@ class DVRGDNStateAdapter:
             accepted_token_counts - 1,
         )
 
-        # Target verify exports the first crossed boundary in step 0.
+        # Alternate the two request-owned ping-pong slots at chunk crossings.
+        # The old slot remains intact so a finishing overlap request can publish
+        # either the host-visible boundary or the one physical step ahead.
         fused_mamba_state_scatter_with_mask(
             state_cache.temporal,
             state_cache.intermediate_ssm,
-            boundary_indices,
+            previous_boundary_indices,
             torch.where(
                 crosses_chunk_boundary,
                 torch.zeros_like(tail_lens_before),
@@ -565,7 +568,7 @@ class DVRGDNStateAdapter:
         fused_conv_window_scatter_with_mask(
             state_cache.conv[0],
             state_cache.intermediate_conv_window[0],
-            boundary_indices,
+            previous_boundary_indices,
             torch.where(
                 crosses_chunk_boundary,
                 self.chunk_size - 1 - tail_lens_before,
@@ -588,7 +591,11 @@ class DVRGDNStateAdapter:
                 state_window,
                 state_cache=state_cache,
                 state_input_indices=state_input_indices,
-                boundary_indices=boundary_indices,
+                boundary_indices=torch.where(
+                    crosses_chunk_boundary,
+                    previous_boundary_indices,
+                    boundary_indices,
+                ),
                 live_indices=live_indices,
                 token_count=tail_lens_after,
             )
@@ -600,3 +607,4 @@ class DVRGDNStateAdapter:
         state_window.set_tail_lens(
             indices=state_input_indices, value=tail_lens_after.to(torch.int32)
         )
+        return crosses_chunk_boundary

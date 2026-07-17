@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import sglang.srt.layers.attention.linear.dvr_gdn as dvr_gdn_module
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.linear.dvr_gdn import (
@@ -421,3 +422,49 @@ def test_gdn_backup_uses_request_pool_rows():
     )
     assert updated is backup
     torch.testing.assert_close(backup[0][:, 2], conv[:, 1])
+
+
+def test_gdn_commit_alternates_boundary_slots(monkeypatch):
+    temporal_scatters = []
+    conv_scatters = []
+    monkeypatch.setattr(
+        dvr_gdn_module,
+        "fused_mamba_state_scatter_with_mask",
+        lambda _dst, _src, indices, steps: temporal_scatters.append(
+            (indices.tolist(), steps.tolist())
+        ),
+    )
+    monkeypatch.setattr(
+        dvr_gdn_module,
+        "fused_conv_window_scatter_with_mask",
+        lambda _dst, _src, indices, steps: conv_scatters.append(
+            (indices.tolist(), steps.tolist())
+        ),
+    )
+    tail_updates = []
+    window = SimpleNamespace(
+        get_tail_lens=lambda **_kwargs: torch.tensor([63, 1]),
+        shift_after_boundary=lambda **_kwargs: None,
+        set_tail_lens=lambda **kwargs: tail_updates.append(kwargs["value"].tolist()),
+    )
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, state_input_cache=window)
+    state_cache = SimpleNamespace(
+        temporal=torch.empty(1),
+        intermediate_ssm=torch.empty(1),
+        conv=(torch.empty(1),),
+        intermediate_conv_window=(torch.empty(1),),
+    )
+
+    crossed = adapter.commit_after_verify(
+        state_cache=state_cache,
+        state_input_indices=torch.tensor([1, 2]),
+        live_indices=torch.tensor([3, 4]),
+        boundary_indices=torch.tensor([5, 6]),
+        previous_boundary_indices=torch.tensor([7, 8]),
+        accepted_token_counts=torch.tensor([2, 2]),
+    )
+
+    assert crossed.tolist() == [True, False]
+    assert temporal_scatters == [([7, 8], [0, -1])]
+    assert conv_scatters == [([3, 4], [1, 1]), ([7, 8], [0, -1])]
+    assert tail_updates == [[1, 3]]

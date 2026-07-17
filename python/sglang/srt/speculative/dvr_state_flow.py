@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -13,6 +16,8 @@ class DVRLinearStateContext:
     state_input_indices: torch.Tensor
     live_indices: torch.Tensor
     boundary_indices: Optional[torch.Tensor] = None
+    previous_boundary_indices: Optional[torch.Tensor] = None
+    boundary_track_indices: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -54,6 +59,8 @@ class DVRLinearStateLifecycle:
         self._state_adapter = None
         self.boundaries: dict[int, _DVRBoundaryCheckpoint] = {}
         self.draft_state_backup = None
+        self.physical_boundary_lens = None
+        self.boundary_track_indices = None
 
     def bind_state_adapter(self, state_adapter) -> None:
         self._state_adapter = state_adapter
@@ -71,6 +78,13 @@ class DVRLinearStateLifecycle:
                 f"the adapter chunk size {state_adapter.chunk_size}, got "
                 f"{self.server_args.mamba_track_interval}."
             )
+        tail_lens = state_adapter.state_input_window().tail_lens
+        self.physical_boundary_lens = tail_lens.new_zeros(
+            tail_lens.shape, dtype=torch.int64
+        )
+        self.boundary_track_indices = tail_lens.new_zeros(
+            tail_lens.shape, dtype=torch.int64
+        )
         if state_adapter.draft_reuses_target_state:
             state_cache = self.model_runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
             # Self draft mutates only the target's live convolution state before
@@ -91,6 +105,9 @@ class DVRLinearStateLifecycle:
 
     def clear_cache_state(self) -> None:
         self.boundaries.clear()
+        if self.physical_boundary_lens is not None:
+            self.physical_boundary_lens.zero_()
+            self.boundary_track_indices.zero_()
 
     @staticmethod
     def _request_retraction_count(req) -> int:
@@ -123,10 +140,20 @@ class DVRLinearStateLifecycle:
         # iteration; execution uses the slot directly, not this cache metadata.
         visible_len = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         committed_len = min(req.kv_committed_len, max(0, visible_len - 1))
-        checkpoint.seq_len = max(
+        next_seq_len = max(
             checkpoint.seq_len,
             committed_len // self.chunk_size * self.chunk_size,
         )
+        steps, remainder = divmod(next_seq_len - checkpoint.seq_len, self.chunk_size)
+        if remainder:
+            raise RuntimeError(
+                f"DVR produced invalid checkpoint length {next_seq_len}."
+            )
+        if steps % 2:
+            checkpoint.track_idx = req_to_token_pool.get_mamba_ping_pong_other_idx(
+                checkpoint.track_idx
+            )
+        checkpoint.seq_len = next_seq_len
         req.mamba_last_track_seqlen = checkpoint.seq_len
         req.mamba_next_track_idx = req_to_token_pool.get_mamba_ping_pong_other_idx(
             checkpoint.track_idx
@@ -135,12 +162,56 @@ class DVRLinearStateLifecycle:
     def prepare_for_cache_release(self, req) -> None:
         if self._state_adapter is None:
             return
-        if self._checkpoint(req) is not None:
-            # An overlap iteration may already have advanced the physical slot
-            # beyond the result that finished the request. Keep the older radix
-            # checkpoint and let a later standard EXTEND rebuild the suffix.
-            req.skip_radix_cache_insert = True
+        checkpoint = self._checkpoint(req)
+        if checkpoint is None:
+            return
+        if self.server_args.disable_radix_cache or req.skip_radix_cache_insert:
             self._drop_checkpoint(req)
+            return
+
+        # Overlap may have completed one future verify. Synchronize only when a
+        # request finishes, then publish the slot matching the host-visible
+        # boundary; the adjacent ping-pong slot preserves the preceding state.
+        forward_stream = getattr(self.model_runner, "forward_stream", None)
+        if forward_stream is not None:
+            forward_stream.synchronize()
+        request_slot = int(req.req_pool_idx)
+        physical_len = int(self.physical_boundary_lens[request_slot].item())
+        committed_len = int(req._cache_commit_len())
+        publish_len = min(
+            checkpoint.seq_len,
+            committed_len // self.chunk_size * self.chunk_size,
+        )
+        published_steps, remainder = divmod(
+            checkpoint.seq_len - publish_len, self.chunk_size
+        )
+        if remainder or physical_len not in (
+            publish_len,
+            publish_len + self.chunk_size,
+        ):
+            logger.warning(
+                "DVR cannot publish an exact finished radix checkpoint for %s "
+                "(publish=%s, physical=%s); retaining the previous cached prefix.",
+                req.rid,
+                publish_len,
+                physical_len,
+            )
+            req.skip_radix_cache_insert = True
+        else:
+            track_idx = checkpoint.track_idx
+            if published_steps % 2:
+                track_idx = (
+                    self.model_runner.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        track_idx
+                    )
+                )
+            req.mamba_last_track_seqlen = publish_len
+            req.mamba_next_track_idx = (
+                self.model_runner.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    track_idx
+                )
+            )
+        self._drop_checkpoint(req)
 
     def prepare_for_draft(
         self,
@@ -217,13 +288,30 @@ class DVRLinearStateLifecycle:
         if ctx is None:
             return None
         assert ctx.boundary_indices is not None
+        assert ctx.previous_boundary_indices is not None
+        assert ctx.boundary_track_indices is not None
         if accept_lens.numel() > 0:
-            self._state_adapter.commit_after_verify(
+            crosses_chunk_boundary = self._state_adapter.commit_after_verify(
                 state_cache=ctx.state_cache,
                 state_input_indices=ctx.state_input_indices,
                 live_indices=ctx.live_indices,
                 boundary_indices=ctx.boundary_indices,
+                previous_boundary_indices=ctx.previous_boundary_indices,
                 accepted_token_counts=accept_lens.to(torch.long),
+            )
+            self.physical_boundary_lens.index_add_(
+                0,
+                ctx.state_input_indices,
+                crosses_chunk_boundary.to(torch.int64) * self.chunk_size,
+            )
+            self.boundary_track_indices.index_copy_(
+                0,
+                ctx.state_input_indices,
+                torch.where(
+                    crosses_chunk_boundary,
+                    1 - ctx.boundary_track_indices,
+                    ctx.boundary_track_indices,
+                ),
             )
         return DVRRollbackActions(linear_state=self)
 
@@ -237,23 +325,31 @@ class DVRLinearStateLifecycle:
             batch=batch, device=live_indices.device
         )
         boundary_indices = None
+        previous_boundary_indices = None
+        boundary_track_indices = None
         if require_boundary:
             checkpoints = [self._checkpoint(req) for req in batch.reqs]
             if any(checkpoint is None for checkpoint in checkpoints):
                 raise RuntimeError(
                     "DVR target verify is missing a boundary checkpoint."
                 )
-            boundary_indices = torch.stack(
-                [
-                    req.mamba_ping_pong_track_buffer[checkpoint.track_idx]
-                    for req, checkpoint in zip(batch.reqs, checkpoints, strict=True)
-                ]
+            slot_pairs = torch.stack(
+                [req.mamba_ping_pong_track_buffer for req in batch.reqs]
             ).to(device=live_indices.device, dtype=torch.long)
+            boundary_track_indices = self.boundary_track_indices[state_input_indices]
+            boundary_indices = slot_pairs.gather(
+                1, boundary_track_indices.unsqueeze(1)
+            ).squeeze(1)
+            previous_boundary_indices = slot_pairs.gather(
+                1, (1 - boundary_track_indices).unsqueeze(1)
+            ).squeeze(1)
         return DVRLinearStateContext(
             state_cache=self._state_adapter.get_state_cache(batch=batch),
             state_input_indices=state_input_indices,
             live_indices=live_indices,
             boundary_indices=boundary_indices,
+            previous_boundary_indices=previous_boundary_indices,
+            boundary_track_indices=boundary_track_indices,
         )
 
     @staticmethod
@@ -284,6 +380,8 @@ class DVRLinearStateLifecycle:
         zero_indices = []
         tail_indices = []
         tail_lens = []
+        boundary_lens = []
+        boundary_tracks = []
         for i in missing:
             req = batch.reqs[i]
             seq_len = int(seq_lens_cpu[i])
@@ -335,6 +433,8 @@ class DVRLinearStateLifecycle:
             self.boundaries[int(req.req_pool_idx)] = checkpoint
             tail_indices.append(ctx.state_input_indices[i])
             tail_lens.append(seq_len - boundary_len)
+            boundary_lens.append(boundary_len)
+            boundary_tracks.append(track_idx)
 
         if zero_indices:
             self._state_adapter.zero_recurrent_state(
@@ -344,7 +444,26 @@ class DVRLinearStateLifecycle:
                 ),
             )
         if tail_indices:
+            state_input_indices = torch.stack(tail_indices).to(torch.long)
+            self.physical_boundary_lens.index_copy_(
+                0,
+                state_input_indices,
+                torch.tensor(
+                    boundary_lens,
+                    device=ctx.live_indices.device,
+                    dtype=torch.int64,
+                ),
+            )
+            self.boundary_track_indices.index_copy_(
+                0,
+                state_input_indices,
+                torch.tensor(
+                    boundary_tracks,
+                    device=ctx.live_indices.device,
+                    dtype=torch.int64,
+                ),
+            )
             self._state_adapter.state_input_window().set_tail_lens(
-                indices=torch.stack(tail_indices),
+                indices=state_input_indices,
                 value=torch.tensor(tail_lens, device=ctx.live_indices.device),
             )

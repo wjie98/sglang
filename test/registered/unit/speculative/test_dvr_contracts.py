@@ -7,7 +7,6 @@ import sglang.srt.speculative.dvr_worker as dvr_worker_module
 import sglang.srt.speculative.eagle_utils as eagle_utils_module
 import sglang.srt.speculative.spec_utils as spec_utils_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.layers.attention.linear.dvr_gdn import DVRGDNStateAdapter
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -944,11 +943,13 @@ def _dvr_checkpoint(req, *, track_idx=0, seq_len=64):
 
 def _dvr_lifecycle(adapter):
     lifecycle = object.__new__(DVRLinearStateLifecycle)
-    lifecycle.server_args = SimpleNamespace()
+    lifecycle.server_args = SimpleNamespace(disable_radix_cache=False)
     lifecycle.model_runner = None
     lifecycle._state_adapter = adapter
     lifecycle.boundaries = {}
     lifecycle.draft_state_backup = None
+    lifecycle.physical_boundary_lens = torch.zeros(8, dtype=torch.int64)
+    lifecycle.boundary_track_indices = torch.zeros(8, dtype=torch.int64)
     return lifecycle
 
 
@@ -970,9 +971,12 @@ def test_dvr_sync_rollback_uses_one_checkpoint_action():
     calls = []
 
     class Adapter:
+        chunk_size = 64
+
         @staticmethod
         def commit_after_verify(**kwargs):
             calls.append(kwargs)
+            return torch.tensor([True])
 
     lifecycle = _dvr_lifecycle(Adapter())
     ctx = SimpleNamespace(
@@ -980,7 +984,10 @@ def test_dvr_sync_rollback_uses_one_checkpoint_action():
         state_input_indices=torch.tensor([1]),
         live_indices=torch.tensor([2]),
         boundary_indices=torch.tensor([3]),
+        previous_boundary_indices=torch.tensor([4]),
+        boundary_track_indices=torch.tensor([0]),
     )
+    lifecycle.physical_boundary_lens[1] = 64
     actions = lifecycle.rollback_after_verify(
         batch=SimpleNamespace(),
         ctx=ctx,
@@ -989,6 +996,9 @@ def test_dvr_sync_rollback_uses_one_checkpoint_action():
 
     assert isinstance(actions, DVRRollbackActions)
     assert calls[0]["accepted_token_counts"].tolist() == [5]
+    assert calls[0]["previous_boundary_indices"].tolist() == [4]
+    assert lifecycle.physical_boundary_lens[1].item() == 128
+    assert lifecycle.boundary_track_indices[1].item() == 1
 
 
 def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
@@ -1020,8 +1030,49 @@ def test_dvr_publish_checkpoint_updates_only_host_metadata():
     lifecycle.publish_checkpoint(req, pool)
 
     assert lifecycle.boundaries[1].seq_len == 128
+    assert lifecycle.boundaries[1].track_idx == 1
     assert req.mamba_last_track_seqlen == 128
-    assert req.mamba_next_track_idx == 1
+    assert req.mamba_next_track_idx == 0
+
+
+def test_dvr_state_context_follows_device_ping_pong_owner():
+    class Adapter:
+        chunk_size = 64
+        draft_reuses_target_state = False
+
+        @staticmethod
+        def get_live_indices(*, batch):
+            return torch.tensor([20])
+
+        @staticmethod
+        def get_state_input_indices(*, batch, device):
+            return torch.tensor([1], device=device)
+
+        @staticmethod
+        def get_state_cache(*, batch):
+            return object()
+
+    lifecycle = _dvr_lifecycle(Adapter())
+    req = SimpleNamespace(
+        rid="r0",
+        req_pool_idx=1,
+        retraction_count=0,
+        mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
+    )
+    lifecycle.boundaries[1] = _dvr_checkpoint(req)
+    lifecycle.boundary_track_indices[1] = 1
+    batch = SimpleNamespace(
+        reqs=[req],
+        req_pool_indices=torch.tensor([1]),
+        req_to_token_pool=SimpleNamespace(),
+        batch_size=lambda: 1,
+    )
+
+    ctx = lifecycle.state_context(batch, require_boundary=True)
+
+    assert ctx.boundary_indices.tolist() == [11]
+    assert ctx.previous_boundary_indices.tolist() == [10]
+    assert ctx.boundary_track_indices.tolist() == [1]
 
 
 def test_dvr_checkpoint_owner_rejects_slot_aba_and_retraction():
@@ -1226,15 +1277,52 @@ def test_dvr_self_draft_backup_is_request_pool_indexed():
     assert calls[0]["backup_indices"].tolist() == [2]
 
 
-def test_dvr_finished_request_keeps_older_radix_checkpoint():
+@pytest.mark.parametrize("physical_len", [128, 192])
+def test_dvr_finished_request_publishes_exact_ping_pong_boundary(physical_len):
     lifecycle = _dvr_lifecycle(SimpleNamespace(chunk_size=64))
+    syncs = []
+    pool = SimpleNamespace(get_mamba_ping_pong_other_idx=lambda idx: 1 - idx)
+    lifecycle.model_runner = SimpleNamespace(
+        forward_stream=SimpleNamespace(synchronize=lambda: syncs.append(True)),
+        req_to_token_pool=pool,
+    )
     req = SimpleNamespace(
         rid="r0",
         req_pool_idx=1,
         retraction_count=0,
         skip_radix_cache_insert=False,
+        mamba_last_track_seqlen=64,
+        mamba_next_track_idx=1,
+        _cache_commit_len=lambda: 128,
     )
-    lifecycle.boundaries[1] = _dvr_checkpoint(req)
+    lifecycle.boundaries[1] = _dvr_checkpoint(req, track_idx=1, seq_len=128)
+    lifecycle.physical_boundary_lens[1] = physical_len
+
+    lifecycle.prepare_for_cache_release(req)
+
+    assert not req.skip_radix_cache_insert
+    assert req.mamba_last_track_seqlen == 128
+    assert req.mamba_next_track_idx == 0
+    assert syncs == [True]
+    assert lifecycle.boundaries == {}
+
+
+def test_dvr_finished_request_skips_insert_when_exact_boundary_is_gone():
+    lifecycle = _dvr_lifecycle(SimpleNamespace(chunk_size=64))
+    pool = SimpleNamespace(get_mamba_ping_pong_other_idx=lambda idx: 1 - idx)
+    lifecycle.model_runner = SimpleNamespace(
+        forward_stream=SimpleNamespace(synchronize=lambda: None),
+        req_to_token_pool=pool,
+    )
+    req = SimpleNamespace(
+        rid="r0",
+        req_pool_idx=1,
+        retraction_count=0,
+        skip_radix_cache_insert=False,
+        _cache_commit_len=lambda: 128,
+    )
+    lifecycle.boundaries[1] = _dvr_checkpoint(req, track_idx=1, seq_len=128)
+    lifecycle.physical_boundary_lens[1] = 256
 
     lifecycle.prepare_for_cache_release(req)
 
