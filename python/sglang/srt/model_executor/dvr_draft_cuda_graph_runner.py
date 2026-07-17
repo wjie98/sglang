@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import torch
 
@@ -12,9 +11,6 @@ from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-logger = logging.getLogger(__name__)
-
 
 @contextmanager
 def _maybe_disable_batch_invariant_ops(disable: bool):
@@ -38,43 +34,7 @@ def _maybe_disable_batch_invariant_ops(disable: bool):
             enable_batch_invariant_mode()
 
 
-def _ensure_decode_custom_all_reduce_comm(group):
-    ca_comm = getattr(group, "ca_comm", None)
-    if ca_comm is None and getattr(group, "world_size", 1) > 1:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            dispatch_custom_allreduce,
-        )
-
-        try:
-            custom_allreduce_cls = dispatch_custom_allreduce(
-                group=group.cpu_group,
-                device=group.device,
-            )
-            ca_comm = custom_allreduce_cls(
-                group=group.cpu_group,
-                device=group.device,
-            )
-            group.ca_comm = ca_comm
-        except Exception as exc:
-            logger.warning("DVR draft custom all-reduce setup failed: %s", exc)
-            return None
-
-    if ca_comm is None or not hasattr(ca_comm, "world_size"):
-        return None
-
-    if hasattr(ca_comm, "full_nvlink") and not ca_comm.full_nvlink:
-        ca_comm.disabled = True
-        if hasattr(ca_comm, "original_disabled"):
-            ca_comm.original_disabled = True
-        return None
-
-    ca_comm.disabled = True
-    if hasattr(ca_comm, "original_disabled"):
-        ca_comm.original_disabled = True
-    return ca_comm
-
-
-def _iter_decode_custom_all_reduce_comms(model_runner):
+def _iter_decode_custom_all_reduce_groups(model_runner):
     candidate_groups = [getattr(model_runner, "tp_group", None)]
     for get_group in (get_moe_ep_group, get_moe_tp_group):
         try:
@@ -87,9 +47,7 @@ def _iter_decode_custom_all_reduce_comms(model_runner):
         if group is None or id(group) in seen:
             continue
         seen.add(id(group))
-        ca_comm = _ensure_decode_custom_all_reduce_comm(group)
-        if ca_comm is not None:
-            yield ca_comm
+        yield group
 
 
 @contextmanager
@@ -127,7 +85,7 @@ def dvr_draft_decode_context(
         if patch_global_state
         else nullcontext()
     )
-    with deterministic_env:
+    with deterministic_env, ExitStack() as custom_ar_stack:
         try:
             if patch_global_state:
                 for server_args in (model_runner.server_args, global_server_args):
@@ -160,8 +118,14 @@ def dvr_draft_decode_context(
                     "_dvr_enable_draft_custom_all_reduce",
                     False,
                 ):
-                    for ca_comm in _iter_decode_custom_all_reduce_comms(model_runner):
-                        patch_attr(ca_comm, "disabled", False)
+                    for group in _iter_decode_custom_all_reduce_groups(model_runner):
+                        custom_ar_stack.enter_context(
+                            group.custom_allreduce_state(
+                                enabled=True,
+                                create_if_missing=True,
+                                require_full_nvlink=True,
+                            )
+                        )
                 if self_draft:
                     # Target graph buffers are already initialized for
                     # TARGET_VERIFY; capture self draft as ordinary DECODE.

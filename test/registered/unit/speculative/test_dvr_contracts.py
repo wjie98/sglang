@@ -7,6 +7,7 @@ import torch
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
 import sglang.srt.speculative.eagle_utils as eagle_utils_module
 import sglang.srt.speculative.spec_utils as spec_utils_module
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -19,7 +20,6 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     DVRTargetVerifyCudaGraphRunner,
-    _ensure_decode_custom_all_reduce_comm,
 )
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -778,7 +778,7 @@ def test_dvr_self_draft_runtime_does_not_patch_global_decode_state(monkeypatch):
         pass
 
 
-def test_dvr_custom_all_reduce_uses_current_dispatch_contract(monkeypatch):
+def test_custom_all_reduce_late_creation_restores_disabled_state(monkeypatch):
     calls = []
 
     class FakeCustomAllReduce:
@@ -796,22 +796,26 @@ def test_dvr_custom_all_reduce_uses_current_dispatch_contract(monkeypatch):
     from sglang.srt.distributed.device_communicators import custom_all_reduce
 
     monkeypatch.setattr(custom_all_reduce, "dispatch_custom_allreduce", fake_dispatch)
-    group = SimpleNamespace(
-        ca_comm=None,
-        world_size=2,
-        cpu_group="cpu-group",
-        device="cuda:0",
-    )
+    group = object.__new__(GroupCoordinator)
+    group.ca_comm = None
+    group.world_size = 2
+    group.cpu_group = "cpu-group"
+    group.device = "cuda:0"
 
-    ca_comm = _ensure_decode_custom_all_reduce_comm(group)
+    with group.custom_allreduce_state(
+        enabled=True,
+        create_if_missing=True,
+        require_full_nvlink=True,
+    ) as active:
+        assert active
+        assert not group.ca_comm.disabled
 
     assert calls == [
         ("dispatch", "cpu-group", "cuda:0"),
         ("init", "cpu-group", "cuda:0"),
     ]
-    assert group.ca_comm is ca_comm
-    assert ca_comm.disabled
-    assert ca_comm.original_disabled
+    assert group.ca_comm.disabled
+    assert group.ca_comm.original_disabled
 
 
 def test_dvr_draft_restores_backend_decode_defaults():
