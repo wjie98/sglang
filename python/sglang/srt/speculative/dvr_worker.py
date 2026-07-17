@@ -36,17 +36,16 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
+    eagle_finish_verify_prepare,
+    eagle_forward_target_verify,
     eagle_prepare_for_verify,
-    eagle_sample,
+    eagle_sample_and_build_bonus,
 )
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
-    generate_token_bitmask,
-    record_stream_each,
     record_stream_for_v2_verify,
     renorm_sampling_probs,
     spec_stage_span,
@@ -692,15 +691,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         on_publish=None,
     ) -> GenerationBatchResult:
         scheduler_seq_lens = batch.seq_lens
-        vocab_mask = None
-
-        if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
-            draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrieve_next_token.shape
-            ).cpu()
-
         assert spec_info.is_verify_input()
         # DVR only supports topk=1 chains, whose tree mask is exactly the
         # backend's native causal mask. Both draft backends therefore enter the
@@ -716,65 +706,32 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             # graph. ForwardBatch.init_new consumes this one-shot mirror.
             batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
 
-        prepared_on_plan_stream = self.plan_stream is not None
-        need_return_logprob = batch.return_logprob
-        batch.return_logprob = False
-        try:
-            with self.plan_stream_ctx, spec_stage_span("verify_prepare"):
-                verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
-                    spec_info,
-                    self.req_to_token_pool,
-                    batch,
-                    self.target_worker,
-                )
-        finally:
-            batch.return_logprob = need_return_logprob
-
-        if self.is_dvr_eagle:
-            record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
-
-        if prepared_on_plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
+        with self.plan_stream_ctx, spec_stage_span("verify_prepare"):
+            verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
+                spec_info,
+                self.req_to_token_pool,
+                batch,
+                self.target_worker,
             )
-            runner = self.target_worker.model_runner.decode_cuda_graph_runner
-            cuda_graph_bs = (
-                None if not can_run_cuda_graph or runner is None else runner.bs
-            )
-            for backend in iter_dvr_attention_backends(
-                self.target_worker.model_runner.attn_backend
-            ):
-                try:
-                    backend.update_verify_buffers_to_fill_after_draft(
-                        spec_info, cuda_graph_bs
-                    )
-                except NotImplementedError:
-                    continue
+
+        eagle_finish_verify_prepare(
+            spec_info,
+            batch,
+            self.target_worker,
+            verify_forward_batch,
+            can_run_cuda_graph,
+            self.plan_stream,
+            record_rebound_inputs=self.is_dvr_eagle,
+        )
 
         with spec_stage_span("dvr_state_restore"):
             # Self-draft graph replay and target verify are both enqueued on
             # Scheduler's forward stream, so CUDA stream order is their fence.
             linear_state_ctx = self.linear_state.restore_for_verify(linear_state_ctx)
         with spec_stage_span("verify"):
-            forward_output = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=verify_forward_batch,
-                is_verify=True,
+            forward_output, vocab_mask = eagle_forward_target_verify(
+                spec_info, batch, self.target_worker, verify_forward_batch
             )
-
-        if batch.has_grammar:
-            vocab_mask = generate_token_bitmask(
-                batch.reqs,
-                spec_info,
-                retrieve_next_token_cpu,
-                retrieve_next_sibling_cpu,
-                draft_tokens_cpu,
-                batch.sampling_info.vocab_size,
-            )
-            if vocab_mask is not None:
-                assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
-                batch.sampling_info.vocab_mask = None
 
         logits_output = forward_output.logits_output
         if self.is_dvr_eagle and logits_output.hidden_states is None:
@@ -783,8 +740,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 "draft step."
             )
 
-        maybe_detect_nan(logits_output.next_token_logits, "DVR target verify")
-        maybe_detect_inf(logits_output.next_token_logits, "DVR target verify")
         # Target acceptance semantics are independent of the draft backend.
         # Accumulated penalties and logit bias are applied by eagle_sample;
         # custom processors need the full verify width here.
@@ -795,8 +750,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 num_tokens_in_batch=verify_tokens,
             )
         with spec_stage_span("verify_sample"):
-            predict, accept_lens, accept_index = eagle_sample(
-                spec_info, batch, logits_output, vocab_mask
+            predict, accept_lens, accept_index, bonus_tokens = (
+                eagle_sample_and_build_bonus(
+                    spec_info, batch, logits_output, vocab_mask
+                )
             )
         new_seq_lens = scheduler_seq_lens + accept_lens
         if on_publish is not None:
@@ -804,21 +761,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             # mutation remains fenced by the WAR event recorded after DVR
             # rollback/checkpoint, so host scheduling may overlap this tail.
             on_publish(new_seq_lens)
-        has_verify_tokens = (
-            not batch.forward_mode.is_idle() and accept_lens.numel() > 0
-        )
-
-        if has_verify_tokens:
-            accept_tokens = predict[accept_index]
-            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            fill_bonus_tokens[(accept_lens.shape[0],)](
-                accept_tokens,
-                accept_lens,
-                bonus_tokens,
-                accept_index.shape[1],
-            )
-        else:
-            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
+        has_verify_tokens = not batch.forward_mode.is_idle() and accept_lens.numel() > 0
 
         if self.is_dvr_eagle:
             next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)

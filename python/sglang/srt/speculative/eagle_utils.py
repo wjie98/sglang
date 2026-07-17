@@ -356,6 +356,109 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+def eagle_finish_verify_prepare(
+    verify_input,
+    batch,
+    target_worker,
+    verify_forward_batch,
+    can_run_cuda_graph: bool,
+    plan_stream,
+    *,
+    record_rebound_inputs: bool = True,
+):
+    """Finish stream-dependent verify preparation before target execution."""
+
+    from sglang.srt.speculative.spec_utils import record_stream_each
+
+    current_stream = torch.get_device_module(target_worker.device).current_stream()
+    if record_rebound_inputs:
+        record_stream_each((batch.input_ids, batch.out_cache_loc), current_stream)
+    if plan_stream is None:
+        return
+
+    current_stream.wait_stream(plan_stream)
+    model_runner = target_worker.model_runner
+    if (
+        _is_npu
+        and model_runner.model_is_mrope
+        and batch.spec_info is not None
+        and getattr(batch.spec_info, "positions", None) is not None
+        and not batch.forward_mode.is_idle()
+    ):
+        verify_forward_batch.compute_spec_mrope_positions(model_runner, batch)
+
+    runner = model_runner.decode_cuda_graph_runner
+    cuda_graph_bs = None if not can_run_cuda_graph or runner is None else runner.bs
+    model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+        verify_input, cuda_graph_bs
+    )
+
+
+def eagle_forward_target_verify(
+    verify_input,
+    batch,
+    target_worker,
+    verify_forward_batch,
+):
+    """Run the common target forward and constrained-decoding mask path."""
+
+    from sglang.srt.speculative.spec_utils import generate_token_bitmask
+
+    grammar_inputs = None
+    if batch.has_grammar:
+        grammar_inputs = (
+            verify_input.retrieve_next_token.cpu(),
+            verify_input.retrieve_next_sibling.cpu(),
+            verify_input.draft_token.view(verify_input.retrieve_next_token.shape).cpu(),
+        )
+
+    forward_output = target_worker.forward_batch_generation(
+        batch=None,
+        forward_batch=verify_forward_batch,
+        is_verify=True,
+    )
+
+    vocab_mask = None
+    if grammar_inputs is not None:
+        vocab_mask = generate_token_bitmask(
+            batch.reqs,
+            verify_input,
+            *grammar_inputs,
+            batch.sampling_info.vocab_size,
+        )
+        if vocab_mask is not None:
+            assert verify_input.grammar is not None
+            vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+            batch.sampling_info.vocab_mask = None
+
+    return forward_output, vocab_mask
+
+
+def eagle_sample_and_build_bonus(verify_input, batch, logits_output, vocab_mask):
+    """Sample one verify result and extract its next root token."""
+
+    from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
+    from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
+
+    maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+    maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+    predict, accept_lens, accept_index = eagle_sample(
+        verify_input, batch, logits_output, vocab_mask
+    )
+    if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
+        accept_tokens = predict[accept_index]
+        bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+        fill_bonus_tokens[(accept_lens.shape[0],)](
+            accept_tokens,
+            accept_lens,
+            bonus_tokens,
+            accept_index.shape[1],
+        )
+    else:
+        bonus_tokens = torch.empty((0,), device=predict.device, dtype=torch.int32)
+    return predict, accept_lens, accept_index, bonus_tokens
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,

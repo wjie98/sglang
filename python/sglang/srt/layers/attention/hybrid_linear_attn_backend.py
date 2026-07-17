@@ -760,6 +760,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cpu_graph_state(max_bs, max_num_tokens)
 
+    def get_verify_buffers_to_fill_after_draft(self):
+        return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
+        return self.full_attn_backend.update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
+        )
+
     def init_forward_metadata_capture_cpu_graph(
         self,
         bs: int,
