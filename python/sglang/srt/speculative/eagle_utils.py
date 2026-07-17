@@ -379,6 +379,8 @@ def eagle_sample(
     from sglang.srt.server_args import get_global_server_args
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
+        SPEC_ACCEPT_HASH_STREAM,
+        SPEC_FINAL_SAMPLE_HASH_STREAM,
         generate_simulated_accept_index,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -489,7 +491,7 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if use_rejection_sampling:
+        if configured_rejection_sampling:
             target_probs = renorm_sampling_probs(
                 target_probs, sampling_info, repeat=verify_input.draft_token_num
             )
@@ -531,7 +533,7 @@ def eagle_sample(
                 f"{tuple(draft_probs.shape)}, expected {expected_draft_shape}."
             )
 
-        if use_rejection_sampling and sampling_info.sampling_seed is not None:
+        if configured_rejection_sampling and sampling_info.sampling_seed is not None:
             from sglang.srt.layers.utils.hash import murmur_hash32
 
             # One rejection and one final-sampling stream per target position.
@@ -542,18 +544,24 @@ def eagle_sample(
             seeds = sampling_info.sampling_seed[:bs].repeat_interleave(
                 verify_input.draft_token_num
             )
-            streams = torch.arange(2, dtype=torch.int64, device=device)
+            streams = torch.tensor(
+                [SPEC_ACCEPT_HASH_STREAM, SPEC_FINAL_SAMPLE_HASH_STREAM],
+                dtype=torch.int64,
+                device=device,
+            )
             # Use the high 24 hash bits so every float32 coin is in [0, 1).
             # A coin equal to one would reject an otherwise exact p == q match.
             uniforms = torch.bitwise_right_shift(
                 murmur_hash32(seeds, positions, streams).to(torch.int64), 8
             ).to(torch.float32)
             uniforms.mul_(1.0 / 2**24)
-            uniforms = uniforms.reshape(
-                bs, verify_input.draft_token_num, 2
-            )
+            uniforms = uniforms.reshape(bs, verify_input.draft_token_num, 2)
             coins = uniforms[:, :, 0].contiguous()
-            coins_for_final_sampling = uniforms[:, :, 1].contiguous()
+            coins_for_final_sampling = (
+                uniforms[:, :, 1].contiguous()
+                if use_rejection_sampling
+                else uniforms[:, 0, 1].contiguous()
+            )
         else:
             coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
             coins_for_final_sampling = torch.rand(

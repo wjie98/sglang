@@ -73,6 +73,13 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# The ordinary deterministic sampler hashes vocabulary token ids as columns.
+# Keep speculative proposal/correction randomness in a disjoint uint32 range so
+# rejection coins remain independent even when self-draft reuses that sampler.
+SPEC_DRAFT_SAMPLE_HASH_STREAM = 0xFFFFFFFD
+SPEC_ACCEPT_HASH_STREAM = 0xFFFFFFFE
+SPEC_FINAL_SAMPLE_HASH_STREAM = 0xFFFFFFFF
+
 
 def fast_sample(
     probs: torch.Tensor,
@@ -91,9 +98,12 @@ def fast_sample(
         from sglang.srt.layers.utils.hash import murmur_hash32
 
         # A single position-keyed uniform is sufficient for categorical
-        # sampling. Keep stream 2 disjoint from rejection/final coins (0/1).
+        # sampling. Its hash stream is disjoint from both vocabulary token ids
+        # and the rejection/final-sampling streams.
         cdf = probs.float().cumsum(dim=-1)
-        stream = torch.full_like(positions[:1], 2, dtype=torch.int64)
+        stream = torch.full_like(
+            positions[:1], SPEC_DRAFT_SAMPLE_HASH_STREAM, dtype=torch.int64
+        )
         # Keep the uniform strictly below one. Converting uint32 max directly
         # to float32 rounds to 2**32 and can select a zero-probability endpoint.
         uniform = torch.bitwise_right_shift(
@@ -109,6 +119,12 @@ def fast_sample(
 def renorm_sampling_probs(probs: torch.Tensor, sampling_info, repeat: int = 1):
     """Apply request sampling filters to an already normalized distribution."""
 
+    need_top_k = sampling_info.need_top_k_sampling
+    need_top_p = sampling_info.need_top_p_sampling
+    need_min_p = sampling_info.need_min_p_sampling
+    if not (need_top_k or need_top_p or need_min_p):
+        return probs
+
     def expand(values):
         return values if repeat == 1 else torch.repeat_interleave(values, repeat, dim=0)
 
@@ -122,26 +138,34 @@ def renorm_sampling_probs(probs: torch.Tensor, sampling_info, repeat: int = 1):
         server_args = get_global_server_args()
         if (
             getattr(server_args, "sampling_backend", None) == "flashinfer"
-            and sampling_info.need_min_p_sampling
+            and need_min_p
         ):
             # Match Sampler._sample_from_probs: FlashInfer's min-p path applies
             # top-k and top-p sequentially before min-p sampling.
-            probs = top_k_renorm_prob(probs, top_ks)
-            probs = top_p_renorm_prob(probs, top_ps)
+            if need_top_k:
+                probs = top_k_renorm_prob(probs, top_ks)
+            if need_top_p:
+                probs = top_p_renorm_prob(probs, top_ps)
         else:
             # PyTorch and FlashInfer's ordinary top-k/top-p path use joint
             # filtering. top-p before top-k preserves that intersection.
-            probs = top_p_renorm_prob(probs, top_ps)
-            probs = top_k_renorm_prob(probs, top_ks)
-    else:
+            if need_top_p:
+                probs = top_p_renorm_prob(probs, top_ps)
+            if need_top_k:
+                probs = top_k_renorm_prob(probs, top_ks)
+    elif need_top_k or need_top_p:
         sorted_probs, indices = probs.sort(dim=-1, descending=True)
-        ranks = torch.arange(probs.shape[-1], device=probs.device).unsqueeze(0)
-        sorted_probs.masked_fill_(ranks >= top_ks.unsqueeze(1), 0)
         cumulative = sorted_probs.cumsum(dim=-1)
-        sorted_probs.masked_fill_(cumulative - sorted_probs > top_ps.unsqueeze(1), 0)
+        if need_top_k:
+            ranks = torch.arange(probs.shape[-1], device=probs.device).unsqueeze(0)
+            sorted_probs.masked_fill_(ranks >= top_ks.unsqueeze(1), 0)
+        if need_top_p:
+            sorted_probs.masked_fill_(
+                cumulative - sorted_probs > top_ps.unsqueeze(1), 0
+            )
         probs = torch.zeros_like(probs).scatter_(-1, indices, sorted_probs)
         probs /= probs.sum(dim=-1, keepdim=True)
-    if sampling_info.need_min_p_sampling:
+    if need_min_p:
         thresholds = probs.amax(dim=-1, keepdim=True) * min_ps.unsqueeze(1)
         probs = torch.where(probs >= thresholds, probs, torch.zeros_like(probs))
         probs /= probs.sum(dim=-1, keepdim=True)
