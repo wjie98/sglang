@@ -51,7 +51,6 @@ def get_config_file_name(
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}.json"
 
 
-@functools.lru_cache
 def get_moe_configs(
     E: int,
     N: int,
@@ -61,15 +60,32 @@ def get_moe_configs(
     per_channel_quant: bool = False,
     down_moe: bool = False,
 ) -> Optional[Dict[int, Any]]:
-    """
-    Return optimized configurations for the fused MoE kernel.
+    """Return optimized configurations for the active determinism mode."""
 
-    The return value will be a dictionary that maps an irregular grid of
-    batch sizes to configurations of the fused_moe kernel. To evaluate the
-    kernel on a given batch size bs, the closest batch size in the grid should
-    be picked and the associated configuration chosen to invoke the kernel.
-    """
-    if get_global_server_args().enable_deterministic_inference:
+    return _get_moe_configs(
+        E,
+        N,
+        dtype,
+        block_n,
+        block_k,
+        per_channel_quant,
+        down_moe,
+        get_global_server_args().enable_deterministic_inference,
+    )
+
+
+@functools.lru_cache
+def _get_moe_configs(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    block_n: Optional[int],
+    block_k: Optional[int],
+    per_channel_quant: bool,
+    down_moe: bool,
+    deterministic: bool,
+) -> Optional[Dict[int, Any]]:
+    if deterministic:
         logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
         )

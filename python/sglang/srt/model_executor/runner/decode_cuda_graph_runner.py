@@ -172,6 +172,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """
 
     record_war_fastpath_event = True
+    initialize_attention_backend_state = True
+    enable_mamba_tracking = True
 
     def __init__(
         self,
@@ -265,7 +267,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        if self.initialize_attention_backend_state:
+            self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -295,7 +298,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         enable_mamba_track = (
-            self.model_runner.server_args.enable_mamba_extra_buffer()
+            self.enable_mamba_tracking
+            and self.model_runner.server_args.enable_mamba_extra_buffer()
             and self.model_runner.spec_algorithm.is_none()
         )
 

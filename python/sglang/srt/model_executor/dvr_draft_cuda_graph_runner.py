@@ -58,22 +58,6 @@ def _maybe_disable_batch_invariant_ops(disable: bool):
             enable_batch_invariant_mode()
 
 
-def _clear_determinism_sensitive_kernel_caches():
-    # These caches read global deterministic or batch-invariant state, but their
-    # cache keys do not include that state. Clear them around self-draft graph
-    # capture/replay so target-verify deterministic choices cannot leak into
-    # the non-deterministic draft path, and vice versa.
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
-        get_moe_configs,
-    )
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-        should_enable_swap_ab,
-    )
-
-    get_moe_configs.cache_clear()
-    should_enable_swap_ab.cache_clear()
-
-
 def _ensure_decode_custom_all_reduce_comm(group):
     ca_comm = getattr(group, "ca_comm", None)
     if ca_comm is None and getattr(group, "world_size", 1) > 1:
@@ -128,10 +112,6 @@ def _iter_decode_custom_all_reduce_comms(model_runner):
             yield ca_comm
 
 
-def _skip_init_cuda_graph_state(*args, **kwargs):
-    return None
-
-
 @contextmanager
 def dvr_draft_decode_context(
     model_runner,
@@ -147,12 +127,18 @@ def dvr_draft_decode_context(
     """
 
     patched_attrs = []
+    patched_keys = set()
     global_server_args = get_global_server_args()
     patch_global_state = capture or not self_draft
 
     def patch_attr(obj, attr_name, value):
         if obj is None or not hasattr(obj, attr_name):
             return
+        key = (id(obj), attr_name)
+        if key in patched_keys:
+            setattr(obj, attr_name, value)
+            return
+        patched_keys.add(key)
         patched_attrs.append((obj, attr_name, getattr(obj, attr_name)))
         setattr(obj, attr_name, value)
 
@@ -163,9 +149,6 @@ def dvr_draft_decode_context(
     )
     with deterministic_env:
         try:
-            if capture:
-                _clear_determinism_sensitive_kernel_caches()
-
             if patch_global_state:
                 for server_args in (model_runner.server_args, global_server_args):
                     patch_attr(server_args, "enable_deterministic_inference", False)
@@ -211,26 +194,12 @@ def dvr_draft_decode_context(
                     patch_attr(
                         model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE
                     )
-                    patch_attr(
-                        model_runner.attn_backend,
-                        "init_cuda_graph_state",
-                        _skip_init_cuda_graph_state,
-                    )
-
-            # Provisional draft tokens must not update mamba prefix-cache
-            # tracking slots. DVR commits verified recurrent state after target
-            # verify.
-            if patch_global_state:
-                for server_args in (model_runner.server_args, global_server_args):
-                    patch_attr(server_args, "mamba_radix_cache_strategy", "no_buffer")
 
             with _maybe_disable_batch_invariant_ops(capture):
                 yield
         finally:
             for obj, attr_name, original_value in reversed(patched_attrs):
                 setattr(obj, attr_name, original_value)
-            if capture:
-                _clear_determinism_sensitive_kernel_caches()
 
 
 class DVRDraftDecodeCudaGraphRunner(DecodeCudaGraphRunner):
@@ -240,6 +209,8 @@ class DVRDraftDecodeCudaGraphRunner(DecodeCudaGraphRunner):
     # after every provisional decode step allocates and records 15 events that
     # the DVR worker must discard before returning to Scheduler.
     record_war_fastpath_event = False
+    initialize_attention_backend_state = False
+    enable_mamba_tracking = False
 
 
 class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
