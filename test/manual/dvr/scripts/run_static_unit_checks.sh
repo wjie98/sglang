@@ -13,10 +13,14 @@ DVR_PY_FILES=(
   python/sglang/srt/layers/attention/flashattention_backend.py
   python/sglang/srt/layers/attention/fla/chunk_delta_h.py
   python/sglang/srt/layers/attention/fla/chunk_o.py
+  python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
   python/sglang/srt/layers/attention/linear/dvr_gdn.py
   python/sglang/srt/layers/attention/linear/dvr_state.py
   python/sglang/srt/layers/attention/linear/gdn_backend.py
   python/sglang/srt/layers/attention/triton_backend.py
+  python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_config.py
+  python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py
+  python/sglang/srt/managers/schedule_batch.py
   python/sglang/srt/managers/scheduler.py
   python/sglang/srt/managers/scheduler_components/batch_result_processor.py
   python/sglang/srt/managers/tokenizer_manager.py

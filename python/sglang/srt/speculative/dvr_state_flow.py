@@ -36,7 +36,7 @@ class DVRRollbackActions:
 
     linear_state: Any = field(repr=False)
 
-    def commit_checkpoint_after_decode(self, *, req, batch) -> bool:
+    def commit_checkpoint_after_decode(self, *, req) -> bool:
         # The verify kernel has already updated the physical boundary slot. The
         # CPU result only publishes its materialized length and prevents generic
         # speculative tracking from rotating that DVR-owned slot.
@@ -170,7 +170,7 @@ class DVRLinearStateLifecycle:
         request_slot = int(req.req_pool_idx)
         physical_len = int(self.physical_boundary_lens[request_slot].item())
         physical_track = int(self.boundary_track_indices[request_slot].item())
-        committed_len = int(req._cache_commit_len())
+        committed_len = int(req.cache_commit_len)
         publish_len = min(
             checkpoint.seq_len,
             committed_len // self.chunk_size * self.chunk_size,
@@ -321,9 +321,11 @@ class DVRLinearStateLifecycle:
                 raise RuntimeError(
                     "DVR target verify is missing a boundary checkpoint."
                 )
-            track_slots = torch.stack(
-                [req.mamba_ping_pong_track_buffer for req in batch.reqs]
-            ).to(device=live_indices.device, dtype=torch.long)
+            track_slots = batch.req_to_token_pool.get_mamba_ping_pong_slots(
+                batch.req_pool_indices
+            ).to(
+                device=live_indices.device, dtype=torch.long
+            )
             boundary_track_indices = self.boundary_track_indices[state_input_indices]
             boundary_indices = track_slots.gather(
                 1, boundary_track_indices.unsqueeze(1)

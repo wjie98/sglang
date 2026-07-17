@@ -901,7 +901,6 @@ class SchedulerBatchResultProcessor:
             result.dvr_rollback_actions is not None
             and result.dvr_rollback_actions.commit_checkpoint_after_decode(
                 req=req,
-                batch=batch,
             )
         )
         if dvr_checkpoint_committed:

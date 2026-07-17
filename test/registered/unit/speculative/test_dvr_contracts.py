@@ -771,10 +771,7 @@ def test_dvr_rollback_action_publishes_owned_checkpoint():
     req = SimpleNamespace(rid="r0")
     actions = DVRRollbackActions(linear_state=LinearState())
 
-    assert actions.commit_checkpoint_after_decode(
-        req=req,
-        batch=SimpleNamespace(),
-    )
+    assert actions.commit_checkpoint_after_decode(req=req)
     assert calls == [req]
 
 
@@ -1095,6 +1092,9 @@ def test_dvr_state_context_follows_request_checkpoint_owner(
         reqs=[req],
         req_pool_indices=torch.tensor([1]),
         req_to_token_pool=SimpleNamespace(
+            get_mamba_ping_pong_slots=lambda indices: torch.tensor(
+                [[0] * len(track_slots), list(track_slots)]
+            )[indices],
             get_mamba_ping_pong_other_idx=lambda idx: (
                 1 - idx if len(track_slots) == 2 else idx
             )
@@ -1380,7 +1380,7 @@ def test_dvr_finished_request_publishes_exact_ping_pong_boundary(
         skip_radix_cache_insert=False,
         mamba_last_track_seqlen=64,
         mamba_next_track_idx=1,
-        _cache_commit_len=lambda: 128,
+        cache_commit_len=128,
     )
     lifecycle.boundaries[1] = _dvr_checkpoint(req, seq_len=128)
     lifecycle.physical_boundary_lens[1] = physical_len
@@ -1409,7 +1409,7 @@ def test_dvr_finished_request_respects_the_host_visible_commit_boundary():
         skip_radix_cache_insert=False,
         mamba_last_track_seqlen=0,
         mamba_next_track_idx=0,
-        _cache_commit_len=lambda: 64,
+        cache_commit_len=64,
     )
     lifecycle.boundaries[1] = _dvr_checkpoint(req, seq_len=128)
     lifecycle.physical_boundary_lens[1] = 128
@@ -1434,7 +1434,7 @@ def test_dvr_finished_request_skips_insert_when_exact_boundary_is_gone():
         req_pool_idx=1,
         retraction_count=0,
         skip_radix_cache_insert=False,
-        _cache_commit_len=lambda: 128,
+        cache_commit_len=128,
     )
     lifecycle.boundaries[1] = _dvr_checkpoint(req, seq_len=128)
     lifecycle.physical_boundary_lens[1] = 256
