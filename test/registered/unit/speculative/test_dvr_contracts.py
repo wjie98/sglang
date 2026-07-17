@@ -266,19 +266,19 @@ def test_speculative_hash_streams_do_not_overlap_sampler_token_ids(monkeypatch):
     assert captured["streams"].item() == SPEC_DRAFT_SAMPLE_HASH_STREAM
 
 
-def test_upstream_eagle_draft_proposal_keeps_unfiltered_distribution():
-    logits = torch.tensor([[2.0, 1.0, 0.0]])
+def test_eagle_draft_proposal_matches_greedy_and_stochastic_rows():
+    logits = torch.tensor([[2.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
     sampling_info = SimpleNamespace(
-        temperatures=torch.tensor([[0.5]]),
-        top_ks=torch.tensor([1]),
-        top_ps=torch.tensor([0.1]),
-        min_ps=torch.tensor([0.9]),
+        temperatures=torch.tensor([[0.5], [0.5]]),
+        top_ks=torch.tensor([1, 3]),
     )
 
     proposal = renorm_draft_probs(logits, sampling_info, True)
 
+    torch.testing.assert_close(proposal[0], torch.tensor([1.0, 0.0, 0.0]))
     torch.testing.assert_close(
-        proposal, torch.softmax(logits / sampling_info.temperatures, dim=-1)
+        proposal[1],
+        torch.softmax(logits[1] / sampling_info.temperatures[1], dim=-1),
     )
 
 

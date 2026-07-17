@@ -181,11 +181,26 @@ def renorm_draft_probs(
 
     Plain softmax, except under rejection sampling where logits are
     temperature-scaled so the draft proposal q tracks the target sampling
-    temperature (higher acceptance; correctness holds for any q).
+    temperature. Greedy rows use their actual one-hot proposal distribution;
+    stochastic rows remain unfiltered because correctness holds for any q.
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
-    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+    probs = torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+
+    # SamplingParams represents greedy decoding as top_k == 1. CUDA graphs may
+    # contain mixed greedy/stochastic rows, so this must be a tensor operation
+    # over runtime top_ks rather than a capture-time is_all_greedy branch.
+    greedy_rows = sampling_info.top_ks == 1
+    greedy_indices = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+    selected_probs = probs.gather(1, greedy_indices)
+    probs.mul_((~greedy_rows).unsqueeze(1))
+    probs.scatter_(
+        1,
+        greedy_indices,
+        torch.where(greedy_rows.unsqueeze(1), 1.0, selected_probs),
+    )
+    return probs
 
 
 # Simulate acceptance length for benchmarking purposes
@@ -206,9 +221,9 @@ def draft_kv_indices_buffer_width(
     num_seqs * topk branches each attend up to max_context_len KV slots; the topk
     factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
-    assert (
-        num_seqs * topk * max_context_len < 2**31
-    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    assert num_seqs * topk * max_context_len < 2**31, (
+        "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    )
     return num_seqs * topk * max_context_len
 
 

@@ -33,6 +33,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -205,6 +206,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
+            self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -377,7 +379,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
             top_ps=torch.ones((num_seqs,), dtype=torch.float),
-            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
+            top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             sampling_seed=(
                 buffers.sampling_seed[:num_seqs]
@@ -502,6 +504,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.topk_index.zero_()
             if sampling_seed_buffer is not None:
                 sampling_seed_buffer.zero_()
+            self.top_ks.fill_(TOP_K_ALL)
             if buffers.draft_probs is not None:
                 buffers.draft_probs.zero_()
             if buffers.hidden_states is not None:
@@ -576,6 +579,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
+            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
             if sampling_seed_buffer is not None:
                 if forward_batch.sampling_info.sampling_seed is None:
                     raise RuntimeError(

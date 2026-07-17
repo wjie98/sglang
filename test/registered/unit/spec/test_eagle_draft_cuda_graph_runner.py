@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -59,7 +60,7 @@ class _RecordingDraftBackend:
 
 
 class TestEagleDraftCudaGraphRunner(CustomTestCase):
-    def _build_runner(self, backend):
+    def _build_runner(self, backend, use_rejection_sampling=False):
         runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.buffers = SimpleNamespace(
@@ -81,9 +82,13 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         runner.seq_len_fill_value = SEQ_LEN_FILL_VALUE
         runner.require_mlp_tp_gather = False
         runner.require_gathered_buffer = False
+        runner.temperatures = torch.ones((CAPTURE_BS, 1), dtype=torch.float32)
+        runner.top_ks = torch.full((CAPTURE_BS,), TOP_K_ALL, dtype=torch.int32)
         runner.model_runner = SimpleNamespace(
             model_config=SimpleNamespace(vocab_size=8),
-            server_args=SimpleNamespace(speculative_use_rejection_sampling=False),
+            server_args=SimpleNamespace(
+                speculative_use_rejection_sampling=use_rejection_sampling
+            ),
             device_timer=None,
             draft_attn_backend=backend,
         )
@@ -192,6 +197,28 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+    def test_rejection_sampling_copies_runtime_greedy_rows(self):
+        backend = _RecordingDraftBackend()
+        runner = self._build_runner(backend, use_rejection_sampling=True)
+        forward_batch = self._build_forward_batch([10, 11], 21)
+        forward_batch.sampling_info = SimpleNamespace(
+            temperatures=torch.tensor([[0.7], [1.0]]),
+            top_ks=torch.tensor([1, 8], dtype=torch.int32),
+            sampling_seed=None,
+        )
+
+        runner.execute(forward_batch)
+
+        torch.testing.assert_close(
+            runner.temperatures[:2], forward_batch.sampling_info.temperatures
+        )
+        torch.testing.assert_close(
+            runner.top_ks[:2], forward_batch.sampling_info.top_ks
+        )
+        torch.testing.assert_close(
+            runner.top_ks[2:], torch.full((2,), TOP_K_ALL, dtype=torch.int32)
+        )
 
 
 if __name__ == "__main__":
