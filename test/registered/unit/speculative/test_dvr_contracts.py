@@ -411,6 +411,121 @@ def test_rejection_sampling_draws_from_positive_residual():
     assert predict[0].item() == 1
 
 
+def _reference_chain_rejection(
+    candidates, retrieve_index, target_probs, draft_probs, coins, final_coins
+):
+    """Small readable oracle for the chain Triton kernel."""
+    batch_size, num_slots = candidates.shape
+    predicts = torch.zeros(batch_size * num_slots, dtype=torch.int32)
+    accept_index = torch.full((batch_size, num_slots), -1, dtype=torch.int32)
+    accept_lens = torch.zeros(batch_size, dtype=torch.int32)
+
+    for batch_idx in range(batch_size):
+        current_row = 0
+        last_index = int(retrieve_index[batch_idx, 0])
+        accept_index[batch_idx, 0] = last_index
+        for step in range(1, num_slots):
+            token = int(candidates[batch_idx, step])
+            p = target_probs[batch_idx, current_row, token]
+            q = draft_probs[batch_idx, current_row, token]
+            if coins[batch_idx, step - 1] * q >= p:
+                break
+            predicts[last_index] = token
+            current_row = step
+            accept_lens[batch_idx] += 1
+            last_index = int(retrieve_index[batch_idx, step])
+            accept_index[batch_idx, current_row] = last_index
+
+        distribution = target_probs[batch_idx, current_row]
+        if current_row != num_slots - 1:
+            residual = (distribution - draft_probs[batch_idx, current_row]).clamp_min(0)
+            if residual.sum() > 0:
+                distribution = residual
+        threshold = final_coins[batch_idx, current_row] * distribution.sum()
+        matches = torch.nonzero(distribution.cumsum(0) > threshold)
+        predicts[last_index] = int(matches[0]) if matches.numel() else len(distribution) - 1
+
+    return predicts, accept_index, accept_lens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_rejection_sampling_matches_reference_across_rejection_boundaries():
+    batch_size, num_slots, vocab_size = 3, 5, 7
+    generator = torch.Generator().manual_seed(1234)
+    draft_probs = torch.rand(
+        batch_size, num_slots - 1, vocab_size, generator=generator
+    )
+    draft_probs /= draft_probs.sum(dim=-1, keepdim=True)
+    target_probs = torch.cat(
+        [
+            draft_probs.clone(),
+            torch.rand(batch_size, 1, vocab_size, generator=generator),
+        ],
+        dim=1,
+    )
+    target_probs[:, -1] /= target_probs[:, -1].sum(dim=-1, keepdim=True)
+
+    candidates = torch.zeros((batch_size, num_slots), dtype=torch.long)
+    for step in range(1, num_slots):
+        candidates[:, step] = torch.multinomial(
+            draft_probs[:, step - 1], 1, generator=generator
+        ).squeeze(1)
+
+    # Force rejection at the first edge, the third edge, and never. Moving
+    # probability mass preserves normalized p while producing a real residual.
+    for batch_idx, reject_step in ((0, 1), (1, 3)):
+        row = reject_step - 1
+        token = int(candidates[batch_idx, reject_step])
+        replacement = (token + 1) % vocab_size
+        removed = target_probs[batch_idx, row, token] * 0.9
+        target_probs[batch_idx, row, token] -= removed
+        target_probs[batch_idx, row, replacement] += removed
+
+    coins = torch.full((batch_size, num_slots), 0.5)
+    final_coins = torch.tensor(
+        [[0.1, 0.3, 0.5, 0.7, 0.9]] * batch_size, dtype=torch.float32
+    )
+    retrieve_index = torch.arange(batch_size * num_slots).reshape(
+        batch_size, num_slots
+    )
+    expected = _reference_chain_rejection(
+        candidates,
+        retrieve_index,
+        target_probs,
+        draft_probs,
+        coins,
+        final_coins,
+    )
+
+    predicts = torch.zeros(batch_size * num_slots, dtype=torch.int32, device="cuda")
+    accept_index = torch.full(
+        (batch_size, num_slots), -1, dtype=torch.int32, device="cuda"
+    )
+    accept_lens = torch.empty(batch_size, dtype=torch.int32, device="cuda")
+    chain_speculative_sampling_triton(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_lens,
+        candidates=candidates.cuda(),
+        retrive_index=retrieve_index.cuda(),
+        retrive_next_token=None,
+        retrive_next_sibling=None,
+        uniform_samples=coins.cuda(),
+        uniform_samples_for_final_sampling=final_coins.cuda(),
+        target_probs=target_probs.cuda(),
+        draft_probs=draft_probs.cuda(),
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+
+    assert accept_lens.cpu().tolist() == [0, 2, num_slots - 1]
+    for actual, reference in zip(
+        (predicts.cpu(), accept_index.cpu(), accept_lens.cpu()), expected
+    ):
+        torch.testing.assert_close(actual, reference)
+
+
 def test_rejection_sampling_rejects_malformed_proposal_shape():
     with pytest.raises(ValueError, match="draft_probs has shape"):
         chain_speculative_sampling_triton(
