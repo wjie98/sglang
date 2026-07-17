@@ -184,7 +184,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             sampling_seed = (
                 torch.zeros((self.max_bs,), dtype=torch.int64)
                 if self.model_runner.server_args.speculative_use_rejection_sampling
-                and self.model_runner.server_args.enable_deterministic_inference
+                and self.model_runner.sampler.enable_deterministic
                 else None
             )
             draft_probs = (
