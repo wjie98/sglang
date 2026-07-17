@@ -27,21 +27,6 @@ class _DVRBoundaryCheckpoint:
 
     request_ref: weakref.ReferenceType = field(repr=False)
     retraction_count: int
-    seq_len: int
-
-
-@dataclass
-class DVRRollbackActions:
-    """Mark a decode result whose Mamba checkpoint is owned by DVR."""
-
-    linear_state: Any = field(repr=False)
-
-    def commit_checkpoint_after_decode(self, *, req) -> bool:
-        # The verify kernel has already updated the physical boundary slot. The
-        # CPU result only publishes its materialized length and prevents generic
-        # speculative tracking from rotating that DVR-owned slot.
-        self.linear_state.publish_checkpoint(req)
-        return True
 
 
 class DVRLinearStateLifecycle:
@@ -136,21 +121,6 @@ class DVRLinearStateLifecycle:
             return None
         return checkpoint
 
-    def publish_checkpoint(self, req) -> None:
-        checkpoint = self._checkpoint(req)
-        if checkpoint is None:
-            raise RuntimeError(f"DVR lost checkpoint ownership for {req.rid}.")
-
-        # The bonus token is visible but has no committed target state until the
-        # next verify. This host length may lag the physical slot by one overlap
-        # iteration; execution uses the slot directly, not this cache metadata.
-        visible_len = len(req.origin_input_ids) + len(req.output_ids_through_stop)
-        committed_len = min(req.kv_committed_len, max(0, visible_len - 1))
-        checkpoint.seq_len = max(
-            checkpoint.seq_len,
-            committed_len // self.chunk_size * self.chunk_size,
-        )
-
     def prepare_for_cache_release(self, req) -> None:
         if self._state_adapter is None:
             return
@@ -171,10 +141,7 @@ class DVRLinearStateLifecycle:
         physical_len = int(self.physical_boundary_lens[request_slot].item())
         physical_track = int(self.boundary_track_indices[request_slot].item())
         committed_len = int(req.cache_commit_len)
-        publish_len = min(
-            checkpoint.seq_len,
-            committed_len // self.chunk_size * self.chunk_size,
-        )
+        publish_len = committed_len // self.chunk_size * self.chunk_size
         pool = self.model_runner.req_to_token_pool
         if physical_len == publish_len:
             publish_track = physical_track
@@ -209,18 +176,9 @@ class DVRLinearStateLifecycle:
         if self._state_adapter is None:
             return None
 
-        missing = []
-        for i, req in enumerate(batch.reqs):
-            checkpoint = self._checkpoint(req)
-            if checkpoint is None:
-                missing.append(i)
-                continue
-
-            if seq_lens_cpu is not None:
-                boundary = int(seq_lens_cpu[i]) // self.chunk_size * self.chunk_size
-                if boundary != checkpoint.seq_len:
-                    self._drop_checkpoint(req)
-                    missing.append(i)
+        missing = [
+            i for i, req in enumerate(batch.reqs) if self._checkpoint(req) is None
+        ]
 
         self._ensure_boundary_state(
             batch,
@@ -270,7 +228,7 @@ class DVRLinearStateLifecycle:
         batch: ScheduleBatch,
         ctx: Optional[DVRLinearStateContext],
         accept_lens: torch.Tensor,
-    ) -> Optional[DVRRollbackActions]:
+    ) -> None:
         if ctx is None:
             return None
         assert ctx.boundary_indices is not None
@@ -301,7 +259,6 @@ class DVRLinearStateLifecycle:
                     ctx.boundary_track_indices,
                 ),
             )
-        return DVRRollbackActions(linear_state=self)
 
     def state_context(
         self, batch: ScheduleBatch, require_boundary: bool = False
@@ -423,7 +380,6 @@ class DVRLinearStateLifecycle:
             checkpoint = _DVRBoundaryCheckpoint(
                 request_ref=weakref.ref(req),
                 retraction_count=self._request_retraction_count(req),
-                seq_len=boundary_len,
             )
             self.boundaries[int(req.req_pool_idx)] = checkpoint
             tail_indices.append(ctx.state_input_indices[i])

@@ -897,15 +897,6 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        dvr_checkpoint_committed = (
-            result.dvr_rollback_actions is not None
-            and result.dvr_rollback_actions.commit_checkpoint_after_decode(
-                req=req,
-            )
-        )
-        if dvr_checkpoint_committed:
-            return
-
         lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
         at_boundary, track_seqlen = self._mamba_check_track_boundary(
             req, batch, result, i

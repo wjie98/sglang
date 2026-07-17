@@ -769,7 +769,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             next_draft_input = self._self_draft_input(bonus_tokens)
 
         with spec_stage_span("dvr_rollback"):
-            rollback_actions = self.linear_state.rollback_after_verify(
+            self.linear_state.rollback_after_verify(
                 batch=batch,
                 ctx=linear_state_ctx,
                 accept_lens=accept_lens,
@@ -800,7 +800,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
-            dvr_rollback_actions=rollback_actions,
             routed_experts_output=forward_output.routed_experts_output,
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

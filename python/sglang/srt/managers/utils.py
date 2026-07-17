@@ -16,7 +16,6 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.dvr_state_flow import DVRRollbackActions
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -64,9 +63,6 @@ class GenerationBatchResult:
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
     extra_keep_alive_refs: Optional[List[Any]] = None
-
-    # DVR-owned metadata consumed after result processing materializes outputs.
-    dvr_rollback_actions: Optional[DVRRollbackActions] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
