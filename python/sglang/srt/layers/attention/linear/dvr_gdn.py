@@ -6,17 +6,14 @@ from typing import Any, Optional, Union
 import torch
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
-from sglang.srt.layers.attention.linear.dvr_state import (
-    DVRRecurrentStateBackup,
-    DVRStateInputCache,
-)
+from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputCache
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.utils import is_cpu
 
-__all__ = ["DVRGDNStateAdapter"]
+__all__ = ["DVRGDNStateAdapter", "dvr_gdn_state_input_bytes_per_request"]
 
 if not is_cpu():
     import triton
@@ -61,9 +58,7 @@ if not is_cpu():
         state_input_idx = tl.load(state_input_indices + i_n).to(tl.int64)
         boundary_idx = tl.load(boundary_indices + i_n).to(tl.int64)
         live_idx = tl.load(live_indices + i_n).to(tl.int64)
-        state_offset = (
-            (i_l * C + boundary_idx) * HV * V * K + i_hv * V * K
-        )
+        state_offset = (i_l * C + boundary_idx) * HV * V * K + i_hv * V * K
         p_h0 = state + state_offset + o_v[:, None] * K + o_k[None, :]
         recurrent_state = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -91,6 +86,41 @@ if not is_cpu():
         state_offset = (i_l * C + live_idx) * HV * V * K + i_hv * V * K
         p_ht = state + state_offset + o_v[:, None] * K + o_k[None, :]
         tl.store(p_ht, recurrent_state.to(p_ht.dtype.element_ty), mask=mask_h)
+
+
+def _local_gdn_dimensions(state_shape):
+    local_value_heads, value_dim, key_dim = state_shape.temporal
+    key_group_width = 2 * state_shape.state_size
+    assert key_group_width > 0
+    assert state_shape.conv_dim >= state_shape.intermediate_size
+    assert (
+        state_shape.conv_dim - state_shape.intermediate_size
+    ) % key_group_width == 0
+    padded_key_groups = (
+        state_shape.conv_dim - state_shape.intermediate_size
+    ) // key_group_width
+    assert local_value_heads > 0
+    assert state_shape.num_heads % local_value_heads == 0
+    tp_world_size = state_shape.num_heads // local_value_heads
+    assert padded_key_groups % tp_world_size == 0
+    local_key_heads = padded_key_groups // tp_world_size
+    return local_key_heads, local_value_heads, key_dim, value_dim
+
+
+def dvr_gdn_state_input_bytes_per_request(cache_params, num_draft_tokens: int) -> int:
+    """Return persistent q/k/v/g/beta window bytes for one request slot."""
+
+    local_key_heads, local_value_heads, key_dim, value_dim = _local_gdn_dimensions(
+        cache_params.shape
+    )
+    window_len = FLA_CHUNK_SIZE + num_draft_tokens
+    conv_bytes = cache_params.dtype.conv.itemsize
+    values_per_token = (
+        2 * local_key_heads * key_dim * conv_bytes
+        + local_value_heads * value_dim * conv_bytes
+        + 2 * local_value_heads * 4  # g and beta are fp32.
+    )
+    return len(cache_params.layers) * window_len * values_per_token + 4
 
 
 def _rebuild_gdn_live_state_for_self_draft(
@@ -191,21 +221,9 @@ class DVRGDNStateAdapter:
             raise RuntimeError("DVR requires speculative_num_draft_tokens.")
 
         state_shape = mamba_cache_params.shape
-        local_value_heads, value_dim, key_dim = state_shape.temporal
-        key_group_width = 2 * state_shape.state_size
-        assert key_group_width > 0
-        assert state_shape.conv_dim >= state_shape.intermediate_size
-        assert (
-            state_shape.conv_dim - state_shape.intermediate_size
-        ) % key_group_width == 0
-        padded_key_groups = (
-            state_shape.conv_dim - state_shape.intermediate_size
-        ) // key_group_width
-        assert local_value_heads > 0
-        assert state_shape.num_heads % local_value_heads == 0
-        tp_world_size = state_shape.num_heads // local_value_heads
-        assert padded_key_groups % tp_world_size == 0
-        local_key_heads = padded_key_groups // tp_world_size
+        local_key_heads, local_value_heads, key_dim, value_dim = _local_gdn_dimensions(
+            state_shape
+        )
 
         # ReqToTokenPool already reserves row 0 for padded CUDA graph requests.
         # Mirror that indexing directly instead of maintaining a second offset.
@@ -245,10 +263,7 @@ class DVRGDNStateAdapter:
                 tensors=(q, torch.zeros_like(q), v, gate, torch.zeros_like(gate)),
                 # Slot 0 is the padded-row dummy; real rows use req_pool_idx.
                 tail_lens=torch.zeros(
-                    num_layers,
-                    num_slots,
-                    dtype=torch.int32,
-                    device=model_runner.device,
+                    num_slots, dtype=torch.int32, device=model_runner.device
                 ),
             ),
         )
@@ -271,9 +286,7 @@ class DVRGDNStateAdapter:
             torch.long
         )
 
-    def get_state_input_indices(
-        self, *, batch, device: torch.device
-    ) -> torch.Tensor:
+    def get_state_input_indices(self, *, batch, device: torch.device) -> torch.Tensor:
         return batch.req_pool_indices.to(device=device, dtype=torch.long)
 
     def zero_recurrent_state(self, *, state_cache, indices: torch.Tensor):
@@ -282,47 +295,35 @@ class DVRGDNStateAdapter:
             conv[:, indices] = 0
         state_cache.temporal[:, indices] = 0
 
-    def backup_recurrent_state(
+    def backup_draft_state(
         self,
         *,
         state_cache,
         indices: torch.Tensor,
         backup_indices: torch.Tensor,
         backup_size: int,
-        include_temporal: bool = True,
-        out: Optional[DVRRecurrentStateBackup] = None,
-    ) -> DVRRecurrentStateBackup:
+        out: Optional[tuple[torch.Tensor, ...]] = None,
+    ) -> tuple[torch.Tensor, ...]:
         indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
         backup_indices = backup_indices.to(
             device=state_cache.temporal.device, dtype=torch.long
         )
         if out is None:
-            out = DVRRecurrentStateBackup(
-                conv=tuple(
-                    tensor.new_empty(
-                        (tensor.shape[0], backup_size, *tensor.shape[2:])
-                    )
-                    for tensor in state_cache.conv
-                ),
-                temporal=(
-                    state_cache.temporal.new_empty(
-                        (
-                            state_cache.temporal.shape[0],
-                            backup_size,
-                            *state_cache.temporal.shape[2:],
-                        )
-                    )
-                    if include_temporal
-                    else None
-                )
+            out = self.allocate_draft_state_backup(
+                state_cache=state_cache, backup_size=backup_size
             )
-        for tensor, saved_tensor in zip(state_cache.conv, out.conv, strict=True):
+        for tensor, saved_tensor in zip(state_cache.conv, out, strict=True):
             saved_tensor[:, backup_indices] = tensor[:, indices]
-        if include_temporal:
-            if out.temporal is None:
-                raise RuntimeError("DVR boundary backup has no temporal storage.")
-            out.temporal[:, backup_indices] = state_cache.temporal[:, indices]
         return out
+
+    @staticmethod
+    def allocate_draft_state_backup(
+        *, state_cache, backup_size: int
+    ) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            tensor.new_empty((tensor.shape[0], backup_size, *tensor.shape[2:]))
+            for tensor in state_cache.conv
+        )
 
     def prepare_recurrent_state_for_verify(
         self,
@@ -330,64 +331,24 @@ class DVRGDNStateAdapter:
         state_cache,
         live_indices: torch.Tensor,
         boundary_indices: torch.Tensor,
-        boundary_backup: Optional[DVRRecurrentStateBackup],
-        live_backup: Optional[DVRRecurrentStateBackup],
+        draft_state_backup: Optional[tuple[torch.Tensor, ...]],
         backup_indices: Optional[torch.Tensor] = None,
     ):
-        if backup_indices is not None:
+        state_cache.temporal[:, live_indices] = state_cache.temporal[
+            :, boundary_indices
+        ]
+        if draft_state_backup is not None:
+            if backup_indices is None:
+                raise RuntimeError("DVR live-state backup indices are missing.")
             backup_indices = backup_indices.to(
                 device=state_cache.temporal.device, dtype=torch.long
             )
-
-        def select_backup(tensor: torch.Tensor) -> torch.Tensor:
-            return tensor if backup_indices is None else tensor[:, backup_indices]
-
-        if boundary_backup is None:
-            state_cache.temporal[:, live_indices] = state_cache.temporal[
-                :, boundary_indices
-            ]
-        else:
-            # Overlap radix may donate and rebind the physical checkpoint slot.
-            # Restore the snapshot into both the rebound boundary and live slots.
-            assert boundary_backup.temporal is not None
             for conv, saved_conv in zip(
-                state_cache.conv, boundary_backup.conv, strict=True
+                state_cache.conv, draft_state_backup, strict=True
             ):
-                conv[:, boundary_indices] = select_backup(saved_conv).to(
+                conv[:, live_indices] = saved_conv[:, backup_indices].to(
                     conv.dtype, copy=False
                 )
-            saved_temporal = select_backup(boundary_backup.temporal).to(
-                state_cache.temporal.dtype, copy=False
-            )
-            state_cache.temporal[:, boundary_indices] = saved_temporal
-            state_cache.temporal[:, live_indices] = saved_temporal
-        if live_backup is not None:
-            for conv, saved_conv in zip(state_cache.conv, live_backup.conv, strict=True):
-                conv[:, live_indices] = select_backup(saved_conv).to(
-                    conv.dtype, copy=False
-                )
-
-    def restore_recurrent_state_backup(
-        self,
-        *,
-        state_cache,
-        indices: torch.Tensor,
-        backup: DVRRecurrentStateBackup,
-        backup_indices: torch.Tensor,
-    ) -> None:
-        indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
-        backup_indices = backup_indices.to(
-            device=state_cache.temporal.device, dtype=torch.long
-        )
-        for conv, saved_conv in zip(state_cache.conv, backup.conv, strict=True):
-            conv[:, indices] = saved_conv[:, backup_indices].to(
-                conv.dtype, copy=False
-            )
-        if backup.temporal is None:
-            raise RuntimeError("DVR cache release requires a temporal backup.")
-        state_cache.temporal[:, indices] = backup.temporal[:, backup_indices].to(
-            state_cache.temporal.dtype, copy=False
-        )
 
     def capture_extend_prefix_boundary(
         self,
@@ -406,9 +367,10 @@ class DVRGDNStateAdapter:
             return
         batch_size = prefix_lens.numel()
         seq_lens = forward_batch.seq_lens[:batch_size]
-        boundaries = torch.div(
-            seq_lens, self.chunk_size, rounding_mode="floor"
-        ) * self.chunk_size
+        boundaries = (
+            torch.div(seq_lens, self.chunk_size, rounding_mode="floor")
+            * self.chunk_size
+        )
         capture_mask = (boundaries > 0) & (boundaries == prefix_lens)
         if forward_batch.mamba_track_mask is not None:
             capture_mask &= ~forward_batch.mamba_track_mask[:batch_size]
@@ -468,7 +430,9 @@ class DVRGDNStateAdapter:
         )
         valid_mask = state_input_indices != 0
         dvr_indices = cache_indices[:batch_size].to(torch.long)
-        dvr_indices = torch.where(valid_mask, dvr_indices, torch.zeros_like(dvr_indices))
+        dvr_indices = torch.where(
+            valid_mask, dvr_indices, torch.zeros_like(dvr_indices)
+        )
         return dvr_indices, state_input_indices, valid_mask
 
     def forward_target_verify(
@@ -522,9 +486,7 @@ class DVRGDNStateAdapter:
             ),
             values=draft_state_inputs,
         )
-        q, k, v, cached_g, cached_beta = state_window.read(
-            indices=state_input_indices
-        )
+        q, k, v, cached_g, cached_beta = state_window.read(indices=state_input_indices)
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -555,9 +517,11 @@ class DVRGDNStateAdapter:
         cols = torch.arange(
             draft_token_num, dtype=torch.long, device=core_attn_out.device
         ).unsqueeze(0) + tail_lens.unsqueeze(1)
-        return core_attn_out[
-            rows.expand(-1, draft_token_num), cols
-        ].reshape(1, batch_size * draft_token_num, *value_shape).contiguous()
+        return (
+            core_attn_out[rows.expand(-1, draft_token_num), cols]
+            .reshape(1, batch_size * draft_token_num, *value_shape)
+            .contiguous()
+        )
 
     def commit_after_verify(
         self,
@@ -569,9 +533,7 @@ class DVRGDNStateAdapter:
         accepted_token_counts: torch.Tensor,
     ) -> None:
         state_window = self.state_input_window()
-        tail_lens_before = state_window.get_tail_lens(
-            indices=state_input_indices
-        ).to(
+        tail_lens_before = state_window.get_tail_lens(indices=state_input_indices).to(
             device=live_indices.device, dtype=torch.long
         )
         accepted_token_counts = accepted_token_counts.to(
@@ -610,7 +572,6 @@ class DVRGDNStateAdapter:
                 no_commit_step,
             ),
         )
-
         new_tail_lens = tail_lens_after - self.chunk_size
         tail_lens_after = torch.where(
             crosses_chunk_boundary, new_tail_lens, tail_lens_after

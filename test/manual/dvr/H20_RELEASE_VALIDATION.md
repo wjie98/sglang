@@ -14,8 +14,8 @@ The qualification covers:
 - DVR-EAGLE with the Qwen3.5 MTP weights
 - exact returned-logprob replay (`KL=0` in the DVR test terminology)
 - long generation and GDN chunk boundaries
-- Triton, FA3, and FlashInfer full-attention backends
-- radix enabled and the FlashInfer-required radix-disabled configuration
+- Triton and FA3 full-attention backends
+- radix-enabled qualification plus a separately labeled radix-disabled case
 - custom all-reduce ownership on an NVLink topology
 - throughput against the matching scheduler/backend baseline
 
@@ -54,15 +54,15 @@ Interpret the comparison before changing code again:
 - custom all-reduce must appear only in provisional self-draft, never target
   prefill or target verify.
 
-Radix correctness is a release invariant, not a benchmark option. DVR stores
-recurrent snapshots by request-pool slot, while `(rid, logical track index)`
-guards slot reuse. Target verify refreshes those rows before result processing;
-sync and overlap both publish physical checkpoint ownership even when the new
-boundary length cannot yet be materialized on the host. Before a finished
-request donates its physical ping-pong slot to radix, DVR restores the exact
-snapshot into that slot. The fixed 0.8B and 35B matrices cover both interleaved
-requests and reuse of a 192-token prefix containing generated tokens. Disabling
-radix to make KL pass is a failed Triton/FA3 run, not an accepted workaround.
+Radix correctness is a release invariant, not a benchmark option. DVR keeps its
+active chunk boundary in the request's existing ping-pong slot; request identity
+and retraction count guard pool-slot reuse. Initial prefill may donate the
+upstream keep slot only after DVR has copied the boundary into its private
+ping-pong slot. Active decode does not publish an overlap-ahead generated-prefix
+checkpoint to radix. A later request reuses the older tree checkpoint and lets
+ordinary EXTEND rebuild the suffix. The fixed 0.8B and 35B matrices cover both
+interleaved requests and this nearest-checkpoint replay. Disabling radix to make
+KL pass is a failed Triton/FA3 run, not an accepted workaround.
 
 ## Implementation audit snapshot
 
@@ -86,18 +86,22 @@ intentional shared semantic changes:
 1. FLA chunk boundary tensors preserve the incoming recurrent-state dtype. This
    is needed for fp32 GDN checkpoints and is also the correct generic dtype
    contract.
-2. EAGLE verification treats a supplied `draft_probs` tensor as the proposal
-   distribution and applies min-p consistently. This is shared with stochastic
-   DVR sampling and therefore needs ordinary EAGLE/rejection-sampling CI as
-   well as DVR tests.
+2. EAGLE treats a supplied `draft_probs` tensor as the proposal distribution,
+   applies min-p consistently, and keys proposal/verify sampling by request
+   seed plus absolute token position. This is shared with stochastic DVR
+   sampling and therefore needs ordinary EAGLE/rejection-sampling CI as well as
+   DVR tests.
 
 Current deliberate restrictions are CUDA-only execution, no DP attention, no
 PDMux, no disaggregation, chain mode with topk=1, Triton linear-attention
 prefill for exact GDN boundary export, at most one 64-token GDN chunk per
-verify, and mandatory draft graphs for self-draft models with linear state.
-Plain transformers may use eager self-draft when graphs are disabled. FlashInfer
-may disable radix cache; DVR correctness must come from request-local checkpoints
-rather than radix.
+verify, and mandatory self-draft graphs. DVR correctness comes from the
+living/ping-pong state lifecycle and must not depend on a radix hit.
+
+Exact rejection sampling is the production default. Run
+`SGLANG_DVR_USE_REJECTION_SAMPLING=0` only as a separately labeled target-only
+acceptance and throughput A/B; never mix it into the default release result
+directory.
 
 The minimum effective prompt length is one token. SGLang rejects an empty
 `input_ids` request before scheduling; an entrypoint that accepts empty text must
@@ -116,12 +120,13 @@ Do not prepare the release branch until all applicable gates pass.
    uses a zero-step, one-root target-verify sentinel before normal drafting.
    These cases use the same strict full-prefill KL oracle. Triton/FA3 runs must
    also pass the staggered shared-prefix case with radix enabled and report
-   `cached=192` with KL=0 for completed-generation prefix reuse.
+   reuse of the nearest 64-token checkpoint with KL=0 after ordinary EXTEND
+   rebuilds the generated suffix.
 3. 35B DVR-EAGLE sync and overlap report `kl_failed: 0` and
    `accept_failed: 0` with both returned-logprob modes.
-4. The seeded 35B MTP boundary acceptance remains at least 0.96, and fixed
-   ShareGPT acceptance remains at least 0.70. Sync and overlap acceptance must
-   agree within 0.02 absolute.
+4. The seeded 35B MTP boundary acceptance remains at least 0.75, and fixed
+   ShareGPT acceptance remains at least 0.70. Sync and overlap hashes and
+   acceptance histograms must agree exactly for the same seed and prompt.
 5. 35B self-DVR TP=4 boundary KL passes before throughput is accepted.
 6. Every 80B run completes all 16 requests and generates 1024 tokens per
    request. Self-DVR accept length remains at least 14.4/16 on ShareGPT and
@@ -244,7 +249,7 @@ sha256sum "${SHAREGPT_DATASET}" "${LONGBENCH_DATASET}" | tee "${RESULT_BASE}/dat
 The topology file must show NVLink connectivity among all selected TP ranks.
 Run the first server for each backend as the real availability check. An import
 warning followed by a fallback backend is a failure; do not relabel that run as
-FA3 or FlashInfer. Transfer the exact fixed LongBench custom JSONL from the
+FA3. Transfer the exact fixed LongBench custom JSONL from the
 development machine; regenerating a different 16-request sample invalidates the
 comparison.
 
@@ -323,11 +328,11 @@ unit tests passing.
 ## 4. 0.8B self-DVR correctness matrix
 
 Run every backend first on one GPU, then on the selected TP=4 NVLink group.
-`DISABLE_RADIX_CACHE=auto` keeps radix for Triton/FA3 and disables it for
-FlashInfer. Do not override this with a FlashInfer-specific DVR workaround.
+`DISABLE_RADIX_CACHE=auto` keeps radix enabled. Run radix-disabled coverage in
+a separate result root rather than introducing a backend-specific workaround.
 
 ```bash
-for backend in triton fa3 flashinfer; do
+for backend in triton fa3; do
   for tp in 1 4; do
     result="${RESULT_BASE}/0p8b-${backend}-tp${tp}"
     CONDA_ENV="${CONDA_ENV}" \
@@ -343,10 +348,11 @@ done
 ```
 
 Check every `spec_v1_kl.log` and `spec_v2_kl.log` for `ALL_OK True`, including
-the `prompt_len=65/129`, `max_new=128` interleaved block. The generated-prefix
-case must use a 193-token input, report `cached=192`, and remain KL=0. The server
-logs must show the requested attention backend, page size 64, expected radix
-mode, and captured graph batch 4.
+the `prompt_len=65/129`, `max_new=128` interleaved block. The replay case must
+use a 193-token input, report at least the original 64-token prompt checkpoint,
+rebuild the generated suffix with EXTEND, and remain KL=0. The server logs must
+show the requested attention backend, page size 64, expected radix mode, and
+captured graph batch 4.
 
 ## 5. 35B MTP/EAGLE correctness matrix
 
@@ -354,7 +360,7 @@ This is the primary check for MTP hidden-state, draft KV, GDN boundary, and
 sync/overlap ownership consistency.
 
 ```bash
-for backend in triton fa3 flashinfer; do
+for backend in triton fa3; do
   result="${RESULT_BASE}/35b-mtp-${backend}"
   CONDA_ENV="${CONDA_ENV}" \
   MODEL_PATH="${MODEL_35B}" \
@@ -370,14 +376,13 @@ for backend in triton fa3 flashinfer; do
 done
 ```
 
-The synthetic boundary and warm-prefix cases must pass both returned-logprob
-modes. Compare the per-prompt ShareGPT acceptance values between `sync_v2` and
-`overlap_v2`; a consistent difference is an ownership bug even if both remain
-above the script's floor.
+The default smoke uses stochastic sampling (`temperature=0.7`) because exact
+rejection is the production path. Synthetic boundary and warm-prefix cases must
+pass both returned-logprob modes. Compare each prompt's hash and acceptance
+histogram between `sync_v2` and `overlap_v2`; a difference is a seed/position or
+ownership bug even if both remain above the script's floor.
 
-After the greedy matrix passes, run one stochastic Triton check as a separate
-experiment. This validates rejection-sampling probability plumbing; it is not
-an acceptance-rate benchmark.
+Run target-only sampling only as a separately labeled A/B:
 
 ```bash
 CONDA_ENV="${CONDA_ENV}" \
@@ -387,22 +392,22 @@ SHAREGPT_DATASET="${SHAREGPT_DATASET}" \
 TP_SIZE=4 \
 ATTENTION_BACKEND=triton \
 LINEAR_ATTN_BACKEND=triton \
-ACCEPT_TEMPERATURE=0.7 \
-ACCEPT_TOP_P=0.9 \
+SGLANG_DVR_USE_REJECTION_SAMPLING=0 \
 MTP_MIN_ACCEPT_RATE=0.0 \
 MTP_REALDATA_MIN_ACCEPT_RATE=0.0 \
-RESULT_ROOT="${RESULT_BASE}/35b-mtp-triton-stochastic" \
+RESULT_ROOT="${RESULT_BASE}/35b-mtp-triton-target-only" \
   bash test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
 ```
 
-The stochastic run still requires `kl_failed: 0`; acceptance is intentionally
-not compared with the greedy floor.
+The target-only A/B still requires `kl_failed: 0`; report its acceptance and
+throughput separately from the production rejection result.
 
 ### Shared ordinary-EAGLE regression
 
-`eagle_utils.py` is the only material shared speculative-sampling path changed
-by DVR. Run upstream's ordinary NEXTN rejection-sampling test once on the H20
-machine. It uses Qwen3.5-9B and may require downloading that additional model.
+Proposal sampling, its draft CUDA-graph seed buffer, and rejection verification
+are shared EAGLE paths. Run upstream's ordinary NEXTN rejection-sampling test
+once on the H20 machine. It uses Qwen3.5-9B and may require downloading that
+additional model.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
@@ -423,7 +428,7 @@ self-v1/v2, EAGLE sync/overlap, and both logprob modes. The summary emits
 `TARGET`, `DET_SPEEDUP`, `PRODUCT_GATE`, and the 35B GDN oracle status.
 
 ```bash
-for backend in triton fa3 flashinfer; do
+for backend in triton fa3; do
   result="${RESULT_BASE}/35b-throughput-${backend}"
   CONDA_ENV="${CONDA_ENV}" \
   MODEL_PATH="${MODEL_35B}" \
@@ -487,7 +492,7 @@ normal sync/overlap, ordinary deterministic sync/overlap, DVR v1/v2, and a
 `summary.txt` with both efficiency and deterministic-speed comparisons.
 
 ```bash
-for backend in triton fa3 flashinfer; do
+for backend in triton fa3; do
   result="${RESULT_BASE}/80b-throughput-${backend}"
   CONDA_ENV="${CONDA_ENV}" \
   MODEL_PATH="${MODEL_80B}" \

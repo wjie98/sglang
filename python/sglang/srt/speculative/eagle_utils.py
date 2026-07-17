@@ -468,7 +468,13 @@ def eagle_sample(
         # draft_probs is the authoritative proposal distribution. DVR self-draft
         # also publishes it when stochastic target sampling needs an exact q.
         use_rejection_sampling = verify_input.draft_probs is not None
-        if configured_rejection_sampling and not use_rejection_sampling:
+        # A zero-step verify tree is a target-only sentinel: it has no draft
+        # edge and therefore no proposal distribution q to reject against.
+        if (
+            configured_rejection_sampling
+            and verify_input.spec_steps > 0
+            and not use_rejection_sampling
+        ):
             raise ValueError(
                 "Rejection sampling is enabled, but the draft worker did not "
                 "provide draft_probs."
@@ -522,10 +528,30 @@ def eagle_sample(
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
 
-        # coins for rejection sampling
-        coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-        # coins for final sampling
-        coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+        if use_rejection_sampling and sampling_info.sampling_seed is not None:
+            from sglang.srt.layers.utils.hash import murmur_hash32
+
+            # One rejection and one final-sampling stream per target position.
+            # The kernel selects the final coin at the first rejected position
+            # (or the bonus position when every draft is accepted).
+            positions = verify_input.positions[: bs * verify_input.draft_token_num]
+            positions = positions.reshape(-1).to(torch.int64)
+            seeds = sampling_info.sampling_seed[:bs].repeat_interleave(
+                verify_input.draft_token_num
+            )
+            streams = torch.arange(2, dtype=torch.int64, device=device)
+            uniforms = murmur_hash32(seeds, positions, streams).to(torch.float64)
+            uniforms /= torch.iinfo(torch.uint32).max
+            uniforms = uniforms.to(torch.float32).reshape(
+                bs, verify_input.draft_token_num, 2
+            )
+            coins = uniforms[:, :, 0].contiguous()
+            coins_for_final_sampling = uniforms[:, :, 1].contiguous()
+        else:
+            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+            coins_for_final_sampling = torch.rand_like(
+                candidates, dtype=torch.float32, device=device
+            )
 
         sampling_fn = (
             chain_speculative_sampling_triton

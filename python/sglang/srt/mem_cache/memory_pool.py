@@ -673,7 +673,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         speculative_ssm_state_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
-        enable_overlap_schedule: bool = True,
+        mamba_ping_pong_track_buffer_size: int = 2,
         start_layer: Optional[int] = None,
     ):
         super().__init__(
@@ -683,7 +683,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
         )
 
-        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        if mamba_ping_pong_track_buffer_size not in (1, 2):
+            raise ValueError("Mamba ping-pong tracking requires one or two slots.")
+        self.mamba_ping_pong_track_buffer_size = mamba_ping_pong_track_buffer_size
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver

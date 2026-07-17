@@ -1,15 +1,9 @@
 """Model-independent rolling state-input storage for DVR linear attention."""
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
 import torch
-
-
-@dataclass(frozen=True)
-class DVRRecurrentStateBackup:
-    conv: Tuple[torch.Tensor, ...]
-    temporal: Optional[torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -18,23 +12,21 @@ class DVRStateInputCache:
 
     tensors: Tuple[torch.Tensor, ...]
     tail_lens: torch.Tensor
+    has_layer_dim: bool = True
 
     def __getitem__(self, layer: int) -> "DVRStateInputCache":
         return type(self)(
             tensors=tuple(tensor[layer] for tensor in self.tensors),
-            tail_lens=self.tail_lens[layer],
+            tail_lens=self.tail_lens,
+            has_layer_dim=False,
         )
 
     @property
     def capacity(self) -> int:
-        if self.tail_lens.dim() == 2:
-            return self.tensors[0].shape[2]
-        return self.tensors[0].shape[1]
+        return self.tensors[0].shape[2 if self.has_layer_dim else 1]
 
     def get_tail_lens(self, *, indices: torch.Tensor) -> torch.Tensor:
         indices = indices.to(device=self.tail_lens.device, dtype=torch.long)
-        if self.tail_lens.dim() == 2:
-            return self.tail_lens[0, indices]
         return self.tail_lens[indices]
 
     def set_tail_lens(
@@ -44,10 +36,7 @@ class DVRStateInputCache:
         value = torch.as_tensor(
             value, device=self.tail_lens.device, dtype=self.tail_lens.dtype
         )
-        if self.tail_lens.dim() == 2:
-            self.tail_lens[:, indices] = value
-        else:
-            self.tail_lens[indices] = value
+        self.tail_lens[indices] = value
 
     def read(self, *, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return tuple(tensor[indices] for tensor in self.tensors)
@@ -109,7 +98,7 @@ class DVRStateInputCache:
 
         mask = crosses_chunk_boundary.to(torch.bool)
         for cache in self.tensors:
-            if self.tail_lens.dim() == 2:
+            if self.has_layer_dim:
                 dst = cache[:, indices, :tail_capacity]
                 src = cache[:, indices, chunk_size : chunk_size + tail_capacity]
                 mask_shape = (1, -1) + (1,) * (dst.dim() - 2)

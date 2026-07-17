@@ -89,11 +89,12 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
 ```
 
 The fixed script also runs a staggered shared-prefix pair at prompt lengths 65
-and 129 with 128 generated tokens. This catches request-local boundary-state
-ownership errors when radix donation rebinds a physical ping-pong slot. A
-separate case generates 128 tokens from a 65-token prompt, reuses the resulting
-193-token sequence as a new prompt, requires `cached=192`, and checks that
-returned logprobs still match a flushed full-prefill oracle. It then runs
+and 129 with 128 generated tokens. This catches boundary ownership errors while
+prefill result processing and the first DVR iteration overlap. A separate case
+generates 128 tokens from a 65-token prompt, reuses the resulting 193-token
+sequence as a new prompt, requires the original 64-token prompt checkpoint,
+and verifies that ordinary EXTEND replay still matches a flushed full-prefill
+oracle. It then runs
 concurrent and batch `prompt_len=65`, `max_new=512` cases. Add a separate fixed
 case for 513 tokens when a change specifically touches end-of-chunk termination
 behavior. One-token prompts are part of the positive matrix: their first
@@ -110,6 +111,13 @@ Fixed EAGLE/MTP smoke script:
 ```bash
 test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
 ```
+
+The production default uses exact proposal rejection. To compare upstream
+target-only EAGLE chain sampling, rerun the same matrix with
+`SGLANG_DVR_USE_REJECTION_SAMPLING=0` and a distinct `RESULT_ROOT`. Rejection
+sampling carries full-vocabulary proposal probabilities and uses request seed
+plus target position for proposal, acceptance, and final-sampling randomness;
+keep the two modes separately labeled.
 
 Fixed non-deterministic normal/ordinary deterministic/self-DVR/DVR-EAGLE
 throughput comparison:
@@ -189,7 +197,8 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
   --max-new 4,16,65 \
   --cache-mode flush-each \
   --check-kl \
-  --min-accept-rate 0.96 \
+  --min-accept-rate 0.75 \
+  --temperature 0.7 \
   --ignore-eos \
   --seed 2032
 ```
@@ -204,7 +213,8 @@ PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
   --max-new 4,16,65 \
   --cache-mode flush-each \
   --no-return-logprob \
-  --min-accept-rate 0.96 \
+  --min-accept-rate 0.75 \
+  --temperature 0.7 \
   --ignore-eos \
   --seed 2032
 ```
@@ -216,10 +226,10 @@ a supported matrix entry.
 
 The `--seed 2032`, `prompt_len=65`, `max_new=65` entry is the fixed regression
 for seeded MTP boundary acceptance.  It crosses the GDN chunk boundary and must
-keep `accept_rate >= 0.96` in both returned-logprob and no-return-logprob
-paths.  A lower value usually means the deterministic verify coin stream or the
-MTP suffix-boundary hidden/state seed no longer matches target prefill
-semantics.
+keep `accept_rate >= 0.75` in both returned-logprob and no-return-logprob paths.
+The two paths, and sync versus overlap, must have identical histograms. A lower
+value or a histogram mismatch usually means the proposal/verify seed stream or
+the MTP suffix-boundary hidden/state no longer matches target prefill semantics.
 
 The fixed ShareGPT cases use `accept_rate >= 0.70`.  Their historical range is
 roughly `0.73-1.00`; using the synthetic-boundary threshold for real prompts
@@ -265,10 +275,10 @@ uses CUDA graph and non-deterministic decode performance knobs.
 
 ## NVLink and attention-backend qualification
 
-The H20 qualification matrix runs full-attention backends `triton`, `fa3`, and
-`flashinfer`; GDN linear-attention prefill remains Triton because exact chunk
-boundary export is a separate requirement. FlashInfer runs both baseline and
-DVR with radix disabled. No DVR backend-specific cache workaround is allowed.
+The H20 qualification matrix runs full-attention backends `triton` and `fa3`;
+GDN linear-attention prefill remains Triton because exact chunk-boundary export
+is a separate requirement. Run a separately labeled radix-disabled case for
+both backends; no backend-specific cache workaround is allowed.
 
 Run 35B at batch sizes 1, 4, and 8 to expose launch-bound and throughput-bound
 behavior. Run 80B ShareGPT and LongBench with at least 1024 generated tokens.
@@ -289,8 +299,8 @@ Use `scripts/profile_dvr_server.sh` before replacing the per-step self-draft
 graph with a graph that captures the entire decode/sampling chain. The script
 reports the number of graph launches per draft iteration, GPU kernel busy
 fraction, and a conservative perfect-chain speedup ceiling. A chain graph is
-eligible only if a prototype preserves all sampling modes and Triton/FA3/
-FlashInfer plus Hybrid/GDN metadata semantics, does not reduce token-pool or
+eligible only if a prototype preserves all sampling modes and Triton/FA3 plus
+Hybrid/GDN metadata semantics, does not reduce token-pool or
 request capacity, and demonstrates a stable end-to-end gain of at least 5%.
 
 The A40 0.8B measurements on 2026-07-14 and 2026-07-16 rejected this

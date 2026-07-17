@@ -90,8 +90,9 @@ still relevant to the current tree.
 - Radix cache may be enabled or disabled without changing DVR correctness.
 - Self draft always uses its dedicated CUDA graph for supported serving inputs;
   unsupported graph shapes fail explicitly instead of silently using eager.
-- Triton, FA3, and FlashInfer full-attention backends remain selectable. GDN
-  backend-specific fallback is contained in the GDN adapter.
+- Triton and FA3 full-attention backends remain selectable. Unsupported draft
+  decode backends fail during initialization instead of retaining deterministic
+  settings silently.
 - The H20/NVLink target remains effective throughput close to
   `acceptance_rate * non_DVR_baseline`.
 

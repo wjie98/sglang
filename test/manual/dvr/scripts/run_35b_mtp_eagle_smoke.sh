@@ -11,9 +11,9 @@ SHAREGPT_DATASET="${SHAREGPT_DATASET:-/mnt/data/hwj/ShareGPT_Vicuna_unfiltered/S
 PORT="${PORT:-30135}"
 SPEC_DRAFT_TOKENS="${SPEC_DRAFT_TOKENS:-2}"
 SPEC_STEPS="${SPEC_STEPS:-1}"
-ACCEPT_TEMPERATURE="${ACCEPT_TEMPERATURE:-0.0}"
+ACCEPT_TEMPERATURE="${ACCEPT_TEMPERATURE:-0.7}"
 ACCEPT_TOP_P="${ACCEPT_TOP_P:-1.0}"
-MTP_MIN_ACCEPT_RATE="${MTP_MIN_ACCEPT_RATE:-0.96}"
+MTP_MIN_ACCEPT_RATE="${MTP_MIN_ACCEPT_RATE:-0.75}"
 MTP_REALDATA_MIN_ACCEPT_RATE="${MTP_REALDATA_MIN_ACCEPT_RATE:-0.70}"
 MTP_REALDATA_NUM_PROMPTS="${MTP_REALDATA_NUM_PROMPTS:-8}"
 MTP_REALDATA_MAX_NEW="${MTP_REALDATA_MAX_NEW:-64}"
@@ -121,11 +121,9 @@ run_one_mode() {
   grep -q "ALL_OK True" "${short_prompt_log}"
 
   echo "==> Running ${label} returned-logprob KL smoke"
-  # Acceptance is used here as a hidden/state consistency oracle.  Keep it
-  # greedy; stochastic sampling can legitimately reject a correct top-1 MTP
-  # draft when the target sample draws a different token.  DVR verifies against
-  # the deterministic full-prefix GDN oracle, which can reject rare MTP drafts
-  # that ordinary target-verify decode would accept.
+  # The default rejection path is meaningful only under stochastic sampling.
+  # Proposal and verify coins are keyed by request seed plus token position, so
+  # sync/overlap and return-logprob variants must report identical histograms.
   conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --prompt-token-lengths 63,64,65 \
@@ -187,7 +185,7 @@ run_one_mode() {
     2>&1 | tee "${prefix_cache_no_logprob_log}"
   grep -q '"accept_failed": 0' "${prefix_cache_no_logprob_log}"
 
-  echo "==> Running ${label} interleaved radix-donation KL smoke"
+  echo "==> Running ${label} interleaved boundary-ownership KL smoke"
   conda_python test/manual/dvr/test_dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent \
@@ -200,19 +198,21 @@ run_one_mode() {
     2>&1 | tee "${interleaved_kl_log}"
   grep -q "ALL_OK True" "${interleaved_kl_log}"
 
-  echo "==> Running ${label} generated-prefix radix reuse KL smoke"
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
-    --base-url "${BASE_URL}" \
-    --request-modes concurrent \
-    --prompt-token-lengths 65 \
-    --reuse-generated-prefix-tokens 128 \
-    --min-cached-tokens 192 \
-    --max-new 128 \
-    --limit-cases 1 \
-    --concurrent-workers 1 \
-    --ignore-eos \
-    2>&1 | tee -a "${interleaved_kl_log}"
-  grep -q "ALL_OK True" "${interleaved_kl_log}"
+  if [[ "${DISABLE_RADIX_CACHE}" == "0" ]]; then
+    echo "==> Running ${label} nearest-radix-checkpoint replay KL smoke"
+    conda_python test/manual/dvr/test_dvr_batch_kl.py \
+      --base-url "${BASE_URL}" \
+      --request-modes concurrent \
+      --prompt-token-lengths 65 \
+      --reuse-generated-prefix-tokens 128 \
+      --min-cached-tokens 64 \
+      --max-new 128 \
+      --limit-cases 1 \
+      --concurrent-workers 1 \
+      --ignore-eos \
+      2>&1 | tee -a "${interleaved_kl_log}"
+    grep -q "ALL_OK True" "${interleaved_kl_log}"
+  fi
 
   echo "==> Running ${label} ShareGPT real-data returned-logprob acceptance/KL smoke"
   conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \

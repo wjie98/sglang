@@ -410,9 +410,6 @@ class DeepseekSparseAttnBackend(
         else:
             self.workspace_buffer = None
 
-    def get_nondeterministic_decode_overrides(self, model_runner):
-        return (("num_splits", 0),)
-
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
         max_seqlen_q: int,

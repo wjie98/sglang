@@ -239,15 +239,6 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif (
-                        result.dvr_rollback_actions is None
-                        or not result.dvr_rollback_actions.cache_prefill_after_rollback(
-                            req=req,
-                            req_index=i,
-                            tree_cache=self.tree_cache,
-                            enable_hisparse=self.server_args.enable_hisparse,
-                            hisparse_coordinator=self.hisparse_coordinator,
-                        )
-                    ) and (
                         not batch.decoding_reqs or req not in batch.decoding_reqs
                     ):
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -913,8 +904,6 @@ class SchedulerBatchResultProcessor:
             and result.dvr_rollback_actions.commit_checkpoint_after_decode(
                 req=req,
                 batch=batch,
-                req_index=i,
-                tree_cache=self.tree_cache,
             )
         )
         if dvr_checkpoint_committed:

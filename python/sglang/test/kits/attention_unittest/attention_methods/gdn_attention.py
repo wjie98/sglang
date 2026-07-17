@@ -278,7 +278,7 @@ class MockGDNModelRunner(ModelRunner):
             mamba_layer_ids=[0],
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=speculative_num_draft_tokens or None,
-            enable_overlap_schedule=False,
+            mamba_ping_pong_track_buffer_size=1,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
         self.token_to_kv_pool = MHATokenToKVPool(

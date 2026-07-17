@@ -138,7 +138,7 @@ class AttentionBackend(ABC):
 
     def get_nondeterministic_decode_overrides(self, model_runner):
         """Return init-time deterministic fields to restore for fast decode."""
-        return ()
+        return None
 
     def get_verify_buffers_to_fill_after_draft(self):
         """

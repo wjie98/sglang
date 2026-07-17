@@ -255,7 +255,7 @@ class FlashAttentionBackend(AttentionBackend):
     def get_nondeterministic_decode_overrides(self, model_runner):
         # FA4 CUDA graphs require a fixed split count; FA3 can restore its
         # normal runtime heuristic for provisional decode.
-        return (("num_splits", 0),) if self.fa_impl_ver == 3 else ()
+        return (("num_splits", 0),) if self.fa_impl_ver == 3 else None
 
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q

@@ -6,8 +6,8 @@ from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.linear.dvr_gdn import (
     DVRGDNStateAdapter,
+    dvr_gdn_state_input_bytes_per_request,
 )
-from sglang.srt.layers.attention.linear.dvr_state import DVRRecurrentStateBackup
 
 
 def create_gdn_state_input_cache(
@@ -15,9 +15,7 @@ def create_gdn_state_input_cache(
 ):
     state_cache = SimpleNamespace(
         temporal=torch.empty(num_layers, 1, dtype=torch.float32),
-        intermediate_ssm=torch.empty(
-            num_layers, num_slots, 1, dtype=torch.float32
-        ),
+        intermediate_ssm=torch.empty(num_layers, num_slots, 1, dtype=torch.float32),
     )
     req_to_token_pool = SimpleNamespace(
         get_speculative_mamba2_params_all_layers=lambda: state_cache
@@ -32,9 +30,7 @@ def create_gdn_state_input_cache(
                 )
             ),
             req_to_token_pool=req_to_token_pool,
-            server_args=SimpleNamespace(
-                speculative_num_draft_tokens=num_draft_tokens
-            ),
+            server_args=SimpleNamespace(speculative_num_draft_tokens=num_draft_tokens),
             spec_algorithm=SimpleNamespace(is_dvr_self_draft=lambda: False),
             device=device,
         ),
@@ -53,9 +49,7 @@ def test_fla_boundary_state_preserves_initial_state_dtype(state_dtype):
     g = torch.nn.functional.logsigmoid(
         torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
     )
-    beta = torch.sigmoid(
-        torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
-    )
+    beta = torch.sigmoid(torch.randn(1, 64, 1, dtype=torch.float32, device="cuda"))
     initial_state = torch.zeros(1, 1, 16, 16, dtype=state_dtype, device="cuda")
     initial_state_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
 
@@ -144,6 +138,40 @@ def test_gdn_state_input_cache_is_its_own_window():
     )[0]
 
     assert cache.capacity == FLA_CHUNK_SIZE + 16
+
+
+def test_gdn_state_input_memory_estimate_matches_allocation():
+    state_shape = Mamba2StateShape.create(
+        tp_world_size=4,
+        intermediate_size=32 * 128,
+        n_groups=16,
+        num_heads=32,
+        head_dim=128,
+        state_size=128,
+        conv_kernel=4,
+    )
+    num_layers = 3
+    num_slots = 5
+    num_draft_tokens = 16
+    cache = create_gdn_state_input_cache(
+        num_layers=num_layers,
+        num_slots=num_slots,
+        num_draft_tokens=num_draft_tokens,
+        state_shape=state_shape,
+        dtype=torch.bfloat16,
+        device="cpu",
+    )
+    params = SimpleNamespace(
+        layers=tuple(range(num_layers)),
+        shape=state_shape,
+        dtype=SimpleNamespace(conv=torch.bfloat16),
+    )
+
+    allocated = sum(t.numel() * t.element_size() for t in cache.tensors)
+    allocated += cache.tail_lens.numel() * cache.tail_lens.element_size()
+    assert allocated // num_slots == dvr_gdn_state_input_bytes_per_request(
+        params, num_draft_tokens
+    )
 
 
 def test_dvr_gdn_adapter_owns_state_input_cache():
@@ -297,9 +325,7 @@ def test_gdn_verify_rejects_backend_without_boundary_states():
         dtype=torch.float32,
         device="cpu",
     )
-    dispatcher = SimpleNamespace(
-        extend=lambda **kwargs: (torch.empty(0), None, None)
-    )
+    dispatcher = SimpleNamespace(extend=lambda **kwargs: (torch.empty(0), None, None))
     adapter = DVRGDNStateAdapter(
         kernel_dispatcher=dispatcher,
         state_input_cache=cache,
@@ -355,23 +381,19 @@ def test_gdn_self_draft_restores_from_stable_boundary_without_snapshot():
     temporal = torch.zeros(1, 3, 2)
     temporal[:, 1] = torch.tensor([3.0, 4.0])
     state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
-    live_backup = DVRRecurrentStateBackup(
-        conv=(torch.tensor([[[5.0, 6.0]]]),), temporal=None
-    )
-    adapter = DVRGDNStateAdapter(
-        kernel_dispatcher=None, draft_reuses_target_state=True
-    )
+    draft_state_backup = (torch.tensor([[[5.0, 6.0]]]),)
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, draft_reuses_target_state=True)
 
     adapter.prepare_recurrent_state_for_verify(
         state_cache=state_cache,
         live_indices=torch.tensor([2]),
         boundary_indices=torch.tensor([1]),
-        boundary_backup=None,
-        live_backup=live_backup,
+        draft_state_backup=draft_state_backup,
+        backup_indices=torch.tensor([0]),
     )
 
     assert torch.equal(temporal[:, 2], temporal[:, 1])
-    assert torch.equal(conv[:, [2]], live_backup.conv[0])
+    assert torch.equal(conv[:, [2]], draft_state_backup[0])
 
 
 def test_gdn_backup_uses_request_pool_rows():
@@ -380,19 +402,17 @@ def test_gdn_backup_uses_request_pool_rows():
     state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
     adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
 
-    backup = adapter.backup_recurrent_state(
+    backup = adapter.backup_draft_state(
         state_cache=state_cache,
         indices=torch.tensor([0, 2]),
         backup_indices=torch.tensor([1, 3]),
         backup_size=4,
     )
-    torch.testing.assert_close(backup.conv[0][:, 1], conv[:, 0])
-    torch.testing.assert_close(backup.conv[0][:, 3], conv[:, 2])
-    torch.testing.assert_close(backup.temporal[:, 1], temporal[:, 0])
-    torch.testing.assert_close(backup.temporal[:, 3], temporal[:, 2])
+    torch.testing.assert_close(backup[0][:, 1], conv[:, 0])
+    torch.testing.assert_close(backup[0][:, 3], conv[:, 2])
 
     conv[:, 1].fill_(99)
-    updated = adapter.backup_recurrent_state(
+    updated = adapter.backup_draft_state(
         state_cache=state_cache,
         indices=torch.tensor([1]),
         backup_indices=torch.tensor([2]),
@@ -400,4 +420,4 @@ def test_gdn_backup_uses_request_pool_rows():
         out=backup,
     )
     assert updated is backup
-    torch.testing.assert_close(backup.conv[0][:, 2], conv[:, 1])
+    torch.testing.assert_close(backup[0][:, 2], conv[:, 1])

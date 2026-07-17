@@ -8,10 +8,9 @@ source "${SCRIPT_DIR}/common.sh"
 # Keep this list explicit: adding a DVR touchpoint in a shared module must also
 # extend the static guard instead of being hidden by a broad directory scan.
 DVR_PY_FILES=(
+  python/sglang/srt/environ.py
   python/sglang/srt/layers/attention/base_attn_backend.py
-  python/sglang/srt/layers/attention/dsa_backend.py
   python/sglang/srt/layers/attention/flashattention_backend.py
-  python/sglang/srt/layers/attention/flashinfer_backend.py
   python/sglang/srt/layers/attention/fla/chunk_delta_h.py
   python/sglang/srt/layers/attention/fla/chunk_o.py
   python/sglang/srt/layers/attention/linear/dvr_gdn.py
@@ -29,15 +28,20 @@ DVR_PY_FILES=(
   python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
   python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
   python/sglang/srt/server_args.py
+  python/sglang/srt/arg_groups/speculative_hook.py
   python/sglang/srt/speculative/dvr_server_args.py
   python/sglang/srt/speculative/dvr_state_flow.py
   python/sglang/srt/speculative/dvr_worker.py
+  python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
   python/sglang/srt/speculative/eagle_utils.py
+  python/sglang/srt/speculative/eagle_worker_v2.py
+  python/sglang/srt/speculative/reject_sampling.py
   python/sglang/srt/speculative/spec_info.py
   python/sglang/srt/speculative/spec_registry.py
   python/sglang/srt/speculative/spec_utils.py
   test/manual/dvr/test_dvr_batch_kl.py
   test/manual/dvr/test_dvr_eagle_acceptance.py
+  test/manual/dvr/test_dvr_radix_lifecycle.py
 )
 
 git diff --check

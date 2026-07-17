@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -15,6 +16,7 @@ DVR_SPECULATIVE_ALGORITHMS = {
     DVR_SPECULATIVE_ALGORITHM,
     DVR_EAGLE_SPECULATIVE_ALGORITHM,
 }
+_DVR_FULL_ATTENTION_BACKENDS = {"triton", "fa3"}
 
 
 def handle_dvr_defaults(server_args):
@@ -113,6 +115,17 @@ def handle_dvr_speculative_decoding(server_args):
         )
 
     uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
+    for field in (
+        "attention_backend",
+        "prefill_attention_backend",
+        "decode_attention_backend",
+    ):
+        backend = getattr(server_args, field, None)
+        if backend is not None and backend not in _DVR_FULL_ATTENTION_BACKENDS:
+            raise ValueError(
+                "DVR currently supports only Triton and FA3 full-attention "
+                f"backends, got --{field.replace('_', '-')} {backend}."
+            )
     linear_prefill_backend = (
         server_args.linear_attn_prefill_backend or server_args.linear_attn_backend
     )
@@ -149,6 +162,18 @@ def handle_dvr_speculative_decoding(server_args):
         server_args.speculative_eagle_topk = 1
     elif server_args.speculative_eagle_topk != 1:
         raise ValueError("DVR currently supports only chain mode with topk == 1.")
+
+    # Exact rejection sampling is the DVR default because it preserves more
+    # useful MTP proposals under stochastic target sampling. Target-only EAGLE
+    # sampling remains available as an explicit throughput/acceptance A/B.
+    server_args.speculative_use_rejection_sampling = (
+        envs.SGLANG_DVR_USE_REJECTION_SAMPLING.get()
+    )
+    if not server_args.speculative_use_rejection_sampling:
+        logger.warning(
+            "DVR target-only sampling is enabled by "
+            "SGLANG_DVR_USE_REJECTION_SAMPLING=0."
+        )
 
     _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
 

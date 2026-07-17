@@ -170,17 +170,30 @@ def dvr_draft_decode_context(
                 for server_args in (model_runner.server_args, global_server_args):
                     patch_attr(server_args, "enable_deterministic_inference", False)
 
+            supported_backends = []
             for backend in iter_dvr_attention_backends(
                 model_runner.attn_backend,
                 *(extra_attn_backends or ()),
             ):
-                patch_attr(backend, "enable_deterministic", False)
                 get_overrides = getattr(
                     backend, "get_nondeterministic_decode_overrides", None
                 )
-                if get_overrides is not None:
-                    for name, value in get_overrides(model_runner):
-                        patch_attr(backend, name, value)
+                overrides = (
+                    None if get_overrides is None else get_overrides(model_runner)
+                )
+                if overrides is None:
+                    continue
+                supported_backends.append(type(backend).__name__)
+                patch_attr(backend, "enable_deterministic", False)
+                for name, value in overrides:
+                    patch_attr(backend, name, value)
+
+            if not supported_backends:
+                raise RuntimeError(
+                    "DVR draft decode supports only Triton or FA3 full-attention "
+                    "backends, but no supported backend was found under "
+                    f"{type(model_runner.attn_backend).__name__}."
+                )
 
             if capture:
                 # Deterministic target prefill/verify keeps custom all-reduce

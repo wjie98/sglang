@@ -152,6 +152,22 @@ class ModelRunnerKVCacheMixin:
                     + math.prod(params.shape.temporal)
                     * params.dtype.temporal.itemsize
                 )
+                if self.spec_algorithm.is_dvr_self_draft():
+                    conv_backup_numel = sum(
+                        math.prod(conv_shape) for conv_shape in params.shape.conv
+                    )
+                    intermediate_per_req += (
+                        len(params.layers)
+                        * conv_backup_numel
+                        * params.dtype.conv.itemsize
+                    )
+                from sglang.srt.layers.attention.linear.dvr_gdn import (
+                    dvr_gdn_state_input_bytes_per_request,
+                )
+
+                intermediate_per_req += dvr_gdn_state_input_bytes_per_request(
+                    params, draft_steps
+                )
             else:
                 intermediate_per_req = (
                     config.mamba2_cache_params.mamba_cache_per_req * draft_steps
@@ -439,11 +455,13 @@ class ModelRunnerKVCacheMixin:
                         1 if self.spec_algorithm.is_dvr() else None
                     ),
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-                    # The pool uses this flag only to choose one or two tracking
-                    # slots. DVR needs a committed rollback slot in sync mode too.
-                    enable_overlap_schedule=(
-                        not self.server_args.disable_overlap_schedule
-                        or self.spec_algorithm.is_dvr()
+                    mamba_ping_pong_track_buffer_size=(
+                        2
+                        if (
+                            not self.server_args.disable_overlap_schedule
+                            or self.spec_algorithm.is_dvr()
+                        )
+                        else 1
                     ),
                     start_layer=self.start_layer,
                 )

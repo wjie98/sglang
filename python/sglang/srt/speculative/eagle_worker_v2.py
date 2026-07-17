@@ -658,7 +658,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.sampling_info,
                     self.server_args.speculative_use_rejection_sampling,
                 )
-                topk_p, topk_index = fast_sample(probs, num_samples=1)
+                topk_p, topk_index = fast_sample(
+                    probs,
+                    sampling_seed=forward_batch.sampling_info.sampling_seed,
+                    positions=forward_batch.positions + 1,
+                )
                 draft_probs_list.append(probs)
             elif self.topk == 1 and not _is_hip:
                 topk_index = torch.argmax(
@@ -796,7 +800,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             use_rejection_sampling,
         )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            topk_p, topk_index = fast_sample(
+                probs,
+                sampling_seed=batch.sampling_info.sampling_seed,
+                positions=batch.seq_lens + 1,
+            )
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
@@ -902,7 +910,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info,
                 self.server_args.speculative_use_rejection_sampling,
             )
-            ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
+            ret_topk_p, ret_topk_index = fast_sample(
+                probs,
+                sampling_seed=batch.sampling_info.sampling_seed,
+                positions=batch.seq_lens + batch_result.accept_lens,
+            )
             ret_draft_probs = probs
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts

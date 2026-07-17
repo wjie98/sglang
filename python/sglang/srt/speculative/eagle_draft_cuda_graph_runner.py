@@ -60,6 +60,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     topk_p: torch.Tensor
     topk_index: torch.Tensor
+    sampling_seed: Optional[torch.Tensor]
     draft_probs: Optional[torch.Tensor]
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
@@ -179,6 +180,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+            sampling_seed = (
+                torch.zeros((self.max_bs,), dtype=torch.int64)
+                if self.model_runner.server_args.speculative_use_rejection_sampling
+                and self.model_runner.server_args.enable_deterministic_inference
+                else None
+            )
             draft_probs = (
                 torch.zeros(
                     (self.max_bs, self.model_runner.model_config.vocab_size),
@@ -234,6 +241,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens=extend_seq_lens,
             topk_p=topk_p,
             topk_index=topk_index,
+            sampling_seed=sampling_seed,
             draft_probs=draft_probs,
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
@@ -371,6 +379,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             top_ps=torch.ones((num_seqs,), dtype=torch.float),
             top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
+            sampling_seed=(
+                buffers.sampling_seed[:num_seqs]
+                if buffers.sampling_seed is not None
+                else None
+            ),
             is_all_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
@@ -486,6 +499,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.bootstrap_room_ids_int.fill_(-1)
             buffers.topk_p.zero_()
             buffers.topk_index.zero_()
+            if buffers.sampling_seed is not None:
+                buffers.sampling_seed.zero_()
             if buffers.draft_probs is not None:
                 buffers.draft_probs.zero_()
             if buffers.hidden_states is not None:
@@ -560,6 +575,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
+            if buffers.sampling_seed is not None:
+                if forward_batch.sampling_info.sampling_seed is None:
+                    raise RuntimeError(
+                        "Deterministic EAGLE rejection sampling requires request seeds."
+                    )
+                buffers.sampling_seed[:raw_bs].copy_(
+                    forward_batch.sampling_info.sampling_seed[:raw_bs]
+                )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

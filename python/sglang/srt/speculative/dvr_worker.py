@@ -28,7 +28,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
+from sglang.srt.speculative.dvr_state_flow import (
+    DVRLinearStateContext,
+    DVRLinearStateLifecycle,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -88,7 +91,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         )
         self.is_dvr_eagle = self.speculative_algorithm.is_dvr_eagle()
         device_module = torch.get_device_module(self.device)
-        self._rollback_ready_event = device_module.Event()
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
@@ -316,9 +318,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
-        penalizer = batch.sampling_info.penalizer_orchestrator
-        if penalizer is not None and penalizer.is_required:
-            penalizer.cumulate_output_tokens(spec_info.bonus_tokens.to(torch.int64))
 
         # ScheduleBatch.prepare_for_decode already reserved the speculative
         # window. Self draft and target verify share it; allocating again would
@@ -429,7 +428,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
-                if not forward_batch.sampling_info.is_all_greedy:
+                if (
+                    self.server_args.speculative_use_rejection_sampling
+                    and not forward_batch.sampling_info.is_all_greedy
+                ):
                     sampling_probs = logits_output.next_token_logits
                     sampling_info = forward_batch.sampling_info
                     if (
@@ -483,23 +485,22 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
 
-    def _prepare_dvr_boundary_for_verify(self, batch: ScheduleBatch) -> None:
+    def _prepare_dvr_boundary_for_verify(
+        self, batch: ScheduleBatch
+    ) -> Optional[DVRLinearStateContext]:
         if batch.forward_mode.is_idle():
-            return
+            return None
 
         prefill_prefix_lens = None
         seq_lens_cpu = None
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             prefill_prefix_lens = [int(x) for x in batch.prefix_lens]
             seq_lens_cpu = self.linear_state.batch_seq_lens_cpu(batch)
-        self.linear_state.prepare_for_draft(
+        return self.linear_state.prepare_for_draft(
             batch,
             seq_lens_cpu=seq_lens_cpu,
             prefill_prefix_lens=prefill_prefix_lens,
         )
-        # EAGLE/MTP draft can run before the next target verify in overlap mode.
-        # Preserve the target checkpoint authority across draft-side mutations.
-        self.linear_state.backup_boundary_state(batch)
 
     @property
     def draft_worker(self):
@@ -555,12 +556,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         self.linear_state.clear_cache_state()
 
     def prepare_for_kv_cache_release(self, req) -> None:
-        # Finished-request radix insertion donates this physical slot. Restore
-        # the request's exact target checkpoint before ownership is transferred.
-        self.linear_state.restore_for_cache_release(
-            req,
-            self.req_to_token_pool,
-        )
+        self.linear_state.prepare_for_cache_release(req)
 
     def forward_batch_generation(
         self, model_worker_batch: ScheduleBatch, on_publish=None
@@ -608,7 +604,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 req.kv_committed_len <= 2 for req in batch.reqs
             )
         with spec_stage_span("dvr_prepare"):
-            self._prepare_dvr_boundary_for_verify(batch)
+            linear_state_ctx = self._prepare_dvr_boundary_for_verify(batch)
         if needs_one_root_verify:
             verify_input = self._build_one_root_verify_input(batch)
         else:
@@ -620,10 +616,33 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 )
         assert verify_input.is_verify_input()
         batch.spec_info = verify_input
-        batch_result = self.verify(batch, verify_input, on_publish=on_publish)
+        batch_result = self.verify(
+            batch,
+            verify_input,
+            linear_state_ctx=linear_state_ctx,
+            on_publish=on_publish,
+        )
+        final_reader = self.war_fastpath_runner
+        # Discard a draft-phase or synchronous previous-iteration event. Only
+        # the final rollback reader may release scheduler result writes.
+        final_reader.war_fastpath_read_done_event = None
         if self.is_dvr_eagle:
-            with self._draft_context(), spec_stage_span("draft_extend"):
+            # EAGLE's draft-extend commits the accepted target result into the
+            # draft backend. It is therefore the final part of rollback, not a
+            # phase that may race scheduler result writes after target rollback.
+            with self._draft_context(), spec_stage_span("dvr_rollback_draft"):
                 self.draft_worker._draft_extend_for_decode(batch, batch_result)
+
+        # Publish one fence for the complete rollback transaction. The EAGLE
+        # graph records this as soon as draft-extend snapshots shared pools;
+        # self-draft (and an eager EAGLE miss) records it here after its final
+        # shared-pool reader has been enqueued.
+        rollback_done = final_reader.war_fastpath_read_done_event
+        if rollback_done is None:
+            rollback_done = torch.get_device_module(self.device).Event()
+            rollback_done.record()
+            final_reader.war_fastpath_read_done_event = rollback_done
+        batch_result.result_process_ready_event = rollback_done
         return batch_result
 
     def _build_one_root_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -669,6 +688,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
+        linear_state_ctx: Optional[DVRLinearStateContext] = None,
         on_publish=None,
     ) -> GenerationBatchResult:
         scheduler_seq_lens = batch.seq_lens
@@ -734,7 +754,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         with spec_stage_span("dvr_state_restore"):
             # Self-draft graph replay and target verify are both enqueued on
             # Scheduler's forward stream, so CUDA stream order is their fence.
-            linear_state_ctx = self.linear_state.restore_for_verify(batch)
+            linear_state_ctx = self.linear_state.restore_for_verify(linear_state_ctx)
         with spec_stage_span("verify"):
             forward_output = self.target_worker.forward_batch_generation(
                 batch=None,
@@ -765,22 +785,15 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
         maybe_detect_nan(logits_output.next_token_logits, "DVR target verify")
         maybe_detect_inf(logits_output.next_token_logits, "DVR target verify")
-        if not self.is_dvr_eagle:
-            # EAGLE draft already applied request processors. Self draft uses a
-            # target-only forward, so apply the same processors before entering
-            # the shared EAGLE accept kernel.
-            sampling_info = batch.sampling_info
-            if sampling_info.has_custom_logit_processor:
-                apply_custom_logit_processor(
-                    logits_output.next_token_logits,
-                    sampling_info,
-                    num_tokens_in_batch=verify_tokens,
-                )
-            penalizer = sampling_info.penalizer_orchestrator
-            if penalizer is not None and penalizer.is_required:
-                penalizer.apply(
-                    logits_output.next_token_logits, repeat=verify_tokens
-                )
+        # Target acceptance semantics are independent of the draft backend.
+        # Accumulated penalties and logit bias are applied by eagle_sample;
+        # custom processors need the full verify width here.
+        if batch.sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                num_tokens_in_batch=verify_tokens,
+            )
         with spec_stage_span("verify_sample"):
             predict, accept_lens, accept_index = eagle_sample(
                 spec_info, batch, logits_output, vocab_mask
@@ -818,13 +831,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 ctx=linear_state_ctx,
                 accept_lens=accept_lens,
             )
-
-        if linear_state_ctx is not None:
-            # FutureMap readiness must cover the state consumed by the next
-            # overlap forward, not only accepted sequence lengths.
-            with spec_stage_span("dvr_checkpoint"):
-                self.linear_state.backup_boundary_state(batch, ctx=linear_state_ctx)
-        elif self.is_dvr_eagle:
+        if linear_state_ctx is None and self.is_dvr_eagle:
             commit_mamba_states_after_verify(
                 self.target_worker,
                 batch,
@@ -832,15 +839,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 accept_index,
                 verify_tokens,
             )
-        # FutureMap intentionally publishes accepted lengths before this tail.
-        # Fence the target state consumed by the next DVR iteration separately;
-        # for self-draft the same event is Scheduler's final shared-pool reader.
-        self._rollback_ready_event.record()
-        # The overlap scheduler may process the preceding result as soon as
-        # this worker returns. Defer its shared-pool writes until the current
-        # target rollback/checkpoint has finished reading those pools.
-        if not self.is_dvr_eagle:
-            self.model_runner.war_fastpath_read_done_event = self._rollback_ready_event
         if has_verify_tokens and batch.return_logprob:
             with spec_stage_span("verify_logprob"):
                 compute_spec_v2_logprobs(
@@ -860,7 +858,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             speculative_num_draft_tokens=self.num_draft_tokens,
             dvr_rollback_actions=rollback_actions,
-            result_process_ready_event=self._rollback_ready_event,
             routed_experts_output=forward_output.routed_experts_output,
             indexer_topk_output=forward_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

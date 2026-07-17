@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dvr_server_args import (
@@ -37,6 +38,10 @@ class _Args:
     mamba_ssm_dtype = "float32"
     linear_attn_backend = "triton"
     linear_attn_prefill_backend = None
+    attention_backend = "triton"
+    prefill_attention_backend = None
+    decode_attention_backend = None
+    speculative_use_rejection_sampling = False
 
     def __init__(self):
         self.cuda_graph_config = SimpleNamespace(
@@ -148,6 +153,16 @@ class TestDVRServerArgs(unittest.TestCase):
 
         self.assertFalse(args.disable_radix_cache)
 
+    def test_dvr_rejection_sampling_is_default_and_can_be_disabled(self):
+        args = _Args()
+        handle_dvr_speculative_decoding(args)
+        self.assertTrue(args.speculative_use_rejection_sampling)
+
+        args = _Args()
+        with envs.SGLANG_DVR_USE_REJECTION_SAMPLING.override(False):
+            handle_dvr_speculative_decoding(args)
+        self.assertFalse(args.speculative_use_rejection_sampling)
+
     def test_dvr_preserves_disabled_radix_cache_with_request_checkpoints(self):
         args = _Args()
         args.disable_radix_cache = True
@@ -174,6 +189,13 @@ class TestDVRServerArgs(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "linear-attn-prefill-backend"):
                 handle_dvr_speculative_decoding(args)
+
+    def test_dvr_rejects_unsupported_full_attention_backend(self):
+        args = _Args()
+        args.attention_backend = "flashinfer"
+
+        with self.assertRaisesRegex(ValueError, "only Triton and FA3"):
+            handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_pdmux_attention(self):
         args = _Args()

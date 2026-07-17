@@ -74,8 +74,30 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def fast_sample(probs: torch.Tensor, num_samples: int = 1):
-    sample_index = torch.multinomial(probs, num_samples=num_samples)
+def fast_sample(
+    probs: torch.Tensor,
+    num_samples: int = 1,
+    *,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+):
+    if sampling_seed is None:
+        sample_index = torch.multinomial(probs, num_samples=num_samples)
+    else:
+        if num_samples != 1 or positions is None:
+            raise ValueError(
+                "Seeded speculative sampling requires one sample and token positions."
+            )
+        from sglang.srt.layers.utils.hash import murmur_hash32
+
+        # A single position-keyed uniform is sufficient for categorical
+        # sampling. Keep stream 2 disjoint from rejection/final coins (0/1).
+        cdf = probs.float().cumsum(dim=-1)
+        stream = torch.full_like(positions[:1], 2, dtype=torch.int64)
+        uniform = murmur_hash32(sampling_seed, positions, stream).to(cdf.dtype)
+        uniform.mul_(1.0 / 2**32).mul_(cdf[:, -1:])
+        sample_index = torch.searchsorted(cdf, uniform, right=True)
+        sample_index.clamp_max_(probs.shape[-1] - 1)
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
 

@@ -324,7 +324,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 get_parallel().attn_tp_size
             ),
         )
-        self._nondeterministic_decode_use_tensor_cores = self.decode_use_tensor_cores
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -478,16 +477,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
-
-    def get_nondeterministic_decode_overrides(self, model_runner):
-        return (
-            ("decode_split_tile_size", None),
-            ("disable_cuda_graph_kv_split", False),
-            (
-                "decode_use_tensor_cores",
-                self._nondeterministic_decode_use_tensor_cores,
-            ),
-        )
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:

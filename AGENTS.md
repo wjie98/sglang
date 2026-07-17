@@ -27,25 +27,30 @@ Use these entry points:
   - includes one-token prompts in concurrent and batch modes; their first DVR
     iteration uses a zero-step, one-root target-verify sentinel and must pass
     the same strict full-prefill KL oracle
-  - includes an interleaved shared-prefix request pair that exercises radix
-    donation while another request owns the worker, plus concurrent and batch
-    512-token strict KL checks
-  - includes a completed-generation reuse case: a 65-token prompt generates
-    128 tokens, the next request must reuse 192 cached tokens, and its returned
-    logprobs must still match the flushed full-prefill oracle exactly
-  - `ATTENTION_BACKEND` may select a separately reported Triton/FlashInfer/FA3
-    compatibility run; the fixed default remains `triton`
+  - includes an interleaved shared-prefix request pair that exercises prefill
+    result processing while another request owns the worker, plus concurrent
+    and batch 512-token strict KL checks
+  - includes a completed-generation replay case: a 65-token prompt generates
+    128 tokens, the next request must reuse the prompt's 64-token checkpoint,
+    rebuild the generated suffix with ordinary EXTEND, and still match the
+    flushed full-prefill oracle exactly
+  - with radix enabled, runs `test_dvr_radix_lifecycle.py` to cover same-rid
+    request-slot reuse, nearest-checkpoint replay around 64/128 tokens, and
+    stop-token truncation; pass `--exhaustive` to that client for the full
+    prompt 63/64/65 by generated length 1..129 scan
+  - `ATTENTION_BACKEND` may select Triton or FA3; the fixed default remains
+    `triton`
   - `RUN_V1=0` or `RUN_V2=0` may resume one half of an interrupted run in the
     same `RESULT_ROOT`; the default remains the complete v1/v2 matrix
 - `test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh`
   - 35B Qwen3.5 MTP/DVR-EAGLE sync-v2 and overlap-v2 smoke
   - covers `return_logprob=True` KL and `return_logprob=False` output path
   - includes the seeded `prompt_len=65`, `max_new=65` boundary acceptance
-    regression and fails if reported accept rate drops below `0.96`
+    regression; stochastic rejection runs use a `0.75` floor
   - includes a staggered shared-prefix KL case so request-local GDN boundary
     ownership is checked with radix enabled
-  - applies the same 192-token generated-prefix reuse check to both sync and
-    overlap DVR-EAGLE
+  - applies the same nearest-checkpoint replay check to both sync and overlap
+    DVR-EAGLE
   - ShareGPT cases use a separate `0.70` floor based on the fixed two-token
     MTP baseline; this catches routing regressions without pretending real-data
     acceptance should be nearly one
@@ -76,9 +81,16 @@ metadata under `RESULT_ROOT`. When reporting a run, include the script path,
 key overrides, result directory, and whether the server log confirms the
 expected backend, radix mode, CUDA graph, and effective concurrency.
 
-`DISABLE_RADIX_CACHE` accepts `0`, `1`, or `auto`. `auto` disables radix for
-FlashInfer and keeps it for Triton/FA3. DVR must preserve request-local GDN
-checkpoints in both cases; do not add a FlashInfer-specific correctness path.
+`DISABLE_RADIX_CACHE` accepts `0`, `1`, or `auto`. `auto` keeps radix enabled
+for both supported full-attention backends. A separately labeled radix-disabled
+run remains part of the state-lifecycle matrix.
+
+The production sampling path uses exact rejection sampling. Set
+`SGLANG_DVR_USE_REJECTION_SAMPLING=0` only for a separately reported upstream
+target-only A/B; do not mix both modes in one throughput baseline.
+For rejection runs, proposal tokens and verify coins are both keyed by request
+`sampling_seed` and absolute token position; compare sync/overlap histograms as
+part of the fixed 35B MTP guard.
 
 Do not use the removed `SGLANG_ENABLE_SPEC_V2` environment variable.  The fixed
 scripts select the self-DVR v1 compatibility worker with
