@@ -102,8 +102,8 @@ def dvr_draft_decode_context(
 ):
     """Temporarily switch a DVR draft runner into performance-first decode mode.
 
-    Self-draft replay only patches backend fields consumed by its captured graph;
-    EAGLE replay and both capture paths also switch global deterministic state.
+    Self draft uses this only while capturing its dedicated graph. EAGLE also
+    uses it for eager graph misses, so its runtime context restores all state.
     """
 
     patched_attrs = []

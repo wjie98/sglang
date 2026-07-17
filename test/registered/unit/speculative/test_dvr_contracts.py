@@ -763,6 +763,21 @@ def test_dvr_self_draft_weight_update_does_not_reload_target():
     )
 
 
+def test_dvr_self_draft_runtime_does_not_patch_global_decode_state(monkeypatch):
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.is_dvr_eagle = False
+    monkeypatch.setattr(
+        dvr_worker_module,
+        "dvr_draft_decode_context",
+        lambda *_args, **_kwargs: pytest.fail(
+            "self-draft runtime must use its captured graph state"
+        ),
+    )
+
+    with worker._draft_context():
+        pass
+
+
 def test_dvr_custom_all_reduce_uses_current_dispatch_contract(monkeypatch):
     calls = []
 

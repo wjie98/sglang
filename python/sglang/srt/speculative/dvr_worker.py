@@ -160,8 +160,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     @contextmanager
     def _draft_context(self):
         if not self.is_dvr_eagle:
-            with dvr_draft_decode_context(self.model_runner, self_draft=True):
-                yield
+            # Self draft always replays the dedicated graph, whose decode
+            # configuration was fixed while it was captured.
+            yield
             return
         draft_worker = self._draft_worker
         extra_attn_backends = (
