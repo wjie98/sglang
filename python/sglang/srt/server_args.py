@@ -6638,14 +6638,15 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        # DVR also uses this pool for request-local rollback checkpoints; it
-        # remains useful when the attention backend disables prefix matching.
+        # With Radix disabled, DVR uses the same pool layout for one active-
+        # request rollback checkpoint. This does not enable prefix matching.
+        if self.disable_radix_cache and self.speculative_algorithm in (
+            "DECODE_VERIFY_ROLLBACK",
+            "DECODE_VERIFY_ROLLBACK_EAGLE",
+        ):
+            return True
         return (
-            (
-                self.disable_radix_cache is False
-                or self.speculative_algorithm
-                in ("DECODE_VERIFY_ROLLBACK", "DECODE_VERIFY_ROLLBACK_EAGLE")
-            )
+            self.disable_radix_cache is False
             and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
         )
 

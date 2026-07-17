@@ -826,11 +826,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
 
-    def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
+    def get_mamba_ping_pong_other_idx(
+        self, mamba_next_track_idx: Union[int, torch.Tensor]
+    ) -> Union[int, torch.Tensor]:
+        """Return the adjacent tracked slot, or the same index for one slot."""
         if self.mamba_ping_pong_track_buffer_size == 2:
             return 1 - mamba_next_track_idx
-        else:
-            return mamba_next_track_idx
+        return mamba_next_track_idx
 
     def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
         """Return the ping-pong index holding the most recent tracked state.

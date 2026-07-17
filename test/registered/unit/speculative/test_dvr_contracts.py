@@ -100,7 +100,8 @@ def test_dvr_without_radix_allocates_recurrent_slots_per_request():
 
     ModelRunnerKVCacheMixin.handle_max_mamba_cache(runner, total_rest_memory=1.0)
 
-    assert server_args.max_mamba_cache_size == 8 * runner._calculate_mamba_ratio()
+    assert runner._calculate_mamba_ratio() == 2
+    assert server_args.max_mamba_cache_size == 16
 
 
 def test_overlap_batch_results_default_to_no_result_process_fence():
@@ -944,9 +945,9 @@ def _dvr_checkpoint(req, *, seq_len=64):
     )
 
 
-def _dvr_lifecycle(adapter):
+def _dvr_lifecycle(adapter, *, disable_radix_cache=False):
     lifecycle = object.__new__(DVRLinearStateLifecycle)
-    lifecycle.server_args = SimpleNamespace(disable_radix_cache=False)
+    lifecycle.server_args = SimpleNamespace(disable_radix_cache=disable_radix_cache)
     lifecycle.model_runner = None
     lifecycle._state_adapter = adapter
     lifecycle.boundaries = {}
@@ -983,7 +984,8 @@ def test_dvr_linear_state_requires_matching_cache_and_verify_chunks():
         lifecycle.bind_state_adapter(SimpleNamespace(chunk_size=64))
 
 
-def test_dvr_sync_rollback_uses_one_checkpoint_action():
+@pytest.mark.parametrize(("slot_count", "expected_track"), [(1, 0), (2, 1)])
+def test_dvr_sync_rollback_uses_one_checkpoint_action(slot_count, expected_track):
     calls = []
 
     class Adapter:
@@ -1005,7 +1007,13 @@ def test_dvr_sync_rollback_uses_one_checkpoint_action():
     )
     lifecycle.physical_boundary_lens[1] = 64
     actions = lifecycle.rollback_after_verify(
-        batch=SimpleNamespace(),
+        batch=SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                get_mamba_ping_pong_other_idx=lambda idx: (
+                    1 - idx if slot_count == 2 else idx
+                )
+            )
+        ),
         ctx=ctx,
         accept_lens=torch.tensor([5], dtype=torch.int32),
     )
@@ -1014,7 +1022,7 @@ def test_dvr_sync_rollback_uses_one_checkpoint_action():
     assert calls[0]["accepted_token_counts"].tolist() == [5]
     assert calls[0]["previous_boundary_indices"].tolist() == [4]
     assert lifecycle.physical_boundary_lens[1].item() == 128
-    assert lifecycle.boundary_track_indices[1].item() == 1
+    assert lifecycle.boundary_track_indices[1].item() == expected_track
 
 
 def test_dvr_self_draft_requires_graph_for_gdn_normal_decode():
@@ -1049,7 +1057,13 @@ def test_dvr_publish_checkpoint_updates_only_visible_boundary():
     assert req.mamba_next_track_idx == 0
 
 
-def test_dvr_state_context_follows_device_ping_pong_owner():
+@pytest.mark.parametrize(
+    ("track_slots", "physical_track", "expected_boundary", "expected_previous"),
+    [((10, 11), 1, 11, 10), ((10,), 0, 10, 10)],
+)
+def test_dvr_state_context_follows_request_checkpoint_owner(
+    track_slots, physical_track, expected_boundary, expected_previous
+):
     class Adapter:
         chunk_size = 64
         draft_reuses_target_state = False
@@ -1066,27 +1080,33 @@ def test_dvr_state_context_follows_device_ping_pong_owner():
         def get_state_cache(*, batch):
             return object()
 
-    lifecycle = _dvr_lifecycle(Adapter())
+    lifecycle = _dvr_lifecycle(
+        Adapter(), disable_radix_cache=len(track_slots) == 1
+    )
     req = _Req(
         rid="r0",
         req_pool_idx=1,
         retraction_count=0,
-        mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
+        mamba_ping_pong_track_buffer=torch.tensor(track_slots),
     )
     lifecycle.boundaries[1] = _dvr_checkpoint(req)
-    lifecycle.boundary_track_indices[1] = 1
+    lifecycle.boundary_track_indices[1] = physical_track
     batch = SimpleNamespace(
         reqs=[req],
         req_pool_indices=torch.tensor([1]),
-        req_to_token_pool=SimpleNamespace(),
+        req_to_token_pool=SimpleNamespace(
+            get_mamba_ping_pong_other_idx=lambda idx: (
+                1 - idx if len(track_slots) == 2 else idx
+            )
+        ),
         batch_size=lambda: 1,
     )
 
     ctx = lifecycle.state_context(batch, require_boundary=True)
 
-    assert ctx.boundary_indices.tolist() == [11]
-    assert ctx.previous_boundary_indices.tolist() == [10]
-    assert ctx.boundary_track_indices.tolist() == [1]
+    assert ctx.boundary_indices.tolist() == [expected_boundary]
+    assert ctx.previous_boundary_indices.tolist() == [expected_previous]
+    assert ctx.boundary_track_indices.tolist() == [physical_track]
 
 
 def test_dvr_checkpoint_owner_rejects_slot_aba_and_retraction():
@@ -1128,7 +1148,14 @@ def test_dvr_existing_boundary_does_not_resolve_gpu_lengths():
     assert lifecycle.prepare_for_draft(SimpleNamespace(reqs=[req])) is not None
 
 
-def _boundary_fixture(*, seq_len, last_track, prefix_len):
+def _boundary_fixture(
+    *,
+    seq_len,
+    last_track,
+    prefix_len,
+    disable_radix_cache=False,
+    track_slots=(10, 11),
+):
     copies = []
     zeroed = []
     tail_updates = []
@@ -1143,11 +1170,11 @@ def _boundary_fixture(*, seq_len, last_track, prefix_len):
 
         @staticmethod
         def get_mamba_ping_pong_other_idx(idx):
-            return 1 - idx
+            return 1 - idx if len(track_slots) == 2 else idx
 
         @staticmethod
         def get_mamba_ping_pong_keep_idx(req):
-            return 1 - req.mamba_next_track_idx
+            return Pool.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
 
     class Adapter:
         chunk_size = 64
@@ -1183,7 +1210,7 @@ def _boundary_fixture(*, seq_len, last_track, prefix_len):
         retraction_count=0,
         mamba_last_track_seqlen=last_track,
         mamba_next_track_idx=0,
-        mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
+        mamba_ping_pong_track_buffer=torch.tensor(track_slots),
     )
     batch = SimpleNamespace(
         reqs=[req],
@@ -1191,7 +1218,7 @@ def _boundary_fixture(*, seq_len, last_track, prefix_len):
         req_to_token_pool=Pool(),
         batch_size=lambda: 1,
     )
-    lifecycle = _dvr_lifecycle(Adapter())
+    lifecycle = _dvr_lifecycle(Adapter(), disable_radix_cache=disable_radix_cache)
     lifecycle._ensure_boundary_state(
         batch,
         seq_lens_cpu=[seq_len],
@@ -1222,6 +1249,21 @@ def test_dvr_unaligned_prefill_uses_ping_pong_keep_state():
     assert lifecycle.boundaries[1].seq_len == 64
 
 
+def test_dvr_unaligned_prefill_keeps_the_single_request_local_slot():
+    lifecycle, req, copies, zeroed, tails = _boundary_fixture(
+        seq_len=65,
+        last_track=64,
+        prefix_len=0,
+        disable_radix_cache=True,
+        track_slots=(10,),
+    )
+
+    assert copies == []
+    assert zeroed == []
+    assert tails == [([1], [1])]
+    assert lifecycle.boundaries[1].seq_len == 64
+
+
 def test_dvr_radix_prefix_boundary_is_captured_by_standard_extend():
     lifecycle, req, copies, zeroed, tails = _boundary_fixture(
         seq_len=65, last_track=None, prefix_len=64
@@ -1231,6 +1273,17 @@ def test_dvr_radix_prefix_boundary_is_captured_by_standard_extend():
     assert zeroed == []
     assert tails == [([1], [1])]
     assert lifecycle.boundaries[1].seq_len == 64
+
+
+def test_dvr_without_radix_rejects_a_prefix_only_boundary_source():
+    with pytest.raises(RuntimeError, match="target EXTEND"):
+        _boundary_fixture(
+            seq_len=65,
+            last_track=None,
+            prefix_len=64,
+            disable_radix_cache=True,
+            track_slots=(10,),
+        )
 
 
 def test_dvr_zero_boundary_uses_zero_state():
@@ -1389,6 +1442,26 @@ def test_dvr_finished_request_skips_insert_when_exact_boundary_is_gone():
     lifecycle.prepare_for_cache_release(req)
 
     assert req.skip_radix_cache_insert
+    assert lifecycle.boundaries == {}
+
+
+def test_dvr_without_radix_drops_request_checkpoint_without_publication():
+    lifecycle = _dvr_lifecycle(SimpleNamespace(chunk_size=64), disable_radix_cache=True)
+    lifecycle.model_runner = SimpleNamespace(
+        forward_stream=SimpleNamespace(
+            synchronize=lambda: pytest.fail("Radix-off release must not synchronize")
+        )
+    )
+    req = _Req(
+        rid="r0",
+        req_pool_idx=1,
+        retraction_count=0,
+        skip_radix_cache_insert=False,
+    )
+    lifecycle.boundaries[1] = _dvr_checkpoint(req)
+
+    lifecycle.prepare_for_cache_release(req)
+
     assert lifecycle.boundaries == {}
 
 

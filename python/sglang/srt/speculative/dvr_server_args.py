@@ -45,22 +45,29 @@ def handle_dvr_defaults(server_args):
     if not _is_dvr_gated_linear_state_model(server_args):
         return
 
-    if server_args.page_size != FLA_CHUNK_SIZE:
-        logger.warning(
-            "DVR for gated linear-state models requires page_size to match "
-            "FLA_CHUNK_SIZE=%s so attention pages and chunkwise verify "
-            "checkpoints share the same boundary. Setting --page-size %s.",
-            FLA_CHUNK_SIZE,
-            FLA_CHUNK_SIZE,
-        )
+    if server_args.page_size is None:
         server_args.page_size = FLA_CHUNK_SIZE
-
-    if server_args.mamba_radix_cache_strategy != "extra_buffer":
-        logger.warning(
-            "DVR for gated linear-state models requires mamba extra_buffer "
-            "state tracking. Setting --mamba-radix-cache-strategy extra_buffer."
+    elif server_args.page_size <= 0 or FLA_CHUNK_SIZE % server_args.page_size != 0:
+        raise ValueError(
+            "DVR gated linear-state page_size must be a positive divisor of "
+            f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, got {server_args.page_size}."
         )
-        server_args.mamba_radix_cache_strategy = "extra_buffer"
+
+    # With Radix disabled, ChunkCache retains the ordinary full-prefill behavior;
+    # DVR's request-local checkpoint does not depend on this cache strategy.
+    if not server_args.disable_radix_cache:
+        if server_args.mamba_radix_cache_strategy == "auto":
+            logger.warning(
+                "DVR for gated linear-state models requires mamba extra_buffer "
+                "state tracking. Setting --mamba-radix-cache-strategy extra_buffer."
+            )
+            server_args.mamba_radix_cache_strategy = "extra_buffer"
+        elif server_args.mamba_radix_cache_strategy != "extra_buffer":
+            raise ValueError(
+                "DVR gated linear-state Radix caching requires "
+                "--mamba-radix-cache-strategy extra_buffer; no_buffer and "
+                "extra_buffer_lazy cannot preserve the overlap checkpoint."
+            )
 
     if server_args.mamba_track_interval != FLA_CHUNK_SIZE:
         logger.warning(

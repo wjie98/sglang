@@ -222,19 +222,61 @@ class TestDVRServerArgs(unittest.TestCase):
                 handle_dvr_speculative_decoding(args)
 
     def test_dvr_preserves_disabled_radix_cache_with_request_checkpoints(self):
-        args = _Args()
-        args.disable_radix_cache = True
+        for strategy in ("auto", "no_buffer", "extra_buffer", "extra_buffer_lazy"):
+            with self.subTest(strategy=strategy):
+                args = _Args()
+                args.disable_radix_cache = True
+                args.mamba_radix_cache_strategy = strategy
 
-        with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
-            return_value=True,
-        ):
-            handle_dvr_defaults(args)
+                with patch(
+                    "sglang.srt.speculative.dvr_server_args."
+                    "_is_dvr_gated_linear_state_model",
+                    return_value=True,
+                ):
+                    handle_dvr_defaults(args)
 
-        self.assertTrue(args.disable_radix_cache)
-        self.assertEqual(args.mamba_radix_cache_strategy, "extra_buffer")
-        self.assertTrue(ServerArgs.enable_mamba_extra_buffer(args))
+                self.assertTrue(args.disable_radix_cache)
+                self.assertEqual(args.mamba_radix_cache_strategy, strategy)
+                self.assertTrue(ServerArgs.enable_mamba_extra_buffer(args))
+
+    def test_dvr_gdn_preserves_supported_page_sizes(self):
+        for page_size in (1, 8, 16, 32, 64):
+            with self.subTest(page_size=page_size):
+                args = _Args()
+                args.page_size = page_size
+                with patch(
+                    "sglang.srt.speculative.dvr_server_args."
+                    "_is_dvr_gated_linear_state_model",
+                    return_value=True,
+                ):
+                    handle_dvr_defaults(args)
+                self.assertEqual(args.page_size, page_size)
+
+    def test_dvr_gdn_rejects_page_sizes_incompatible_with_fla_chunks(self):
+        for page_size in (0, 48, 128):
+            with self.subTest(page_size=page_size):
+                args = _Args()
+                args.page_size = page_size
+                with patch(
+                    "sglang.srt.speculative.dvr_server_args."
+                    "_is_dvr_gated_linear_state_model",
+                    return_value=True,
+                ):
+                    with self.assertRaisesRegex(ValueError, "positive divisor"):
+                        handle_dvr_defaults(args)
+
+    def test_dvr_gdn_radix_requires_non_lazy_extra_buffer(self):
+        for strategy in ("no_buffer", "extra_buffer_lazy"):
+            with self.subTest(strategy=strategy):
+                args = _Args()
+                args.mamba_radix_cache_strategy = strategy
+                with patch(
+                    "sglang.srt.speculative.dvr_server_args."
+                    "_is_dvr_gated_linear_state_model",
+                    return_value=True,
+                ):
+                    with self.assertRaisesRegex(ValueError, "requires.*extra_buffer"):
+                        handle_dvr_defaults(args)
 
     def test_dvr_gdn_requires_boundary_exporting_linear_prefill(self):
         args = _Args()

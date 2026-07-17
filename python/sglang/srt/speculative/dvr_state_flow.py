@@ -23,7 +23,7 @@ class DVRLinearStateContext:
 
 @dataclass
 class _DVRBoundaryCheckpoint:
-    """Logical owner of one request's physical ping-pong boundary slot."""
+    """Logical owner of one request's physical boundary-state slot."""
 
     request_ref: weakref.ReferenceType = field(repr=False)
     retraction_count: int
@@ -48,7 +48,7 @@ class DVRLinearStateLifecycle:
     """Own DVR's target boundary and self-draft rollback state.
 
     The recurrent boundary itself stays in SGLang's existing Mamba state pools:
-    an aligned live state is preferred, otherwise the latest ping-pong state is
+    an aligned live state is preferred, otherwise the latest tracked state is
     reused. A radix miss is rebuilt by the ordinary match-prefix + EXTEND path;
     DVR does not maintain a second temporal checkpoint store.
     """
@@ -295,7 +295,9 @@ class DVRLinearStateLifecycle:
                 ctx.state_input_indices,
                 torch.where(
                     crosses_chunk_boundary,
-                    1 - ctx.boundary_track_indices,
+                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        ctx.boundary_track_indices
+                    ),
                     ctx.boundary_track_indices,
                 ),
             )
@@ -319,15 +321,20 @@ class DVRLinearStateLifecycle:
                 raise RuntimeError(
                     "DVR target verify is missing a boundary checkpoint."
                 )
-            slot_pairs = torch.stack(
+            track_slots = torch.stack(
                 [req.mamba_ping_pong_track_buffer for req in batch.reqs]
             ).to(device=live_indices.device, dtype=torch.long)
             boundary_track_indices = self.boundary_track_indices[state_input_indices]
-            boundary_indices = slot_pairs.gather(
+            boundary_indices = track_slots.gather(
                 1, boundary_track_indices.unsqueeze(1)
             ).squeeze(1)
-            previous_boundary_indices = slot_pairs.gather(
-                1, (1 - boundary_track_indices).unsqueeze(1)
+            previous_track_indices = (
+                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    boundary_track_indices
+                )
+            )
+            previous_boundary_indices = track_slots.gather(
+                1, previous_track_indices.unsqueeze(1)
             ).squeeze(1)
         return DVRLinearStateContext(
             state_cache=self._state_adapter.get_state_cache(batch=batch),
@@ -375,7 +382,7 @@ class DVRLinearStateLifecycle:
             track_idx = req.mamba_next_track_idx
             if track_idx is None or req.mamba_ping_pong_track_buffer is None:
                 raise RuntimeError(
-                    f"DVR request {req.rid} has no ping-pong checkpoint slot."
+                    f"DVR request {req.rid} has no recurrent checkpoint slot."
                 )
             boundary_index = req.mamba_ping_pong_track_buffer[track_idx]
 
@@ -396,7 +403,8 @@ class DVRLinearStateLifecycle:
             elif boundary_len == 0:
                 zero_indices.append(boundary_index)
             elif (
-                prefill_prefix_lens is None
+                self.server_args.disable_radix_cache
+                or prefill_prefix_lens is None
                 or int(prefill_prefix_lens[i]) != boundary_len
             ):
                 raise RuntimeError(

@@ -317,18 +317,16 @@ class ModelRunnerKVCacheMixin:
         return kv_cache_dim
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
-        # DVR keeps request-local recurrent checkpoints even when deterministic
-        # attention disables prefix matching (for example, FlashInfer).
-        if (
-            self.server_args.disable_radix_cache
-            and not self.server_args.enable_mamba_extra_buffer()
-        ):
-            return 1
+        if self.server_args.disable_radix_cache:
+            # No prefix state survives a request. DVR needs only the live state
+            # and one request-local rollback boundary; ordinary decode needs the
+            # live state alone.
+            return 2 if self.spec_algorithm.is_dvr() else 1
 
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
-            # DVR keeps one request-local rollback checkpoint while radix may
-            # donate another, so both sync and overlap modes require two slots.
+            # Radix may donate one DVR boundary while overlap advances the
+            # request, so both request-owned checkpoint slots are required.
             if self.spec_algorithm.is_dvr():
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             elif not self.server_args.disable_overlap_schedule:
@@ -432,6 +430,11 @@ class ModelRunnerKVCacheMixin:
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
+                dvr_track_buffer_size = None
+                if self.spec_algorithm.is_dvr():
+                    dvr_track_buffer_size = (
+                        1 if self.server_args.disable_radix_cache else 2
+                    )
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
@@ -456,9 +459,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
-                    mamba_ping_pong_track_buffer_size=(
-                        2 if self.spec_algorithm.is_dvr() else None
-                    ),
+                    mamba_ping_pong_track_buffer_size=dvr_track_buffer_size,
                     start_layer=self.start_layer,
                 )
             else:

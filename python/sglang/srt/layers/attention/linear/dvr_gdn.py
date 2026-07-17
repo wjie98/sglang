@@ -552,9 +552,9 @@ class DVRGDNStateAdapter:
             accepted_token_counts - 1,
         )
 
-        # Alternate the two request-owned ping-pong slots at chunk crossings.
-        # The old slot remains intact so a finishing overlap request can publish
-        # either the host-visible boundary or the one physical step ahead.
+        # Commit to the pool-selected next checkpoint slot. Radix execution uses
+        # two slots so finish can publish either overlap boundary; without Radix,
+        # the sole request-local slot is updated in place.
         fused_mamba_state_scatter_with_mask(
             state_cache.temporal,
             state_cache.intermediate_ssm,
