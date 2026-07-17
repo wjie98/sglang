@@ -194,6 +194,19 @@ class TestDVRServerArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "thresholds must remain 1.0"):
             handle_dvr_speculative_decoding(args)
 
+    def test_dvr_rejection_sampling_rejects_tree_and_multi_layer_eagle(self):
+        args = _Args()
+        args.speculative_eagle_topk = 2
+        with self.assertRaisesRegex(ValueError, "chain mode with topk == 1"):
+            handle_dvr_speculative_decoding(args)
+
+        args = _Args()
+        args.speculative_algorithm = DVR_EAGLE_SPECULATIVE_ALGORITHM
+        args.speculative_draft_model_path = "draft"
+        args.enable_multi_layer_eagle = True
+        with self.assertRaisesRegex(NotImplementedError, "multi-layer EAGLE"):
+            handle_dvr_speculative_decoding(args)
+
     def test_dvr_rejects_custom_sampler(self):
         for rejection_sampling in (True, False):
             args = _Args()

@@ -177,6 +177,23 @@ def test_dvr_sampling_filters_use_joint_top_k_top_p_semantics(device, monkeypatc
     )
 
 
+def test_dvr_sampling_filters_preserve_mixed_greedy_rows():
+    probs = torch.tensor([[0.6, 0.3, 0.1], [0.6, 0.3, 0.1]])
+    sampling_info = SimpleNamespace(
+        top_ks=torch.tensor([1, 3]),
+        top_ps=torch.ones(2),
+        min_ps=torch.zeros(2),
+        need_top_k_sampling=True,
+        need_top_p_sampling=False,
+        need_min_p_sampling=False,
+    )
+
+    filtered = renorm_sampling_probs(probs, sampling_info)
+
+    torch.testing.assert_close(filtered[0], torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(filtered[1], probs[1])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_dvr_sampling_filters_match_flashinfer_min_p_order(monkeypatch):
     monkeypatch.setattr(
