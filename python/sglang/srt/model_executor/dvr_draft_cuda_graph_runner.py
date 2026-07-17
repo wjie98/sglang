@@ -16,26 +16,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 
-def iter_dvr_attention_backends(*roots):
-    """Yield each backend reachable through SGLang's attention wrappers once."""
-
-    seen = set()
-    stack = list(reversed(roots))
-    while stack:
-        backend = stack.pop()
-        if backend is None or isinstance(backend, str) or id(backend) in seen:
-            continue
-        seen.add(id(backend))
-        yield backend
-
-        for attr_name in ("decode_backend", "prefill_backend", "primary"):
-            stack.append(getattr(backend, attr_name, None))
-
-        for attr_name in ("attn_backend_list", "attn_backends", "children"):
-            for child in getattr(backend, attr_name, None) or ():
-                stack.append(child)
-
-
 @contextmanager
 def _maybe_disable_batch_invariant_ops(disable: bool):
     if not disable:
@@ -154,22 +134,16 @@ def dvr_draft_decode_context(
                     patch_attr(server_args, "enable_deterministic_inference", False)
 
             supported_backends = []
-            for backend in iter_dvr_attention_backends(
+            for backend in (
                 model_runner.attn_backend,
                 *(extra_attn_backends or ()),
             ):
-                get_overrides = getattr(
-                    backend, "get_nondeterministic_decode_overrides", None
-                )
-                overrides = (
-                    None if get_overrides is None else get_overrides(model_runner)
-                )
+                overrides = backend.get_nondeterministic_decode_overrides(model_runner)
                 if overrides is None:
                     continue
                 supported_backends.append(type(backend).__name__)
-                patch_attr(backend, "enable_deterministic", False)
-                for name, value in overrides:
-                    patch_attr(backend, name, value)
+                for owner, name, value in overrides:
+                    patch_attr(owner, name, value)
 
             if not supported_backends:
                 raise RuntimeError(

@@ -8,6 +8,11 @@ import sglang.srt.speculative.dvr_worker as dvr_worker_module
 import sglang.srt.speculative.eagle_utils as eagle_utils_module
 import sglang.srt.speculative.spec_utils as spec_utils_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -15,7 +20,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     DVRTargetVerifyCudaGraphRunner,
     _ensure_decode_custom_all_reduce_comm,
-    iter_dvr_attention_backends,
 )
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -810,14 +814,16 @@ def test_dvr_draft_restores_backend_decode_defaults():
     )
 
     def apply_overrides(backend, method):
-        for name, value in method(backend, model_runner):
-            setattr(backend, name, value)
+        for owner, name, value in method(backend, model_runner):
+            setattr(owner, name, value)
 
     fa3 = SimpleNamespace()
     fa3.fa_impl_ver = 3
     fa3.num_splits = 1
+    fa3.enable_deterministic = True
     apply_overrides(fa3, FlashAttentionBackend.get_nondeterministic_decode_overrides)
     assert fa3.num_splits == 0
+    assert not fa3.enable_deterministic
 
     fa4 = SimpleNamespace(fa_impl_ver=4)
     assert (
@@ -831,6 +837,7 @@ def test_dvr_draft_restores_backend_decode_defaults():
     triton_backend._nondeterministic_decode_config = (False, None, 8)
     triton_backend.split_tile_size = 256
     triton_backend.static_kv_splits = False
+    triton_backend.enable_deterministic = True
     triton_backend.cuda_graph_attn_logits = torch.zeros(4, 2, 32, 8)
     triton_backend.cuda_graph_attn_lse = torch.zeros(4, 2, 32)
     triton_backend.cuda_graph_swa_attn_logits = None
@@ -841,6 +848,7 @@ def test_dvr_draft_restores_backend_decode_defaults():
     assert triton_backend.max_kv_splits == 8
     assert triton_backend.split_tile_size is None
     assert not triton_backend.static_kv_splits
+    assert not triton_backend.enable_deterministic
     assert triton_backend.cuda_graph_attn_logits.shape[2] == 8
     assert triton_backend.cuda_graph_attn_lse.shape[2] == 8
     assert torch.equal(
@@ -849,26 +857,44 @@ def test_dvr_draft_restores_backend_decode_defaults():
     )
 
 
-def test_dvr_draft_reaches_nested_hybrid_attention_backends():
-    full_attention = SimpleNamespace()
-    linear_attention = SimpleNamespace()
-    hybrid = SimpleNamespace(
-        attn_backend_list=[full_attention, linear_attention],
-        full_attn_backend=full_attention,
+def test_dvr_draft_uses_explicit_attention_wrapper_delegation():
+    class Backend:
+        token_to_kv_pool = object()
+        req_to_token_pool = object()
+        needs_cpu_seq_lens = False
+
+        def __init__(self, adapter=None):
+            self.dvr_state_adapter = adapter
+
+        def get_nondeterministic_decode_overrides(self, _model_runner):
+            return [(self, "fast_decode", True)]
+
+    adapter = object()
+    full_attention = Backend()
+    linear_attention = Backend(adapter)
+    hybrid_linear = HybridLinearAttnBackend(
+        full_attention, linear_attention, full_attn_layers=[]
+    )
+    tbo_children = [Backend(), Backend()]
+    tbo = TboAttnBackend(primary=hybrid_linear, children=tbo_children)
+    model_runner = SimpleNamespace(
+        kv_cache_dtype=torch.bfloat16,
+        token_to_kv_pool=object(),
+        req_to_token_pool=object(),
+    )
+    hybrid = HybridAttnBackend(
+        model_runner=model_runner,
+        prefill_backend=Backend(),
+        decode_backend=tbo,
     )
 
-    backends = list(iter_dvr_attention_backends(hybrid))
+    overrides = hybrid.get_nondeterministic_decode_overrides(model_runner)
 
-    assert {id(backend) for backend in backends} == {
-        id(hybrid),
-        id(full_attention),
-        id(linear_attention),
-    }
-
-    assert (
-        list(iter_dvr_attention_backends(hybrid, full_attention, linear_attention))
-        == backends
-    )
+    assert [owner for owner, _, _ in overrides] == [
+        full_attention,
+        *tbo_children,
+    ]
+    assert hybrid.dvr_state_adapter is adapter
 
 
 @pytest.mark.parametrize("is_dvr_eagle", [False, True])

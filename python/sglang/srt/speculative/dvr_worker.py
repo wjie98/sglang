@@ -20,7 +20,6 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     dvr_draft_decode_context,
-    iter_dvr_attention_backends,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -224,14 +223,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backends()
         # Self-DVR target worker owns the model and attention backend. Scheduler
         # already initializes it before calling this self-draft worker hook.
-        adapters = []
-        for backend in iter_dvr_attention_backends(self.model_runner.attn_backend):
-            adapter = getattr(backend, "dvr_state_adapter", None)
-            if adapter is not None and all(adapter is not item for item in adapters):
-                adapters.append(adapter)
-        if len(adapters) > 1:
-            raise RuntimeError("DVR target resolved multiple linear-state adapters.")
-        self.linear_state.bind_state_adapter(adapters[0] if adapters else None)
+        self.linear_state.bind_state_adapter(
+            getattr(self.model_runner.attn_backend, "dvr_state_adapter", None)
+        )
 
     def init_cuda_graphs(self):
         if self.is_dvr_eagle:

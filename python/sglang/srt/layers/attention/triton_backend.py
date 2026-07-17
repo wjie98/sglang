@@ -301,7 +301,7 @@ class TritonAttnBackend(AttentionBackend):
         # Deterministic initialization owns the allocation. A narrower view
         # recovers normal decode planning without a second graph workspace.
         max_kv_splits = min(self.max_kv_splits, max_kv_splits)
-        overrides = []
+        overrides = [(self, "enable_deterministic", False)]
         for name in (
             "cuda_graph_attn_logits",
             "cuda_graph_attn_lse",
@@ -309,7 +309,7 @@ class TritonAttnBackend(AttentionBackend):
         ):
             buffer = getattr(self, name, None)
             if buffer is not None:
-                overrides.append((name, buffer[:, :, :max_kv_splits]))
+                overrides.append((self, name, buffer[:, :, :max_kv_splits]))
         for name in (
             "cuda_graph_num_kv_splits",
             "cuda_graph_window_num_kv_splits",
@@ -323,12 +323,12 @@ class TritonAttnBackend(AttentionBackend):
                 if draft_buffer is None:
                     draft_buffer = torch.full_like(buffer, max_kv_splits)
                     buffers[name] = draft_buffer
-                overrides.append((name, draft_buffer))
+                overrides.append((self, name, draft_buffer))
         overrides.extend(
             (
-                ("max_kv_splits", max_kv_splits),
-                ("split_tile_size", split_tile_size),
-                ("static_kv_splits", static_kv_splits),
+                (self, "max_kv_splits", max_kv_splits),
+                (self, "split_tile_size", split_tile_size),
+                (self, "static_kv_splits", static_kv_splits),
             )
         )
         return overrides

@@ -24,6 +24,14 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.dvr_state_adapter = getattr(decode_backend, "dvr_state_adapter", None)
+        if self.dvr_state_adapter is None:
+            self.dvr_state_adapter = getattr(
+                prefill_backend, "dvr_state_adapter", None
+            )
+
+    def get_nondeterministic_decode_overrides(self, model_runner):
+        return self.decode_backend.get_nondeterministic_decode_overrides(model_runner)
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """

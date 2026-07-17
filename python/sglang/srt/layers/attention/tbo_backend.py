@@ -17,6 +17,18 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
+        self.dvr_state_adapter = getattr(primary, "dvr_state_adapter", None)
+
+    def get_nondeterministic_decode_overrides(self, model_runner):
+        overrides = []
+        for backend in (self.primary, *self.children):
+            child_overrides = backend.get_nondeterministic_decode_overrides(
+                model_runner
+            )
+            if child_overrides is None:
+                return None
+            overrides.extend(child_overrides)
+        return overrides
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
