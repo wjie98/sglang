@@ -26,7 +26,9 @@ DVR_PY_FILES=(
   python/sglang/srt/model_executor/dvr_draft_cuda_graph_runner.py
   python/sglang/srt/model_executor/model_runner.py
   python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  python/sglang/srt/model_executor/pool_configurator.py
   python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+  python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py
   python/sglang/srt/server_args.py
   python/sglang/srt/arg_groups/speculative_hook.py
   python/sglang/srt/speculative/dvr_server_args.py
@@ -50,4 +52,5 @@ conda_python -m py_compile "${DVR_PY_FILES[@]}"
 conda_python -m pytest \
   test/registered/unit/speculative/test_dvr_contracts.py \
   test/registered/unit/server_args/test_dvr_server_args.py \
-  test/registered/unit/layers/test_dvr_gdn_state_input_cache.py
+  test/registered/unit/layers/test_dvr_gdn_state_input_cache.py \
+  test/registered/unit/model_executor/test_pool_configurator.py::TestEagleConfigurator::test_dvr_eagle_does_not_exceed_budget

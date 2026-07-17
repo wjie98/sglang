@@ -156,7 +156,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         if (
             _prefill_backend_name == Backend.BREAKABLE
-            and model_runner.spec_algorithm.is_eagle()
+            and (
+                model_runner.spec_algorithm.is_eagle()
+                or model_runner.spec_algorithm.is_dvr_eagle()
+            )
         ):
             self.capture_hidden_mode = (
                 CaptureHiddenMode.LAST
@@ -245,7 +248,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_eagle()
+            and (
+                model_runner.spec_algorithm.is_eagle()
+                or model_runner.spec_algorithm.is_dvr_eagle()
+            )
         ):
             from sglang.srt.speculative.eagle_utils import get_draft_hidden_dim
 

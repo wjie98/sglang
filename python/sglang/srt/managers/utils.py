@@ -240,14 +240,11 @@ class EmbeddingBatchResult:
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
         copy_done: CUDA event recorded after the async CPU copy completes.
-        result_process_ready_event: Optional fence before result processing may
-            write shared request pools.
     """
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
-    result_process_ready_event: Optional[torch.cuda.Event] = None
 
     @property
     def can_run_cuda_graph(self) -> bool:

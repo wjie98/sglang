@@ -1587,7 +1587,7 @@ class Scheduler(
             if (
                 self.last_batch
                 and self.result_queue
-                and not self.spec_algorithm.is_none()
+                and self.spec_algorithm.is_dvr()
                 and self.last_batch.has_grammar
             ):
                 pop_and_process()
@@ -1607,12 +1607,15 @@ class Scheduler(
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
-                if batch_result.result_process_ready_event is not None:
+                result_process_ready_event = getattr(
+                    batch_result, "result_process_ready_event", None
+                )
+                if result_process_ready_event is not None:
                     # Queue preceding result writes behind any current forward
                     # phase that still reads shared pools, without blocking CPU
                     # result processing.
                     self.schedule_stream.wait_event(
-                        batch_result.result_process_ready_event
+                        result_process_ready_event
                     )
             else:
                 batch_result = None

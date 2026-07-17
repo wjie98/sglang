@@ -519,13 +519,16 @@ def eagle_sample(
         # Defense-in-depth behind the spec_hook startup allowlist: validate the
         # actual kernel inputs (catches draft_probs plumbing regressions or a
         # startup guard bypassed by a worker subclass) before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
+        expected_draft_shape = (
+            bs,
+            verify_input.draft_token_num - 1,
+            target_probs.shape[-1],
+        )
+        if use_rejection_sampling and draft_probs.shape != expected_draft_shape:
             raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
+                "Rejection sampling requires one target-vocab proposal row per "
+                "draft edge; got draft_probs shape "
+                f"{tuple(draft_probs.shape)}, expected {expected_draft_shape}."
             )
 
         if use_rejection_sampling and sampling_info.sampling_seed is not None:
@@ -540,17 +543,27 @@ def eagle_sample(
                 verify_input.draft_token_num
             )
             streams = torch.arange(2, dtype=torch.int64, device=device)
-            uniforms = murmur_hash32(seeds, positions, streams).to(torch.float64)
-            uniforms /= torch.iinfo(torch.uint32).max
-            uniforms = uniforms.to(torch.float32).reshape(
+            # Use the high 24 hash bits so every float32 coin is in [0, 1).
+            # A coin equal to one would reject an otherwise exact p == q match.
+            uniforms = torch.bitwise_right_shift(
+                murmur_hash32(seeds, positions, streams).to(torch.int64), 8
+            ).to(torch.float32)
+            uniforms.mul_(1.0 / 2**24)
+            uniforms = uniforms.reshape(
                 bs, verify_input.draft_token_num, 2
             )
             coins = uniforms[:, :, 0].contiguous()
             coins_for_final_sampling = uniforms[:, :, 1].contiguous()
         else:
             coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-            coins_for_final_sampling = torch.rand_like(
-                candidates, dtype=torch.float32, device=device
+            coins_for_final_sampling = torch.rand(
+                (
+                    (bs, verify_input.draft_token_num)
+                    if use_rejection_sampling
+                    else (bs,)
+                ),
+                dtype=torch.float32,
+                device=device,
             )
 
         sampling_fn = (

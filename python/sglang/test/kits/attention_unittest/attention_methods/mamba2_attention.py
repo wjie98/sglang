@@ -429,7 +429,7 @@ class MockMamba2ModelRunner(ModelRunner):
                 if speculative_num_draft_tokens > 0
                 else None
             ),
-            mamba_ping_pong_track_buffer_size=1,
+            enable_overlap_schedule=False,
         )
         max_token_loc = case.page_size + pool_batch_size * max_context_len
         # Mamba2 doesn't use KV; the pool is required only because ModelRunner

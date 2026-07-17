@@ -19,6 +19,8 @@ class _Args:
     enable_dp_attention = False
     enable_pdmux = False
     disaggregation_mode = "null"
+    pp_size = 1
+    speculative_adaptive = False
     speculative_draft_model_path = None
     speculative_num_draft_tokens = 16
     speculative_num_steps = None
@@ -42,6 +44,10 @@ class _Args:
     prefill_attention_backend = None
     decode_attention_backend = None
     speculative_use_rejection_sampling = False
+    speculative_accept_threshold_single = 1.0
+    speculative_accept_threshold_acc = 1.0
+    enable_multi_layer_eagle = False
+    sampling_backend = "flashinfer"
 
     def __init__(self):
         self.cuda_graph_config = SimpleNamespace(
@@ -59,6 +65,13 @@ class TestDVRServerArgs(unittest.TestCase):
         args = _Args()
         args.speculative_num_draft_tokens = 1
         with self.assertRaisesRegex(ValueError, "speculative_num_draft_tokens >= 2"):
+            handle_dvr_speculative_decoding(args)
+
+    def test_dvr_rejects_pipeline_parallelism(self):
+        args = _Args()
+        args.pp_size = 2
+
+        with self.assertRaisesRegex(ValueError, "pp_size == 1"):
             handle_dvr_speculative_decoding(args)
 
     def test_dvr_self_draft_extends_cuda_graph_max_with_padding(self):
@@ -153,6 +166,17 @@ class TestDVRServerArgs(unittest.TestCase):
 
         self.assertFalse(args.disable_radix_cache)
 
+    def test_dvr_eagle_defaults_to_one_mtp_draft_step(self):
+        args = _Args()
+        args.speculative_algorithm = DVR_EAGLE_SPECULATIVE_ALGORITHM
+        args.speculative_draft_model_path = "draft"
+        args.speculative_num_draft_tokens = None
+
+        handle_dvr_speculative_decoding(args)
+
+        self.assertEqual(args.speculative_num_draft_tokens, 2)
+        self.assertEqual(args.speculative_num_steps, 1)
+
     def test_dvr_rejection_sampling_is_default_and_can_be_disabled(self):
         args = _Args()
         handle_dvr_speculative_decoding(args)
@@ -162,6 +186,25 @@ class TestDVRServerArgs(unittest.TestCase):
         with envs.SGLANG_DVR_USE_REJECTION_SAMPLING.override(False):
             handle_dvr_speculative_decoding(args)
         self.assertFalse(args.speculative_use_rejection_sampling)
+
+    def test_dvr_rejection_sampling_rejects_ignored_acceptance_thresholds(self):
+        args = _Args()
+        args.speculative_accept_threshold_single = 0.9
+
+        with self.assertRaisesRegex(ValueError, "thresholds must remain 1.0"):
+            handle_dvr_speculative_decoding(args)
+
+    def test_dvr_rejects_custom_sampler(self):
+        for rejection_sampling in (True, False):
+            args = _Args()
+            args.sampling_backend = "custom"
+            with (
+                envs.SGLANG_DVR_USE_REJECTION_SAMPLING.override(rejection_sampling),
+                self.assertRaisesRegex(
+                    ValueError, "built-in flashinfer and pytorch"
+                ),
+            ):
+                handle_dvr_speculative_decoding(args)
 
     def test_dvr_preserves_disabled_radix_cache_with_request_checkpoints(self):
         args = _Args()

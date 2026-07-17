@@ -94,8 +94,12 @@ def fast_sample(
         # sampling. Keep stream 2 disjoint from rejection/final coins (0/1).
         cdf = probs.float().cumsum(dim=-1)
         stream = torch.full_like(positions[:1], 2, dtype=torch.int64)
-        uniform = murmur_hash32(sampling_seed, positions, stream).to(cdf.dtype)
-        uniform.mul_(1.0 / 2**32).mul_(cdf[:, -1:])
+        # Keep the uniform strictly below one. Converting uint32 max directly
+        # to float32 rounds to 2**32 and can select a zero-probability endpoint.
+        uniform = torch.bitwise_right_shift(
+            murmur_hash32(sampling_seed, positions, stream).to(torch.int64), 8
+        ).to(cdf.dtype)
+        uniform.mul_(1.0 / 2**24).mul_(cdf[:, -1:])
         sample_index = torch.searchsorted(cdf, uniform, right=True)
         sample_index.clamp_max_(probs.shape[-1] - 1)
     sample_p = probs.gather(1, sample_index)
@@ -115,8 +119,20 @@ def renorm_sampling_probs(probs: torch.Tensor, sampling_info, repeat: int = 1):
         _is_musa and probs.device.type == "musa"
     )
     if use_kernel:
-        probs = top_k_renorm_prob(probs, top_ks)
-        probs = top_p_renorm_prob(probs, top_ps)
+        server_args = get_global_server_args()
+        if (
+            getattr(server_args, "sampling_backend", None) == "flashinfer"
+            and sampling_info.need_min_p_sampling
+        ):
+            # Match Sampler._sample_from_probs: FlashInfer's min-p path applies
+            # top-k and top-p sequentially before min-p sampling.
+            probs = top_k_renorm_prob(probs, top_ks)
+            probs = top_p_renorm_prob(probs, top_ps)
+        else:
+            # PyTorch and FlashInfer's ordinary top-k/top-p path use joint
+            # filtering. top-p before top-k preserves that intersection.
+            probs = top_p_renorm_prob(probs, top_ps)
+            probs = top_k_renorm_prob(probs, top_ks)
     else:
         sorted_probs, indices = probs.sort(dim=-1, descending=True)
         ranks = torch.arange(probs.shape[-1], device=probs.device).unsqueeze(0)

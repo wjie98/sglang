@@ -94,6 +94,10 @@ def handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR currently does not support PDMux attention backends.")
     if server_args.disaggregation_mode != "null":
         raise ValueError("DVR currently does not support disaggregation mode.")
+    if server_args.pp_size != 1:
+        raise ValueError("DVR currently supports only pp_size == 1.")
+    if server_args.speculative_adaptive:
+        raise ValueError("DVR does not support adaptive speculative decoding.")
     if (
         server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is not None
@@ -107,11 +111,16 @@ def handle_dvr_speculative_decoding(server_args):
             "DVR EAGLE requires setting --speculative-draft-model-path."
         )
     if server_args.speculative_num_draft_tokens is None:
-        server_args.speculative_num_draft_tokens = 16
+        server_args.speculative_num_draft_tokens = (
+            2
+            if server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
+            else 16
+        )
         logger.warning(
-            "speculative_num_draft_tokens is set to 16 by default for DVR. "
+            "speculative_num_draft_tokens is set to %s by default for DVR. "
             "You can override this by explicitly setting "
-            "--speculative-num-draft-tokens."
+            "--speculative-num-draft-tokens.",
+            server_args.speculative_num_draft_tokens,
         )
 
     uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
@@ -162,6 +171,12 @@ def handle_dvr_speculative_decoding(server_args):
         server_args.speculative_eagle_topk = 1
     elif server_args.speculative_eagle_topk != 1:
         raise ValueError("DVR currently supports only chain mode with topk == 1.")
+    if server_args.sampling_backend not in ("flashinfer", "pytorch"):
+        raise ValueError(
+            "DVR supports only the built-in flashinfer and pytorch sampling "
+            "backends because target verification must reproduce the sampler's "
+            "request distribution."
+        )
 
     # Exact rejection sampling is the DVR default because it preserves more
     # useful MTP proposals under stochastic target sampling. Target-only EAGLE
@@ -169,7 +184,23 @@ def handle_dvr_speculative_decoding(server_args):
     server_args.speculative_use_rejection_sampling = (
         envs.SGLANG_DVR_USE_REJECTION_SAMPLING.get()
     )
-    if not server_args.speculative_use_rejection_sampling:
+    if server_args.speculative_use_rejection_sampling:
+        if (
+            server_args.speculative_accept_threshold_single != 1.0
+            or server_args.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "DVR rejection sampling does not use speculative acceptance "
+                "thresholds; both thresholds must remain 1.0."
+            )
+        if (
+            server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
+            and server_args.enable_multi_layer_eagle
+        ):
+            raise NotImplementedError(
+                "DVR EAGLE rejection sampling does not support multi-layer EAGLE."
+            )
+    else:
         logger.warning(
             "DVR target-only sampling is enabled by "
             "SGLANG_DVR_USE_REJECTION_SAMPLING=0."

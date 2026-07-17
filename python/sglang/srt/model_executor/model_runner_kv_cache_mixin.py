@@ -455,13 +455,9 @@ class ModelRunnerKVCacheMixin:
                         1 if self.spec_algorithm.is_dvr() else None
                     ),
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
+                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     mamba_ping_pong_track_buffer_size=(
-                        2
-                        if (
-                            not self.server_args.disable_overlap_schedule
-                            or self.spec_algorithm.is_dvr()
-                        )
-                        else 1
+                        2 if self.spec_algorithm.is_dvr() else None
                     ),
                     start_layer=self.start_layer,
                 )

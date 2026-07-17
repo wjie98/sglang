@@ -4,11 +4,13 @@ import pytest
 import torch
 
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
+import sglang.srt.speculative.eagle_utils as eagle_utils_module
+import sglang.srt.speculative.spec_utils as spec_utils_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.linear.dvr_gdn import DVRGDNStateAdapter
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
-from sglang.srt.managers.utils import EmbeddingBatchResult, GenerationBatchResult
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     DVRTargetVerifyCudaGraphRunner,
@@ -100,12 +102,6 @@ def test_dvr_without_radix_allocates_recurrent_slots_per_request():
 
 def test_overlap_batch_results_default_to_no_result_process_fence():
     assert GenerationBatchResult().result_process_ready_event is None
-    assert (
-        EmbeddingBatchResult(
-            embeddings=torch.empty((0,), dtype=torch.float32)
-        ).result_process_ready_event
-        is None
-    )
 
 
 @pytest.mark.parametrize(
@@ -135,6 +131,89 @@ def test_dvr_draft_proposal_applies_min_p():
     proposal = renorm_sampling_probs(torch.tensor([[0.6, 0.3, 0.1]]), sampling_info)
 
     torch.testing.assert_close(proposal, torch.tensor([[2 / 3, 1 / 3, 0.0]]))
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is required"
+            ),
+        ),
+    ],
+)
+def test_dvr_sampling_filters_use_joint_top_k_top_p_semantics(device, monkeypatch):
+    monkeypatch.setattr(
+        spec_utils_module,
+        "get_global_server_args",
+        lambda: SimpleNamespace(sampling_backend="pytorch"),
+    )
+    sampling_info = SimpleNamespace(
+        top_ks=torch.tensor([2], device=device),
+        top_ps=torch.tensor([0.7], device=device),
+        min_ps=torch.tensor([0.0], device=device),
+        need_min_p_sampling=False,
+    )
+
+    proposal = renorm_sampling_probs(
+        torch.tensor([[0.6, 0.25, 0.15]], device=device), sampling_info
+    )
+
+    # Joint filtering evaluates top-p against the original distribution, so
+    # the first two tokens survive. Top-k-first would renormalize to 0.706/0.294
+    # before top-p and incorrectly collapse this distribution to top-1.
+    torch.testing.assert_close(
+        proposal, torch.tensor([[12 / 17, 5 / 17, 0.0]], device=device)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dvr_sampling_filters_match_flashinfer_min_p_order(monkeypatch):
+    monkeypatch.setattr(
+        spec_utils_module,
+        "get_global_server_args",
+        lambda: SimpleNamespace(sampling_backend="flashinfer"),
+    )
+    sampling_info = SimpleNamespace(
+        top_ks=torch.tensor([2], device="cuda"),
+        top_ps=torch.tensor([0.7], device="cuda"),
+        min_ps=torch.tensor([0.0], device="cuda"),
+        need_min_p_sampling=True,
+    )
+
+    proposal = renorm_sampling_probs(
+        torch.tensor([[0.6, 0.25, 0.15]], device="cuda"), sampling_info
+    )
+
+    # FlashInfer's min-p sampler first renormalizes top-k, so the first token
+    # alone crosses top-p=0.7. DVR must publish that exact proposal as q.
+    torch.testing.assert_close(
+        proposal, torch.tensor([[1.0, 0.0, 0.0]], device="cuda")
+    )
+
+
+def test_seeded_draft_sampling_excludes_the_one_endpoint(monkeypatch):
+    from sglang.srt.layers.utils import hash as hash_module
+
+    def max_uint32_hash(seed, positions, streams):
+        return torch.full(
+            (seed.shape[0], streams.shape[0]),
+            torch.iinfo(torch.uint32).max,
+            dtype=torch.uint32,
+            device=seed.device,
+        )
+
+    monkeypatch.setattr(hash_module, "murmur_hash32", max_uint32_hash)
+    _, sample_index = fast_sample(
+        torch.tensor([[1.0, 0.0]]),
+        sampling_seed=torch.tensor([7]),
+        positions=torch.tensor([65]),
+    )
+
+    assert sample_index.item() == 0
 
 
 def test_upstream_eagle_draft_proposal_keeps_unfiltered_distribution():
@@ -215,6 +294,145 @@ def test_rejection_sampling_selects_final_coin_at_accepted_position():
 
     assert accept_lens.item() == 2
     assert predict[2].item() == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_rejection_sampling_zero_residual_falls_back_to_target():
+    candidates = torch.zeros((1, 2), dtype=torch.long, device="cuda")
+    retrieve_index = torch.arange(2, dtype=torch.long, device="cuda").view(1, 2)
+    target_probs = torch.tensor([[[0.25, 0.75], [1.0, 0.0]]], device="cuda")
+    draft_probs = torch.tensor([[[0.25, 0.75]]], device="cuda")
+    predict = torch.zeros(2, dtype=torch.int32, device="cuda")
+    accept_index = torch.full((1, 2), -1, dtype=torch.int32, device="cuda")
+    accept_lens = torch.empty(1, dtype=torch.int32, device="cuda")
+
+    # coin=1 forces the numerically degenerate p == q rejection that normal
+    # [0, 1) random generation excludes. The fallback must sample p, not the
+    # vocabulary endpoint by accident.
+    chain_speculative_sampling_triton(
+        predicts=predict,
+        accept_index=accept_index,
+        accept_token_num=accept_lens,
+        candidates=candidates,
+        retrive_index=retrieve_index,
+        retrive_next_token=None,
+        retrive_next_sibling=None,
+        uniform_samples=torch.ones((1, 2), device="cuda"),
+        uniform_samples_for_final_sampling=torch.tensor([[0.1, 0.1]], device="cuda"),
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+
+    assert accept_lens.item() == 0
+    assert predict[0].item() == 0
+
+
+def test_rejection_sampling_rejects_malformed_proposal_shape():
+    with pytest.raises(ValueError, match="draft_probs has shape"):
+        chain_speculative_sampling_triton(
+            predicts=torch.empty(3, dtype=torch.int32),
+            accept_index=torch.empty((1, 3), dtype=torch.int32),
+            accept_token_num=torch.empty(1, dtype=torch.int32),
+            candidates=torch.empty((1, 3), dtype=torch.long),
+            retrive_index=torch.empty((1, 3), dtype=torch.long),
+            retrive_next_token=None,
+            retrive_next_sibling=None,
+            uniform_samples=torch.empty((1, 3)),
+            uniform_samples_for_final_sampling=torch.empty((1, 3)),
+            target_probs=torch.empty((1, 3, 5)),
+            draft_probs=torch.empty((1, 3, 5)),
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+        )
+
+
+def test_target_only_eagle_uses_one_final_coin_per_request(monkeypatch):
+    import sgl_kernel
+    import sglang.srt.distributed as distributed_module
+    import sglang.srt.layers.dp_attention as dp_attention_module
+    import sglang.srt.server_args as server_args_module
+
+    captured = {}
+
+    def fake_target_sampling(**kwargs):
+        captured["final_coin_shape"] = tuple(
+            kwargs["uniform_samples_for_final_sampling"].shape
+        )
+        kwargs["predicts"].zero_()
+        kwargs["accept_index"].zero_()
+        kwargs["accept_token_num"].zero_()
+
+    monkeypatch.setattr(sgl_kernel, "top_k_renorm_prob", lambda probs, _: probs)
+    monkeypatch.setattr(sgl_kernel, "top_p_renorm_prob", lambda probs, _: probs)
+    monkeypatch.setattr(
+        sgl_kernel, "tree_speculative_sampling_target_only", fake_target_sampling
+    )
+    monkeypatch.setattr(
+        distributed_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(dp_attention_module, "is_dp_attention_enabled", lambda: False)
+    monkeypatch.setattr(
+        server_args_module,
+        "get_global_server_args",
+        lambda: SimpleNamespace(
+            speculative_use_rejection_sampling=False,
+            speculative_accept_threshold_single=1.0,
+            speculative_accept_threshold_acc=1.0,
+        ),
+    )
+
+    batch_size, draft_tokens, vocab_size = 2, 3, 5
+    sampling_info = SimpleNamespace(
+        is_all_greedy=False,
+        acc_additive_penalties=None,
+        acc_scaling_penalties=None,
+        logit_bias=None,
+        temperatures=torch.ones((batch_size, 1)),
+        top_ks=torch.full((batch_size,), vocab_size, dtype=torch.int32),
+        top_ps=torch.ones(batch_size),
+        sampling_seed=None,
+    )
+    verify_input = SimpleNamespace(
+        draft_token=torch.zeros(batch_size * draft_tokens, dtype=torch.long),
+        draft_token_num=draft_tokens,
+        max_tree_depth=draft_tokens,
+        retrieve_index=torch.arange(batch_size * draft_tokens).reshape(
+            batch_size, draft_tokens
+        ),
+        retrieve_next_token=torch.zeros(
+            (batch_size, draft_tokens), dtype=torch.long
+        ),
+        retrieve_next_sibling=torch.zeros(
+            (batch_size, draft_tokens), dtype=torch.long
+        ),
+        draft_probs=None,
+        spec_steps=draft_tokens - 1,
+        positions=torch.arange(batch_size * draft_tokens),
+    )
+    batch = SimpleNamespace(
+        device="cpu",
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+        seq_lens=torch.ones(batch_size, dtype=torch.int32),
+        sampling_info=sampling_info,
+    )
+
+    eagle_utils_module.eagle_sample(
+        verify_input,
+        batch,
+        SimpleNamespace(
+            next_token_logits=torch.zeros(
+                (batch_size * draft_tokens, vocab_size), dtype=torch.float32
+            )
+        ),
+    )
+
+    assert captured["final_coin_shape"] == (batch_size,)
 
 
 def test_dvr_seq_lens_uses_current_batch_when_host_mirror_is_absent():

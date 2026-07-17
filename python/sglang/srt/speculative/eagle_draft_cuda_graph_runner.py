@@ -472,6 +472,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
+        sampling_seed_buffer = getattr(buffers, "sampling_seed", None)
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
@@ -499,8 +500,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.bootstrap_room_ids_int.fill_(-1)
             buffers.topk_p.zero_()
             buffers.topk_index.zero_()
-            if buffers.sampling_seed is not None:
-                buffers.sampling_seed.zero_()
+            if sampling_seed_buffer is not None:
+                sampling_seed_buffer.zero_()
             if buffers.draft_probs is not None:
                 buffers.draft_probs.zero_()
             if buffers.hidden_states is not None:
@@ -575,12 +576,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
-            if buffers.sampling_seed is not None:
+            if sampling_seed_buffer is not None:
                 if forward_batch.sampling_info.sampling_seed is None:
                     raise RuntimeError(
                         "Deterministic EAGLE rejection sampling requires request seeds."
                     )
-                buffers.sampling_seed[:raw_bs].copy_(
+                sampling_seed_buffer[:raw_bs].copy_(
                     forward_batch.sampling_info.sampling_seed[:raw_bs]
                 )
 

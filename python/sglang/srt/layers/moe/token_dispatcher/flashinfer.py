@@ -124,7 +124,9 @@ class FlashinferDispatcher(BaseDispatcher):
         speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
-        if MOE_NVFP4_DISPATCH and not speculative_algo.is_eagle():
+        if MOE_NVFP4_DISPATCH and not (
+            speculative_algo.is_eagle() or speculative_algo.is_dvr_eagle()
+        ):
             total_dispatch_payload_size_per_token = (
                 hidden_size // 2  # nvfp4 hidden states
                 + hidden_size // 16  # fp8 scaling factors

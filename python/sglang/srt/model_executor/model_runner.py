@@ -446,7 +446,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
         if (
-            (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
+            (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+                or self.spec_algorithm.is_dvr_eagle()
+            )
             and not self.is_draft_worker
             and server_args.speculative_draft_model_path
         ):
@@ -2750,7 +2754,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
         # (restored from #25795), so it does NOT need this skip.
         if (
-            self.spec_algorithm.is_eagle()
+            (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dvr_eagle())
             and not self.is_draft_worker
             and not self.server_args.enable_return_hidden_states
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)

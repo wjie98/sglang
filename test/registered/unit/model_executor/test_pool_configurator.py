@@ -531,6 +531,33 @@ class TestEagleConfigurator(unittest.TestCase):
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
 
+    def test_dvr_eagle_does_not_exceed_budget(self):
+        available = 10_000_000
+        num_layers = 32
+        draft_num_layers = 1
+
+        mr = _make_model_runner(num_layers=num_layers)
+        mr.spec_algorithm.is_eagle.return_value = False
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_dvr_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.eagle_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            config = create_memory_pool_configurator(mr).calculate_pool_sizes(
+                available, 1
+            )
+
+        full_pt = _full_per_token(mr)
+        used = config.max_total_num_tokens * full_pt * (
+            num_layers + draft_num_layers
+        )
+        self.assertLessEqual(used, available)
+
 
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
