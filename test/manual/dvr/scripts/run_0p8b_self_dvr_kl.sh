@@ -141,8 +141,14 @@ run_one_mode() {
       2>&1 | tee -a "${client_log}"
 
     echo "==> Running ${label} radix ownership and boundary lifecycle cases"
+    local lifecycle_args=()
+    if [[ "${spec_v2}" == "1" ]]; then
+      # Upstream does not support overlap + speculative decoding + grammar.
+      lifecycle_args=(--skip-grammar)
+    fi
     conda_python test/manual/dvr/test_dvr_radix_lifecycle.py \
       --base-url "${BASE_URL}" \
+      "${lifecycle_args[@]}" \
       2>&1 | tee -a "${client_log}"
   fi
 

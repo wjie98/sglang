@@ -122,9 +122,9 @@ run_one_mode() {
   grep -q "ALL_OK True" "${short_prompt_log}"
 
   echo "==> Running ${label} returned-logprob KL smoke"
-  # The default rejection path is meaningful only under stochastic sampling.
-  # Proposal and verify coins are keyed by request seed plus token position, so
-  # sync/overlap and return-logprob variants must report identical histograms.
+  # Rejection is meaningful only under stochastic sampling. Compare aggregate
+  # acceptance across modes; ordinary EAGLE RNG does not promise identical
+  # token trajectories for different batch shapes or overlap schedules.
   conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --prompt-token-lengths 63,64,65 \
@@ -215,11 +215,17 @@ run_one_mode() {
     grep -q "ALL_OK True" "${interleaved_kl_log}"
 
     echo "==> Running ${label} generated-prefix radix lifecycle smoke"
+    local lifecycle_args=()
+    if [[ "${spec_v2}" == "1" ]]; then
+      # Upstream does not support overlap + speculative decoding + grammar.
+      lifecycle_args=(--skip-grammar)
+    fi
     conda_python test/manual/dvr/test_dvr_radix_lifecycle.py \
       --base-url "${BASE_URL}" \
       --slot-cycles 4 \
       --prompt-lengths 63,64,65 \
       --generated-lengths 1,63,64,65,127,128,129 \
+      "${lifecycle_args[@]}" \
       2>&1 | tee "${radix_lifecycle_log}"
     grep -q "ALL_OK True" "${radix_lifecycle_log}"
   fi
@@ -233,7 +239,7 @@ run_one_mode() {
     --max-new "${MTP_REALDATA_MAX_NEW}" \
     --cache-mode flush-each \
     --check-kl \
-    --min-accept-rate "${MTP_REALDATA_MIN_ACCEPT_RATE}" \
+    --min-aggregate-accept-rate "${MTP_REALDATA_MIN_ACCEPT_RATE}" \
     --temperature "${ACCEPT_TEMPERATURE}" \
     --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \
@@ -251,7 +257,7 @@ run_one_mode() {
     --max-new "${MTP_REALDATA_MAX_NEW}" \
     --cache-mode flush-each \
     --no-return-logprob \
-    --min-accept-rate "${MTP_REALDATA_MIN_ACCEPT_RATE}" \
+    --min-aggregate-accept-rate "${MTP_REALDATA_MIN_ACCEPT_RATE}" \
     --temperature "${ACCEPT_TEMPERATURE}" \
     --top-p "${ACCEPT_TOP_P}" \
     --ignore-eos \

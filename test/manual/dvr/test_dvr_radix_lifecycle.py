@@ -273,6 +273,11 @@ def main() -> None:
         action="store_true",
         help="Scan every generated-prefix length from 1 through 129.",
     )
+    parser.add_argument(
+        "--skip-grammar",
+        action="store_true",
+        help="Skip grammar coverage when speculative overlap is enabled.",
+    )
     args = parser.parse_args()
 
     prompt_lengths = [int(value) for value in args.prompt_lengths.split(",")]
@@ -284,7 +289,8 @@ def main() -> None:
     test_same_rid_slot_reuse(args.base_url, args.slot_cycles)
     test_generated_prefix_boundaries(args.base_url, prompt_lengths, generated_lengths)
     test_stop_boundary(args.base_url)
-    test_grammar_boundary(args.base_url)
+    if not args.skip_grammar:
+        test_grammar_boundary(args.base_url)
     print("ALL_OK True")
 
 

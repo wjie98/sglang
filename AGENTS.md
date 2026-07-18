@@ -85,12 +85,10 @@ expected backend, radix mode, CUDA graph, and effective concurrency.
 for both supported full-attention backends. A separately labeled radix-disabled
 run remains part of the state-lifecycle matrix.
 
-The production sampling path uses exact rejection sampling. Set
-`SGLANG_DVR_USE_REJECTION_SAMPLING=0` only for a separately reported upstream
-target-only A/B; do not mix both modes in one throughput baseline.
-For rejection runs, proposal tokens and verify coins are both keyed by request
-`sampling_seed` and absolute token position; compare sync/overlap histograms as
-part of the fixed 35B MTP guard.
+The production sampling path always uses exact rejection sampling. Sampling
+follows SGLang's ordinary EAGLE RNG contract; do not require token-for-token or
+histogram identity across different batch shapes and overlap schedules. Strict
+KL replay and real-data aggregate acceptance are the correctness guards.
 
 Do not use the removed `SGLANG_ENABLE_SPEC_V2` environment variable.  The fixed
 scripts select the self-DVR v1 compatibility worker with

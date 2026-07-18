@@ -1047,10 +1047,7 @@ class Req(ReqDllmMixin):
             or self.mamba_host_hit_length > 0
         )
 
-    @property
-    def cache_commit_len(self) -> int:
-        """Committed cache length visible to cache-release consumers."""
-
+    def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
@@ -1063,7 +1060,7 @@ class Req(ReqDllmMixin):
             not self.kv_committed_freed
         ), f"Committed KV cache already freed ({self.kv_committed_len=})"
         self.kv_committed_freed = True
-        return self.cache_commit_len
+        return self._cache_commit_len()
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of over-allocated KV cache and mark them as freed."""
@@ -1075,7 +1072,7 @@ class Req(ReqDllmMixin):
             not self.kv_overallocated_freed
         ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
         self.kv_overallocated_freed = True
-        return self.cache_commit_len, self.kv_allocated_len
+        return self._cache_commit_len(), self.kv_allocated_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Update the speculative decoding acceptance histogram.

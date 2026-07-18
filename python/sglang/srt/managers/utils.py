@@ -42,9 +42,6 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
-    # Fence result-processor writes behind forward phases that still read shared
-    # request pools. Most workers leave this unset and use the normal WAR path.
-    result_process_ready_event: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None

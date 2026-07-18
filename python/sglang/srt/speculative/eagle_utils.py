@@ -283,6 +283,8 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
+    *,
+    capture_hidden_mode: Optional[CaptureHiddenMode] = None,
 ):
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -327,14 +329,13 @@ def eagle_prepare_for_verify(
     batch.forward_mode = (
         ForwardMode.IDLE if batch.forward_mode.is_idle() else ForwardMode.TARGET_VERIFY
     )
-    capture_mode = verify_input.capture_hidden_mode
-    if capture_mode is None:
-        capture_mode = (
+    if capture_hidden_mode is None:
+        capture_hidden_mode = (
             CaptureHiddenMode.NULL
             if target_worker.model_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
-    batch.capture_hidden_mode = capture_mode
+    batch.capture_hidden_mode = capture_hidden_mode
     verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
     # Run attention backend plan and cuda graph preparation
@@ -356,114 +357,14 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
-def eagle_finish_verify_prepare(
-    verify_input,
-    batch,
-    target_worker,
-    verify_forward_batch,
-    can_run_cuda_graph: bool,
-    plan_stream,
-    *,
-    record_rebound_inputs: bool = True,
-):
-    """Finish stream-dependent verify preparation before target execution."""
-
-    from sglang.srt.speculative.spec_utils import record_stream_each
-
-    current_stream = torch.get_device_module(target_worker.device).current_stream()
-    if record_rebound_inputs:
-        record_stream_each((batch.input_ids, batch.out_cache_loc), current_stream)
-    if plan_stream is None:
-        return
-
-    current_stream.wait_stream(plan_stream)
-    model_runner = target_worker.model_runner
-    if (
-        _is_npu
-        and model_runner.model_is_mrope
-        and batch.spec_info is not None
-        and getattr(batch.spec_info, "positions", None) is not None
-        and not batch.forward_mode.is_idle()
-    ):
-        verify_forward_batch.compute_spec_mrope_positions(model_runner, batch)
-
-    runner = model_runner.decode_cuda_graph_runner
-    cuda_graph_bs = None if not can_run_cuda_graph or runner is None else runner.bs
-    model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
-        verify_input, cuda_graph_bs
-    )
-
-
-def eagle_forward_target_verify(
-    verify_input,
-    batch,
-    target_worker,
-    verify_forward_batch,
-):
-    """Run the common target forward and constrained-decoding mask path."""
-
-    from sglang.srt.speculative.spec_utils import generate_token_bitmask
-
-    grammar_inputs = None
-    if batch.has_grammar:
-        grammar_inputs = (
-            verify_input.retrieve_next_token.cpu(),
-            verify_input.retrieve_next_sibling.cpu(),
-            verify_input.draft_token.view(verify_input.retrieve_next_token.shape).cpu(),
-        )
-
-    forward_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
-    )
-
-    vocab_mask = None
-    if grammar_inputs is not None:
-        vocab_mask = generate_token_bitmask(
-            batch.reqs,
-            verify_input,
-            *grammar_inputs,
-            batch.sampling_info.vocab_size,
-        )
-        if vocab_mask is not None:
-            assert verify_input.grammar is not None
-            vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
-            batch.sampling_info.vocab_mask = None
-
-    return forward_output, vocab_mask
-
-
-def eagle_sample_and_build_bonus(verify_input, batch, logits_output, vocab_mask):
-    """Sample one verify result and extract its next root token."""
-
-    from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
-    from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
-
-    maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-    maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    predict, accept_lens, accept_index = eagle_sample(
-        verify_input, batch, logits_output, vocab_mask
-    )
-    if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
-        accept_tokens = predict[accept_index]
-        bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-        fill_bonus_tokens[(accept_lens.shape[0],)](
-            accept_tokens,
-            accept_lens,
-            bonus_tokens,
-            accept_index.shape[1],
-        )
-    else:
-        bonus_tokens = torch.empty((0,), device=predict.device, dtype=torch.int32)
-    return predict, accept_lens, accept_index, bonus_tokens
-
-
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
+    *,
+    target_prob_filter=None,
+    use_rejection_sampling: Optional[bool] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -482,8 +383,6 @@ def eagle_sample(
     from sglang.srt.server_args import get_global_server_args
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
-        SPEC_ACCEPT_HASH_STREAM,
-        SPEC_FINAL_SAMPLE_HASH_STREAM,
         generate_simulated_accept_index,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -565,24 +464,10 @@ def eagle_sample(
         from sglang.srt.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
-        from sglang.srt.speculative.spec_utils import renorm_sampling_probs
 
-        configured_rejection_sampling = (
-            get_global_server_args().speculative_use_rejection_sampling
-        )
-        # draft_probs is the authoritative proposal distribution. DVR self-draft
-        # also publishes it when stochastic target sampling needs an exact q.
-        use_rejection_sampling = verify_input.draft_probs is not None
-        # A zero-step verify tree is a target-only sentinel: it has no draft
-        # edge and therefore no proposal distribution q to reject against.
-        if (
-            configured_rejection_sampling
-            and verify_input.spec_steps > 0
-            and not use_rejection_sampling
-        ):
-            raise ValueError(
-                "Rejection sampling is enabled, but the draft worker did not "
-                "provide draft_probs."
+        if use_rejection_sampling is None:
+            use_rejection_sampling = (
+                get_global_server_args().speculative_use_rejection_sampling
             )
 
         # Apply temperature and get target probs
@@ -594,88 +479,47 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if configured_rejection_sampling:
-            target_probs = renorm_sampling_probs(
-                target_probs, sampling_info, repeat=verify_input.draft_token_num
-            )
-        else:
-            # Preserve the standard EAGLE target-only sampling path. The shared
-            # helper additionally applies min-p and is needed only when p/q
-            # rejection sampling must use the exact request distribution.
+        if target_prob_filter is None:
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, verify_input.draft_token_num, dim=0
                 ),
-            )
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ps, verify_input.draft_token_num, dim=0
                 ),
             )
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after sampling filters")
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        else:
+            target_probs = target_prob_filter(
+                target_probs, sampling_info, verify_input.draft_token_num
+            )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
             else torch.zeros_like(target_probs)
         )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate the
-        # actual kernel inputs (catches draft_probs plumbing regressions or a
-        # startup guard bypassed by a worker subclass) before the Triton kernel.
-        expected_draft_shape = (
-            bs,
-            verify_input.draft_token_num - 1,
-            target_probs.shape[-1],
-        )
-        if use_rejection_sampling and draft_probs.shape != expected_draft_shape:
+        # Defense-in-depth behind the startup allowlist: validate the actual
+        # kernel inputs before entering the Triton rejection sampler.
+        if use_rejection_sampling and (
+            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+        ):
             raise ValueError(
-                "Rejection sampling requires one target-vocab proposal row per "
-                "draft edge; got draft_probs shape "
-                f"{tuple(draft_probs.shape)}, expected {expected_draft_shape}."
+                "Rejection sampling requires a target-vocab draft proposal "
+                "distribution; the current speculative algorithm/draft worker "
+                "does not produce one (draft_probs missing or vocab-mismatched)."
             )
-
-        if configured_rejection_sampling and sampling_info.sampling_seed is not None:
-            from sglang.srt.layers.utils.hash import murmur_hash32
-
-            # One rejection and one final-sampling stream per target position.
-            # The kernel selects the final coin at the first rejected position
-            # (or the bonus position when every draft is accepted).
-            positions = verify_input.positions[: bs * verify_input.draft_token_num]
-            positions = positions.reshape(-1).to(torch.int64)
-            seeds = sampling_info.sampling_seed[:bs].repeat_interleave(
-                verify_input.draft_token_num
-            )
-            streams = torch.tensor(
-                [SPEC_ACCEPT_HASH_STREAM, SPEC_FINAL_SAMPLE_HASH_STREAM],
-                dtype=torch.int64,
-                device=device,
-            )
-            # Use the high 24 hash bits so every float32 coin is in [0, 1).
-            # A coin equal to one would reject an otherwise exact p == q match.
-            uniforms = torch.bitwise_right_shift(
-                murmur_hash32(seeds, positions, streams).to(torch.int64), 8
-            ).to(torch.float32)
-            uniforms.mul_(1.0 / 2**24)
-            uniforms = uniforms.reshape(bs, verify_input.draft_token_num, 2)
-            coins = uniforms[:, :, 0].contiguous()
-            coins_for_final_sampling = (
-                uniforms[:, :, 1].contiguous()
-                if use_rejection_sampling
-                else uniforms[:, 0, 1].contiguous()
-            )
-        else:
-            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-            coins_for_final_sampling = torch.rand(
-                (
-                    (bs, verify_input.draft_token_num)
-                    if use_rejection_sampling
-                    else (bs,)
-                ),
-                dtype=torch.float32,
-                device=device,
-            )
+        # coins for rejection sampling
+        coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+        # coins for final sampling
+        coins_for_final_sampling = torch.rand(
+            (bs,), dtype=torch.float32, device=device
+        )
 
         sampling_fn = (
             chain_speculative_sampling_triton

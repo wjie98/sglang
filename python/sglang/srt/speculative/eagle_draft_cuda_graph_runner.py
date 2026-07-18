@@ -33,7 +33,6 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -61,7 +60,6 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     topk_p: torch.Tensor
     topk_index: torch.Tensor
-    sampling_seed: Optional[torch.Tensor]
     draft_probs: Optional[torch.Tensor]
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
@@ -181,12 +179,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            sampling_seed = (
-                torch.zeros((self.max_bs,), dtype=torch.int64)
-                if self.model_runner.server_args.speculative_use_rejection_sampling
-                and self.model_runner.sampler.enable_deterministic
-                else None
-            )
             draft_probs = (
                 torch.zeros(
                     (self.max_bs, self.model_runner.model_config.vocab_size),
@@ -206,7 +198,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
-            self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -243,7 +234,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens=extend_seq_lens,
             topk_p=topk_p,
             topk_index=topk_index,
-            sampling_seed=sampling_seed,
             draft_probs=draft_probs,
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
@@ -379,13 +369,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
             top_ps=torch.ones((num_seqs,), dtype=torch.float),
-            top_ks=self.top_ks[:num_seqs],
+            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
-            sampling_seed=(
-                buffers.sampling_seed[:num_seqs]
-                if buffers.sampling_seed is not None
-                else None
-            ),
             is_all_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
@@ -474,7 +459,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
-        sampling_seed_buffer = getattr(buffers, "sampling_seed", None)
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
@@ -502,9 +486,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.bootstrap_room_ids_int.fill_(-1)
             buffers.topk_p.zero_()
             buffers.topk_index.zero_()
-            if sampling_seed_buffer is not None:
-                sampling_seed_buffer.zero_()
-            self.top_ks.fill_(TOP_K_ALL)
             if buffers.draft_probs is not None:
                 buffers.draft_probs.zero_()
             if buffers.hidden_states is not None:
@@ -579,15 +560,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
-            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
-            if sampling_seed_buffer is not None:
-                if forward_batch.sampling_info.sampling_seed is None:
-                    raise RuntimeError(
-                        "Deterministic EAGLE rejection sampling requires request seeds."
-                    )
-                sampling_seed_buffer[:raw_bs].copy_(
-                    forward_batch.sampling_info.sampling_seed[:raw_bs]
-                )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

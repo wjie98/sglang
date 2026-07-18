@@ -1,37 +1,174 @@
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 
 import torch
 
 from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import get_bool_env_var
 
-@contextmanager
-def _maybe_disable_batch_invariant_ops(disable: bool):
-    if not disable:
-        yield
-        return
+_OVERRIDE_PLAN_CACHE = object()
 
-    from sglang.srt.batch_invariant_ops import (
-        disable_batch_invariant_mode,
-        enable_batch_invariant_mode,
-        is_batch_invariant_mode_enabled,
+
+def _resolve_dvr_backends(backend, forward_mode=ForwardMode.DECODE):
+    """Resolve full-attention leaves and the optional linear-state adapter."""
+
+    leaves = []
+    state_adapter = None
+
+    def visit(current, *, collect_attention=True):
+        nonlocal state_adapter
+        if isinstance(current, HybridLinearAttnBackend):
+            state_adapter = state_adapter or getattr(
+                current.linear_attn_backend, "dvr_state_adapter", None
+            )
+            visit(current.full_attn_backend, collect_attention=collect_attention)
+        elif isinstance(current, HybridAttnBackend):
+            selected = current._select_backend(forward_mode)
+            visit(selected, collect_attention=collect_attention)
+            if state_adapter is None:
+                for candidate in (current.decode_backend, current.prefill_backend):
+                    if candidate is not selected:
+                        visit(candidate, collect_attention=False)
+        elif isinstance(current, TboAttnBackend):
+            visit(current.primary, collect_attention=collect_attention)
+            for child in current.children:
+                visit(child, collect_attention=collect_attention)
+        else:
+            state_adapter = state_adapter or getattr(
+                current, "dvr_state_adapter", None
+            )
+            if collect_attention:
+                leaves.append(current)
+
+    visit(backend)
+    return leaves, state_adapter
+
+
+def _validate_dvr_attention_backend(
+    backend, forward_mode=ForwardMode.DECODE, *, phase="draft decode"
+):
+    """Return supported full-attention leaves after wrapper resolution."""
+
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+    leaves, state_adapter = _resolve_dvr_backends(backend, forward_mode)
+    if not leaves:
+        raise RuntimeError(f"DVR {phase} did not resolve an attention backend.")
+    for leaf in leaves:
+        if isinstance(leaf, FlashAttentionBackend):
+            if leaf.fa_impl_ver == 3:
+                continue
+            raise RuntimeError(
+                f"DVR {phase} requires FlashAttention 3, got "
+                f"fa_impl_ver={leaf.fa_impl_ver}."
+            )
+        if not isinstance(leaf, TritonAttnBackend):
+            raise RuntimeError(
+                f"DVR {phase} supports only Triton or FA3 full-attention "
+                f"backends, got {type(leaf).__name__}."
+            )
+    return leaves, state_adapter
+
+
+def _fast_decode_overrides(backend, model_runner, buffer_cache=None):
+    """Return fast-decode state for the DVR-supported Triton and FA3 leaves."""
+
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+    plan_cache = None
+    plan_key = None
+    if buffer_cache is not None:
+        plan_cache = buffer_cache.setdefault(_OVERRIDE_PLAN_CACHE, {})
+        plan_key = (id(backend), id(model_runner))
+        if plan_key in plan_cache:
+            return plan_cache[plan_key]
+
+    overrides = []
+    leaves, _ = _validate_dvr_attention_backend(backend)
+    for leaf in leaves:
+        if isinstance(leaf, FlashAttentionBackend):
+            overrides.append((leaf, "num_splits", 0))
+            continue
+
+        split_tile_size = model_runner.server_args.triton_attention_split_tile_size
+        max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        if split_tile_size is not None:
+            max_kv_splits = (
+                leaf.max_context_len + split_tile_size - 1
+            ) // split_tile_size
+        max_kv_splits = min(leaf.max_kv_splits, max_kv_splits)
+        overrides.append((leaf, "enable_deterministic", False))
+        for name in (
+            "cuda_graph_attn_logits",
+            "cuda_graph_attn_lse",
+            "cuda_graph_swa_attn_logits",
+        ):
+            buffer = getattr(leaf, name, None)
+            if buffer is not None:
+                overrides.append((leaf, name, buffer[:, :, :max_kv_splits]))
+
+        if buffer_cache is None:
+            buffer_cache = {}
+        buffers = buffer_cache.setdefault(leaf, {})
+        for name in (
+            "cuda_graph_num_kv_splits",
+            "cuda_graph_window_num_kv_splits",
+        ):
+            buffer = getattr(leaf, name, None)
+            if buffer is not None:
+                draft_buffer = buffers.get(name)
+                if draft_buffer is None or draft_buffer.shape != buffer.shape:
+                    draft_buffer = torch.full_like(buffer, max_kv_splits)
+                    buffers[name] = draft_buffer
+                overrides.append((leaf, name, draft_buffer))
+        overrides.extend(
+            (
+                (leaf, "max_kv_splits", max_kv_splits),
+                (leaf, "split_tile_size", split_tile_size),
+                (
+                    leaf,
+                    "static_kv_splits",
+                    get_bool_env_var(
+                        "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
+                    ),
+                ),
+            )
+        )
+    if plan_cache is not None:
+        plan_cache[plan_key] = overrides
+    return overrides
+
+
+def _clear_moe_policy_caches():
+    # These upstream caches read global determinism state without keying on it.
+    # Draft graph capture is the only DVR phase that changes that state.
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+        get_moe_configs,
+    )
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+        should_enable_swap_ab,
     )
 
-    was_enabled = is_batch_invariant_mode_enabled()
-    if was_enabled:
-        disable_batch_invariant_mode()
-    try:
-        yield
-    finally:
-        if was_enabled:
-            enable_batch_invariant_mode()
+    get_moe_configs.cache_clear()
+    should_enable_swap_ab.cache_clear()
 
 
 def _iter_decode_custom_all_reduce_groups(model_runner):
@@ -53,6 +190,7 @@ def _iter_decode_custom_all_reduce_groups(model_runner):
 @contextmanager
 def dvr_draft_decode_context(
     model_runner,
+    buffer_cache,
     *,
     capture: bool = False,
     self_draft: bool = False,
@@ -60,14 +198,18 @@ def dvr_draft_decode_context(
 ):
     """Temporarily switch a DVR draft runner into performance-first decode mode.
 
-    Self draft uses this only while capturing its dedicated graph. EAGLE also
-    uses it for eager graph misses, so its runtime context restores all state.
+    Global determinism changes only while a draft graph is captured. Runtime
+    replay temporarily switches attention metadata but leaves ordinary target,
+    sampler, and MoE policy untouched.
     """
 
     patched_attrs = []
     patched_keys = set()
     global_server_args = get_global_server_args()
-    patch_global_state = capture or not self_draft
+    if capture:
+        # Attention graph buffers may be allocated inside this context. Never
+        # retain a plan resolved before capture has finished initializing them.
+        buffer_cache.pop(_OVERRIDE_PLAN_CACHE, None)
 
     def patch_attr(obj, attr_name, value):
         if obj is None or not hasattr(obj, attr_name):
@@ -80,34 +222,35 @@ def dvr_draft_decode_context(
         patched_attrs.append((obj, attr_name, getattr(obj, attr_name)))
         setattr(obj, attr_name, value)
 
-    deterministic_env = (
-        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False)
-        if patch_global_state
-        else nullcontext()
-    )
-    with deterministic_env, ExitStack() as custom_ar_stack:
+    with ExitStack() as stack:
         try:
-            if patch_global_state:
+            if capture:
+                stack.enter_context(
+                    envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False)
+                )
+                _clear_moe_policy_caches()
+                # Leave no fast-draft policy entry for deterministic target work.
+                stack.callback(_clear_moe_policy_caches)
                 for server_args in (model_runner.server_args, global_server_args):
                     patch_attr(server_args, "enable_deterministic_inference", False)
 
-            supported_backends = []
+            resolved_backend = False
             for backend in (
                 model_runner.attn_backend,
                 *(extra_attn_backends or ()),
             ):
-                overrides = backend.get_nondeterministic_decode_overrides(model_runner)
-                if overrides is None:
+                if backend is None:
                     continue
-                supported_backends.append(type(backend).__name__)
+                overrides = _fast_decode_overrides(
+                    backend, model_runner, buffer_cache
+                )
+                resolved_backend = True
                 for owner, name, value in overrides:
                     patch_attr(owner, name, value)
 
-            if not supported_backends:
+            if not resolved_backend:
                 raise RuntimeError(
-                    "DVR draft decode supports only Triton or FA3 full-attention "
-                    "backends, but no supported backend was found under "
-                    f"{type(model_runner.attn_backend).__name__}."
+                    "DVR draft decode did not receive an attention backend."
                 )
 
             if capture:
@@ -117,11 +260,10 @@ def dvr_draft_decode_context(
                     model_runner.server_args,
                     "_dvr_enable_draft_custom_all_reduce",
                     False,
-                ):
+                    ):
                     for group in _iter_decode_custom_all_reduce_groups(model_runner):
-                        custom_ar_stack.enter_context(
-                            group.custom_allreduce_state(
-                                enabled=True,
+                        stack.enter_context(
+                            group.custom_allreduce_enabled(
                                 create_if_missing=True,
                                 require_full_nvlink=True,
                             )
@@ -132,12 +274,22 @@ def dvr_draft_decode_context(
                     patch_attr(
                         model_runner, "spec_algorithm", SpeculativeAlgorithm.NONE
                     )
+                from sglang.srt.batch_invariant_ops import (
+                    disable_batch_invariant_mode,
+                    enable_batch_invariant_mode,
+                    is_batch_invariant_mode_enabled,
+                )
 
-            with _maybe_disable_batch_invariant_ops(capture):
-                yield
+                if is_batch_invariant_mode_enabled():
+                    disable_batch_invariant_mode()
+                    stack.callback(enable_batch_invariant_mode)
+
+            yield
         finally:
             for obj, attr_name, original_value in reversed(patched_attrs):
                 setattr(obj, attr_name, original_value)
+            if capture:
+                buffer_cache.pop(_OVERRIDE_PLAN_CACHE, None)
 
 
 class DVRDraftDecodeCudaGraphRunner(DecodeCudaGraphRunner):

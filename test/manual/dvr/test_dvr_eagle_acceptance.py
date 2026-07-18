@@ -306,6 +306,12 @@ def main() -> None:
         default=None,
         help="Fail if any reported speculative accept rate is below this value.",
     )
+    parser.add_argument(
+        "--min-aggregate-accept-rate",
+        type=float,
+        default=None,
+        help="Fail if the verify-count-weighted acceptance rate is below this value.",
+    )
     parser.add_argument("--no-return-logprob", action="store_true")
     args = parser.parse_args()
 
@@ -388,6 +394,23 @@ def main() -> None:
 
     failed = [row for row in rows if row["kl_ok"] is False]
     accept_failed = [row for row in rows if row["accept_ok"] is False]
+    weighted_rows = [
+        row
+        for row in rows
+        if row["accept_rate"] is not None and row["verify_ct"] is not None
+    ]
+    total_verify = sum(int(row["verify_ct"]) for row in weighted_rows)
+    aggregate_accept_rate = (
+        sum(float(row["accept_rate"]) * int(row["verify_ct"]) for row in weighted_rows)
+        / total_verify
+        if total_verify
+        else None
+    )
+    aggregate_accept_ok = (
+        args.min_aggregate_accept_rate is None
+        or aggregate_accept_rate is None
+        or aggregate_accept_rate >= args.min_aggregate_accept_rate
+    )
     print(
         "SUMMARY "
         + json.dumps(
@@ -395,10 +418,12 @@ def main() -> None:
                 "cases": len(rows),
                 "kl_failed": len(failed),
                 "accept_failed": len(accept_failed),
+                "aggregate_accept_rate": aggregate_accept_rate,
+                "aggregate_accept_ok": aggregate_accept_ok,
             }
         )
     )
-    if failed or accept_failed:
+    if failed or accept_failed or not aggregate_accept_ok:
         raise SystemExit(1)
 
 

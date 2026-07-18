@@ -2526,11 +2526,15 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
-        # DVR page-size and GDN state-tracking defaults must be resolved before
-        # model-specific mamba/radix validation runs below.
-        from sglang.srt.speculative.dvr_server_args import handle_dvr_defaults
+        if (self.speculative_algorithm or "").upper() in {
+            "DECODE_VERIFY_ROLLBACK",
+            "DECODE_VERIFY_ROLLBACK_EAGLE",
+        }:
+            # Resolve DVR state tracking before generic Mamba/Radix validation.
+            # Keep the import lazy so ordinary servers do not load FLA/Triton.
+            from sglang.srt.speculative.dvr_server_args import handle_dvr_defaults
 
-        handle_dvr_defaults(self)
+            handle_dvr_defaults(self)
 
         self._handle_cuda_graph_config()
 
@@ -6638,13 +6642,6 @@ class ServerArgs:
         )
 
     def enable_mamba_extra_buffer(self) -> bool:
-        # With Radix disabled, DVR uses the same pool layout for one active-
-        # request rollback checkpoint. This does not enable prefix matching.
-        if self.disable_radix_cache and self.speculative_algorithm in (
-            "DECODE_VERIFY_ROLLBACK",
-            "DECODE_VERIFY_ROLLBACK_EAGLE",
-        ):
-            return True
         return (
             self.disable_radix_cache is False
             and self.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")

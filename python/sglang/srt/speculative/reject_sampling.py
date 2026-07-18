@@ -21,8 +21,6 @@ def speculative_sampling_classic_kernel(
     stride_idx_s,
     stride_uni_b,
     stride_uni_s,
-    stride_uni_final_b,
-    stride_uni_final_s,
     stride_tp_b,
     stride_tp_s,
     stride_tp_v,
@@ -90,11 +88,7 @@ def speculative_sampling_classic_kernel(
 
     # Final Sampling
     all_drafts_accepted = continue_verifying
-    coin_final = tl.load(
-        UniformSamplesFinal
-        + pid * stride_uni_final_b
-        + cur_prob_row * stride_uni_final_s
-    )
+    coin_final = tl.load(UniformSamplesFinal + pid)
     norm_sum = 0.0
 
     tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
@@ -105,14 +99,12 @@ def speculative_sampling_classic_kernel(
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
 
     # Pass 1: Sum
-    target_norm_sum = 0.0
     for v_start in range(0, VOCAB_SIZE, BLOCK_V):
         v_offsets = v_start + tl.arange(0, BLOCK_V)
         mask = v_offsets < VOCAB_SIZE
 
         p_ptr = tp_base_ptr + v_offsets * stride_tp_v
         p_val = tl.load(p_ptr, mask=mask, other=0.0)
-        target_norm_sum += tl.sum(p_val)
 
         if all_drafts_accepted:
             val = p_val
@@ -124,11 +116,10 @@ def speculative_sampling_classic_kernel(
 
         norm_sum += tl.sum(val)
 
-    # Pass 2: CDF. A zero residual can only result from finite-precision drift;
-    # fall back to p instead of emitting an arbitrary vocabulary endpoint.
-    sample_target = (all_drafts_accepted == 1) | (norm_sum <= 0.0)
-    sample_norm = tl.where(sample_target, target_norm_sum, norm_sum)
-    target_u = coin_final * sample_norm
+    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
+    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
+    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
+    target_u = coin_final * norm_sum
     cum_sum = 0.0
     final_token = VOCAB_SIZE - 1
     found = 0
@@ -141,7 +132,7 @@ def speculative_sampling_classic_kernel(
             p_ptr = tp_base_ptr + v_offsets * stride_tp_v
             p_val = tl.load(p_ptr, mask=mask, other=0.0)
 
-            if sample_target:
+            if all_drafts_accepted:
                 val = p_val
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
@@ -183,30 +174,6 @@ def chain_speculative_sampling_triton(
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
-    expected_target_shape = (batch_size, num_slots, vocab_size)
-    expected_draft_shape = (batch_size, num_slots - 1, vocab_size)
-    if target_probs.shape != expected_target_shape:
-        raise ValueError(
-            f"target_probs has shape {tuple(target_probs.shape)}, "
-            f"expected {expected_target_shape}."
-        )
-    if draft_probs.shape != expected_draft_shape:
-        raise ValueError(
-            f"draft_probs has shape {tuple(draft_probs.shape)}, "
-            f"expected {expected_draft_shape}."
-        )
-    expected_coin_shape = (batch_size, num_slots)
-    if uniform_samples.shape != expected_coin_shape:
-        raise ValueError(
-            f"uniform_samples has shape {tuple(uniform_samples.shape)}, "
-            f"expected {expected_coin_shape}."
-        )
-    if uniform_samples_for_final_sampling.shape != expected_coin_shape:
-        raise ValueError(
-            "uniform_samples_for_final_sampling has shape "
-            f"{tuple(uniform_samples_for_final_sampling.shape)}, "
-            f"expected {expected_coin_shape}."
-        )
 
     grid = (batch_size,)
     speculative_sampling_classic_kernel[grid](
@@ -225,8 +192,6 @@ def chain_speculative_sampling_triton(
         retrive_index.stride(1),
         uniform_samples.stride(0),
         uniform_samples.stride(1),
-        uniform_samples_for_final_sampling.stride(0),
-        uniform_samples_for_final_sampling.stride(1),
         target_probs.stride(0),
         target_probs.stride(1),
         target_probs.stride(2),

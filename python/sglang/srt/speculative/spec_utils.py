@@ -62,114 +62,20 @@ if TYPE_CHECKING:
 
 
 if _is_cuda:
-    from sgl_kernel import fast_topk, top_k_renorm_prob, top_p_renorm_prob
+    from sgl_kernel import fast_topk
 elif _is_hip:
     from sgl_kernel import fast_topk
-elif _is_musa:
-    from sgl_kernel import fast_topk, top_k_renorm_prob, top_p_renorm_prob
 else:
     from sglang.srt.utils.common import fast_topk
 
 
 logger = logging.getLogger(__name__)
 
-# The ordinary deterministic sampler hashes vocabulary token ids as columns.
-# Keep speculative proposal/correction randomness in a disjoint uint32 range so
-# rejection coins remain independent even when self-draft reuses that sampler.
-SPEC_DRAFT_SAMPLE_HASH_STREAM = 0xFFFFFFFD
-SPEC_ACCEPT_HASH_STREAM = 0xFFFFFFFE
-SPEC_FINAL_SAMPLE_HASH_STREAM = 0xFFFFFFFF
 
-
-def fast_sample(
-    probs: torch.Tensor,
-    num_samples: int = 1,
-    *,
-    sampling_seed: Optional[torch.Tensor] = None,
-    positions: Optional[torch.Tensor] = None,
-):
-    if sampling_seed is None:
-        sample_index = torch.multinomial(probs, num_samples=num_samples)
-    else:
-        if num_samples != 1 or positions is None:
-            raise ValueError(
-                "Seeded speculative sampling requires one sample and token positions."
-            )
-        from sglang.srt.layers.utils.hash import murmur_hash32
-
-        # A single position-keyed uniform is sufficient for categorical
-        # sampling. Its hash stream is disjoint from both vocabulary token ids
-        # and the rejection/final-sampling streams.
-        cdf = probs.float().cumsum(dim=-1)
-        stream = torch.full_like(
-            positions[:1], SPEC_DRAFT_SAMPLE_HASH_STREAM, dtype=torch.int64
-        )
-        # Keep the uniform strictly below one. Converting uint32 max directly
-        # to float32 rounds to 2**32 and can select a zero-probability endpoint.
-        uniform = torch.bitwise_right_shift(
-            murmur_hash32(sampling_seed, positions, stream).to(torch.int64), 8
-        ).to(cdf.dtype)
-        uniform.mul_(1.0 / 2**24).mul_(cdf[:, -1:])
-        sample_index = torch.searchsorted(cdf, uniform, right=True)
-        sample_index.clamp_max_(probs.shape[-1] - 1)
+def fast_sample(probs: torch.Tensor, num_samples: int = 1):
+    sample_index = torch.multinomial(probs, num_samples=num_samples)
     sample_p = probs.gather(1, sample_index)
     return sample_p, sample_index
-
-
-def renorm_sampling_probs(probs: torch.Tensor, sampling_info, repeat: int = 1):
-    """Apply request sampling filters to an already normalized distribution."""
-
-    need_top_k = sampling_info.need_top_k_sampling
-    need_top_p = sampling_info.need_top_p_sampling
-    need_min_p = sampling_info.need_min_p_sampling
-    if not (need_top_k or need_top_p or need_min_p):
-        return probs
-
-    def expand(values):
-        return values if repeat == 1 else torch.repeat_interleave(values, repeat, dim=0)
-
-    top_ks = expand(sampling_info.top_ks)
-    top_ps = expand(sampling_info.top_ps)
-    min_ps = expand(sampling_info.min_ps)
-    use_kernel = (_is_cuda and probs.is_cuda) or (
-        _is_musa and probs.device.type == "musa"
-    )
-    if use_kernel:
-        server_args = get_global_server_args()
-        if (
-            getattr(server_args, "sampling_backend", None) == "flashinfer"
-            and need_min_p
-        ):
-            # Match Sampler._sample_from_probs: FlashInfer's min-p path applies
-            # top-k and top-p sequentially before min-p sampling.
-            if need_top_k:
-                probs = top_k_renorm_prob(probs, top_ks)
-            if need_top_p:
-                probs = top_p_renorm_prob(probs, top_ps)
-        else:
-            # PyTorch and FlashInfer's ordinary top-k/top-p path use joint
-            # filtering. top-p before top-k preserves that intersection.
-            if need_top_p:
-                probs = top_p_renorm_prob(probs, top_ps)
-            if need_top_k:
-                probs = top_k_renorm_prob(probs, top_ks)
-    elif need_top_k or need_top_p:
-        sorted_probs, indices = probs.sort(dim=-1, descending=True)
-        cumulative = sorted_probs.cumsum(dim=-1)
-        if need_top_k:
-            ranks = torch.arange(probs.shape[-1], device=probs.device).unsqueeze(0)
-            sorted_probs.masked_fill_(ranks >= top_ks.unsqueeze(1), 0)
-        if need_top_p:
-            sorted_probs.masked_fill_(
-                cumulative - sorted_probs > top_ps.unsqueeze(1), 0
-            )
-        probs = torch.zeros_like(probs).scatter_(-1, indices, sorted_probs)
-        probs /= probs.sum(dim=-1, keepdim=True)
-    if need_min_p:
-        thresholds = probs.amax(dim=-1, keepdim=True) * min_ps.unsqueeze(1)
-        probs = torch.where(probs >= thresholds, probs, torch.zeros_like(probs))
-        probs /= probs.sum(dim=-1, keepdim=True)
-    return probs
 
 
 def renorm_draft_probs(
@@ -181,26 +87,11 @@ def renorm_draft_probs(
 
     Plain softmax, except under rejection sampling where logits are
     temperature-scaled so the draft proposal q tracks the target sampling
-    temperature. Greedy rows use their actual one-hot proposal distribution;
-    stochastic rows remain unfiltered because correctness holds for any q.
+    temperature (higher acceptance; correctness holds for any q).
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
-    probs = torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
-
-    # SamplingParams represents greedy decoding as top_k == 1. CUDA graphs may
-    # contain mixed greedy/stochastic rows, so this must be a tensor operation
-    # over runtime top_ks rather than a capture-time is_all_greedy branch.
-    greedy_rows = sampling_info.top_ks == 1
-    greedy_indices = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-    selected_probs = probs.gather(1, greedy_indices)
-    probs.mul_((~greedy_rows).unsqueeze(1))
-    probs.scatter_(
-        1,
-        greedy_indices,
-        torch.where(greedy_rows.unsqueeze(1), 1.0, selected_probs),
-    )
-    return probs
+    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
 # Simulate acceptance length for benchmarking purposes
@@ -221,9 +112,9 @@ def draft_kv_indices_buffer_width(
     num_seqs * topk branches each attend up to max_context_len KV slots; the topk
     factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
-    assert num_seqs * topk * max_context_len < 2**31, (
-        "kv_indices flat offset would overflow int32; reduce batch/topk/context"
-    )
+    assert (
+        num_seqs * topk * max_context_len < 2**31
+    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
     return num_seqs * topk * max_context_len
 
 

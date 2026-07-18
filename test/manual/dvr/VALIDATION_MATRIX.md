@@ -112,12 +112,10 @@ Fixed EAGLE/MTP smoke script:
 test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
 ```
 
-The production default uses exact proposal rejection. To compare upstream
-target-only EAGLE chain sampling, rerun the same matrix with
-`SGLANG_DVR_USE_REJECTION_SAMPLING=0` and a distinct `RESULT_ROOT`. Rejection
-sampling carries full-vocabulary proposal probabilities and uses request seed
-plus target position for proposal, acceptance, and final-sampling randomness;
-keep the two modes separately labeled.
+The production path uses exact proposal rejection and carries full-vocabulary
+proposal probabilities. It follows ordinary EAGLE RNG semantics; strict replay
+KL and real-data aggregate acceptance are compared across modes, not exact
+sample trajectories.
 
 Fixed non-deterministic normal/ordinary deterministic/self-DVR/DVR-EAGLE
 throughput comparison:
@@ -229,9 +227,9 @@ slot reuse, early stop, and grammar termination.
 The `--seed 2032`, `prompt_len=65`, `max_new=65` entry is the fixed regression
 for seeded MTP boundary acceptance.  It crosses the GDN chunk boundary and must
 keep `accept_rate >= 0.75` in both returned-logprob and no-return-logprob paths.
-The two paths, and sync versus overlap, must have identical histograms. A lower
-value or a histogram mismatch usually means the proposal/verify seed stream or
-the MTP suffix-boundary hidden/state no longer matches target prefill semantics.
+The two paths, and sync versus overlap, must satisfy the same acceptance floor.
+A material aggregate regression usually means the MTP suffix-boundary
+hidden/state no longer matches target prefill semantics.
 
 The fixed ShareGPT cases use `accept_rate >= 0.70`.  Their historical range is
 roughly `0.73-1.00`; using the synthetic-boundary threshold for real prompts

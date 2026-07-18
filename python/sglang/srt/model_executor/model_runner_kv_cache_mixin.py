@@ -131,42 +131,19 @@ class ModelRunnerKVCacheMixin:
             assert server_args.max_running_requests is not None
             draft_steps = server_args.speculative_num_draft_tokens
             if self.spec_algorithm.is_dvr():
-                # DVR stores one committed temporal step while retaining every
-                # conv step needed for rollback. Size that layout exactly; keep
-                # the established estimate unchanged for other spec workers.
-                params = config.mamba2_cache_params
-                dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu,
-                    current_platform.is_cpu(),
-                    server_args.speculative_eagle_topk,
-                )
-                intermediate_conv_numel = 0
-                for conv_dim, window_size in params.shape.conv:
-                    intermediate_conv_numel += conv_dim * (
-                        draft_steps + window_size - 1
-                        if dedup_conv_window
-                        else draft_steps * window_size
-                    )
-                intermediate_per_req = len(params.layers) * (
-                    intermediate_conv_numel * params.dtype.conv.itemsize
-                    + math.prod(params.shape.temporal)
-                    * params.dtype.temporal.itemsize
-                )
-                if self.spec_algorithm.is_dvr_self_draft():
-                    conv_backup_numel = sum(
-                        math.prod(conv_shape) for conv_shape in params.shape.conv
-                    )
-                    intermediate_per_req += (
-                        len(params.layers)
-                        * conv_backup_numel
-                        * params.dtype.conv.itemsize
-                    )
                 from sglang.srt.layers.attention.linear.dvr_gdn import (
-                    dvr_gdn_state_input_bytes_per_request,
+                    dvr_gdn_intermediate_bytes_per_request,
                 )
 
-                intermediate_per_req += dvr_gdn_state_input_bytes_per_request(
-                    params, draft_steps
+                intermediate_per_req = dvr_gdn_intermediate_bytes_per_request(
+                    config.mamba2_cache_params,
+                    draft_steps,
+                    dedup_conv_window=conv_window_dedup_enabled(
+                        _is_npu,
+                        current_platform.is_cpu(),
+                        server_args.speculative_eagle_topk,
+                    ),
+                    draft_reuses_target_state=self.spec_algorithm.is_dvr_self_draft(),
                 )
             else:
                 intermediate_per_req = (
@@ -435,6 +412,10 @@ class ModelRunnerKVCacheMixin:
                     dvr_track_buffer_size = (
                         1 if self.server_args.disable_radix_cache else 2
                     )
+                enable_mamba_track_buffer = (
+                    self.server_args.enable_mamba_extra_buffer()
+                    or dvr_track_buffer_size is not None
+                )
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
@@ -451,7 +432,9 @@ class ModelRunnerKVCacheMixin:
                             if self.start_layer <= i < self.end_layer
                         ]
                     ),
-                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                    # DVR owns this request-local boundary slot when Radix is
+                    # disabled; the scheduler's Radix tracking remains off.
+                    enable_mamba_extra_buffer=enable_mamba_track_buffer,
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_ssm_state_steps=(

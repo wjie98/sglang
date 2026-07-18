@@ -58,8 +58,6 @@ write_run_metadata() {
     printf 'sglang_jit_deepgemm_precompile=%s\n' "${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-default}"
     printf 'sglang_batch_invariant_deepgemm=%s\n' "${SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM:-default}"
     printf 'sglang_dg_cache_dir=%s\n' "${SGLANG_DG_CACHE_DIR:-default}"
-    printf 'sglang_dvr_use_rejection_sampling=%s\n' \
-      "${SGLANG_DVR_USE_REJECTION_SAMPLING:-1 (default)}"
     printf '\n[gpus]\n'
     nvidia-smi \
       --query-gpu=index,name,memory.total,driver_version,pci.bus_id \

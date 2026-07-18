@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 
@@ -123,12 +122,6 @@ def handle_dvr_speculative_decoding(server_args):
             if server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
             else 16
         )
-        logger.warning(
-            "speculative_num_draft_tokens is set to %s by default for DVR. "
-            "You can override this by explicitly setting "
-            "--speculative-num-draft-tokens.",
-            server_args.speculative_num_draft_tokens,
-        )
 
     uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
     if uses_gated_linear_state and server_args.enable_streaming_session:
@@ -194,51 +187,28 @@ def handle_dvr_speculative_decoding(server_args):
             "request distribution."
         )
 
-    # Exact rejection sampling is the DVR default because it preserves more
-    # useful MTP proposals under stochastic target sampling. Target-only EAGLE
-    # sampling remains available as an explicit throughput/acceptance A/B.
-    server_args.speculative_use_rejection_sampling = (
-        envs.SGLANG_DVR_USE_REJECTION_SAMPLING.get()
-    )
-    if server_args.speculative_use_rejection_sampling:
-        if (
-            server_args.speculative_accept_threshold_single != 1.0
-            or server_args.speculative_accept_threshold_acc != 1.0
-        ):
-            raise ValueError(
-                "DVR rejection sampling does not use speculative acceptance "
-                "thresholds; both thresholds must remain 1.0."
-            )
-        if (
-            server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
-            and server_args.enable_multi_layer_eagle
-        ):
-            raise NotImplementedError(
-                "DVR EAGLE rejection sampling does not support multi-layer EAGLE."
-            )
-    else:
-        logger.warning(
-            "DVR target-only sampling is enabled by "
-            "SGLANG_DVR_USE_REJECTION_SAMPLING=0."
+    # DVR uses exact rejection sampling. The one-root short-prompt sentinel is
+    # the only target-only iteration and selects that locally in the worker.
+    server_args.speculative_use_rejection_sampling = True
+    if (
+        server_args.speculative_accept_threshold_single != 1.0
+        or server_args.speculative_accept_threshold_acc != 1.0
+    ):
+        raise ValueError(
+            "DVR rejection sampling does not use speculative acceptance "
+            "thresholds; both thresholds must remain 1.0."
+        )
+    if (
+        server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
+        and server_args.enable_multi_layer_eagle
+    ):
+        raise NotImplementedError(
+            "DVR EAGLE rejection sampling does not support multi-layer EAGLE."
         )
 
     _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
 
-    if server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM:
-        if server_args.disable_overlap_schedule:
-            logger.warning("Synchronous spec v2 is used for DVR EAGLE.")
-        else:
-            logger.warning("Overlap spec v2 is enabled for DVR EAGLE.")
-    elif not server_args.disable_overlap_schedule:
-        logger.warning("Spec v2 is enabled for DVR and overlap schedule is on.")
-    else:
-        logger.warning(
-            "Overlap scheduler is disabled for DVR, so self-draft uses the "
-            "synchronous DVR worker path. Omit --disable-overlap-schedule to "
-            "use overlap scheduling."
-        )
     server_args.enable_mixed_chunk = False
-    logger.warning("Mixed chunked prefill is disabled for DVR.")
 
 
 def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
@@ -321,6 +291,22 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
 
 
 def _is_dvr_gated_linear_state_model(server_args):
-    from sglang.srt.configs import get_hybrid_gdn_config
+    from sglang.srt.configs import (
+        InternS2PreviewConfig,
+        JetNemotronConfig,
+        JetVLMConfig,
+        Qwen3_5Config,
+        Qwen3_5MoeConfig,
+        Qwen3NextConfig,
+    )
 
-    return get_hybrid_gdn_config(server_args.get_model_config().hf_config) is not None
+    config = server_args.get_model_config().hf_config.get_text_config()
+    return isinstance(
+        config,
+        Qwen3NextConfig
+        | Qwen3_5Config
+        | Qwen3_5MoeConfig
+        | InternS2PreviewConfig
+        | JetNemotronConfig
+        | JetVLMConfig,
+    )

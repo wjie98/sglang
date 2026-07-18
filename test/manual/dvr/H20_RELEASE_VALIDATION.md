@@ -104,10 +104,9 @@ request-local recurrent state. The Mamba cache chunk, tracking interval, and
 linear-state adapter chunk must agree. DVR correctness comes from the
 living/ping-pong state lifecycle and must not depend on a radix hit.
 
-Exact rejection sampling is the production default. Run
-`SGLANG_DVR_USE_REJECTION_SAMPLING=0` only as a separately labeled target-only
-acceptance and throughput A/B; never mix it into the default release result
-directory.
+Exact rejection sampling is the production path. It follows ordinary EAGLE RNG
+semantics, so release validation compares strict replay KL and aggregate
+acceptance rather than exact sampled trajectories across scheduler modes.
 
 The minimum effective prompt length is one token. SGLang rejects an empty
 `input_ids` request before scheduling; an entrypoint that accepts empty text must
@@ -131,8 +130,8 @@ Do not prepare the release branch until all applicable gates pass.
 3. 35B DVR-EAGLE sync and overlap report `kl_failed: 0` and
    `accept_failed: 0` with both returned-logprob modes.
 4. The seeded 35B MTP boundary acceptance remains at least 0.75, and fixed
-   ShareGPT acceptance remains at least 0.70. Sync and overlap hashes and
-   acceptance histograms must agree exactly for the same seed and prompt.
+   ShareGPT acceptance remains at least 0.70. Sync and overlap aggregate
+   acceptance must remain in the established range; sampled hashes may differ.
 5. 35B self-DVR TP=4 boundary KL passes before throughput is accepted.
 6. Every 80B run completes all 16 requests and generates 1024 tokens per
    request. Self-DVR accept length remains at least 14.4/16 on ShareGPT and
@@ -384,34 +383,14 @@ done
 
 The default smoke uses stochastic sampling (`temperature=0.7`) because exact
 rejection is the production path. Synthetic boundary and warm-prefix cases must
-pass both returned-logprob modes. Compare each prompt's hash and acceptance
-histogram between `sync_v2` and `overlap_v2`; a difference is a seed/position or
-ownership bug even if both remain above the script's floor.
-
-Run target-only sampling only as a separately labeled A/B:
-
-```bash
-CONDA_ENV="${CONDA_ENV}" \
-MODEL_PATH="${MODEL_35B}" \
-DRAFT_MODEL_PATH="${MODEL_35B}" \
-SHAREGPT_DATASET="${SHAREGPT_DATASET}" \
-TP_SIZE=4 \
-ATTENTION_BACKEND=triton \
-LINEAR_ATTN_BACKEND=triton \
-SGLANG_DVR_USE_REJECTION_SAMPLING=0 \
-MTP_MIN_ACCEPT_RATE=0.0 \
-MTP_REALDATA_MIN_ACCEPT_RATE=0.0 \
-RESULT_ROOT="${RESULT_BASE}/35b-mtp-triton-target-only" \
-  bash test/manual/dvr/scripts/run_35b_mtp_eagle_smoke.sh
-```
-
-The target-only A/B still requires `kl_failed: 0`; report its acceptance and
-throughput separately from the production rejection result.
+pass both returned-logprob modes. Compare aggregate acceptance between
+`sync_v2` and `overlap_v2`; exact hashes and histograms are not scheduler-shape
+invariants.
 
 ### Shared ordinary-EAGLE regression
 
-Proposal sampling, its draft CUDA-graph seed buffer, and rejection verification
-are shared EAGLE paths. Run upstream's ordinary NEXTN rejection-sampling test
+Proposal sampling and rejection verification are shared EAGLE paths. Run
+upstream's ordinary NEXTN rejection-sampling test
 once on the H20 machine. It uses Qwen3.5-9B and may require downloading that
 additional model.
 

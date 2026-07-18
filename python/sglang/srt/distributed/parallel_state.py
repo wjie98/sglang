@@ -352,6 +352,9 @@ class GroupCoordinator:
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # Lazy import to avoid documentation build error
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            dispatch_custom_allreduce,
+        )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
         )
@@ -395,7 +398,21 @@ class GroupCoordinator:
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
-            self.ensure_custom_allreduce(initially_enabled=True)
+            # Initialize a custom fast all-reduce implementation.
+            try:
+                CAClass = dispatch_custom_allreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+                self.ca_comm = CAClass(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Setup Custom allreduce failed with {e}. To silence this "
+                    "warning, specify --disable-custom-all-reduce explicitly."
+                )
 
             if is_hip():
                 try:
@@ -495,73 +512,42 @@ class GroupCoordinator:
         world_size = self.world_size
         return self.ranks[(rank_in_group - 1) % world_size]
 
-    def ensure_custom_allreduce(
-        self, *, initially_enabled: bool = True, require_full_nvlink: bool = False
+    @contextmanager
+    def custom_allreduce_enabled(
+        self, *, create_if_missing: bool = False, require_full_nvlink: bool = False
     ):
-        """Create this group's custom all-reduce communicator when requested."""
-        created = False
-        if self.ca_comm is None and self.world_size > 1:
+        """Temporarily enable this group's custom all-reduce communicator."""
+
+        communicator = self.ca_comm
+        if communicator is None and create_if_missing and self.world_size > 1:
             from sglang.srt.distributed.device_communicators.custom_all_reduce import (
                 dispatch_custom_allreduce,
             )
 
             try:
                 communicator = dispatch_custom_allreduce(
-                    group=self.cpu_group,
-                    device=self.device,
-                )(
-                    group=self.cpu_group,
-                    device=self.device,
-                )
+                    group=self.cpu_group, device=self.device
+                )(group=self.cpu_group, device=self.device)
                 self.ca_comm = communicator
-                created = True
-            except Exception as exc:
-                logger.warning("Setup Custom allreduce failed with %s.", exc)
-                return None
-
-        communicator = self.ca_comm
-        if communicator is None or not hasattr(communicator, "world_size"):
-            return None
-        if require_full_nvlink and not getattr(
-            communicator, "full_nvlink", False
-        ):
-            if created:
+                # A lazily created communicator remains disabled outside this
+                # context; callers such as deterministic target execution keep
+                # their original collective policy.
                 communicator.disabled = True
                 if hasattr(communicator, "original_disabled"):
                     communicator.original_disabled = True
-            return None
-        if created:
-            communicator.disabled = not initially_enabled
-            if hasattr(communicator, "original_disabled"):
-                communicator.original_disabled = not initially_enabled
-        return communicator
+            except Exception as exc:
+                logger.warning("Setup Custom allreduce failed with %s.", exc)
+                communicator = None
 
-    @contextmanager
-    def custom_allreduce_state(
-        self,
-        *,
-        enabled: bool,
-        create_if_missing: bool = False,
-        require_full_nvlink: bool = False,
-    ):
-        """Temporarily set custom all-reduce state and restore it on exit."""
-        communicator = self.ca_comm
-        if create_if_missing:
-            communicator = self.ensure_custom_allreduce(
-                initially_enabled=False,
-                require_full_nvlink=require_full_nvlink,
-            )
-        elif require_full_nvlink and not getattr(
-            communicator, "full_nvlink", False
+        if communicator is None or (
+            require_full_nvlink
+            and not getattr(communicator, "full_nvlink", False)
         ):
-            communicator = None
-
-        if communicator is None or not hasattr(communicator, "world_size"):
             yield False
             return
 
         previous_disabled = communicator.disabled
-        communicator.disabled = not enabled
+        communicator.disabled = False
         try:
             yield True
         finally:

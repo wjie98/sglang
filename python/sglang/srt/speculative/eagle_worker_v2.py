@@ -63,14 +63,13 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
+from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
-    eagle_finish_verify_prepare,
-    eagle_forward_target_verify,
     eagle_prepare_for_verify,
-    eagle_sample_and_build_bonus,
+    eagle_sample,
     organize_draft_results,
     per_step_draft_out_cache_loc,
 )
@@ -79,8 +78,10 @@ from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     draft_tp_context,
     fast_sample,
+    generate_token_bitmask,
     load_token_map,
     move_accept_tokens_to_target_kvcache,
+    record_stream_each,
     record_stream_for_v2_verify,
     renorm_draft_probs,
     select_top_k_tokens,
@@ -657,11 +658,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.sampling_info,
                     self.server_args.speculative_use_rejection_sampling,
                 )
-                topk_p, topk_index = fast_sample(
-                    probs,
-                    sampling_seed=forward_batch.sampling_info.sampling_seed,
-                    positions=forward_batch.positions + 1,
-                )
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
                 draft_probs_list.append(probs)
             elif self.topk == 1 and not _is_hip:
                 topk_index = torch.argmax(
@@ -799,11 +796,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             use_rejection_sampling,
         )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(
-                probs,
-                sampling_seed=batch.sampling_info.sampling_seed,
-                positions=batch.seq_lens + 1,
-            )
+            topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
@@ -909,11 +902,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info,
                 self.server_args.speculative_use_rejection_sampling,
             )
-            ret_topk_p, ret_topk_index = fast_sample(
-                probs,
-                sampling_seed=batch.sampling_info.sampling_seed,
-                positions=batch.seq_lens + batch_result.accept_lens,
-            )
+            ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
             ret_draft_probs = probs
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
@@ -1463,27 +1452,87 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.target_worker,
             )
 
-        eagle_finish_verify_prepare(
-            verify_input,
-            batch,
-            self.target_worker,
-            verify_forward_batch,
-            can_run_cuda_graph,
-            self.plan_stream,
-        )
-        forward_batch_output, vocab_mask = eagle_forward_target_verify(
-            verify_input, batch, self.target_worker, verify_forward_batch
+        # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
+        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
+
+        # Correct some buffers due to the overlap plan
+        if self.plan_stream:
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
+            if (
+                _is_npu
+                and self._target_worker.model_runner.model_is_mrope
+                and batch.spec_info is not None
+                and getattr(batch.spec_info, "positions", None) is not None
+                and not batch.forward_mode.is_idle()
+            ):
+                # mrope_position depends on draft output in default stream and is computed in plan stream,
+                # causing errors. Compute it here for correct values.
+                verify_forward_batch.compute_spec_mrope_positions(
+                    self._target_worker.model_runner, batch
+                )
+
+            # Some values such as custom_mask and position depend on the output of draft,
+            # so the previous plan step used the wrong values. Here, we need to run the related
+            # computation again to update them to the correct values.
+            self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+                verify_input,
+                (
+                    self.target_worker.model_runner.decode_cuda_graph_runner.bs
+                    if can_run_cuda_graph
+                    else None
+                ),
+            )
+
+        # Prepare grammar data on CPU if needed
+        if batch.has_grammar:
+            retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
+            draft_tokens_cpu = verify_input.draft_token.view(
+                verify_input.retrieve_next_token.shape
+            ).cpu()
+
+        # Run target verify batch in the main compute stream (GPU compute).
+        # Metadata init is skipped iff cuda-graph already ran load_batch —
+        # eagle_prepare_for_verify marked the batch in exactly that case; the
+        # non-cuda-graph path stays unmarked and gets forward_extend's init
+        # (post-pad).
+        forward_batch_output = self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
         )
         logits_output = forward_batch_output.logits_output
 
+        # Generate vocab mask for constrained decoding
+        vocab_mask = None
+        if batch.has_grammar:
+            # Generate the logit mask for structured output.
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                verify_input,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+                # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
+                # and will be applied to produce wrong results
+                batch.sampling_info.vocab_mask = None
+
+        # Sample
+        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_lens,
             accept_index,
-            bonus_tokens,
-        ) = eagle_sample_and_build_bonus(
-            verify_input, batch, logits_output, vocab_mask
-        )
+        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification
@@ -1494,6 +1543,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
             self.speculative_num_draft_tokens,
         )
+
+        if not batch.forward_mode.is_idle():
+            accept_tokens = predict[accept_index]
+            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            # stride = accept_tokens per-req width = accept_index.shape[1]
+            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
+            fill_bonus_tokens[(bs,)](
+                accept_tokens,
+                accept_lens,
+                bonus_tokens,
+                accept_index.shape[1],
+            )
+        else:
+            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(

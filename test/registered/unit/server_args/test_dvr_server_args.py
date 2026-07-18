@@ -2,14 +2,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.configs import get_hybrid_gdn_config
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dvr_server_args import (
     DVR_EAGLE_SPECULATIVE_ALGORITHM,
     DVR_SPECULATIVE_ALGORITHM,
+    _is_dvr_gated_linear_state_model,
     handle_dvr_defaults,
     handle_dvr_speculative_decoding,
 )
@@ -69,15 +68,22 @@ class TestDVRServerArgs(unittest.TestCase):
     def test_gdn_capability_uses_normalized_text_config(self):
         text_config = Qwen3NextConfig()
 
-        self.assertIs(
-            get_hybrid_gdn_config(
-                SimpleNamespace(get_text_config=lambda: text_config)
-            ),
-            text_config,
+        self.assertTrue(
+            _is_dvr_gated_linear_state_model(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(
+                        hf_config=SimpleNamespace(get_text_config=lambda: text_config)
+                    )
+                )
+            )
         )
-        self.assertIsNone(
-            get_hybrid_gdn_config(
-                SimpleNamespace(get_text_config=lambda: object())
+        self.assertFalse(
+            _is_dvr_gated_linear_state_model(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(
+                        hf_config=SimpleNamespace(get_text_config=lambda: object())
+                    )
+                )
             )
         )
 
@@ -98,8 +104,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args = _Args()
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             handle_dvr_speculative_decoding(args)
@@ -115,8 +120,7 @@ class TestDVRServerArgs(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             handle_dvr_speculative_decoding(args)
@@ -131,8 +135,7 @@ class TestDVRServerArgs(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             handle_dvr_speculative_decoding(args)
@@ -145,8 +148,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args._cuda_graph_config_locked = {(Phase.DECODE, "bs")}
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "Explicit.*decode.*bs"):
@@ -160,8 +162,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args._cuda_graph_config_locked = {(Phase.DECODE, "max_bs")}
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "Explicit.*decode.*max_bs"):
@@ -174,8 +175,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.disable_draft_cuda_graph = True
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
@@ -186,8 +186,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
@@ -199,8 +198,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.cuda_graph_config.decode.backend = Backend.DISABLED
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=False,
         ):
             with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
@@ -226,15 +224,10 @@ class TestDVRServerArgs(unittest.TestCase):
         self.assertEqual(args.speculative_num_draft_tokens, 2)
         self.assertEqual(args.speculative_num_steps, 1)
 
-    def test_dvr_rejection_sampling_is_default_and_can_be_disabled(self):
+    def test_dvr_rejection_sampling_is_always_enabled(self):
         args = _Args()
         handle_dvr_speculative_decoding(args)
         self.assertTrue(args.speculative_use_rejection_sampling)
-
-        args = _Args()
-        with envs.SGLANG_DVR_USE_REJECTION_SAMPLING.override(False):
-            handle_dvr_speculative_decoding(args)
-        self.assertFalse(args.speculative_use_rejection_sampling)
 
     def test_dvr_rejection_sampling_rejects_ignored_acceptance_thresholds(self):
         args = _Args()
@@ -257,18 +250,12 @@ class TestDVRServerArgs(unittest.TestCase):
             handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_custom_sampler(self):
-        for rejection_sampling in (True, False):
-            args = _Args()
-            args.sampling_backend = "custom"
-            with (
-                envs.SGLANG_DVR_USE_REJECTION_SAMPLING.override(rejection_sampling),
-                self.assertRaisesRegex(
-                    ValueError, "built-in flashinfer and pytorch"
-                ),
-            ):
-                handle_dvr_speculative_decoding(args)
+        args = _Args()
+        args.sampling_backend = "custom"
+        with self.assertRaisesRegex(ValueError, "built-in flashinfer and pytorch"):
+            handle_dvr_speculative_decoding(args)
 
-    def test_dvr_preserves_disabled_radix_cache_with_request_checkpoints(self):
+    def test_dvr_preserves_disabled_radix_cache_without_enabling_radix_tracking(self):
         for strategy in ("auto", "no_buffer", "extra_buffer", "extra_buffer_lazy"):
             with self.subTest(strategy=strategy):
                 args = _Args()
@@ -284,7 +271,7 @@ class TestDVRServerArgs(unittest.TestCase):
 
                 self.assertTrue(args.disable_radix_cache)
                 self.assertEqual(args.mamba_radix_cache_strategy, strategy)
-                self.assertTrue(ServerArgs.enable_mamba_extra_buffer(args))
+                self.assertFalse(ServerArgs.enable_mamba_extra_buffer(args))
 
     def test_dvr_gdn_preserves_supported_page_sizes(self):
         for page_size in (1, 8, 16, 32, 64):
@@ -330,8 +317,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.linear_attn_prefill_backend = "flashinfer"
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "linear-attn-prefill-backend"):
@@ -356,8 +342,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.enable_streaming_session = True
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "streaming sessions"):
@@ -368,8 +353,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.enable_int8_mamba_checkpoint = True
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "exact recurrent checkpoints"):
@@ -381,8 +365,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.enable_int8_mamba_checkpoint = True
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=False,
         ):
             handle_dvr_speculative_decoding(args)
@@ -390,8 +373,7 @@ class TestDVRServerArgs(unittest.TestCase):
     def test_dvr_preserves_draft_custom_all_reduce_intent(self):
         args = _Args()
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=False,
         ):
             handle_dvr_defaults(args)
@@ -401,8 +383,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args = _Args()
         args.disable_custom_all_reduce = True
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=False,
         ):
             handle_dvr_defaults(args)
@@ -412,8 +393,7 @@ class TestDVRServerArgs(unittest.TestCase):
     def test_dvr_enables_deterministic_target_execution(self):
         args = _Args()
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=False,
         ):
             handle_dvr_defaults(args)
@@ -426,8 +406,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.speculative_algorithm = DVR_SPECULATIVE_ALGORITHM.lower()
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=False,
         ):
             handle_dvr_defaults(args)
@@ -442,8 +421,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.speculative_num_steps = 64
 
         with patch(
-            "sglang.srt.speculative.dvr_server_args."
-            "_is_dvr_gated_linear_state_model",
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=False,
         ):
             handle_dvr_defaults(args)

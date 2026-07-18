@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.linear.dvr_gdn import (
     DVRGDNStateAdapter,
     dvr_gdn_state_input_bytes_per_request,
 )
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 
 
 def create_gdn_state_input_cache(
@@ -193,13 +194,13 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
     )
     req_to_token_pool = SimpleNamespace(
         mamba_pool=SimpleNamespace(mamba_cache=all_layers_state_cache),
-        mamba_map={7: 0},
-        get_mamba_indices=lambda req_pool_indices: req_pool_indices,
+        get_mamba_indices=lambda req_pool_indices: torch.zeros_like(req_pool_indices),
         get_speculative_mamba2_params_all_layers=lambda: all_layers_state_cache,
     )
     batch = SimpleNamespace(
         batch_size=lambda: 1,
         req_to_token_pool=req_to_token_pool,
+        req_pool_indices=torch.tensor([2]),
         reqs=[SimpleNamespace(mamba_ping_pong_track_buffer=torch.tensor([0]))],
     )
     adapter = DVRGDNStateAdapter.for_gdn(
@@ -218,13 +219,18 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
         ),
     )
 
-    returned_state_cache = adapter.get_state_cache(batch=batch)
+    returned_state_cache, state_input_indices, live_indices = adapter.batch_state(
+        batch=batch
+    )
 
     assert returned_state_cache is all_layers_state_cache
+    assert state_input_indices.tolist() == [2]
+    assert live_indices.tolist() == [0]
     assert adapter.state_input_cache is not None
     window = adapter.state_input_window(layer_idx=0)
     assert window.capacity == FLA_CHUNK_SIZE + 4
     assert window.tensors[0].shape == (3, FLA_CHUNK_SIZE + 4, 8, 128)
+    assert adapter.state_input_window(layer_idx=0) is window
 
     # The adapter owns the side cache without mutating upstream pool/cache objects.
     assert not hasattr(req_to_token_pool, "_dvr_linear_state_input_cache")
@@ -290,7 +296,7 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
         assert torch.all(tensor[1, 2:] == 1)
 
 
-def test_gdn_verify_uses_request_pool_dummy_row_directly():
+def test_gdn_verify_uses_mamba_padding_sentinel():
     adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
     forward_batch = SimpleNamespace(
         input_ids=torch.zeros(4, dtype=torch.long),
@@ -300,7 +306,7 @@ def test_gdn_verify_uses_request_pool_dummy_row_directly():
 
     dvr_indices, state_input_indices, valid_mask = adapter.target_verify_indices(
         forward_batch=forward_batch,
-        cache_indices=torch.tensor([7, 9]),
+        cache_indices=torch.tensor([7, PAD_SLOT_ID]),
     )
 
     assert torch.equal(dvr_indices, torch.tensor([7, 0]))
@@ -402,13 +408,17 @@ def test_gdn_backup_uses_request_pool_rows():
     temporal = torch.arange(18, dtype=torch.float32).reshape(1, 3, 6)
     state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
     adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
+    backup = adapter.allocate_draft_state_backup(
+        state_cache=state_cache, backup_size=4
+    )
 
-    backup = adapter.backup_draft_state(
+    updated = adapter.backup_draft_state(
         state_cache=state_cache,
         indices=torch.tensor([0, 2]),
         backup_indices=torch.tensor([1, 3]),
-        backup_size=4,
+        out=backup,
     )
+    assert updated is backup
     torch.testing.assert_close(backup[0][:, 1], conv[:, 0])
     torch.testing.assert_close(backup[0][:, 3], conv[:, 2])
 
@@ -417,7 +427,6 @@ def test_gdn_backup_uses_request_pool_rows():
         state_cache=state_cache,
         indices=torch.tensor([1]),
         backup_indices=torch.tensor([2]),
-        backup_size=4,
         out=backup,
     )
     assert updated is backup
@@ -460,7 +469,7 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
         state_input_indices=torch.tensor([1, 2]),
         live_indices=torch.tensor([3, 4]),
         boundary_indices=torch.tensor([5, 6]),
-        previous_boundary_indices=torch.tensor([7, 8]),
+        next_boundary_indices=torch.tensor([7, 8]),
         accepted_token_counts=torch.tensor([2, 2]),
     )
 

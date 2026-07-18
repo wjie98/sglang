@@ -1577,22 +1577,6 @@ class Scheduler(
 
             self._apply_war_barrier()
 
-            # Grammar state is advanced while processing the preceding result.
-            # Do that before planning the next speculative batch; otherwise a
-            # request that just finished can leave a stale, already-prepared
-            # decode batch referring to cache slots released by result handling.
-            # Keep last_batch alive: it still owns overlap accounting and cache
-            # references until the loop installs the newly planned batch.
-            last_result_processed = False
-            if (
-                self.last_batch
-                and self.result_queue
-                and not self.last_batch.spec_algorithm.is_none()
-                and self.last_batch.has_grammar
-            ):
-                pop_and_process()
-                last_result_processed = True
-
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1600,27 +1584,19 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch and not last_result_processed:
+            if disable_overlap_for_batch:
                 pop_and_process()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
-                result_process_ready_event = batch_result.result_process_ready_event
-                if result_process_ready_event is not None:
-                    # Queue preceding result writes behind any current forward
-                    # phase that still reads shared pools, without blocking CPU
-                    # result processing.
-                    self.schedule_stream.wait_event(
-                        result_process_ready_event
-                    )
             else:
                 batch_result = None
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch and not last_result_processed:
+                if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
