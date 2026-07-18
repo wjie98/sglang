@@ -113,9 +113,7 @@ def handle_dvr_speculative_decoding(server_args):
         server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is None
     ):
-        raise ValueError(
-            "DVR EAGLE requires setting --speculative-draft-model-path."
-        )
+        raise ValueError("DVR EAGLE requires setting --speculative-draft-model-path.")
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = (
             2
@@ -155,7 +153,10 @@ def handle_dvr_speculative_decoding(server_args):
 
     if server_args.speculative_num_steps is None:
         server_args.speculative_num_steps = server_args.speculative_num_draft_tokens - 1
-    elif server_args.speculative_num_draft_tokens != server_args.speculative_num_steps + 1:
+    elif (
+        server_args.speculative_num_draft_tokens
+        != server_args.speculative_num_steps + 1
+    ):
         logger.warning(
             "speculative_num_draft_tokens is adjusted to "
             "speculative_num_steps + 1 for DVR chain mode."
@@ -233,53 +234,41 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
         )
 
     decode_graph = server_args.cuda_graph_config.decode
-    cuda_graph_bs = decode_graph.bs
     locked = getattr(server_args, "_cuda_graph_config_locked", set())
-    bs_locked = (Phase.DECODE, "bs") in locked
-    max_bs_locked = (Phase.DECODE, "max_bs") in locked
-    max_running_requests = server_args.max_running_requests
-    if max_running_requests is None:
-        return
-
-    max_running_requests = int(max_running_requests)
+    max_running_requests = int(server_args.max_running_requests or 0)
     if max_running_requests <= 0:
         return
 
-    if cuda_graph_bs is None:
-        cuda_graph_max_bs = decode_graph.max_bs
-        if (
-            cuda_graph_max_bs is not None
-            and int(cuda_graph_max_bs) < max_running_requests
-        ):
-            if max_bs_locked:
-                raise ValueError(
-                    "Explicit cuda_graph_config[decode].max_bs does not cover "
-                    f"DVR self-draft max_running_requests={max_running_requests}."
-                )
-            decode_graph.max_bs = max_running_requests
+    if decode_graph.bs is None:
+        if decode_graph.max_bs is None or decode_graph.max_bs >= max_running_requests:
+            return
+        if (Phase.DECODE, "max_bs") in locked:
+            raise ValueError(
+                "Explicit cuda_graph_config[decode].max_bs does not cover "
+                f"DVR self-draft max_running_requests={max_running_requests}."
+            )
+        decode_graph.max_bs = max_running_requests
         return
 
-    graph_bs = {int(bs) for bs in cuda_graph_bs if int(bs) > 0}
-    if not graph_bs:
+    graph_bs = {int(bs) for bs in decode_graph.bs if int(bs) > 0}
+    if server_args.disable_cuda_graph_padding:
+        missing_bs = set(range(1, max_running_requests + 1)) - graph_bs
+    else:
+        missing_bs = (
+            set()
+            if graph_bs and max(graph_bs) >= max_running_requests
+            else {max_running_requests}
+        )
+    if not missing_bs:
         return
-
-    required_bs = (
-        set(range(1, max_running_requests + 1))
-        if server_args.disable_cuda_graph_padding
-        else {max_running_requests}
-    )
-    missing_bs = required_bs - graph_bs
-    if not missing_bs or (
-        not server_args.disable_cuda_graph_padding
-        and max(graph_bs) >= max_running_requests
-    ):
-        return
-    if bs_locked:
+    if (Phase.DECODE, "bs") in locked:
         raise ValueError(
             "Explicit cuda_graph_config[decode].bs does not cover DVR "
             f"self-draft batch sizes {sorted(missing_bs)}."
         )
-    if max_bs_locked and int(decode_graph.max_bs or 0) < max(missing_bs):
+    if (Phase.DECODE, "max_bs") in locked and int(decode_graph.max_bs or 0) < max(
+        missing_bs
+    ):
         raise ValueError(
             "Explicit cuda_graph_config[decode].max_bs does not cover DVR "
             f"self-draft batch size {max(missing_bs)}."
@@ -291,22 +280,14 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
 
 
 def _is_dvr_gated_linear_state_model(server_args):
-    from sglang.srt.configs import (
-        InternS2PreviewConfig,
-        JetNemotronConfig,
-        JetVLMConfig,
-        Qwen3_5Config,
-        Qwen3_5MoeConfig,
-        Qwen3NextConfig,
-    )
+    from sglang.srt.configs import JetNemotronConfig, Qwen3NextConfig
+    from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 
-    config = server_args.get_model_config().hf_config.get_text_config()
-    return isinstance(
-        config,
-        Qwen3NextConfig
-        | Qwen3_5Config
-        | Qwen3_5MoeConfig
-        | InternS2PreviewConfig
-        | JetNemotronConfig
-        | JetVLMConfig,
-    )
+    hf_config = server_args.get_model_config().hf_config
+    registered = get_linear_attn_config(hf_config)
+    if registered is not None:
+        return registered[0].backend_class_name.endswith(".gdn_backend.GDNAttnBackend")
+
+    # Qwen3.5/InternS2 text configs inherit Qwen3NextConfig; JetVLM unwraps
+    # to JetNemotronConfig. Keep built-ins until they move to the registry.
+    return isinstance(hf_config.get_text_config(), Qwen3NextConfig | JetNemotronConfig)

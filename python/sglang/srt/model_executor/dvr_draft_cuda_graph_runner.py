@@ -46,9 +46,7 @@ def _resolve_dvr_backends(backend, forward_mode=ForwardMode.DECODE):
             for child in current.children:
                 visit(child, collect_attention=collect_attention)
         else:
-            state_adapter = state_adapter or getattr(
-                current, "dvr_state_adapter", None
-            )
+            state_adapter = state_adapter or getattr(current, "dvr_state_adapter", None)
             if collect_attention:
                 leaves.append(current)
 
@@ -91,7 +89,6 @@ def _fast_decode_overrides(backend, model_runner, buffer_cache=None):
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
-    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
     plan_cache = None
     plan_key = None
@@ -241,9 +238,7 @@ def dvr_draft_decode_context(
             ):
                 if backend is None:
                     continue
-                overrides = _fast_decode_overrides(
-                    backend, model_runner, buffer_cache
-                )
+                overrides = _fast_decode_overrides(backend, model_runner, buffer_cache)
                 resolved_backend = True
                 for owner, name, value in overrides:
                     patch_attr(owner, name, value)
@@ -260,7 +255,7 @@ def dvr_draft_decode_context(
                     model_runner.server_args,
                     "_dvr_enable_draft_custom_all_reduce",
                     False,
-                    ):
+                ):
                     for group in _iter_decode_custom_all_reduce_groups(model_runner):
                         stack.enter_context(
                             group.custom_allreduce_enabled(

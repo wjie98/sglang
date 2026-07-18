@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -15,9 +12,9 @@ class DVRLinearStateContext:
     state_cache: Any
     state_input_indices: torch.Tensor
     live_indices: torch.Tensor
-    boundary_indices: Optional[torch.Tensor] = None
-    next_boundary_indices: Optional[torch.Tensor] = None
-    boundary_track_indices: Optional[torch.Tensor] = None
+    boundary_indices: torch.Tensor
+    next_boundary_indices: torch.Tensor
+    boundary_track_indices: torch.Tensor
 
 
 class DVRLinearStateLifecycle:
@@ -185,37 +182,36 @@ class DVRLinearStateLifecycle:
         state_cache, state_input_indices, live_indices = (
             self._state_adapter.batch_state(batch=batch)
         )
-        ctx = DVRLinearStateContext(
-            state_cache=state_cache,
-            state_input_indices=state_input_indices,
-            live_indices=live_indices,
-        )
         track_slots = batch.req_to_token_pool.get_mamba_ping_pong_slots(
             batch.req_pool_indices
-        ).to(device=ctx.live_indices.device, dtype=torch.long)
-        active_lens = self.boundary_lens[ctx.state_input_indices]
-        ctx.boundary_track_indices = active_lens.argmax(dim=1)
-        ctx.boundary_indices = track_slots.gather(
-            1, ctx.boundary_track_indices.unsqueeze(1)
+        ).to(device=live_indices.device, dtype=torch.long)
+        boundary_track_indices = self.boundary_lens[state_input_indices].argmax(dim=1)
+        boundary_indices = track_slots.gather(
+            1, boundary_track_indices.unsqueeze(1)
         ).squeeze(1)
-        next_track_indices = (
-            batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                ctx.boundary_track_indices
-            )
+        next_track_indices = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+            boundary_track_indices
         )
-        ctx.next_boundary_indices = track_slots.gather(
+        next_boundary_indices = track_slots.gather(
             1, next_track_indices.unsqueeze(1)
         ).squeeze(1)
         if self._state_adapter.draft_reuses_target_state:
             if self.draft_state_backup is None:
                 raise RuntimeError("DVR self draft has no live-state backup storage.")
             self.draft_state_backup = self._state_adapter.backup_draft_state(
-                state_cache=ctx.state_cache,
-                indices=ctx.live_indices,
-                backup_indices=ctx.state_input_indices,
+                state_cache=state_cache,
+                indices=live_indices,
+                backup_indices=state_input_indices,
                 out=self.draft_state_backup,
             )
-        return ctx
+        return DVRLinearStateContext(
+            state_cache=state_cache,
+            state_input_indices=state_input_indices,
+            live_indices=live_indices,
+            boundary_indices=boundary_indices,
+            next_boundary_indices=next_boundary_indices,
+            boundary_track_indices=boundary_track_indices,
+        )
 
     def finish_target_extend(self, batch: ScheduleBatch) -> None:
         """Publish the exact recurrent boundary produced by target EXTEND."""
@@ -232,7 +228,6 @@ class DVRLinearStateLifecycle:
         )
         prefix_lens = [int(x) for x in batch.prefix_lens]
         zero_indices = []
-        boundary_indices = []
         tail_lens = []
         boundary_lens = []
         boundary_tracks = []
@@ -259,10 +254,7 @@ class DVRLinearStateLifecycle:
                     )
             elif boundary_len == 0:
                 zero_indices.append(boundary_index)
-            elif (
-                self.server_args.disable_radix_cache
-                or prefix_lens[i] != boundary_len
-            ):
+            elif self.server_args.disable_radix_cache or prefix_lens[i] != boundary_len:
                 raise RuntimeError(
                     "DVR target EXTEND did not restore the latest chunk boundary: "
                     f"rid={req.rid}, boundary={boundary_len}, "
@@ -272,7 +264,6 @@ class DVRLinearStateLifecycle:
             # Otherwise GDN captured the radix-owned prefix boundary before
             # target EXTEND consumed the unclosed tail.
 
-            boundary_indices.append(state_input_indices[i])
             tail_lens.append(seq_len - boundary_len)
             boundary_lens.append(boundary_len)
             boundary_tracks.append(track_idx)
@@ -284,22 +275,20 @@ class DVRLinearStateLifecycle:
                     device=live_indices.device, dtype=torch.long
                 ),
             )
-        boundary_indices = torch.stack(boundary_indices).to(torch.long)
         boundary_tracks = torch.tensor(
             boundary_tracks, device=live_indices.device, dtype=torch.int64
         )
-        self.boundary_lens[boundary_indices, boundary_tracks] = torch.tensor(
+        self.boundary_lens[state_input_indices, boundary_tracks] = torch.tensor(
             boundary_lens, device=live_indices.device, dtype=torch.int64
         )
         self._state_adapter.state_input_window().set_tail_lens(
-            indices=boundary_indices,
+            indices=state_input_indices,
             value=torch.tensor(tail_lens, device=live_indices.device),
         )
 
     def restore_for_verify(self, ctx: Optional[DVRLinearStateContext]) -> None:
         if ctx is None:
             return
-        assert ctx.boundary_indices is not None
         if (
             self._state_adapter.draft_reuses_target_state
             and self.draft_state_backup is None
@@ -322,9 +311,6 @@ class DVRLinearStateLifecycle:
     ) -> None:
         if ctx is None:
             return
-        assert ctx.boundary_indices is not None
-        assert ctx.next_boundary_indices is not None
-        assert ctx.boundary_track_indices is not None
         if accept_lens.numel() > 0:
             crosses_chunk_boundary = self._state_adapter.commit_after_verify(
                 state_cache=ctx.state_cache,

@@ -14,8 +14,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
-    DVRDraftDecodeCudaGraphRunner,
-    DVRTargetVerifyCudaGraphRunner,
     _fast_decode_overrides,
     _resolve_dvr_backends,
     _validate_dvr_attention_backend,
@@ -23,7 +21,6 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
 from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorkerV2,
@@ -40,13 +37,6 @@ def test_dvr_spec_algorithm_contracts():
     assert eagle_draft.is_dvr_eagle() and not eagle_draft.is_eagle()
     assert not self_draft.has_draft_kv()
     assert eagle_draft.has_draft_kv()
-
-
-def test_dvr_worker_and_graph_contracts():
-    assert issubclass(DecodeVerifyRollbackWorkerV2, BaseSpecWorker)
-    assert not DecodeVerifyRollbackWorkerV2.__abstractmethods__
-    assert DVRTargetVerifyCudaGraphRunner.dvr_target_verify_cuda_graph
-    assert not DVRDraftDecodeCudaGraphRunner.record_war_fastpath_event
 
 
 def test_dvr_without_radix_reserves_one_active_boundary_per_request():
@@ -506,9 +496,7 @@ def _finished_req(**overrides):
 
 
 def test_release_publishes_latest_visible_boundary_and_clears_row():
-    lifecycle, _, _, *_ = _lifecycle_fixture(
-        seq_len=65, last_track=64, prefix_len=0
-    )
+    lifecycle, _, _, *_ = _lifecycle_fixture(seq_len=65, last_track=64, prefix_len=0)
     lifecycle.boundary_lens[1] = torch.tensor([128, 192])
     req = _finished_req()
 
@@ -520,9 +508,7 @@ def test_release_publishes_latest_visible_boundary_and_clears_row():
 
 
 def test_release_fails_if_committed_boundary_was_lost():
-    lifecycle, _, _, *_ = _lifecycle_fixture(
-        seq_len=65, last_track=64, prefix_len=0
-    )
+    lifecycle, _, _, *_ = _lifecycle_fixture(seq_len=65, last_track=64, prefix_len=0)
     lifecycle.boundary_lens[1] = torch.tensor([256, -1])
 
     with pytest.raises(RuntimeError, match="lost the recurrent checkpoint"):

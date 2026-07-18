@@ -150,6 +150,8 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         )
         self.is_dvr_eagle = self.speculative_algorithm.is_dvr_eagle()
         device_module = torch.get_device_module(self.device)
+        self.plan_stream = None
+        self.plan_stream_ctx = nullcontext()
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
@@ -198,18 +200,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             # Reuse the upstream EAGLE/MTP worker as the draft backend. DVR owns
             # target verify and rollback, not a second copy of EAGLE draft logic.
             if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
-                device_module = torch.get_device_module(self.device)
                 self.plan_stream = device_module.Stream()
                 self.plan_stream_ctx = device_module.stream(self.plan_stream)
-            else:
-                self.plan_stream = None
-                self.plan_stream_ctx = nullcontext()
             log_prefix = "DVR EAGLE"
         else:
             del dp_rank, moe_ep_rank, attn_cp_rank, moe_dp_rank, nccl_port
             self._draft_worker = None
-            self.plan_stream = None
-            self.plan_stream_ctx = nullcontext()
             log_prefix = "DVR self-decode"
 
         logger.info(
@@ -386,10 +382,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # ScheduleBatch.prepare_for_decode already reserved the speculative
         # window. Self draft and target verify share it; allocating again would
         # split KV ownership between two paths.
-        offsets = (
-            batch.seq_lens.to(torch.long).unsqueeze(1)
-            + self._chain_position_offsets.unsqueeze(0)
-        )
+        offsets = batch.seq_lens.to(torch.long).unsqueeze(
+            1
+        ) + self._chain_position_offsets.unsqueeze(0)
         rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
         batch.out_cache_loc = batch.req_to_token_pool.req_to_token[
             rows, offsets
@@ -702,8 +697,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             ),
             custom_mask=None,
             positions=(
-                batch.seq_lens[:, None]
-                + self._chain_position_offsets[None, :]
+                batch.seq_lens[:, None] + self._chain_position_offsets[None, :]
             ).reshape(-1),
             retrieve_index=retrieve_index,
             retrieve_next_token=terminal,

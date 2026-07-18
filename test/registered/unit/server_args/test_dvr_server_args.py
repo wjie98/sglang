@@ -87,6 +87,31 @@ class TestDVRServerArgs(unittest.TestCase):
             )
         )
 
+    def test_gdn_capability_uses_registered_backend(self):
+        args = SimpleNamespace(
+            get_model_config=lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(get_text_config=lambda: object())
+            )
+        )
+        registry_path = (
+            "sglang.srt.configs.linear_attn_model_registry.get_linear_attn_config"
+        )
+        for backend, expected in (
+            ("sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend", True),
+            ("sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend", False),
+        ):
+            with (
+                self.subTest(backend=backend),
+                patch(
+                    registry_path,
+                    return_value=(
+                        SimpleNamespace(backend_class_name=backend),
+                        object(),
+                    ),
+                ),
+            ):
+                self.assertEqual(_is_dvr_gated_linear_state_model(args), expected)
+
     def test_dvr_rejects_zero_step_chain_mode(self):
         args = _Args()
         args.speculative_num_draft_tokens = 1
@@ -100,109 +125,44 @@ class TestDVRServerArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pp_size == 1"):
             handle_dvr_speculative_decoding(args)
 
-    def test_dvr_self_draft_extends_cuda_graph_max_with_padding(self):
-        args = _Args()
-
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=True,
-        ):
-            handle_dvr_speculative_decoding(args)
-
-        self.assertEqual(args.cuda_graph_config.decode.bs, [1, 2, 4])
-        self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
-
-    def test_dvr_self_draft_extends_exact_cuda_graph_bs_without_padding(self):
-        args = _Args()
-        args.disable_cuda_graph_padding = True
-        args.cuda_graph_config = SimpleNamespace(
-            decode=SimpleNamespace(backend=Backend.FULL, bs=[1, 4], max_bs=4)
+    def test_dvr_self_draft_fills_default_cuda_graph_coverage(self):
+        cases = (
+            (False, [1, 2], 2, [1, 2, 4], 4),
+            (True, [1, 4], 4, [1, 2, 3, 4], 4),
+            (False, None, 2, None, 4),
         )
-
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=True,
-        ):
-            handle_dvr_speculative_decoding(args)
-
-        self.assertEqual(args.cuda_graph_config.decode.bs, [1, 2, 3, 4])
-        self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
-
-    def test_dvr_self_draft_extends_cuda_graph_max_before_default_bs(self):
-        args = _Args()
-        args.cuda_graph_config = SimpleNamespace(
-            decode=SimpleNamespace(backend=Backend.FULL, bs=None, max_bs=2)
-        )
-
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=True,
-        ):
-            handle_dvr_speculative_decoding(args)
-
-        self.assertIsNone(args.cuda_graph_config.decode.bs)
-        self.assertEqual(args.cuda_graph_config.decode.max_bs, 4)
-
-    def test_dvr_self_draft_does_not_mutate_explicit_cuda_graph_bs(self):
-        args = _Args()
-        args._cuda_graph_config_locked = {(Phase.DECODE, "bs")}
-
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=True,
-        ):
-            with self.assertRaisesRegex(ValueError, "Explicit.*decode.*bs"):
+        for padding_disabled, bs, max_bs, expected_bs, expected_max_bs in cases:
+            with self.subTest(padding_disabled=padding_disabled, bs=bs):
+                args = _Args()
+                args.disable_cuda_graph_padding = padding_disabled
+                args.cuda_graph_config.decode.bs = bs
+                args.cuda_graph_config.decode.max_bs = max_bs
                 handle_dvr_speculative_decoding(args)
+                self.assertEqual(args.cuda_graph_config.decode.bs, expected_bs)
+                self.assertEqual(args.cuda_graph_config.decode.max_bs, expected_max_bs)
 
-        self.assertEqual(args.cuda_graph_config.decode.bs, [1, 2])
+    def test_dvr_self_draft_preserves_explicit_cuda_graph_limits(self):
+        for field, bs in (("bs", [1, 2]), ("max_bs", None)):
+            with self.subTest(field=field):
+                args = _Args()
+                args.cuda_graph_config.decode.bs = bs
+                args._cuda_graph_config_locked = {(Phase.DECODE, field)}
+                original = getattr(args.cuda_graph_config.decode, field)
+                with self.assertRaisesRegex(ValueError, f"Explicit.*decode.*{field}"):
+                    handle_dvr_speculative_decoding(args)
+                self.assertEqual(getattr(args.cuda_graph_config.decode, field), original)
 
-    def test_dvr_self_draft_does_not_mutate_explicit_cuda_graph_max_bs(self):
-        args = _Args()
-        args.cuda_graph_config.decode.bs = None
-        args._cuda_graph_config_locked = {(Phase.DECODE, "max_bs")}
-
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=True,
+    def test_dvr_self_draft_requires_cuda_graph(self):
+        for disable_draft, backend in (
+            (True, Backend.FULL),
+            (False, Backend.DISABLED),
         ):
-            with self.assertRaisesRegex(ValueError, "Explicit.*decode.*max_bs"):
-                handle_dvr_speculative_decoding(args)
-
-        self.assertEqual(args.cuda_graph_config.decode.max_bs, 2)
-
-    def test_dvr_self_draft_gdn_requires_draft_cuda_graph(self):
-        args = _Args()
-        args.disable_draft_cuda_graph = True
-
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=True,
-        ):
-            with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
-                handle_dvr_speculative_decoding(args)
-
-    def test_dvr_self_draft_gdn_uses_phase_graph_config(self):
-        args = _Args()
-        args.cuda_graph_config.decode.backend = Backend.DISABLED
-
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=True,
-        ):
-            with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
-                handle_dvr_speculative_decoding(args)
-
-    def test_dvr_self_draft_plain_transformer_requires_draft_cuda_graph(self):
-        args = _Args()
-        args.disable_draft_cuda_graph = True
-        args.cuda_graph_config.decode.backend = Backend.DISABLED
-
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=False,
-        ):
-            with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
-                handle_dvr_speculative_decoding(args)
+            with self.subTest(disable_draft=disable_draft, backend=backend):
+                args = _Args()
+                args.disable_draft_cuda_graph = disable_draft
+                args.cuda_graph_config.decode.backend = backend
+                with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
+                    handle_dvr_speculative_decoding(args)
 
     def test_dvr_eagle_keeps_radix_cache(self):
         args = _Args()
