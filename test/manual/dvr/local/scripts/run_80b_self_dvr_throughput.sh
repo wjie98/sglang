@@ -127,7 +127,7 @@ run_bench() {
   fi
 
   echo "==> Running ${label}"
-  conda_python -m sglang.bench_serving \
+  conda_python -m sglang.benchmark.serving \
     --backend sglang \
     --base-url "${BASE_URL}" \
     --dataset-name "${dataset_name}" \
