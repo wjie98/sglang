@@ -131,7 +131,9 @@ class SchedulerWeightUpdaterManager:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
                 logger.error(message)
-            return UpdateWeightFromDiskReqOutput(success, message, 0)
+            return UpdateWeightFromDiskReqOutput(
+                success=success, message=message, num_paused_requests=0
+            )
 
     def pull_weights(self, recv_req: PullWeightsReqInput):
         """Sync this host's local checkpoint up to recv_req.target_version.
@@ -169,12 +171,12 @@ class SchedulerWeightUpdaterManager:
             )
             success = all(ok for ok, _ in results)
             message = "; ".join(msg for ok, msg in results if not ok) or message
-        return PullWeightsReqOutput(success, message)
+        return PullWeightsReqOutput(success=success, message=message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        return InitWeightsUpdateGroupReqOutput(success, message)
+        return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
         self,
@@ -182,7 +184,7 @@ class SchedulerWeightUpdaterManager:
     ):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
-        return DestroyWeightsUpdateGroupReqOutput(success, message)
+        return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def iter_weight_update_workers(
         self, selector: str = "all"
@@ -242,7 +244,9 @@ class SchedulerWeightUpdaterManager:
             if success:
                 self._weight_update_loaded = True
                 self.flush_cache_after_weight_update(recv_req)
-            return UpdateWeightsFromDistributedReqOutput(success, message)
+            return UpdateWeightsFromDistributedReqOutput(
+                success=success, message=message
+            )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors, fanning out to the
@@ -269,7 +273,7 @@ class SchedulerWeightUpdaterManager:
             else:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromTensorReqOutput(success, message)
+            return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
@@ -283,11 +287,11 @@ class SchedulerWeightUpdaterManager:
             if not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromIPCReqOutput(success, message)
+            return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
-        return GetWeightsByNameReqOutput(parameter)
+        return GetWeightsByNameReqOutput(parameter=parameter)
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Begin a weight-update session: restore in-place-packed weights to a
@@ -303,7 +307,7 @@ class SchedulerWeightUpdaterManager:
         self._weight_update_in_progress = True
         self._weight_update_loaded = False
         torch.distributed.barrier(group=self.tp_cpu_group)
-        return BeginWeightUpdateReqOutput(True, "Success")
+        return BeginWeightUpdateReqOutput(success=True, message="Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
         """End the weight-update session on the runners begin_weight_update opened
@@ -318,7 +322,7 @@ class SchedulerWeightUpdaterManager:
             runner.end_weight_update(run_post_load=run_post_load)
         self._weight_update_in_progress = False
         torch.distributed.barrier(group=self.tp_cpu_group)
-        return EndWeightUpdateReqOutput(True, "Success")
+        return EndWeightUpdateReqOutput(success=True, message="Success")
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (

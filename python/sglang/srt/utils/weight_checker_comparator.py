@@ -1,4 +1,4 @@
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -13,11 +13,18 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 
 # chunk to avoid too high GPU memory peak
-_CHUNK_NUMEL = 64 * 1024 * 1024
+CHUNK_NUMEL = 64 * 1024 * 1024
+
+
+class CompareResult(NamedTuple):
+    equal: bool
+    max_abs_err: float
+    mean_abs_err: float
+    num_exceed: int  # elements past the combined per-side tolerance
 
 
 class ComparableWeight:
-    """Base class: a weight in comparable (dequantized) form, for all precisions."""
+    """Base comparable-weight class; one subclass per precision or raw tensor."""
 
     @staticmethod
     def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
@@ -52,6 +59,8 @@ class Fp8BlockComparable(ComparableWeight):
     def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
         if w_s.dtype == torch.int32:
             w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+            # ue8m0 packing aligns k to a multiple of 4; drop the padding blocks.
+            w_s = w_s[..., : -(-w_q.shape[-1] // 128)]
         return w_s.to(torch.float32)
 
     @staticmethod
@@ -67,7 +76,7 @@ class Fp8BlockComparable(ComparableWeight):
         q3 = w_q.reshape(-1, *w_q.shape[-2:])
         s3 = w_s.reshape(-1, *w_s.shape[-2:])
         n, k = q3.shape[-2:]
-        rows = max(block_n, _CHUNK_NUMEL // k // block_n * block_n)
+        rows = max(block_n, CHUNK_NUMEL // k // block_n * block_n)
         for b in range(q3.shape[0]):
             for r0 in range(0, n, rows):
                 r1 = min(r0 + rows, n)
@@ -94,7 +103,7 @@ class Fp8BlockComparable(ComparableWeight):
 
 
 class RawComparable(ComparableWeight):
-    """Unquantized tensor: identity dequant, exact (no-tolerance) compare."""
+    """Bitwise equal compare on raw tensor."""
 
     def __init__(self, tensor: torch.Tensor):
         self.tensor = tensor
@@ -104,48 +113,48 @@ class RawComparable(ComparableWeight):
 
     def iter_chunks(self):
         flat = self.tensor.reshape(-1)
-        for start in range(0, flat.numel(), _CHUNK_NUMEL):
-            yield flat[start : start + _CHUNK_NUMEL].cuda(), None
+        for start in range(0, flat.numel(), CHUNK_NUMEL):
+            yield flat[start : start + CHUNK_NUMEL].cuda(), None
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         return self.tensor
 
 
-def _compare_weights(
+def compare_weights(
     expect: ComparableWeight, actual: ComparableWeight
-) -> Tuple[bool, float, float, int]:
-    """Chunked dequant-space compare; returns (equal, max_abs_err, mean_abs_err,
-    num_exceed), num_exceed counting elements past the combined per-side tolerance."""
+) -> CompareResult:
+    """Chunked element-wise compare in ComparableWeight space."""
     equal = True
     max_abs_err = torch.zeros((), dtype=torch.float32)
     sum_abs_err = 0.0
     num_exceed = 0
     numel = 0
-    for (e_dq, e_tol), (a_dq, a_tol) in zip(
+    for (expect_dq, expect_tol), (actual_dq, actual_tol) in zip(
         expect.iter_chunks(), actual.iter_chunks(), strict=True
     ):
-        assert e_dq.shape == a_dq.shape, f"{e_dq.shape=} {a_dq.shape=}"
-        numel += e_dq.numel()
-        abs_diff = (a_dq.float() - e_dq.float()).abs()
+        assert (
+            expect_dq.shape == actual_dq.shape
+        ), f"{expect_dq.shape=} {actual_dq.shape=}"
+        numel += expect_dq.numel()
+        abs_diff = (actual_dq.float() - expect_dq.float()).abs()
         if torch.all(abs_diff == 0):
             continue
         equal = False
-        # |a_dq - e_dq| ≤ |a_dq - w| + |e_dq - w| ≤ a_tol + e_tol
-        tol = 0.0 if e_tol is None or a_tol is None else e_tol + a_tol
+        # |actual_dq - expect_dq| ≤ |actual_dq - w| + |expect_dq - w| ≤ actual_tol + expect_tol
+        tol = (
+            0.0 if expect_tol is None or actual_tol is None else expect_tol + actual_tol
+        )
         max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
         sum_abs_err += abs_diff.sum().item()
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
         num_exceed += int((~(abs_diff <= tol)).sum())
-    return equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
+    return CompareResult(
+        equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
+    )
 
 
 def select_comparable_weight(quant_method) -> Optional[type]:
-    """Map a module's quant_method to its ComparableWeight subclass; None means raw
-    (bit-exact) compare. fp8 block quant -> Fp8BlockComparable: load-time ue8m0
-    requant yields two valid fp8 encodings, so compare in dequant space with ULP
-    tolerance. nvfp4 -> raise (non-bit-exact, unsupported). int4/mxfp8/mxfp4 and
-    unquantized -> None.
-    """
+    """Map a module's quant_method to its ComparableWeight. None means raw (bitwise equal) compare."""
     if (
         isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
         and quant_method.block_quant

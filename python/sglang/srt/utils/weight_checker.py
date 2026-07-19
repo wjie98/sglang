@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Set
 
 import torch
 import torch.distributed as dist
@@ -9,10 +9,10 @@ from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.utils.weight_checker_comparator import (
-    _CHUNK_NUMEL,
+    CHUNK_NUMEL,
     ComparableWeight,
     RawComparable,
-    _compare_weights,
+    compare_weights,
     select_comparable_weight,
 )
 
@@ -38,6 +38,17 @@ class ChecksumInfo(_StrictBaseModel):
     checksums: Dict[str, str]
     per_gpu_checksum: str
     parallelism_info: ParallelismInfo
+
+
+class CheckEntry(NamedTuple):
+    name: str
+    should_compare: bool
+    comparable: ComparableWeight
+
+
+class QuantizedWeight(NamedTuple):
+    comparable_cls: type[ComparableWeight]
+    scale_name: str
 
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
@@ -126,10 +137,10 @@ class WeightChecker:
         quantized_set = _build_quantized_set(self._model_runner.model)
         skip_compare_names = self._skip_compare_names(skip_tensor_list)
         _check_tensors(
-            expect_tensors=_build_entries(
+            expect_tensors=_build_check_entries(
                 self._snapshot_tensors, skip_compare_names, quantized_set
             ),
-            actual_tensors=_build_entries(
+            actual_tensors=_build_check_entries(
                 dict(self._model_state()), skip_compare_names, quantized_set
             ),
             allow_quant_error=allow_quant_error,
@@ -145,11 +156,11 @@ class WeightChecker:
         # Hash the dequantized weight so two (qweight, scale) pairs with the same
         # bf16 hash equal.
         checksums = {}
-        for name, should_compare, ref in _build_entries(
+        for name, should_compare, comparable in _build_check_entries(
             dict(self._model_state()), skip_compare_names, quantized_set
         ):
             if should_compare:
-                checksums[name] = _hash_tensor(ref.dequantize().data)
+                checksums[name] = _hash_tensor(comparable.dequantize().data)
 
         overall = overall_checksum(checksums)
 
@@ -197,18 +208,18 @@ def overall_checksum(checksums: Dict[str, str]) -> str:
 
 
 def _check_tensors(
-    expect_tensors: Iterable[Tuple[str, bool, ComparableWeight]],
-    actual_tensors: Iterable[Tuple[str, bool, ComparableWeight]],
+    expect_tensors: Iterable[CheckEntry],
+    actual_tensors: Iterable[CheckEntry],
     allow_quant_error: bool = False,
 ):
     good_names = []
     error_messages = []
     info_messages = []
 
-    for (expect_name, should_compare, expect_ref), (
+    for (expect_name, should_compare, expect_comparable), (
         actual_name,
         actual_should_compare,
-        actual_ref,
+        actual_comparable,
     ) in zip(expect_tensors, actual_tensors, strict=True):
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
@@ -217,12 +228,12 @@ def _check_tensors(
         name = expect_name
 
         try:
-            equal, max_abs_err, mean_abs_err, num_exceed = _compare_weights(
-                expect_ref, actual_ref
+            equal, max_abs_err, mean_abs_err, num_exceed = compare_weights(
+                expect_comparable, actual_comparable
             )
         except Exception as e:
             e.add_note(
-                f"when handling {name=} expect={expect_ref!r} actual={actual_ref!r}"
+                f"when handling {name=} expect={expect_comparable!r} actual={actual_comparable!r}"
             )
             raise
         if equal:
@@ -233,7 +244,7 @@ def _check_tensors(
             f"max_abs_err={max_abs_err} "
             f"mean_abs_err={mean_abs_err} "
             f"num_exceed={num_exceed} "
-            f"expect={expect_ref!r} actual={actual_ref!r} "
+            f"expect={expect_comparable!r} actual={actual_comparable!r} "
         )
         if not should_compare:
             info_messages.append(msg)
@@ -256,7 +267,7 @@ def _random_like(t: torch.Tensor):
 
     if dtype.is_floating_point:
         out = torch.empty(shape, device=device, dtype=dtype)
-        for chunk in out.view(-1).split(_CHUNK_NUMEL):
+        for chunk in out.view(-1).split(CHUNK_NUMEL):
             chunk.copy_(
                 torch.rand(chunk.shape, device=device, dtype=torch.float32).to(dtype)
             )
@@ -271,9 +282,9 @@ def _random_like(t: torch.Tensor):
     )
 
 
-def _build_quantized_set(model) -> Dict[str, Tuple[type, str]]:
-    """Run the router over the model: {weight_name: (ComparableWeight subclass,
-    scale_name)} for each quantized weight; weights absent from the set compare raw."""
+def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
+    """Run the router over the model: {weight_name: QuantizedWeight} for each
+    quantized weight; weights absent from the set compare raw."""
     quantized_set = {}
     for module_name, module in model.named_modules():
         comparable_cls = select_comparable_weight(getattr(module, "quant_method", None))
@@ -284,27 +295,31 @@ def _build_quantized_set(model) -> Dict[str, Tuple[type, str]]:
         for name in own:
             scale = name.replace("weight", "weight_scale_inv")
             if name.endswith("weight") and scale in own:
-                quantized_set[prefix + name] = (comparable_cls, prefix + scale)
+                quantized_set[prefix + name] = QuantizedWeight(
+                    comparable_cls, prefix + scale
+                )
     return quantized_set
 
 
-def _build_entries(
+def _build_check_entries(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
-    quantized_set: Optional[Dict[str, Tuple[type, str]]] = None,
-) -> Iterable[Tuple[str, bool, ComparableWeight]]:
-    """Yields (name, should_compare, ComparableWeight); quantized weights consume
-    their scale, everything else is raw."""
+    quantized_set: Optional[Dict[str, QuantizedWeight]] = None,
+) -> Iterable[CheckEntry]:
+    """Yields a CheckEntry per weight; quantized weights consume their scale, everything
+    else is raw."""
     skip_compare_names = set(skip_compare_names)
     quantized_set = quantized_set or {}
-    scale_names = {scale for _, scale in quantized_set.values()}
+    scale_names = {qw.scale_name for qw in quantized_set.values()}
 
     for name, tensor in raw.items():
         if name in scale_names:
             continue  # compared via its weight's comparable
         should_compare = name not in skip_compare_names
         if name in quantized_set:
-            comparable_cls, s_name = quantized_set[name]
-            yield name, should_compare, comparable_cls(tensor, raw[s_name])
+            qw = quantized_set[name]
+            yield CheckEntry(
+                name, should_compare, qw.comparable_cls(tensor, raw[qw.scale_name])
+            )
         else:
-            yield name, should_compare, RawComparable(tensor)
+            yield CheckEntry(name, should_compare, RawComparable(tensor))

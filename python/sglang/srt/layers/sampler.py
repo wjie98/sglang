@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -80,7 +81,7 @@ class Sampler(nn.Module):
         )
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = true_on_policy.enabled
-        self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
+        self.use_ascend_backend = get_flags().sampling_backend == "ascend"
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -225,7 +226,7 @@ class Sampler(nn.Module):
                 positions=positions,
             )
         else:
-            backend = get_global_server_args().sampling_backend
+            backend = get_flags().sampling_backend
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None
@@ -324,13 +325,13 @@ class Sampler(nn.Module):
         """Handle the full Ascend backend sampling path.
 
         Ascend backend has fused kernels that handle softmax internally,
-        so we sample directly from temperature-scaled logits.
+        so we sample directly from temperature-scaled logits. Temperature
+        scaling is already applied by the caller before branch dispatch.
 
         Returns:
             A tuple of (batch_next_token_ids, logprobs). logprobs is None
             when return_logprob is False or SGLANG_RETURN_ORIGINAL_LOGPROB is set.
         """
-        logits.div_(sampling_info.temperatures)
         batch_next_token_ids = self._sample_from_logits(
             logits, sampling_info, simple_sampling_case, positions
         )
