@@ -71,10 +71,10 @@ def _dvr_proposal_probs(probs, sampling_info, sampling_backend, repeat=1):
         top_ps = torch.repeat_interleave(top_ps, repeat, dim=0)
         min_ps = torch.repeat_interleave(min_ps, repeat, dim=0)
     if need_top_k or need_top_p:
-        if probs.is_cuda:
+        if sampling_backend == "flashinfer" and probs.is_cuda:
             from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
-            if sampling_backend == "flashinfer" and need_min_p:
+            if need_min_p:
                 if need_top_k:
                     probs = top_k_renorm_prob(probs, top_ks)
                 if need_top_p:
@@ -85,6 +85,9 @@ def _dvr_proposal_probs(probs, sampling_info, sampling_backend, repeat=1):
                 if need_top_k:
                     probs = top_k_renorm_prob(probs, top_ks)
         else:
+            # Match the ordinary PyTorch sampler's joint top-k/top-p filtering
+            # even when the tensors live on CUDA. Rejection sampling needs the
+            # proposal distribution, not merely an equivalent sampled token.
             sorted_probs, indices = probs.sort(dim=-1, descending=True)
             cumulative = sorted_probs.cumsum(dim=-1)
             if need_top_k:

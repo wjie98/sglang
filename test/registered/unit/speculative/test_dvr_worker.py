@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
+from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorkerV2,
     _dvr_proposal_probs,
@@ -66,6 +67,42 @@ def test_proposal_filter_handles_mixed_and_repeated_sampling_rows():
     )
     torch.testing.assert_close(repeated[:2], torch.tensor([[1.0, 0.0]] * 2))
     torch.testing.assert_close(repeated[2:], torch.tensor([[0.6, 0.4]] * 2))
+
+
+@pytest.mark.parametrize(
+    ("top_ks", "top_ps", "min_ps"),
+    [
+        ([4, 2], [1.0, 1.0], [0.0, 0.0]),
+        ([4, 4], [0.75, 0.55], [0.0, 0.0]),
+        ([3, 2], [0.8, 0.7], [0.15, 0.35]),
+    ],
+)
+def test_pytorch_proposal_filter_matches_sampler(monkeypatch, top_ks, top_ps, min_ps):
+    probs = torch.tensor([[0.40, 0.30, 0.20, 0.10], [0.50, 0.25, 0.15, 0.10]])
+    sampling_info = _sampling_info(top_ks, top_ps, min_ps)
+    captured = None
+
+    def capture_multinomial(filtered, **_kwargs):
+        nonlocal captured
+        captured = filtered.clone()
+        return torch.zeros((filtered.shape[0], 1), dtype=torch.long)
+
+    monkeypatch.setattr(torch, "multinomial", capture_multinomial)
+    top_k_top_p_min_p_sampling_from_probs_torch(
+        probs,
+        sampling_info.top_ks,
+        sampling_info.top_ps,
+        sampling_info.min_ps,
+        sampling_info.need_min_p_sampling,
+        sampling_seed=None,
+        positions=torch.arange(probs.shape[0]),
+    )
+
+    sorted_indices = probs.argsort(dim=-1, descending=True)
+    expected = torch.zeros_like(probs).scatter_(-1, sorted_indices, captured)
+    expected /= expected.sum(dim=-1, keepdim=True)
+    actual = _dvr_proposal_probs(probs, sampling_info, "pytorch")
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("is_dvr_eagle", [False, True])

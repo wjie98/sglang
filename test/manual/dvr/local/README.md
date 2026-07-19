@@ -7,7 +7,9 @@ machines, but it should be omitted when preparing a minimal upstream PR.
 Do not replace these entry points with hand-written commands when comparing
 correctness, acceptance, or throughput:
 
-- `scripts/run_static_unit_checks.sh`: diff, syntax, import, and DVR unit tests.
+- `scripts/run_static_unit_checks.sh`: upstream-range and worktree diff checks,
+  syntax/import checks, and DVR unit tests. Set `DVR_DIFF_BASE` when validating
+  against a baseline other than `upstream/sglang-miles`.
 - `scripts/run_0p8b_self_dvr_kl.sh`: self-DVR synchronous/overlap KL and Radix
   boundary cases, including long output and one-token prompts.
 - `scripts/run_35b_mtp_eagle_smoke.sh`: Qwen3.5 MTP DVR-EAGLE acceptance and KL

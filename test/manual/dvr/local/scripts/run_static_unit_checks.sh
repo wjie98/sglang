@@ -41,6 +41,9 @@ DVR_PY_FILES=(
   test/registered/unit/speculative/test_dvr_worker.py
 )
 
+DVR_DIFF_BASE="${DVR_DIFF_BASE:-upstream/sglang-miles}"
+git rev-parse --verify "${DVR_DIFF_BASE}^{commit}" >/dev/null
+git diff --check "${DVR_DIFF_BASE}...HEAD"
 git diff --check
 bash -n test/manual/dvr/launch_server.sh test/manual/dvr/local/scripts/*.sh
 conda_python -m py_compile "${DVR_PY_FILES[@]}"
