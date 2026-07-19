@@ -19,7 +19,6 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
-    _resolve_dvr_backends,
     _validate_dvr_attention_backend,
     dvr_draft_decode_context,
 )
@@ -228,11 +227,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 yield
             return
         draft_worker = self._draft_worker
-        extra_attn_backends = (
-            draft_worker.draft_attn_backend,
-            draft_worker.draft_extend_attn_backend
-            or draft_worker.draft_runner.attn_backend,
-        )
         with (
             draft_worker.draft_tp_context(draft_worker.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -240,7 +234,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             dvr_draft_decode_context(
                 draft_worker.draft_runner,
                 self._draft_decode_buffers,
-                extra_attn_backends=extra_attn_backends,
+                extra_attn_backends=self.spec_v2_attn_backends[1:],
             ),
         ):
             yield
@@ -288,26 +282,22 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backends()
         # Self-DVR target worker owns the model and attention backend. Scheduler
         # already initializes it before calling this self-draft worker hook.
-        _, state_adapter = _validate_dvr_attention_backend(
+        target_verify_backends, state_adapter = _validate_dvr_attention_backend(
             self.model_runner.attn_backend,
             ForwardMode.TARGET_VERIFY,
             phase="target verify",
         )
+        self._target_verify_attn_backends = tuple(target_verify_backends)
         self.linear_state.bind_state_adapter(state_adapter)
 
     def init_cuda_graphs(self):
         if self.is_dvr_eagle:
             draft_worker = self._draft_worker
-            extra_attn_backends = (
-                draft_worker.draft_attn_backend,
-                draft_worker.draft_extend_attn_backend
-                or draft_worker.draft_runner.attn_backend,
-            )
             with dvr_draft_decode_context(
                 draft_worker.draft_runner,
                 self._draft_decode_buffers,
                 capture=True,
-                extra_attn_backends=extra_attn_backends,
+                extra_attn_backends=self.spec_v2_attn_backends[1:],
             ):
                 draft_worker.init_cuda_graphs()
             return
@@ -754,10 +744,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             cuda_graph_bs = (
                 None if not can_run_cuda_graph or runner is None else runner.bs
             )
-            backends, _ = _resolve_dvr_backends(
-                self.model_runner.attn_backend, ForwardMode.TARGET_VERIFY
-            )
-            for backend in backends:
+            for backend in self._target_verify_attn_backends:
                 backend.update_verify_buffers_to_fill_after_draft(
                     spec_info, cuda_graph_bs
                 )

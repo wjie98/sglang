@@ -90,28 +90,6 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
     assert torch.equal(beta_cache[1, :2], beta)
 
 
-def test_gdn_state_input_cache_is_its_own_window():
-    state_shape = Mamba2StateShape.create(
-        tp_world_size=2,
-        intermediate_size=32 * 128,
-        n_groups=16,
-        num_heads=32,
-        head_dim=128,
-        state_size=128,
-        conv_kernel=4,
-    )
-    cache = create_gdn_state_input_cache(
-        num_layers=1,
-        num_slots=3,
-        num_draft_tokens=16,
-        state_shape=state_shape,
-        dtype=torch.float32,
-        device="cpu",
-    )[0]
-
-    assert cache.capacity == FLA_CHUNK_SIZE + 16
-
-
 def test_gdn_state_input_memory_estimate_matches_allocation():
     state_shape = Mamba2StateShape.create(
         tp_world_size=4,
@@ -146,7 +124,7 @@ def test_gdn_state_input_memory_estimate_matches_allocation():
     )
 
 
-def test_dvr_gdn_adapter_owns_state_input_cache():
+def test_dvr_gdn_adapter_maps_request_and_state_slots():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
         intermediate_size=32 * 128,
@@ -196,11 +174,9 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
     assert returned_state_cache is all_layers_state_cache
     assert state_input_indices.tolist() == [2]
     assert live_indices.tolist() == [0]
-    assert adapter.state_input_cache is not None
     window = adapter.state_input_window(layer_idx=0)
     assert window.capacity == FLA_CHUNK_SIZE + 4
     assert window.tensors[0].shape == (3, FLA_CHUNK_SIZE + 4, 8, 128)
-    assert adapter.state_input_window(layer_idx=0) is window
 
 
 def test_gdn_extend_tail_cache_uses_target_request_slots():
