@@ -7,13 +7,14 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
 fi
 
 DVR_MODE="${DVR_MODE:-self}"
-HOST="${HOST:-127.0.0.1}"
+SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-1}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-triton}"
 LINEAR_ATTN_BACKEND="${LINEAR_ATTN_BACKEND:-triton}"
 SAMPLING_BACKEND="${SAMPLING_BACKEND:-pytorch}"
+RANDOM_SEED="${RANDOM_SEED:-2026}"
 
 case "${ATTENTION_BACKEND}" in
   triton|fa3) ;;
@@ -47,7 +48,7 @@ DRAFT_STEPS="${DRAFT_STEPS:-$((DRAFT_TOKENS - 1))}"
 
 args=(
   --model-path "${MODEL_PATH}"
-  --host "${HOST}"
+  --host "${SERVER_HOST}"
   --port "${PORT}"
   --tp-size "${TP_SIZE}"
   --speculative-algorithm "${SPECULATIVE_ALGORITHM}"
@@ -58,6 +59,7 @@ args=(
   --attention-backend "${ATTENTION_BACKEND}"
   --linear-attn-backend "${LINEAR_ATTN_BACKEND}"
   --sampling-backend "${SAMPLING_BACKEND}"
+  --random-seed "${RANDOM_SEED}"
 )
 
 if [[ "${DVR_MODE}" == "eagle" ]]; then

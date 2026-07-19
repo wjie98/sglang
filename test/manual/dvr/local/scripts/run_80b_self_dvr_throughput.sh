@@ -21,6 +21,9 @@ RUN_DVR="${RUN_DVR:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-16}"
 OUTPUT_LEN="${OUTPUT_LEN:-1024}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-2}"
+RANDOM_SEED="${RANDOM_SEED:-2026}"
+FLUSH_CACHE_EACH_RUN="${FLUSH_CACHE_EACH_RUN:-1}"
+ALLOW_RESULT_REUSE="${ALLOW_RESULT_REUSE:-0}"
 DRAFT_TOKENS="${DRAFT_TOKENS:-16}"
 DRAFT_STEPS="${DRAFT_STEPS:-$((DRAFT_TOKENS - 1))}"
 SHAREGPT_MAX_CONCURRENCY="${SHAREGPT_MAX_CONCURRENCY:-3}"
@@ -42,6 +45,10 @@ if ((DRAFT_TOKENS < 2)) || ((DRAFT_STEPS + 1 != DRAFT_TOKENS)); then
   echo "DVR chain mode requires DRAFT_TOKENS >= 2 and DRAFT_STEPS + 1 == DRAFT_TOKENS." >&2
   exit 1
 fi
+if [[ "${FLUSH_CACHE_EACH_RUN}" != "0" && "${FLUSH_CACHE_EACH_RUN}" != "1" ]]; then
+  echo "FLUSH_CACHE_EACH_RUN must be 0 or 1." >&2
+  exit 1
+fi
 require_precompiled_deep_gemm
 
 if ((LONGBENCH_MAX_CONCURRENCY > SERVER_MAX_CONCURRENCY)); then
@@ -58,6 +65,12 @@ if [[ "${DISABLE_CUSTOM_ALL_REDUCE}" == "1" ]]; then
 fi
 
 mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
+if [[ "${ALLOW_RESULT_REUSE}" != "1" ]] && \
+   compgen -G "${RESULT_ROOT}/results/*.jsonl" >/dev/null; then
+  echo "RESULT_ROOT already contains benchmark JSONL files: ${RESULT_ROOT}" >&2
+  echo "Use a new directory, or set ALLOW_RESULT_REUSE=1 only for an intentional resume." >&2
+  exit 1
+fi
 write_run_metadata "${RESULT_ROOT}"
 append_run_config "${RESULT_ROOT}" \
   "script=$(basename "$0")" "model=${MODEL_PATH}" \
@@ -69,7 +82,9 @@ append_run_config "${RESULT_ROOT}" \
   "disable_radix_cache=${DISABLE_RADIX_CACHE}" \
   "disable_custom_all_reduce=${DISABLE_CUSTOM_ALL_REDUCE}" \
   "num_prompts=${NUM_PROMPTS}" "output_len=${OUTPUT_LEN}" \
-  "warmup_requests=${WARMUP_REQUESTS}" \
+  "warmup_requests=${WARMUP_REQUESTS}" "random_seed=${RANDOM_SEED}" \
+  "flush_cache_each_run=${FLUSH_CACHE_EACH_RUN}" \
+  "allow_result_reuse=${ALLOW_RESULT_REUSE}" \
   "draft_tokens=${DRAFT_TOKENS}" "draft_steps=${DRAFT_STEPS}" \
   "sharegpt_concurrency=${SHAREGPT_MAX_CONCURRENCY}" \
   "longbench_concurrency=${LONGBENCH_MAX_CONCURRENCY}" \
@@ -100,9 +115,15 @@ run_bench() {
   local output_file="${RESULT_ROOT}/results/${label}.jsonl"
   local output_log="${RESULT_ROOT}/results/${label}.log"
   local return_arg=()
+  local cache_args=(--cache-report)
 
   if [[ "${return_logprob}" == "true" ]]; then
     return_arg=(--return-logprob)
+  fi
+  if [[ "${FLUSH_CACHE_EACH_RUN}" == "1" ]]; then
+    # bench_serving flushes after warmup, preserving kernel warmup while making
+    # every measured sub-run start from the same empty prefix-cache state.
+    cache_args+=(--flush-cache)
   fi
 
   echo "==> Running ${label}"
@@ -119,8 +140,9 @@ run_bench() {
     --max-concurrency "${max_concurrency}" \
     --disable-tqdm \
     --disable-stream \
-    --seed 2026 \
+    --seed "${RANDOM_SEED}" \
     --output-file "${output_file}" \
+    "${cache_args[@]}" \
     "${return_arg[@]}" \
     2>&1 | tee "${output_log}"
 }
@@ -164,8 +186,9 @@ run_baseline_mode() {
       --attention-backend "${ATTENTION_BACKEND}" \
       --linear-attn-backend "${LINEAR_ATTN_BACKEND}" \
       --sampling-backend pytorch \
+      --random-seed "${RANDOM_SEED}" \
       --cuda-graph-bs "${CUDA_GRAPH_BS[@]}" \
-      --cuda-graph-max-bs "${SERVER_MAX_CONCURRENCY}" \
+      --cuda-graph-max-bs-decode "${SERVER_MAX_CONCURRENCY}" \
       "${RADIX_ARGS[@]}" \
       "${CUSTOM_AR_ARGS[@]}" \
       "${deterministic_args[@]}" \
@@ -212,12 +235,13 @@ run_one_mode() {
       --attention-backend "${ATTENTION_BACKEND}" \
       --linear-attn-backend "${LINEAR_ATTN_BACKEND}" \
       --sampling-backend pytorch \
+      --random-seed "${RANDOM_SEED}" \
       --enable-deterministic-inference \
       --speculative-algorithm DECODE_VERIFY_ROLLBACK \
       --speculative-num-draft-tokens "${DRAFT_TOKENS}" \
       --speculative-num-steps "${DRAFT_STEPS}" \
       --cuda-graph-bs "${CUDA_GRAPH_BS[@]}" \
-      --cuda-graph-max-bs "${SERVER_MAX_CONCURRENCY}" \
+      --cuda-graph-max-bs-decode "${SERVER_MAX_CONCURRENCY}" \
       "${RADIX_ARGS[@]}" \
       "${CUSTOM_AR_ARGS[@]}" \
       "${overlap_args[@]}" \
@@ -230,6 +254,7 @@ run_one_mode() {
   assert_server_capacity "${server_log}" "${SERVER_MAX_CONCURRENCY}"
   assert_server_config \
     "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
+  assert_dvr_graphs "${server_log}" self "${DRAFT_TOKENS}" "${SERVER_MAX_CONCURRENCY}"
 
   run_benchmark_matrix "${label}"
 
@@ -253,13 +278,17 @@ for path in sorted(glob.glob(os.path.join(base, "results", "80b_*.jsonl"))):
     row = json.loads(rows[-1])
     accept_length = row.get("accept_length")
     accept_text = "n/a" if accept_length is None else f"{accept_length:.2f}"
+    cache = row.get("cache_report") or {}
     print(
-        "{} out={:.2f} accept={} completed={} duration={:.2f}".format(
+        "{} out={:.2f} accept={} completed={} duration={:.2f} "
+        "cached={} hit_rate={:.2f}%".format(
             os.path.basename(path),
             row.get("output_throughput"),
             accept_text,
             row.get("completed"),
             row.get("duration"),
+            cache.get("total_cached_tokens", "n/a"),
+            cache.get("cache_hit_rate_pct", float("nan")),
         )
     )
 
@@ -273,6 +302,23 @@ for path in glob.glob(os.path.join(base, "results", "80b_*.jsonl")):
 product_speedups = []
 for dataset in ("sharegpt", "longbench"):
     for logprob in ("false", "true"):
+        v1 = rows.get(f"80b_v1_{dataset}_logprob_{logprob}.jsonl")
+        v2 = rows.get(f"80b_v2_{dataset}_logprob_{logprob}.jsonl")
+        if v1 is not None and v2 is not None:
+            v1_accept = min(1.0, (v1.get("accept_length") or 0.0) / draft_tokens)
+            v2_accept = min(1.0, (v2.get("accept_length") or 0.0) / draft_tokens)
+            normalized = (
+                (v2["output_throughput"] / v2_accept)
+                / (v1["output_throughput"] / v1_accept)
+                if v1_accept and v2_accept
+                else float("nan")
+            )
+            print(
+                f"V2_V1 dataset={dataset} logprob={logprob} "
+                f"throughput_ratio={v2['output_throughput'] / v1['output_throughput']:.3f} "
+                f"acceptance_ratio={v2_accept / v1_accept:.3f} "
+                f"acceptance_normalized_ratio={normalized:.3f}"
+            )
         for mode, baseline_mode in (("v1", "baseline_sync"), ("v2", "baseline_overlap")):
             baseline = rows.get(f"80b_{baseline_mode}_{dataset}_logprob_{logprob}.jsonl")
             row = rows.get(f"80b_{mode}_{dataset}_logprob_{logprob}.jsonl")

@@ -20,7 +20,8 @@ export RESULT_ROOT=/path/to/dvr-results
 Each script sets this worktree's `PYTHONPATH`, writes commit and GPU topology
 metadata, and checks that the requested server configuration was actually
 resolved. Keep `CUDA_VISIBLE_DEVICES`, TP size, backend, and result directory in
-the final report.
+the final report. The scripts use `RANDOM_SEED=2026` for server startup; keep it
+fixed together with the benchmark client seed.
 
 ## 2. Static gate
 
@@ -39,6 +40,7 @@ Use a cache dedicated to the source revision and driver/toolchain combination:
 export SGLANG_DG_CACHE_DIR=/path/to/cache
 export SGLANG_ENABLE_JIT_DEEPGEMM=1
 export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=1
+DRAFT_TOKEN_COUNTS="2 16 32" \
 bash test/manual/dvr/local/scripts/prepare_h20_deep_gemm.sh
 ```
 
@@ -47,6 +49,7 @@ For the formal run, retain the cache and set:
 ```bash
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 export REQUIRE_PRECOMPILED_DEEPGEMM=1
+export SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT=0
 ```
 
 Do not use a globally DeepGEMM-disabled run as the release performance number.
@@ -60,6 +63,11 @@ Run self-DVR first:
 ```bash
 MODEL_PATH="${MODEL_0P8B}" \
 RESULT_ROOT="${RESULT_ROOT}/0p8b-self" \
+bash test/manual/dvr/local/scripts/run_0p8b_self_dvr_kl.sh
+
+MODEL_PATH="${MODEL_0P8B}" \
+DRAFT_TOKENS=32 \
+RESULT_ROOT="${RESULT_ROOT}/0p8b-self-dvr32" \
 bash test/manual/dvr/local/scripts/run_0p8b_self_dvr_kl.sh
 ```
 
@@ -101,8 +109,34 @@ bash test/manual/dvr/local/scripts/run_80b_self_dvr_throughput.sh
 ```
 
 For each backend and logprob mode, compare only configurations with identical
-TP, scheduling, Radix, page size, request count, output length, and effective
-concurrency. Cover Triton and FA3 where the model and machine support them.
+TP, scheduling, Radix, page size, request count, output length, effective
+concurrency, and cache policy. The scripts default to
+`FLUSH_CACHE_EACH_RUN=1`: warmup compiles kernels, then the measured requests
+start from an empty prefix cache. Cover Triton and FA3 where the model and
+machine support them.
+
+Run self-DVR with both chain widths. Keep separate result directories because
+the target-verify graph and DeepGEMM shapes differ:
+
+```bash
+for draft_tokens in 16 32; do
+  MODEL_PATH="${MODEL_80B}" \
+  DRAFT_TOKENS="${draft_tokens}" \
+  RESULT_ROOT="${RESULT_ROOT}/80b-dvr${draft_tokens}" \
+  bash test/manual/dvr/local/scripts/run_80b_self_dvr_throughput.sh
+done
+```
+
+`dvr16` remains the latency-oriented release configuration. `dvr32` is also a
+diagnostic: if it recovers target efficiency while draft decode remains
+unchanged, the remaining gap is fixed verify/state cost rather than an overlap
+scheduler bubble. Report its acceptance and absolute throughput as well: a
+longer draft chain can improve implementation efficiency while reducing both.
+
+For a production-warm-cache measurement, run a second, clearly labelled matrix
+with `FLUSH_CACHE_EACH_RUN=0`. Do not compare one policy's DVR result with the
+other policy's baseline. Every JSON row contains `cache_report`; reject a cold
+comparison if prompt/cache totals differ unexpectedly between modes.
 
 Report:
 
@@ -133,3 +167,34 @@ Before accepting a result, confirm from the server log that:
 
 Attach `run_metadata.txt`, `summary.txt`, server logs, script overrides, and the
 exact commit to the qualification report.
+
+## 7. Decode-only profiler
+
+Profile already-running normal-sync, normal-overlap, DVR-sync, and DVR-overlap
+servers independently. Use a unique output directory for every trace:
+
+```bash
+BASE_URL=http://127.0.0.1:30000 \
+SERVER_LOG=/path/to/server.log \
+PROFILE_BATCH_SIZE=2 \
+RESULT_ROOT="${RESULT_ROOT}/profiles/dvr16-triton-overlap" \
+bash test/manual/dvr/local/scripts/profile_dvr_server.sh
+```
+
+Repeat for Triton and FA3. The decisive checks are:
+
+- self-draft time per draft step is close to normal non-deterministic overlap
+  decode on the same backend;
+- `unaccounted_gap_ms` is near zero;
+- FA3 D2H copies and host `verify_prepare` do not dominate the iteration;
+- reducing target-verify and state-maintenance time, not graph launch count,
+  explains any dvr32 gain.
+
+Use `PROFILE_BATCH_SIZE` values that match the throughput matrix. The helper
+waits for asynchronous trace export and rejects stale traces from an earlier
+run. For finite workloads, compare steady-state iteration periods separately
+from pipeline fill/drain time.
+
+Do not implement a whole-chain self-draft graph solely to remove launches. The
+existing profiler reports `perfect_chain_speedup_ceiling`; prior A40 traces put
+that ceiling near 1.015x.

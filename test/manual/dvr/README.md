@@ -49,10 +49,10 @@ test/manual/dvr/launch_server.sh
 
 `DRAFT_MODEL_PATH` defaults to `MODEL_PATH` in EAGLE mode. Set it explicitly
 when using a separate EAGLE checkpoint. Useful environment overrides include
-`HOST`, `PORT`, `TP_SIZE`, `DRAFT_TOKENS`, `DRAFT_STEPS`, `PAGE_SIZE`,
+`SERVER_HOST`, `PORT`, `TP_SIZE`, `DRAFT_TOKENS`, `DRAFT_STEPS`, `PAGE_SIZE`,
 `ATTENTION_BACKEND`, `LINEAR_ATTN_BACKEND`, `SAMPLING_BACKEND`,
 `MAX_RUNNING_REQUESTS`, `MAX_MAMBA_CACHE_SIZE`, `MEM_FRACTION_STATIC`,
-`DISABLE_OVERLAP`, and `DISABLE_RADIX_CACHE`.
+`DISABLE_OVERLAP`, `DISABLE_RADIX_CACHE`, and `RANDOM_SEED`.
 
 The launcher does not activate Conda, select GPUs, configure datasets, or pin a
 benchmark-specific CUDA graph batch list.

@@ -16,11 +16,18 @@ LINEAR_ATTN_BACKEND="${LINEAR_ATTN_BACKEND:-triton}"
 DISABLE_RADIX_CACHE="$(resolve_radix_setting "${ATTENTION_BACKEND}" "${DISABLE_RADIX_CACHE:-auto}")"
 RUN_V1="${RUN_V1:-1}"
 RUN_V2="${RUN_V2:-1}"
+DRAFT_TOKENS="${DRAFT_TOKENS:-16}"
+DRAFT_STEPS="${DRAFT_STEPS:-$((DRAFT_TOKENS - 1))}"
+RANDOM_SEED="${RANDOM_SEED:-2026}"
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/0p8b-self-dvr-kl}"
 SERVER_PID=""
 
 require_precompiled_deep_gemm
+if ((DRAFT_TOKENS < 2)) || ((DRAFT_STEPS + 1 != DRAFT_TOKENS)); then
+  echo "DVR chain mode requires DRAFT_TOKENS >= 2 and DRAFT_STEPS + 1 == DRAFT_TOKENS." >&2
+  exit 1
+fi
 
 mkdir -p "${RESULT_ROOT}/logs" "${RESULT_ROOT}/results"
 write_run_metadata "${RESULT_ROOT}"
@@ -29,7 +36,9 @@ append_run_config "${RESULT_ROOT}" \
   "context_length=${CONTEXT_LENGTH}" \
   "page_size=${PAGE_SIZE}" "attention_backend=${ATTENTION_BACKEND}" \
   "linear_attn_backend=${LINEAR_ATTN_BACKEND}" \
-  "disable_radix_cache=${DISABLE_RADIX_CACHE}"
+  "disable_radix_cache=${DISABLE_RADIX_CACHE}" \
+  "draft_tokens=${DRAFT_TOKENS}" "draft_steps=${DRAFT_STEPS}" \
+  "random_seed=${RANDOM_SEED}"
 
 cleanup() {
   stop_process_group "${SERVER_PID}"
@@ -61,15 +70,17 @@ run_one_mode() {
       --tp-size "${TP_SIZE}" \
       --context-length "${CONTEXT_LENGTH}" \
       --speculative-algorithm DECODE_VERIFY_ROLLBACK \
-      --speculative-num-draft-tokens 16 \
+      --speculative-num-draft-tokens "${DRAFT_TOKENS}" \
+      --speculative-num-steps "${DRAFT_STEPS}" \
       --page-size "${PAGE_SIZE}" \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" \
       --attention-backend "${ATTENTION_BACKEND}" \
       --linear-attn-backend "${LINEAR_ATTN_BACKEND}" \
       --sampling-backend pytorch \
+      --random-seed "${RANDOM_SEED}" \
       --enable-deterministic-inference \
       --cuda-graph-bs 1 2 4 \
-      --cuda-graph-max-bs 4 \
+      --cuda-graph-max-bs-decode 4 \
       --max-running-requests 4 \
       "${radix_args[@]}" \
       "${overlap_args[@]}" \
@@ -81,6 +92,7 @@ run_one_mode() {
   assert_server_capacity "${server_log}" 4
   assert_server_config \
     "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
+  assert_dvr_graphs "${server_log}" self "${DRAFT_TOKENS}" 4
 
   echo "==> Running ${label} KL and boundary smoke"
   conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \

@@ -57,6 +57,7 @@ write_run_metadata() {
     printf 'sglang_enable_jit_deepgemm=%s\n' "${SGLANG_ENABLE_JIT_DEEPGEMM:-default}"
     printf 'sglang_jit_deepgemm_precompile=%s\n' "${SGLANG_JIT_DEEPGEMM_PRECOMPILE:-default}"
     printf 'sglang_batch_invariant_deepgemm=%s\n' "${SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM:-default}"
+    printf 'sglang_batch_invariant_deepgemm_fallback=%s\n' "${SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT:-default}"
     printf 'sglang_dg_cache_dir=%s\n' "${SGLANG_DG_CACHE_DIR:-default}"
     printf '\n[gpus]\n'
     nvidia-smi \
@@ -78,10 +79,19 @@ require_precompiled_deep_gemm() {
     echo "Run prepare_h20_deep_gemm.sh first, then export the environment from the guide." >&2
     return 1
   fi
+  if [[ "${SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT:-0}" != "0" ]]; then
+    echo "H20 release runs must not allow batch-variant GEMM fallback." >&2
+    return 1
+  fi
   if [[ -z "${SGLANG_DG_CACHE_DIR:-}" ]] || \
      [[ ! -d "${SGLANG_DG_CACHE_DIR}" ]] || \
      [[ -z "$(find "${SGLANG_DG_CACHE_DIR}" -mindepth 1 -print -quit)" ]]; then
     echo "SGLANG_DG_CACHE_DIR is missing or empty: ${SGLANG_DG_CACHE_DIR:-unset}" >&2
+    return 1
+  fi
+  if ! conda_python -c \
+    'from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM; assert ENABLE_JIT_DEEPGEMM'; then
+    echo "DeepGEMM is unavailable in the selected environment or GPU architecture." >&2
     return 1
   fi
 }
@@ -140,6 +150,32 @@ assert_server_capacity() {
   if [[ "${REQUIRE_PRECOMPILED_DEEPGEMM:-0}" == "1" ]] && \
      grep -q "Entering DeepGEMM JIT Pre-Compile session" "${server_log}"; then
     echo "DeepGEMM re-entered exhaustive JIT during graph startup; prewarm cache is incomplete." >&2
+    return 1
+  fi
+  if [[ "${REQUIRE_PRECOMPILED_DEEPGEMM:-0}" == "1" ]] && \
+     grep -q "Disable DeepGEMM in batch invariant ops" "${server_log}"; then
+    echo "Batch-invariant DeepGEMM was disabled at runtime; benchmark is invalid." >&2
+    return 1
+  fi
+}
+
+assert_dvr_graphs() {
+  local server_log="$1"
+  local draft_mode="$2"
+  local draft_tokens="$3"
+  local expected_graph_bs="$4"
+
+  if ! grep -Eq \
+    "Capture target verify CUDA graph begin\..*num_tokens_per_bs=${draft_tokens}.*bs=\[[^]]*${expected_graph_bs}[^]]*\]" \
+    "${server_log}"; then
+    echo "DVR target-verify graph did not capture tokens=${draft_tokens}, bs=${expected_graph_bs}." >&2
+    tail -160 "${server_log}" >&2 || true
+    return 1
+  fi
+  if [[ "${draft_mode}" == "self" ]] && \
+     ! grep -q "Capture DVR self-draft CUDA graph end" "${server_log}"; then
+    echo "DVR self-draft graph capture did not complete." >&2
+    tail -160 "${server_log}" >&2 || true
     return 1
   fi
 }

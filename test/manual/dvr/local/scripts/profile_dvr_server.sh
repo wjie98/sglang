@@ -7,22 +7,52 @@ source "${SCRIPT_DIR}/common.sh"
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:30124}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/profile}"
-PROFILE_NUM_STEPS="${PROFILE_NUM_STEPS:-32}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+PROFILE_NUM_STEPS="${PROFILE_NUM_STEPS:-16}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+PROFILE_BATCH_SIZE="${PROFILE_BATCH_SIZE:-1}"
+PROFILE_EXPORT_TIMEOUT_SEC="${PROFILE_EXPORT_TIMEOUT_SEC:-120}"
 SERVER_LOG="${SERVER_LOG:-}"
 PROFILE_DIR="${RESULT_ROOT}/torch-profile"
+PROFILE_MARKER="${RESULT_ROOT}/profile_started.marker"
 
 mkdir -p "${RESULT_ROOT}"
 
-profile_input_ids='[10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25]'
-request_payload="$(printf '{"input_ids":%s,"sampling_params":{"temperature":0,"max_new_tokens":%s,"ignore_eos":true}}' "${profile_input_ids}" "${MAX_NEW_TOKENS}")"
+if ((PROFILE_BATCH_SIZE < 1)) || ((PROFILE_NUM_STEPS < 1)) || \
+   ((MAX_NEW_TOKENS < 1)) || ((PROFILE_EXPORT_TIMEOUT_SEC < 1)); then
+  echo "Profile batch size, steps, output length, and export timeout must be positive." >&2
+  exit 1
+fi
+
+mapfile -t request_payloads < <(
+  PROFILE_BATCH_SIZE="${PROFILE_BATCH_SIZE}" MAX_NEW_TOKENS="${MAX_NEW_TOKENS}" \
+    python3 - <<'PY'
+import json
+import os
+
+batch_size = int(os.environ["PROFILE_BATCH_SIZE"])
+prompts = [[10 + i + j for j in range(16)] for i in range(batch_size)]
+input_ids = prompts[0] if batch_size == 1 else prompts
+for max_new_tokens in (32, int(os.environ["MAX_NEW_TOKENS"])):
+    print(json.dumps({
+        "input_ids": input_ids,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+            "ignore_eos": True,
+        },
+    }))
+PY
+)
+warmup_payload="${request_payloads[0]}"
+request_payload="${request_payloads[1]}"
 profile_payload="$(printf '{"output_dir":"%s","num_steps":%s,"activities":["CPU","GPU"],"record_shapes":false,"with_stack":false,"profile_prefix":"dvr-decode"}' "${PROFILE_DIR}" "${PROFILE_NUM_STEPS}")"
 
 # Warm kernels before collecting a decode-only trace.
 curl -fsS -H 'Content-Type: application/json' \
-  -d "{\"input_ids\":${profile_input_ids},\"sampling_params\":{\"temperature\":0,\"max_new_tokens\":32,\"ignore_eos\":true}}" \
+  -d "${warmup_payload}" \
   "${BASE_URL}/generate" >"${RESULT_ROOT}/warmup_response.json"
 
+: >"${PROFILE_MARKER}"
 curl -fsS -H 'Content-Type: application/json' \
   -d "${profile_payload}" "${BASE_URL}/start_profile" \
   >"${RESULT_ROOT}/start_profile_response.json"
@@ -30,12 +60,29 @@ curl -fsS -H 'Content-Type: application/json' \
   -d "${request_payload}" "${BASE_URL}/generate" \
   >"${RESULT_ROOT}/profile_response.json"
 
+# Trace export happens after the profiled request completes and may lag the HTTP
+# response by several seconds. Only accept a trace produced by this invocation.
+for ((i = 0; i < PROFILE_EXPORT_TIMEOUT_SEC; i++)); do
+  if find "${PROFILE_DIR}" -type f -name '*.trace.json.gz' \
+      -newer "${PROFILE_MARKER}" -print -quit 2>/dev/null | grep -q .; then
+    break
+  fi
+  sleep 1
+done
+if ! find "${PROFILE_DIR}" -type f -name '*.trace.json.gz' \
+    -newer "${PROFILE_MARKER}" -print -quit 2>/dev/null | grep -q .; then
+  echo "No fresh torch profiler trace was exported within ${PROFILE_EXPORT_TIMEOUT_SEC}s." >&2
+  exit 1
+fi
+
 if [[ -n "${SERVER_LOG}" ]]; then
   grep -E 'Capture (target verify |DVR self-draft )?CUDA graph|Capturing batches|max_total_num_tokens=' \
     "${SERVER_LOG}" >"${RESULT_ROOT}/graph_memory_summary.log" || true
 fi
 
-PROFILE_DIR="${PROFILE_DIR}" python3 - <<'PY' >"${RESULT_ROOT}/profile_summary.txt"
+PROFILE_DIR="${PROFILE_DIR}" PROFILE_MARKER="${PROFILE_MARKER}" \
+  PROFILE_BATCH_SIZE="${PROFILE_BATCH_SIZE}" python3 - <<'PY' \
+  >"${RESULT_ROOT}/profile_summary.txt"
 import collections
 import glob
 import gzip
@@ -43,9 +90,14 @@ import json
 import os
 import statistics
 
-paths = glob.glob(os.path.join(os.environ["PROFILE_DIR"], "*.trace.json.gz"))
+marker_mtime = os.path.getmtime(os.environ["PROFILE_MARKER"])
+paths = [
+    path
+    for path in glob.glob(os.path.join(os.environ["PROFILE_DIR"], "*.trace.json.gz"))
+    if os.path.getmtime(path) > marker_mtime
+]
 if not paths:
-    raise SystemExit("No torch profiler trace was produced.")
+    raise SystemExit("No fresh torch profiler trace was produced.")
 trace_path = max(paths, key=os.path.getmtime)
 with gzip.open(trace_path, "rt") as f:
     events = json.load(f)["traceEvents"]
@@ -67,6 +119,7 @@ for event in events:
         durations[name].append(event["dur"] / 1000.0)
 
 print(f"trace={os.path.basename(trace_path)}")
+print(f"profile_batch_size={os.environ['PROFILE_BATCH_SIZE']}")
 print(f"cuda_graph_launches={graph_launches}")
 for name, values in sorted(durations.items()):
     print(

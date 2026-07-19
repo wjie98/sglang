@@ -27,8 +27,24 @@ command-line experiment drivers, not pytest collection targets.
 
 - Record the commit, topology, model, backend, TP size, page size, overlap mode,
   Radix mode, logprob mode, request count, output length, and concurrency.
+- The fixed scripts pass `--random-seed 2026` by default. Keep the same server
+  seed as well as the same client seed when comparing independently launched
+  v1/v2 servers.
 - Compare self v1 with a synchronous baseline and self v2 with an overlap
   baseline. Do not compare unlike scheduling modes.
+- The throughput scripts flush Radix after each warmup by default and include a
+  cache report in every JSON row. Set `FLUSH_CACHE_EACH_RUN=0` only for a
+  separately labelled production-warm-cache experiment; never mix the two
+  policies in one summary.
+- A result directory containing JSONL rows is rejected by default so a partial
+  rerun cannot silently mix commits. Prefer a new `RESULT_ROOT`; use
+  `ALLOW_RESULT_REUSE=1` only to resume the exact same matrix deliberately.
+- Read the `V2_V1` line before comparing target efficiencies. It separates the
+  absolute scheduler-path ratio, acceptance drift, and the residual ratio per
+  accepted token.
+- A finite overlap run includes pipeline fill and drain. For short matrices with
+  only a few verify rounds per request, report a decode-only profile as well as
+  end-to-end throughput; do not attribute a drain bubble to the DVR GPU core.
 - `bench_serving` throughput already includes accepted draft tokens. Compute
   `acceptance_fraction = accept_length / draft_tokens` and
   `target_efficiency = dvr_tps / (baseline_tps * acceptance_fraction)`.

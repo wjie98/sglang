@@ -57,7 +57,7 @@ python -m sglang.launch_server \
   --sampling-backend pytorch \
   --enable-deterministic-inference \
   --cuda-graph-bs 1 2 4 \
-  --cuda-graph-max-bs 4 \
+  --cuda-graph-max-bs-decode 4 \
   --max-running-requests 4 \
   --skip-server-warmup
 

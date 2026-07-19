@@ -17,6 +17,7 @@ MTP_MIN_ACCEPT_RATE="${MTP_MIN_ACCEPT_RATE:-0.75}"
 MTP_REALDATA_MIN_ACCEPT_RATE="${MTP_REALDATA_MIN_ACCEPT_RATE:-0.70}"
 MTP_REALDATA_NUM_PROMPTS="${MTP_REALDATA_NUM_PROMPTS:-8}"
 MTP_REALDATA_MAX_NEW="${MTP_REALDATA_MAX_NEW:-64}"
+RANDOM_SEED="${RANDOM_SEED:-2026}"
 MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-}"
 TP_SIZE="${TP_SIZE:-4}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
@@ -39,7 +40,8 @@ append_run_config "${RESULT_ROOT}" \
   "attention_backend=${ATTENTION_BACKEND}" \
   "linear_attn_backend=${LINEAR_ATTN_BACKEND}" \
   "disable_radix_cache=${DISABLE_RADIX_CACHE}" \
-  "draft_tokens=${SPEC_DRAFT_TOKENS}" "draft_steps=${SPEC_STEPS}"
+  "draft_tokens=${SPEC_DRAFT_TOKENS}" "draft_steps=${SPEC_STEPS}" \
+  "random_seed=${RANDOM_SEED}"
 
 cleanup() {
   stop_process_group "${SERVER_PID}"
@@ -93,9 +95,10 @@ run_one_mode() {
       --attention-backend "${ATTENTION_BACKEND}" \
       --linear-attn-backend "${LINEAR_ATTN_BACKEND}" \
       --sampling-backend pytorch \
+      --random-seed "${RANDOM_SEED}" \
       --enable-deterministic-inference \
       --cuda-graph-bs 1 2 4 \
-      --cuda-graph-max-bs 4 \
+      --cuda-graph-max-bs-decode 4 \
       --max-running-requests 4 \
       "${radix_args[@]}" \
       "${mamba_cache_args[@]}" \
@@ -108,6 +111,7 @@ run_one_mode() {
   assert_server_capacity "${server_log}" 4
   assert_server_config \
     "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
+  assert_dvr_graphs "${server_log}" eagle "${SPEC_DRAFT_TOKENS}" 4
 
   echo "==> Running ${label} one-token verify-sentinel KL smoke"
   conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
