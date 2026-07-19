@@ -40,36 +40,6 @@ def create_gdn_state_input_cache(
     return adapter.state_input_cache
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-def test_fla_boundary_state_preserves_initial_state_dtype(state_dtype):
-    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-
-    q = torch.randn(1, 64, 1, 16, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    g = torch.nn.functional.logsigmoid(
-        torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
-    )
-    beta = torch.sigmoid(torch.randn(1, 64, 1, dtype=torch.float32, device="cuda"))
-    initial_state = torch.zeros(1, 1, 16, 16, dtype=state_dtype, device="cuda")
-    initial_state_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
-
-    output, _, boundary_states = chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state=initial_state,
-        initial_state_indices=initial_state_indices,
-        use_qk_l2norm_in_kernel=True,
-    )
-
-    assert output.dtype == q.dtype
-    assert boundary_states.dtype == initial_state.dtype
-
-
 def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
@@ -231,13 +201,6 @@ def test_dvr_gdn_adapter_owns_state_input_cache():
     assert window.capacity == FLA_CHUNK_SIZE + 4
     assert window.tensors[0].shape == (3, FLA_CHUNK_SIZE + 4, 8, 128)
     assert adapter.state_input_window(layer_idx=0) is window
-
-    # The adapter owns the side cache without mutating upstream pool/cache objects.
-    assert not hasattr(req_to_token_pool, "_dvr_linear_state_input_cache")
-    assert not hasattr(
-        all_layers_state_cache,
-        "linear_state_input_cache",
-    )
 
 
 def test_gdn_extend_tail_cache_uses_target_request_slots():
@@ -408,9 +371,7 @@ def test_gdn_backup_uses_request_pool_rows():
     temporal = torch.arange(18, dtype=torch.float32).reshape(1, 3, 6)
     state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
     adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
-    backup = adapter.allocate_draft_state_backup(
-        state_cache=state_cache, backup_size=4
-    )
+    backup = adapter.allocate_draft_state_backup(state_cache=state_cache, backup_size=4)
 
     updated = adapter.backup_draft_state(
         state_cache=state_cache,

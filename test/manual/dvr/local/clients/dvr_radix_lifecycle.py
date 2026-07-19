@@ -6,7 +6,7 @@ import argparse
 import uuid
 from typing import Any
 
-from test_dvr_batch_kl import (
+from dvr_batch_kl import (
     first_failure,
     flush_cache,
     logprobs,

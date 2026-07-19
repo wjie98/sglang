@@ -157,7 +157,7 @@ run_benchmark_pair() {
 run_self_kl() {
   local label="$1"
   local output_log="${RESULT_ROOT}/results/${label}_kl.log"
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+  conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \
     --prompt-token-lengths 63,64,65 \
@@ -192,7 +192,7 @@ run_baseline_mode() {
   # reportable; a client/server failure remains fatal.
   if [[ "${label}" == "det_overlap" ]]; then
     local kl_log="${RESULT_ROOT}/results/35b_${label}_kl.log"
-    conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
       --base-url "${BASE_URL}" \
       --request-modes concurrent \
       --prompt-token-lengths 65 \

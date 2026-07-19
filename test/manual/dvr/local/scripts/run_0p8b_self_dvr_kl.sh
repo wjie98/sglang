@@ -83,7 +83,7 @@ run_one_mode() {
     "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
 
   echo "==> Running ${label} KL and boundary smoke"
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+  conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \
     --prompt-token-lengths 1 \
@@ -93,7 +93,7 @@ run_one_mode() {
     --ignore-eos \
     2>&1 | tee "${client_log}"
 
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+  conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \
     --prompt-token-lengths 2,63,64,65 \
@@ -104,7 +104,7 @@ run_one_mode() {
     2>&1 | tee -a "${client_log}"
 
   echo "==> Running ${label} cross-chunk KL cases"
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+  conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \
     --prompt-token-lengths 63,64,65 \
@@ -115,7 +115,7 @@ run_one_mode() {
     2>&1 | tee -a "${client_log}"
 
   echo "==> Running ${label} interleaved boundary-ownership KL case"
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+  conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent \
     --prompt-token-lengths 65,129 \
@@ -128,7 +128,7 @@ run_one_mode() {
 
   if [[ "${DISABLE_RADIX_CACHE}" == "0" ]]; then
     echo "==> Running ${label} nearest-radix-checkpoint replay KL case"
-    conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
       --base-url "${BASE_URL}" \
       --request-modes concurrent \
       --prompt-token-lengths 65 \
@@ -146,14 +146,14 @@ run_one_mode() {
       # Upstream does not support overlap + speculative decoding + grammar.
       lifecycle_args=(--skip-grammar)
     fi
-    conda_python test/manual/dvr/test_dvr_radix_lifecycle.py \
+    conda_python test/manual/dvr/local/clients/dvr_radix_lifecycle.py \
       --base-url "${BASE_URL}" \
       "${lifecycle_args[@]}" \
       2>&1 | tee -a "${client_log}"
   fi
 
   echo "==> Running ${label} 512-token KL cases"
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+  conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \
     --prompt-token-lengths 65 \

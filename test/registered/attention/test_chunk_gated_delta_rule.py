@@ -69,6 +69,39 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         )
         return o, pool
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_boundary_state_preserves_initial_state_dtype(self):
+        for state_dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(state_dtype=state_dtype):
+                q = torch.randn(1, 64, 1, 16, dtype=torch.bfloat16, device="cuda")
+                k = torch.randn_like(q)
+                v = torch.randn_like(q)
+                g = torch.nn.functional.logsigmoid(
+                    torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
+                )
+                beta = torch.sigmoid(
+                    torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
+                )
+                initial_state = torch.zeros(
+                    1, 1, 16, 16, dtype=state_dtype, device="cuda"
+                )
+
+                output, _, boundary_states = chunk_gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    initial_state=initial_state,
+                    initial_state_indices=torch.zeros(
+                        1, dtype=torch.int32, device="cuda"
+                    ),
+                    use_qk_l2norm_in_kernel=True,
+                )
+
+                self.assertEqual(output.dtype, q.dtype)
+                self.assertEqual(boundary_states.dtype, initial_state.dtype)
+
     def _check_shape(
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42
     ):

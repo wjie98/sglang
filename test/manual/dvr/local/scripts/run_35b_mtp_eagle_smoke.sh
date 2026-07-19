@@ -110,7 +110,7 @@ run_one_mode() {
     "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
 
   echo "==> Running ${label} one-token verify-sentinel KL smoke"
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+  conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \
     --prompt-token-lengths 1 \
@@ -125,7 +125,7 @@ run_one_mode() {
   # Rejection is meaningful only under stochastic sampling. Compare aggregate
   # acceptance across modes; ordinary EAGLE RNG does not promise identical
   # token trajectories for different batch shapes or overlap schedules.
-  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+  conda_python test/manual/dvr/local/clients/dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --prompt-token-lengths 63,64,65 \
     --max-new 4,16,65 \
@@ -141,7 +141,7 @@ run_one_mode() {
   grep -q '"accept_failed": 0' "${kl_log}"
 
   echo "==> Running ${label} no-return-logprob smoke"
-  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+  conda_python test/manual/dvr/local/clients/dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --prompt-token-lengths 63,64,65 \
     --max-new 4,16,65 \
@@ -156,7 +156,7 @@ run_one_mode() {
   grep -q '"accept_failed": 0' "${no_logprob_log}"
 
   echo "==> Running ${label} prefix-cache safety boundary returned-logprob KL smoke"
-  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+  conda_python test/manual/dvr/local/clients/dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --prompt-token-lengths 65 \
     --max-new 65 \
@@ -172,7 +172,7 @@ run_one_mode() {
   grep -q '"accept_failed": 0' "${prefix_cache_kl_log}"
 
   echo "==> Running ${label} prefix-cache safety boundary no-return-logprob smoke"
-  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+  conda_python test/manual/dvr/local/clients/dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --prompt-token-lengths 65 \
     --max-new 65 \
@@ -187,7 +187,7 @@ run_one_mode() {
   grep -q '"accept_failed": 0' "${prefix_cache_no_logprob_log}"
 
   echo "==> Running ${label} interleaved boundary-ownership KL smoke"
-  conda_python test/manual/dvr/test_dvr_batch_kl.py \
+  conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent \
     --prompt-token-lengths 65,129 \
@@ -201,7 +201,7 @@ run_one_mode() {
 
   if [[ "${DISABLE_RADIX_CACHE}" == "0" ]]; then
     echo "==> Running ${label} nearest-radix-checkpoint replay KL smoke"
-    conda_python test/manual/dvr/test_dvr_batch_kl.py \
+    conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
       --base-url "${BASE_URL}" \
       --request-modes concurrent \
       --prompt-token-lengths 65 \
@@ -220,7 +220,7 @@ run_one_mode() {
       # Upstream does not support overlap + speculative decoding + grammar.
       lifecycle_args=(--skip-grammar)
     fi
-    conda_python test/manual/dvr/test_dvr_radix_lifecycle.py \
+    conda_python test/manual/dvr/local/clients/dvr_radix_lifecycle.py \
       --base-url "${BASE_URL}" \
       --slot-cycles 4 \
       --prompt-lengths 63,64,65 \
@@ -231,7 +231,7 @@ run_one_mode() {
   fi
 
   echo "==> Running ${label} ShareGPT real-data returned-logprob acceptance/KL smoke"
-  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+  conda_python test/manual/dvr/local/clients/dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --dataset-path "${SHAREGPT_DATASET}" \
     --num-prompts "${MTP_REALDATA_NUM_PROMPTS}" \
@@ -249,7 +249,7 @@ run_one_mode() {
   grep -q '"accept_failed": 0' "${realdata_kl_log}"
 
   echo "==> Running ${label} ShareGPT real-data no-return-logprob acceptance smoke"
-  conda_python test/manual/dvr/test_dvr_eagle_acceptance.py \
+  conda_python test/manual/dvr/local/clients/dvr_eagle_acceptance.py \
     --base-url "${BASE_URL}" \
     --dataset-path "${SHAREGPT_DATASET}" \
     --num-prompts "${MTP_REALDATA_NUM_PROMPTS}" \

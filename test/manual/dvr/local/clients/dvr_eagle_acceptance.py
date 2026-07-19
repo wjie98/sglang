@@ -8,7 +8,7 @@ reproducible instead of being hidden in request order.
 Typical use:
 
 PYTHONPATH=python conda run --no-capture-output -n dvr_dev python \
-  test/manual/dvr/test_dvr_eagle_acceptance.py \
+  test/manual/dvr/local/clients/dvr_eagle_acceptance.py \
   --base-url http://127.0.0.1:31835 \
   --prompt-token-lengths 63,64,65 \
   --max-new 4,16,65,256 \

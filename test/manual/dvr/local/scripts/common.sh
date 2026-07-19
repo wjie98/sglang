@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DVR_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DVR_REPO_ROOT="$(cd "${DVR_SCRIPT_DIR}/../../../.." && pwd)"
+DVR_REPO_ROOT="$(cd "${DVR_SCRIPT_DIR}/../../../../.." && pwd)"
 
 cd "${DVR_REPO_ROOT}"
 

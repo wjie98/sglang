@@ -31,16 +31,24 @@ DVR_PY_FILES=(
   python/sglang/srt/speculative/eagle_utils.py
   python/sglang/srt/speculative/spec_info.py
   python/sglang/srt/speculative/spec_registry.py
-  test/manual/dvr/test_dvr_batch_kl.py
-  test/manual/dvr/test_dvr_eagle_acceptance.py
-  test/manual/dvr/test_dvr_radix_lifecycle.py
+  test/manual/dvr/local/clients/dvr_batch_kl.py
+  test/manual/dvr/local/clients/dvr_eagle_acceptance.py
+  test/manual/dvr/local/clients/dvr_radix_lifecycle.py
+  test/registered/unit/layers/test_dvr_gdn.py
+  test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py
+  test/registered/unit/server_args/test_dvr_server_args.py
+  test/registered/unit/speculative/test_dvr_state_flow.py
+  test/registered/unit/speculative/test_dvr_worker.py
 )
 
 git diff --check
-bash -n test/manual/dvr/scripts/*.sh
+bash -n test/manual/dvr/launch_server.sh test/manual/dvr/local/scripts/*.sh
 conda_python -m py_compile "${DVR_PY_FILES[@]}"
 conda_python -m pytest \
-  test/registered/unit/speculative/test_dvr_contracts.py \
+  test/registered/unit/speculative/test_dvr_worker.py \
+  test/registered/unit/speculative/test_dvr_state_flow.py \
+  test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py \
   test/registered/unit/server_args/test_dvr_server_args.py \
-  test/registered/unit/layers/test_dvr_gdn_state_input_cache.py \
+  test/registered/unit/layers/test_dvr_gdn.py \
+  test/registered/attention/test_chunk_gated_delta_rule.py::TestChunkGatedDeltaRule::test_boundary_state_preserves_initial_state_dtype \
   test/registered/unit/model_executor/test_pool_configurator.py::TestEagleConfigurator::test_dvr_eagle_does_not_exceed_budget

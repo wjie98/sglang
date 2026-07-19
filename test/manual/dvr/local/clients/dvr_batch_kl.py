@@ -62,7 +62,7 @@ python -m sglang.launch_server \
   --skip-server-warmup
 
 PYTHONPATH=python conda run -n dvr_dev python \
-  test/manual/dvr/test_dvr_batch_kl.py \
+  test/manual/dvr/local/clients/dvr_batch_kl.py \
   --base-url http://127.0.0.1:30124 \
   --request-modes concurrent,batch \
   --max-new 1,8,16,17,63,64,65,80,129
