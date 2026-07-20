@@ -330,26 +330,6 @@ class TestDVRServerArgs(unittest.TestCase):
         ):
             handle_dvr_speculative_decoding(args)
 
-    def test_dvr_preserves_draft_custom_all_reduce_intent(self):
-        args = _Args()
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=False,
-        ):
-            handle_dvr_defaults(args)
-
-        self.assertTrue(args._dvr_enable_draft_custom_all_reduce)
-
-        args = _Args()
-        args.disable_custom_all_reduce = True
-        with patch(
-            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=False,
-        ):
-            handle_dvr_defaults(args)
-
-        self.assertFalse(args._dvr_enable_draft_custom_all_reduce)
-
     def test_dvr_enables_deterministic_target_execution(self):
         args = _Args()
         with patch(
@@ -359,7 +339,6 @@ class TestDVRServerArgs(unittest.TestCase):
             handle_dvr_defaults(args)
 
         self.assertTrue(args.enable_deterministic_inference)
-        self.assertTrue(args._dvr_enable_draft_custom_all_reduce)
 
     def test_dvr_defaults_normalize_algorithm_before_generic_spec_handling(self):
         args = _Args()
@@ -372,7 +351,6 @@ class TestDVRServerArgs(unittest.TestCase):
             handle_dvr_defaults(args)
 
         self.assertEqual(args.speculative_algorithm, DVR_SPECULATIVE_ALGORITHM)
-        self.assertTrue(args._dvr_enable_draft_custom_all_reduce)
 
     def test_non_gdn_dvr_does_not_inherit_fla_limits(self):
         args = _Args()

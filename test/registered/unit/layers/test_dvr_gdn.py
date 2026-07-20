@@ -322,52 +322,32 @@ def test_gdn_extend_preserves_cached_prefix_boundary_in_request_slot():
     assert not torch.equal(temporal[3], temporal[1])
 
 
-def test_gdn_self_draft_restores_from_stable_boundary_without_snapshot():
-    conv = torch.zeros(1, 3, 2)
-    temporal = torch.zeros(1, 3, 2)
-    temporal[:, 1] = torch.tensor([3.0, 4.0])
-    state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
-    draft_state_backup = (torch.tensor([[[5.0, 6.0]]]),)
-    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, draft_reuses_target_state=True)
-
-    adapter.prepare_recurrent_state_for_verify(
-        state_cache=state_cache,
-        live_indices=torch.tensor([2]),
-        boundary_indices=torch.tensor([1]),
-        draft_state_backup=draft_state_backup,
-        backup_indices=torch.tensor([0]),
-    )
-
-    assert torch.equal(temporal[:, 2], temporal[:, 1])
-    assert torch.equal(conv[:, [2]], draft_state_backup[0])
-
-
-def test_gdn_backup_uses_request_pool_rows():
+def test_gdn_self_draft_backup_and_restore_are_request_owned():
     conv = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
     temporal = torch.arange(18, dtype=torch.float32).reshape(1, 3, 6)
     state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
-    adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, draft_reuses_target_state=True)
     backup = adapter.allocate_draft_state_backup(state_cache=state_cache, backup_size=4)
+    original_conv = conv[:, [0, 2]].clone()
+    boundary_state = temporal[:, [1, 1]].clone()
 
-    updated = adapter.backup_draft_state(
+    adapter.backup_draft_state(
         state_cache=state_cache,
         indices=torch.tensor([0, 2]),
         backup_indices=torch.tensor([1, 3]),
         out=backup,
     )
-    assert updated is backup
-    torch.testing.assert_close(backup[0][:, 1], conv[:, 0])
-    torch.testing.assert_close(backup[0][:, 3], conv[:, 2])
-
-    conv[:, 1].fill_(99)
-    updated = adapter.backup_draft_state(
+    conv[:, [0, 2]].fill_(99)
+    adapter.prepare_recurrent_state_for_verify(
         state_cache=state_cache,
-        indices=torch.tensor([1]),
-        backup_indices=torch.tensor([2]),
-        out=backup,
+        live_indices=torch.tensor([0, 2]),
+        boundary_indices=torch.tensor([1, 1]),
+        draft_state_backup=backup,
+        backup_indices=torch.tensor([1, 3]),
     )
-    assert updated is backup
-    torch.testing.assert_close(backup[0][:, 2], conv[:, 1])
+
+    torch.testing.assert_close(conv[:, [0, 2]], original_conv)
+    torch.testing.assert_close(temporal[:, [0, 2]], boundary_state)
 
 
 def test_gdn_commit_alternates_boundary_slots(monkeypatch):

@@ -163,10 +163,12 @@ def test_target_extend_publishes_exact_boundary(
 
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
+    draft_ctx = lifecycle.prepare_for_draft(batch)
 
     assert copies == ([] if expected_copy is None else [expected_copy])
     assert tails == [([1], [expected_tail])]
-    assert lifecycle.boundary_lens[1].tolist() == [64, -1]
+    assert draft_ctx.boundary_indices.tolist() == [10]
+    assert draft_ctx.next_boundary_indices.tolist() == [11]
 
 
 def test_target_extend_replaces_stale_request_state():
@@ -177,9 +179,10 @@ def test_target_extend_replaces_stale_request_state():
 
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
+    draft_ctx = lifecycle.prepare_for_draft(batch)
 
     assert zeroed == [10]
-    assert lifecycle.boundary_lens[1].tolist() == [0, -1]
+    assert draft_ctx.boundary_indices.tolist() == [10]
 
 
 def test_target_extend_fails_without_a_boundary_source():
@@ -203,18 +206,21 @@ def test_radix_disabled_uses_request_local_boundary():
 
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
+    draft_ctx = lifecycle.prepare_for_draft(batch)
 
     assert batch.mamba_track_indices.tolist() == [10]
     assert batch.mamba_track_mask.tolist() == [True]
     assert req.mamba_last_track_seqlen == 64
-    assert lifecycle.boundary_lens[1].tolist() == [64]
+    assert draft_ctx.boundary_indices.tolist() == [10]
 
 
 def test_prepare_for_draft_uses_device_authoritative_boundary():
-    lifecycle, _, batch, *_ = _lifecycle_fixture(
+    lifecycle, req, batch, *_ = _lifecycle_fixture(
         seq_len=65, last_track=64, prefix_len=0
     )
-    lifecycle.boundary_lens[1, 1] = 64
+    req.mamba_next_track_idx = 1
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
 
     ctx = lifecycle.prepare_for_draft(batch)
 
@@ -226,34 +232,27 @@ def test_prepare_for_draft_uses_device_authoritative_boundary():
 def test_rollback_advances_only_the_next_boundary_slot():
     calls = []
 
-    class Adapter:
-        chunk_size = 64
-
-        @staticmethod
-        def commit_after_verify(**kwargs):
-            calls.append(kwargs)
-            return torch.tensor([True])
-
     lifecycle, _, batch, *_ = _lifecycle_fixture(
         seq_len=65, last_track=64, prefix_len=0
     )
-    lifecycle._state_adapter = Adapter()
-    lifecycle.boundary_lens[1, 0] = 64
-    ctx = SimpleNamespace(
-        state_cache=object(),
-        state_input_indices=torch.tensor([1]),
-        live_indices=torch.tensor([2]),
-        boundary_indices=torch.tensor([10]),
-        next_boundary_indices=torch.tensor([11]),
-        boundary_track_indices=torch.tensor([0]),
-    )
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
+    ctx = lifecycle.prepare_for_draft(batch)
+
+    def commit_after_verify(**kwargs):
+        calls.append(kwargs)
+        return torch.tensor([True])
+
+    lifecycle._state_adapter.commit_after_verify = commit_after_verify
 
     lifecycle.rollback_after_verify(
         batch=batch, ctx=ctx, accept_lens=torch.tensor([5], dtype=torch.int32)
     )
+    next_ctx = lifecycle.prepare_for_draft(batch)
 
     assert calls[0]["accepted_token_counts"].tolist() == [5]
-    assert lifecycle.boundary_lens[1].tolist() == [64, 128]
+    assert next_ctx.boundary_indices.tolist() == [11]
+    assert next_ctx.next_boundary_indices.tolist() == [10]
 
 
 def _finished_req(**overrides):
@@ -272,39 +271,49 @@ def _finished_req(**overrides):
 
 
 def test_release_publishes_latest_visible_boundary():
-    lifecycle, _, _, *_ = _lifecycle_fixture(seq_len=65, last_track=64, prefix_len=0)
-    lifecycle.boundary_lens[1] = torch.tensor([128, 192])
+    lifecycle, _, batch, *_ = _lifecycle_fixture(
+        seq_len=128, last_track=128, prefix_len=0
+    )
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
+    ctx = lifecycle.prepare_for_draft(batch)
+    lifecycle._state_adapter.commit_after_verify = lambda **_kwargs: torch.tensor(
+        [True]
+    )
+    lifecycle.rollback_after_verify(
+        batch=batch, ctx=ctx, accept_lens=torch.tensor([64], dtype=torch.int32)
+    )
     req = _finished_req()
 
     lifecycle.prepare_for_cache_release(req)
 
     assert req.mamba_last_track_seqlen == 192
     assert req.mamba_next_track_idx == 0
-    assert lifecycle.boundary_lens[1].tolist() == [-1, -1]
 
 
 def test_release_fails_if_committed_boundary_was_lost():
-    lifecycle, _, _, *_ = _lifecycle_fixture(seq_len=65, last_track=64, prefix_len=0)
-    lifecycle.boundary_lens[1] = torch.tensor([256, -1])
+    lifecycle, _, batch, *_ = _lifecycle_fixture(
+        seq_len=256, last_track=256, prefix_len=0
+    )
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
 
     with pytest.raises(RuntimeError, match="lost the recurrent checkpoint"):
         lifecycle.prepare_for_cache_release(_finished_req(kv_committed_len=128))
 
-    assert lifecycle.boundary_lens[1].tolist() == [-1, -1]
-
 
 def test_radix_disabled_release_drops_request_local_boundary():
-    lifecycle, _, _, *_ = _lifecycle_fixture(
+    lifecycle, _, batch, *_ = _lifecycle_fixture(
         seq_len=65,
         last_track=64,
         prefix_len=0,
         disable_radix=True,
         slots=(10,),
     )
-    lifecycle.boundary_lens[1, 0] = 64
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
     req = _finished_req()
 
     lifecycle.prepare_for_cache_release(req)
 
     assert not req.skip_radix_cache_insert
-    assert lifecycle.boundary_lens[1].tolist() == [-1]

@@ -21,12 +21,15 @@ from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def test_draft_capture_is_fast_and_restores_target_state(monkeypatch):
+@pytest.mark.parametrize("draft_custom_all_reduce", [True, False])
+def test_draft_capture_is_fast_and_restores_target_state(
+    monkeypatch, draft_custom_all_reduce
+):
     events = []
     backend = SimpleNamespace(enable_deterministic=True)
     server_args = SimpleNamespace(
         enable_deterministic_inference=True,
-        _dvr_enable_draft_custom_all_reduce=True,
+        _dvr_enable_draft_custom_all_reduce=draft_custom_all_reduce,
     )
     global_server_args = SimpleNamespace(enable_deterministic_inference=True)
     model_runner = SimpleNamespace(
@@ -77,14 +80,17 @@ def test_draft_capture_is_fast_and_restores_target_state(monkeypatch):
         assert not server_args.enable_deterministic_inference
         assert not global_server_args.enable_deterministic_inference
         assert model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
-        assert events[-1][0] == "custom_all_reduce"
+        if draft_custom_all_reduce:
+            assert events[-1][0] == "custom_all_reduce"
 
     assert backend.enable_deterministic
     assert server_args.enable_deterministic_inference
     assert global_server_args.enable_deterministic_inference
     assert model_runner.spec_algorithm == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
     assert events[-1][0:2] == ("deterministic_env", True)
-    assert ("custom_all_reduce", False) in [event[:2] for event in events]
+    assert (("custom_all_reduce", False) in [event[:2] for event in events]) == (
+        draft_custom_all_reduce
+    )
 
 
 def test_triton_fast_decode_override_contract(monkeypatch):
