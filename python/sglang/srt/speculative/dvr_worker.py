@@ -471,10 +471,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits, f"dvr draft step {step}"
                 )
                 next_token_ids = self.model_runner.sample(logits_output, forward_batch)
-                if (
-                    self.server_args.speculative_use_rejection_sampling
-                    and not forward_batch.sampling_info.is_all_greedy
-                ):
+                if not forward_batch.sampling_info.is_all_greedy:
                     sampling_probs = logits_output.next_token_logits
                     sampling_info = forward_batch.sampling_info
                     if (
@@ -800,11 +797,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 batch.sampling_info,
                 num_tokens_in_batch=verify_tokens,
             )
-        if (
-            self.server_args.speculative_use_rejection_sampling
-            and spec_info.spec_steps > 0
-            and not batch.sampling_info.is_all_greedy
-        ):
+        if spec_info.spec_steps > 0 and not batch.sampling_info.is_all_greedy:
             expected_shape = (
                 len(batch.seq_lens),
                 verify_tokens - 1,
@@ -844,10 +837,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                         repeat,
                     )
                 ),
-                use_rejection_sampling=(
-                    self.server_args.speculative_use_rejection_sampling
-                    and spec_info.spec_steps > 0
-                ),
+                use_rejection_sampling=spec_info.spec_steps > 0,
             )
             if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
                 accept_tokens = predict[accept_index]
