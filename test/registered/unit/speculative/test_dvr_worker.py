@@ -29,6 +29,10 @@ def test_dvr_algorithm_contracts():
 
     assert self_draft.is_dvr_self_draft() and not self_draft.is_dvr_eagle()
     assert eagle_draft.is_dvr_eagle() and not eagle_draft.is_eagle()
+    assert not self_draft.uses_eagle_draft_backend()
+    assert eagle_draft.uses_eagle_draft_backend()
+    assert not self_draft.need_topk()
+    assert eagle_draft.need_topk()
     assert not self_draft.has_draft_kv()
     assert eagle_draft.has_draft_kv()
 

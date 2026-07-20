@@ -145,11 +145,13 @@ class ModelRunnerKVCacheMixin:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
+        is_dvr = self.spec_algorithm.is_dvr()
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
             draft_steps = server_args.speculative_num_draft_tokens
-            if self.spec_algorithm.is_dvr():
+            state_slots_per_request = self._calculate_mamba_ratio()
+            if is_dvr:
                 from sglang.srt.layers.attention.linear.dvr_gdn import (
                     dvr_gdn_intermediate_bytes_per_request,
                 )
@@ -176,11 +178,10 @@ class ModelRunnerKVCacheMixin:
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
-                ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests
                     // (self.dp_size if server_args.enable_dp_attention else 1),
-                    server_args.max_mamba_cache_size // ratio,
+                    server_args.max_mamba_cache_size // state_slots_per_request,
                 )
                 intermediate_size = intermediate_per_req * capped_reqs
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -193,7 +194,7 @@ class ModelRunnerKVCacheMixin:
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
             server_args.max_mamba_cache_size = request_capacity * (
-                self._calculate_mamba_ratio() if self.spec_algorithm.is_dvr() else 1
+                state_slots_per_request if is_dvr else 1
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -216,25 +217,24 @@ class ModelRunnerKVCacheMixin:
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
             if has_spec_dec:
-                ratio = self._calculate_mamba_ratio()
-                if self.spec_algorithm.is_dvr():
+                if is_dvr:
                     server_args.max_mamba_cache_size = int(
                         mamba_budget_bytes
-                        // (per_req + intermediate_per_req / ratio)
+                        // (per_req + intermediate_per_req / state_slots_per_request)
                     )
                 else:
                     # Preserve the upstream arithmetic, including operation
                     # order, for every non-DVR speculative worker.
                     server_args.max_mamba_cache_size = int(
                         mamba_budget_bytes
-                        // (per_req * (1 + draft_steps / ratio))
+                        // (per_req * (1 + draft_steps / state_slots_per_request))
                     )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
                     server_args.max_running_requests
                     // (self.dp_size if server_args.enable_dp_attention else 1),
-                    server_args.max_mamba_cache_size // ratio,
+                    server_args.max_mamba_cache_size // state_slots_per_request,
                 )
                 intermediate_size = intermediate_per_req * capped_reqs
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -601,8 +601,9 @@ class ModelRunnerKVCacheMixin:
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
+                is_dvr = self.spec_algorithm.is_dvr()
                 dvr_track_buffer_size = None
-                if self.spec_algorithm.is_dvr():
+                if is_dvr:
                     dvr_track_buffer_size = (
                         1 if self.server_args.disable_radix_cache else 2
                     )
@@ -631,9 +632,7 @@ class ModelRunnerKVCacheMixin:
                     enable_mamba_extra_buffer=enable_mamba_track_buffer,
                     enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
                     speculative_num_draft_tokens=max_spec_draft_tokens,
-                    speculative_ssm_state_steps=(
-                        1 if self.spec_algorithm.is_dvr() else None
-                    ),
+                    speculative_ssm_state_steps=1 if is_dvr else None,
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     mamba_ping_pong_track_buffer_size=dvr_track_buffer_size,

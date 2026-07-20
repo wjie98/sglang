@@ -453,9 +453,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_draft_num_layers = None
         if (
             (
-                self.spec_algorithm.is_eagle()
+                self.spec_algorithm.uses_eagle_draft_backend()
                 or self.spec_algorithm.is_standalone()
-                or self.spec_algorithm.is_dvr_eagle()
             )
             and not self.is_draft_worker
             and server_args.speculative_draft_model_path
@@ -1680,7 +1679,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.debug_tensor_dump_output_folder is not None:
             dump_folder = self.server_args.debug_tensor_dump_output_folder
-            if self.spec_algorithm.is_eagle():
+            if self.spec_algorithm.uses_eagle_draft_backend():
                 role = "draft" if self.is_draft_worker else "target"
                 dump_folder = os.path.join(dump_folder, role)
             register_forward_hook_for_model(
@@ -2847,7 +2846,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
         # (restored from #25795), so it does NOT need this skip.
         if (
-            (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dvr_eagle())
+            self.spec_algorithm.uses_eagle_draft_backend()
             and not self.is_draft_worker
             and not self.server_args.enable_return_hidden_states
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)

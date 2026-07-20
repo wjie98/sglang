@@ -126,6 +126,10 @@ class SpeculativeAlgorithm(Enum):
     def is_dvr(self) -> bool:
         return self.is_dvr_self_draft() or self.is_dvr_eagle()
 
+    def uses_eagle_draft_backend(self) -> bool:
+        """Whether draft execution uses EAGLE's model, KV, and token layout."""
+        return self.is_eagle() or self.is_dvr_eagle()
+
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
 
@@ -166,7 +170,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def need_topk(self) -> bool:
-        return self.is_eagle() or self.is_standalone() or self.is_dvr_eagle()
+        return self.uses_eagle_draft_backend() or self.is_standalone()
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         """Hook for per-algorithm server args mutation.

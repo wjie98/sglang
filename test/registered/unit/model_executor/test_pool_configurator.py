@@ -124,6 +124,7 @@ def _make_model_runner(
 
     spec = MagicMock()
     spec.is_eagle.return_value = False
+    spec.uses_eagle_draft_backend.return_value = False
     spec.is_standalone.return_value = False
     spec.is_dflash.return_value = False
     spec.is_none.return_value = True
@@ -518,6 +519,7 @@ class TestEagleConfigurator(unittest.TestCase):
 
         mr = _make_model_runner(num_layers=num_layers)
         mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.uses_eagle_draft_backend.return_value = True
         mr.spec_algorithm.is_standalone.return_value = False
         mr.spec_algorithm.is_none.return_value = False
         mr.eagle_draft_num_layers = eagle_draft_num_layers
@@ -544,6 +546,7 @@ class TestEagleConfigurator(unittest.TestCase):
         mr.spec_algorithm.is_eagle.return_value = False
         mr.spec_algorithm.is_standalone.return_value = False
         mr.spec_algorithm.is_dvr_eagle.return_value = True
+        mr.spec_algorithm.uses_eagle_draft_backend.return_value = True
         mr.spec_algorithm.is_none.return_value = False
         mr.eagle_draft_num_layers = draft_num_layers
 

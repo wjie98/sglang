@@ -141,9 +141,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
         # reuse the target architecture's attention config.
         if (
-            mr.spec_algorithm.is_eagle()
+            mr.spec_algorithm.uses_eagle_draft_backend()
             or mr.spec_algorithm.is_standalone()
-            or mr.spec_algorithm.is_dvr_eagle()
         ) and not mr.is_draft_worker:
             eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
             if (

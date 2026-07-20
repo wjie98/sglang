@@ -129,6 +129,22 @@ def test_radix_disabled_reserves_one_active_boundary_per_request():
     assert server_args.max_mamba_cache_size == 16
 
 
+def test_radix_enabled_reserves_two_checkpoint_slots_per_request():
+    server_args = SimpleNamespace(
+        disable_radix_cache=False,
+        disable_overlap_schedule=False,
+        enable_mamba_extra_buffer=lambda: True,
+        enable_mamba_extra_buffer_lazy=lambda: False,
+    )
+    runner = SimpleNamespace(
+        server_args=server_args,
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+    )
+
+    # Upstream's three live/radix slots plus two DVR checkpoint slots.
+    assert ModelRunnerKVCacheMixin._calculate_mamba_ratio(runner) == 5
+
+
 @pytest.mark.parametrize(
     ("seq_len", "last_track", "prefix_len", "expected_copy", "expected_tail"),
     [
