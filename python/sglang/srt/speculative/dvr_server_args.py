@@ -27,6 +27,15 @@ def handle_dvr_defaults(server_args):
         return
     server_args.speculative_algorithm = algorithm
 
+    # Deterministic target setup disables FlashInfer communication fusion.
+    # Keep the user's original request so the provisional self-draft graph can
+    # resolve the same communication policy as ordinary non-deterministic
+    # decode after all model- and topology-specific defaults are available.
+    server_args._dvr_draft_flashinfer_allreduce_fusion = (
+        getattr(server_args, "flashinfer_allreduce_fusion_backend", None),
+        getattr(server_args, "enforce_disable_flashinfer_allreduce_fusion", False),
+    )
+
     # Deterministic target prefill/verify disables custom all-reduce later in
     # ServerArgs. Preserve the user's original choice for provisional draft
     # graphs without exposing another CLI option.

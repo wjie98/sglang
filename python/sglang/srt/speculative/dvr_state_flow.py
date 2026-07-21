@@ -7,6 +7,46 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
+def copy_cached_prefix_boundary(
+    *, forward_batch, req_to_token_pool, chunk_size: int
+) -> None:
+    """Copy a warm Radix boundary into DVR's request-owned checkpoint slot.
+
+    This runs eagerly after deferred Mamba COW and before target EXTEND enters a
+    prefill graph. Keeping the whole-pool copy outside model layers avoids
+    capturing data-dependent indexing from the dummy prefill batch.
+    """
+
+    if (
+        not forward_batch.forward_mode.is_extend()
+        or forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+        or forward_batch.mamba_track_indices is None
+        or forward_batch.extend_prefix_lens is None
+    ):
+        return
+
+    batch_size = forward_batch._original_batch_size or forward_batch.batch_size
+    prefix_lens = forward_batch.extend_prefix_lens[:batch_size]
+    seq_lens = forward_batch.seq_lens[:batch_size]
+    copy_mask = (prefix_lens > 0) & (
+        prefix_lens == seq_lens // chunk_size * chunk_size
+    )
+    if forward_batch.mamba_track_mask is not None:
+        copy_mask &= ~forward_batch.mamba_track_mask[:batch_size]
+
+    translate = req_to_token_pool.translate_mamba_indices
+    source = translate(
+        req_to_token_pool.get_mamba_indices(
+            forward_batch.req_pool_indices[:batch_size]
+        )
+    )
+    destination = translate(forward_batch.mamba_track_indices[:batch_size])
+    req_to_token_pool.mamba_pool.copy_from(
+        source[copy_mask].to(torch.long), destination[copy_mask].to(torch.long)
+    )
+
+
 @dataclass
 class DVRLinearStateContext:
     state_cache: Any

@@ -36,6 +36,8 @@ class _Args:
     disable_radix_cache = False
     disable_custom_all_reduce = False
     enable_deterministic_inference = False
+    flashinfer_allreduce_fusion_backend = None
+    enforce_disable_flashinfer_allreduce_fusion = False
     mamba_radix_cache_strategy = "auto"
     mamba_track_interval = 1
     mamba_ssm_dtype = "float32"
@@ -152,7 +154,9 @@ class TestDVRServerArgs(unittest.TestCase):
                 original = getattr(args.cuda_graph_config.decode, field)
                 with self.assertRaisesRegex(ValueError, f"Explicit.*decode.*{field}"):
                     handle_dvr_speculative_decoding(args)
-                self.assertEqual(getattr(args.cuda_graph_config.decode, field), original)
+                self.assertEqual(
+                    getattr(args.cuda_graph_config.decode, field), original
+                )
 
     def test_dvr_self_draft_requires_cuda_graph(self):
         for disable_draft, backend in (
@@ -357,6 +361,24 @@ class TestDVRServerArgs(unittest.TestCase):
             handle_dvr_defaults(args)
 
         self.assertTrue(args.enable_deterministic_inference)
+
+    def test_dvr_preserves_draft_allreduce_fusion_request(self):
+        for backend, force_disabled in (("trtllm", False), (None, True)):
+            with self.subTest(backend=backend, force_disabled=force_disabled):
+                args = _Args()
+                args.flashinfer_allreduce_fusion_backend = backend
+                args.enforce_disable_flashinfer_allreduce_fusion = force_disabled
+                with patch(
+                    "sglang.srt.speculative.dvr_server_args."
+                    "_is_dvr_gated_linear_state_model",
+                    return_value=False,
+                ):
+                    handle_dvr_defaults(args)
+
+                self.assertEqual(
+                    args._dvr_draft_flashinfer_allreduce_fusion,
+                    (backend, force_disabled),
+                )
 
     def test_dvr_defaults_normalize_algorithm_before_generic_spec_handling(self):
         args = _Args()

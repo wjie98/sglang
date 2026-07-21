@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import ExitStack, contextmanager
 
 import torch
@@ -19,6 +20,30 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_bool_env_var
 
 _OVERRIDE_PLAN_CACHE = object()
+logger = logging.getLogger(__name__)
+
+
+def _resolve_draft_flashinfer_allreduce_fusion(server_args):
+    """Resolve the communication fusion ordinary decode would have selected."""
+
+    request = getattr(server_args, "_dvr_draft_flashinfer_allreduce_fusion", None)
+    if request is None:
+        return None
+    requested_backend, force_disabled = request
+    if force_disabled:
+        return None
+    if requested_backend is not None:
+        return requested_backend
+
+    # Reuse the upstream eligibility policy after MoE/topology/model defaults
+    # have settled instead of duplicating its architecture and hardware list.
+    from sglang.srt.arg_groups.overrides import (
+        _flashinfer_allreduce_fusion_auto_enable,
+    )
+
+    return _flashinfer_allreduce_fusion_auto_enable(server_args).get(
+        "flashinfer_allreduce_fusion_backend"
+    )
 
 
 def _resolve_dvr_backends(backend, forward_mode=ForwardMode.DECODE):
@@ -230,6 +255,41 @@ def dvr_draft_decode_context(
                 stack.callback(_clear_moe_policy_caches)
                 for server_args in (model_runner.server_args, global_server_args):
                     patch_attr(server_args, "enable_deterministic_inference", False)
+
+                if self_draft:
+                    fusion_backend = _resolve_draft_flashinfer_allreduce_fusion(
+                        model_runner.server_args
+                    )
+                    for server_args in (
+                        model_runner.server_args,
+                        global_server_args,
+                    ):
+                        patch_attr(
+                            server_args,
+                            "flashinfer_allreduce_fusion_backend",
+                            fusion_backend,
+                        )
+                    if fusion_backend is not None:
+                        # Workspace creation performs collectives and must
+                        # precede both CUDA graph capture and custom-AR graph
+                        # buffer registration. The captured graph then reuses
+                        # these stable addresses without a runtime policy patch.
+                        from sglang.srt.layers.communicator import (
+                            FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+                        )
+                        from sglang.srt.layers.flashinfer_comm_fusion import (
+                            pre_initialize_workspaces,
+                        )
+
+                        pre_initialize_workspaces(
+                            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+                            hidden_dim=model_runner.model_config.hidden_size,
+                            dtype=model_runner.dtype,
+                        )
+                    logger.info(
+                        "DVR self-draft FlashInfer all-reduce fusion backend: %s",
+                        fusion_backend or "disabled",
+                    )
 
             resolved_backend = False
             for backend in (

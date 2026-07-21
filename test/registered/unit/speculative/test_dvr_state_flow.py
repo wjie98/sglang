@@ -8,7 +8,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.srt.speculative.dvr_state_flow import DVRLinearStateLifecycle
+from sglang.srt.speculative.dvr_state_flow import (
+    DVRLinearStateLifecycle,
+    copy_cached_prefix_boundary,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -172,6 +175,44 @@ def test_dvr_mamba_first_decode_waits_for_prefill_cache_donation():
     assert not needs_sync(SpeculativeAlgorithm.EAGLE)
     scheduler.last_batch.forward_mode = ForwardMode.DECODE
     assert not needs_sync(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK)
+
+
+def test_warm_prefix_boundary_copy_uses_current_physical_slots():
+    copies = []
+
+    class BoundaryPool:
+        mamba_pool = SimpleNamespace(
+            copy_from=lambda source, destination: copies.append(
+                (source.tolist(), destination.tolist())
+            )
+        )
+
+        @staticmethod
+        def get_mamba_indices(req_indices):
+            return req_indices + 10
+
+        @staticmethod
+        def translate_mamba_indices(indices):
+            return indices + 100
+
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=4,
+        _original_batch_size=3,
+        extend_prefix_lens=torch.tensor([64, 64, 63, 64]),
+        seq_lens=torch.tensor([65, 128, 64, 65]),
+        req_pool_indices=torch.tensor([1, 2, 3, 4]),
+        mamba_track_indices=torch.tensor([21, 22, 23, 24]),
+        mamba_track_mask=torch.tensor([False, True, False, False]),
+    )
+
+    copy_cached_prefix_boundary(
+        forward_batch=batch, req_to_token_pool=BoundaryPool(), chunk_size=64
+    )
+
+    # Only row 0 is a warm exact-boundary hit not owned by ordinary tracking.
+    # Row 3 is padding and must not participate in the copy.
+    assert copies == [([111], [121])]
 
 
 @pytest.mark.parametrize(

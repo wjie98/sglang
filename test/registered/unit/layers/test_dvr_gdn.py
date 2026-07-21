@@ -317,31 +317,6 @@ def test_gdn_verify_rejects_backend_without_boundary_states():
         )
 
 
-def test_gdn_extend_preserves_cached_prefix_boundary_in_request_slot():
-    conv = torch.arange(12, dtype=torch.float32).view(4, 3)
-    temporal = torch.arange(20, dtype=torch.float32).view(4, 5)
-    state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
-    batch = SimpleNamespace(
-        extend_prefix_lens=torch.tensor([64, 64]),
-        seq_lens=torch.tensor([70, 128]),
-        mamba_track_indices=torch.tensor([2, 3]),
-        mamba_track_mask=torch.tensor([False, True]),
-    )
-    adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
-
-    adapter.capture_extend_prefix_boundary(
-        forward_batch=batch,
-        state_cache=state_cache,
-        cache_indices=torch.tensor([0, 1]),
-    )
-
-    assert torch.equal(conv[2], conv[0])
-    assert torch.equal(temporal[2], temporal[0])
-    # The normal prefill tracker owns requests whose extend reaches a new chunk.
-    assert not torch.equal(conv[3], conv[1])
-    assert not torch.equal(temporal[3], temporal[1])
-
-
 def test_gdn_self_draft_backup_and_restore_are_request_owned():
     conv = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
     temporal = torch.arange(18, dtype=torch.float32).reshape(1, 3, 6)

@@ -3320,6 +3320,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+            if self.spec_algorithm.is_dvr() and not self.is_draft_worker:
+                from sglang.srt.speculative.dvr_state_flow import (
+                    copy_cached_prefix_boundary,
+                )
+
+                # A warm Radix hit must initialize DVR's request-owned recurrent
+                # checkpoint before a captured target EXTEND reads it.
+                copy_cached_prefix_boundary(
+                    forward_batch=forward_batch,
+                    req_to_token_pool=self.req_to_token_pool,
+                    chunk_size=self.server_args.mamba_cache_chunk_size,
+                )
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.

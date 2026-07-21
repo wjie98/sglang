@@ -438,14 +438,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             intermediate_state_indices = self.verify_intermediate_state_indices
         else:
-            if dvr_state_adapter is not None:
-                # Preserve an aligned cached-prefix state before EXTEND consumes
-                # its tail; DVR then owns this request-local verify checkpoint.
-                dvr_state_adapter.capture_extend_prefix_boundary(
-                    forward_batch=forward_batch,
-                    state_cache=mamba_cache_params,
-                    cache_indices=cache_indices,
-                )
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,

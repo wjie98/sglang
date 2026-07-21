@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
     _fast_decode_overrides,
     _resolve_dvr_backends,
+    _resolve_draft_flashinfer_allreduce_fusion,
     _validate_dvr_attention_backend,
     dvr_draft_decode_context,
 )
@@ -174,3 +175,99 @@ def test_backend_validation_accepts_triton_and_rejects_non_fa3():
     fa4.fa_impl_ver = 4
     with pytest.raises(RuntimeError, match="requires FlashAttention 3"):
         _validate_dvr_attention_backend(fa4)
+
+
+def test_draft_fusion_policy_preserves_user_intent_and_reuses_auto_policy(
+    monkeypatch,
+):
+    server_args = SimpleNamespace(
+        _dvr_draft_flashinfer_allreduce_fusion=("trtllm", False)
+    )
+    assert _resolve_draft_flashinfer_allreduce_fusion(server_args) == "trtllm"
+
+    server_args._dvr_draft_flashinfer_allreduce_fusion = (None, True)
+    assert _resolve_draft_flashinfer_allreduce_fusion(server_args) is None
+
+    import sglang.srt.arg_groups.overrides as overrides
+
+    server_args._dvr_draft_flashinfer_allreduce_fusion = (None, False)
+    monkeypatch.setattr(
+        overrides,
+        "_flashinfer_allreduce_fusion_auto_enable",
+        lambda _: {"flashinfer_allreduce_fusion_backend": "auto"},
+    )
+    assert _resolve_draft_flashinfer_allreduce_fusion(server_args) == "auto"
+
+
+def test_self_draft_preinitializes_fusion_before_custom_all_reduce(monkeypatch):
+    events = []
+    backend = SimpleNamespace(enable_deterministic=True)
+    server_args = SimpleNamespace(
+        enable_deterministic_inference=True,
+        flashinfer_allreduce_fusion_backend=None,
+        _dvr_enable_draft_custom_all_reduce=True,
+        _dvr_draft_flashinfer_allreduce_fusion=("trtllm", False),
+    )
+    global_server_args = SimpleNamespace(
+        enable_deterministic_inference=True,
+        flashinfer_allreduce_fusion_backend=None,
+    )
+    model_runner = SimpleNamespace(
+        attn_backend=backend,
+        server_args=server_args,
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+        model_config=SimpleNamespace(hidden_size=4096),
+        dtype=torch.bfloat16,
+    )
+
+    class FakeEnv:
+        @contextmanager
+        def override(self, _value):
+            yield
+
+    class FakeGroup:
+        @contextmanager
+        def custom_allreduce_enabled(self, **_kwargs):
+            events.append("custom_ar_enter")
+            yield
+            events.append("custom_ar_exit")
+
+    monkeypatch.setattr(
+        graph_module,
+        "envs",
+        SimpleNamespace(SGLANG_ENABLE_DETERMINISTIC_INFERENCE=FakeEnv()),
+    )
+    monkeypatch.setattr(
+        graph_module, "get_global_server_args", lambda: global_server_args
+    )
+    monkeypatch.setattr(graph_module, "_clear_moe_policy_caches", lambda: None)
+    monkeypatch.setattr(
+        graph_module,
+        "_fast_decode_overrides",
+        lambda *_args, **_kwargs: [(backend, "enable_deterministic", False)],
+    )
+    monkeypatch.setattr(
+        graph_module, "_iter_decode_custom_all_reduce_groups", lambda _: [FakeGroup()]
+    )
+
+    import sglang.srt.batch_invariant_ops as batch_invariant_ops
+    import sglang.srt.layers.flashinfer_comm_fusion as fusion
+
+    monkeypatch.setattr(
+        batch_invariant_ops, "is_batch_invariant_mode_enabled", lambda: False
+    )
+
+    def pre_initialize_workspaces(**kwargs):
+        assert server_args.flashinfer_allreduce_fusion_backend == "trtllm"
+        assert global_server_args.flashinfer_allreduce_fusion_backend == "trtllm"
+        events.append(("workspace", kwargs))
+
+    monkeypatch.setattr(fusion, "pre_initialize_workspaces", pre_initialize_workspaces)
+
+    with dvr_draft_decode_context(model_runner, {}, capture=True, self_draft=True):
+        assert events[0][0] == "workspace"
+        assert events[1] == "custom_ar_enter"
+
+    assert server_args.flashinfer_allreduce_fusion_backend is None
+    assert global_server_args.flashinfer_allreduce_fusion_backend is None
+    assert events[-1] == "custom_ar_exit"
