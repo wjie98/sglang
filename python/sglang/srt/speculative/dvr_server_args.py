@@ -46,10 +46,10 @@ def handle_dvr_defaults(server_args):
 
     if server_args.page_size is None:
         server_args.page_size = FLA_CHUNK_SIZE
-    elif server_args.page_size <= 0 or FLA_CHUNK_SIZE % server_args.page_size != 0:
+    elif server_args.page_size != FLA_CHUNK_SIZE:
         raise ValueError(
-            "DVR gated linear-state page_size must be a positive divisor of "
-            f"FLA_CHUNK_SIZE={FLA_CHUNK_SIZE}, got {server_args.page_size}."
+            "DVR gated linear-state models require page_size == "
+            f"FLA_CHUNK_SIZE == {FLA_CHUNK_SIZE}, got {server_args.page_size}."
         )
 
     # With Radix disabled, ChunkCache retains the ordinary full-prefill behavior;
@@ -122,6 +122,16 @@ def handle_dvr_speculative_decoding(server_args):
         )
 
     uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
+    if uses_gated_linear_state and server_args.enable_page_major_kv_layout:
+        raise ValueError(
+            "DVR gated linear-state verify requires contiguous recurrent-state "
+            "storage and does not support --enable-page-major-kv-layout."
+        )
+    if uses_gated_linear_state and server_args.enable_linear_replayssm:
+        raise ValueError(
+            "DVR gated linear-state rollback does not support "
+            "--enable-linear-replayssm."
+        )
     if uses_gated_linear_state and server_args.enable_streaming_session:
         raise ValueError(
             "DVR gated linear-state models do not yet support streaming sessions."

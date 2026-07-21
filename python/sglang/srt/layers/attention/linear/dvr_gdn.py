@@ -242,6 +242,16 @@ class DVRGDNStateAdapter:
         state_cache = (
             model_runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
+        state_tensors = (state_cache.temporal, *getattr(state_cache, "conv", ()))
+        if any(not tensor.is_contiguous() for tensor in state_tensors):
+            raise RuntimeError(
+                "DVR GDN verify requires contiguous recurrent-state storage."
+            )
+        if any(
+            getattr(state_cache, name, None) is not None
+            for name in ("replayssm_d", "replayssm_k", "replayssm_g")
+        ):
+            raise RuntimeError("DVR GDN rollback does not support ReplaySSM state.")
         if (
             state_cache.temporal.dtype != torch.float32
             or state_cache.intermediate_ssm.dtype != torch.float32

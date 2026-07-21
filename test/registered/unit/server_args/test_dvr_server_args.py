@@ -51,6 +51,8 @@ class _Args:
     sampling_backend = "flashinfer"
     enable_streaming_session = False
     enable_int8_mamba_checkpoint = False
+    enable_page_major_kv_layout = False
+    enable_linear_replayssm = False
 
     def __init__(self):
         self.cuda_graph_config = SimpleNamespace(
@@ -233,21 +235,19 @@ class TestDVRServerArgs(unittest.TestCase):
                 self.assertEqual(args.mamba_radix_cache_strategy, strategy)
                 self.assertFalse(ServerArgs.enable_mamba_extra_buffer(args))
 
-    def test_dvr_gdn_preserves_supported_page_sizes(self):
-        for page_size in (1, 8, 16, 32, 64):
-            with self.subTest(page_size=page_size):
-                args = _Args()
-                args.page_size = page_size
-                with patch(
-                    "sglang.srt.speculative.dvr_server_args."
-                    "_is_dvr_gated_linear_state_model",
-                    return_value=True,
-                ):
-                    handle_dvr_defaults(args)
-                self.assertEqual(args.page_size, page_size)
+    def test_dvr_gdn_defaults_to_fla_page_size(self):
+        args = _Args()
+        args.page_size = None
+        with patch(
+            "sglang.srt.speculative.dvr_server_args."
+            "_is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            handle_dvr_defaults(args)
+        self.assertEqual(args.page_size, 64)
 
-    def test_dvr_gdn_rejects_page_sizes_incompatible_with_fla_chunks(self):
-        for page_size in (0, 48, 128):
+    def test_dvr_gdn_requires_fla_page_size(self):
+        for page_size in (0, 1, 8, 16, 32, 48, 128):
             with self.subTest(page_size=page_size):
                 args = _Args()
                 args.page_size = page_size
@@ -256,8 +256,24 @@ class TestDVRServerArgs(unittest.TestCase):
                     "_is_dvr_gated_linear_state_model",
                     return_value=True,
                 ):
-                    with self.assertRaisesRegex(ValueError, "positive divisor"):
+                    with self.assertRaisesRegex(ValueError, "page_size =="):
                         handle_dvr_defaults(args)
+
+    def test_dvr_gdn_rejects_incompatible_state_layouts(self):
+        for field, message in (
+            ("enable_page_major_kv_layout", "page-major"),
+            ("enable_linear_replayssm", "linear-replayssm"),
+        ):
+            with self.subTest(field=field):
+                args = _Args()
+                setattr(args, field, True)
+                with patch(
+                    "sglang.srt.speculative.dvr_server_args."
+                    "_is_dvr_gated_linear_state_model",
+                    return_value=True,
+                ):
+                    with self.assertRaisesRegex(ValueError, message):
+                        handle_dvr_speculative_decoding(args)
 
     def test_dvr_gdn_radix_requires_non_lazy_extra_buffer(self):
         for strategy in ("no_buffer", "extra_buffer_lazy"):
@@ -323,6 +339,8 @@ class TestDVRServerArgs(unittest.TestCase):
         args = _Args()
         args.enable_streaming_session = True
         args.enable_int8_mamba_checkpoint = True
+        args.enable_page_major_kv_layout = True
+        args.enable_linear_replayssm = True
 
         with patch(
             "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",

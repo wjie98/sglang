@@ -15,6 +15,7 @@ DVR_PY_FILES=(
   python/sglang/srt/layers/attention/linear/dvr_state.py
   python/sglang/srt/layers/attention/linear/gdn_backend.py
   python/sglang/srt/layers/moe/token_dispatcher/flashinfer.py
+  python/sglang/srt/managers/scheduler.py
   python/sglang/srt/managers/tokenizer_manager.py
   python/sglang/srt/mem_cache/kv_cache_builder.py
   python/sglang/srt/mem_cache/memory_pool.py

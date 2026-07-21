@@ -1680,7 +1680,24 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        return disable_overlap_for_batch or need_grammar_sync
+        # Processing an unfinished Mamba prefill donates its tracked state slot
+        # to Radix and replaces the request-side slot. DVR may use that replaced
+        # slot as its next rollback boundary, so finish the donation before the
+        # request's first speculative decode captures physical state indices.
+        need_dvr_mamba_prefill_sync = (
+            batch
+            and batch.spec_algorithm.is_dvr()
+            and batch.forward_mode.is_decode()
+            and last_batch_is_extend
+            and self.server_args.enable_mamba_extra_buffer()
+            and len(self.result_queue) > 0
+        )
+
+        return (
+            disable_overlap_for_batch
+            or need_grammar_sync
+            or need_dvr_mamba_prefill_sync
+        )
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):

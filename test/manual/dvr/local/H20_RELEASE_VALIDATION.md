@@ -31,7 +31,91 @@ bash test/manual/dvr/local/scripts/run_static_unit_checks.sh
 
 This must pass before allocating a multi-GPU model.
 
-## 3. DeepGEMM preparation
+## 3. State-transition closure
+
+The GPU matrix validates one target-state transaction. Do not interpret a
+passing token-only request or an unchanged prompt checkpoint as sufficient
+coverage.
+
+### 3.1 State ownership
+
+- Full-attention KV uses the ordinary request-to-token and Radix pools.
+- The target live recurrent slot contains the state used by ordinary target
+  execution. It is not a cross-request checkpoint by itself.
+- With Radix enabled, the existing Mamba extra-buffer pool provides two
+  physical checkpoint slots. DVR records which exact 64-token boundary each
+  request-owned logical slot contains. Radix donation may replace a physical
+  slot, so physical indices are resolved only after donation is processed.
+- With Radix disabled, one request-local checkpoint is sufficient. It is
+  discarded with the request; the next request must report no Radix reuse and
+  perform an ordinary full prefill.
+- Each GDN layer retains at most one unclosed 64-token tail plus the current
+  draft rows as `q/k/v/g/beta`. Self-draft additionally saves request-owned
+  convolution state. EAGLE/MTP owns a separate draft cache and does not write
+  target state-input windows.
+
+### 3.2 Closed transition
+
+1. **Target EXTEND prepare:** clear stale logical ownership for reused request
+   slots. Radix-enabled execution uses upstream Mamba tracking; Radix-disabled
+   execution installs the request-local tracking slot.
+2. **Target EXTEND forward:** preserve an exact cached-prefix boundary before
+   GDN consumes the unclosed suffix, and retain only the target inputs after the
+   last 64-token boundary.
+3. **Target EXTEND finish:** publish exactly one authoritative boundary from an
+   aligned live state, an upstream tracked state, the zero state, or the
+   captured Radix prefix. Missing all four sources is a correctness error.
+4. **First-decode donation fence:** under overlap, process the unfinished
+   prefill result before launching the first DVR decode. Donation transfers the
+   cached slot to Radix and installs a replacement in the request/device
+   mapping; draft preparation must observe that replacement.
+5. **Draft:** select the newest logical boundary and resolve its current
+   physical slot. Self-draft backs up convolution state before provisional fast
+   decode; EAGLE/MTP advances only its separate draft state.
+6. **Target verify:** restore the exact target boundary and self-draft
+   convolution state, then run deterministic GDN EXTEND over `64 + D`. The
+   Triton chunk kernel exports the state before each chunk, so `h[:, 1]` is the
+   exact state after the first 64 rows. Returned outputs correspond only to the
+   `D` logical verify rows.
+7. **Rollback/commit:** commit convolution state at the last accepted input.
+   If `tail + accepted >= 64`, write `h[:, 1]` to the alternate checkpoint and
+   shift the state-input window by 64. Rebuild target live temporal state only
+   for self-draft; EAGLE/MTP keeps target and draft state separate.
+8. **Release/re-hit:** publish the newest exact checkpoint not later than the
+   visible committed prefix. Radix truncates its stored token KV to the same
+   length. A new request matches that aligned state and recomputes the remaining
+   suffix through ordinary EXTEND. If output trimming leaves no retained
+   checkpoint at or before the visible prefix, skip this insertion and retain
+   normal inference semantics.
+
+### 3.3 Required invariants
+
+- Before every non-empty draft, each GDN request has an exact checkpoint.
+- At phase boundaries, `boundary_length + tail_length` equals the target's
+  committed state length.
+- The boundary and `q/k/v/g/beta` window come from the same accepted target
+  history; rejected rows never become authoritative.
+- A physical checkpoint mapping cannot change between draft preparation and
+  rollback.
+- `D <= 64`, so one verify transaction crosses at most one recurrent chunk.
+- `return_logprob=True` and `False` use the same state transition. Logprob
+  materialization must not introduce another replay or commit path.
+- Cache inability is a cache miss, not an inference fallback. It may reduce the
+  next request's cached prefix but must not alter generated tokens or logits.
+
+For a generated prefix of `P` prompt tokens and `G` generated tokens, the probe
+request must normally report at least
+`floor((P + G - 1) / 64) * 64` cached tokens. The `-1` follows SGLang's committed
+KV convention for the sampled bonus token. Do not weaken this check to the old
+prompt checkpoint: doing so hides a failure to publish generated boundaries.
+
+The boundary-focused cases in `run_0p8b_self_dvr_kl.sh` cover first-decode
+donation (`prompt=126/127`, `max_new=17/65`), request-slot reuse, interleaved
+ownership, generated-prefix re-hit, stop/grammar trimming, and 512-token
+generation. Run them with Radix enabled first, then repeat with
+`DISABLE_RADIX_CACHE=1` to confirm full-prefill semantics.
+
+## 4. DeepGEMM preparation
 
 On H20, compile the exact target-verify GEMM shapes before CUDA graph capture.
 Use a cache dedicated to the source revision and driver/toolchain combination:
@@ -56,7 +140,7 @@ Do not use a globally DeepGEMM-disabled run as the release performance number.
 If formal serving enters another exhaustive precompile session, the cache is
 incomplete and the result is invalid.
 
-## 4. Correctness matrix
+## 5. Correctness matrix
 
 Run self-DVR first:
 
@@ -81,6 +165,11 @@ Required coverage:
 - at least one 512-token generation;
 - Radix enabled, plus a separately labelled Radix-disabled run.
 
+For the Radix-enabled run, `dvr_radix_lifecycle.py` must confirm that generated
+boundaries advance the reusable checkpoint. A result that only reuses the
+original prompt boundary is a failure even when KL remains zero. For the
+Radix-disabled run, do not expect any cross-request recurrent-state reuse.
+
 Then run the Qwen3.5 MTP path:
 
 ```bash
@@ -94,7 +183,7 @@ Both sync and overlap must satisfy the strict full-prefill KL oracle. Compare
 aggregate real-data acceptance instead of requiring identical stochastic token
 trajectories across batch shapes or schedules.
 
-## 5. Throughput matrix
+## 6. Throughput matrix
 
 Run matched normal, ordinary deterministic, and DVR configurations:
 
@@ -151,7 +240,7 @@ The NVLink target is `target_efficiency >= 0.95` after warmup. DVR must also be
 faster than the matched ordinary deterministic baseline. Record lower results
 rather than changing benchmark knobs in place.
 
-## 6. Log audit
+## 7. Log audit
 
 Before accepting a result, confirm from the server log that:
 
@@ -164,11 +253,13 @@ Before accepting a result, confirm from the server log that:
 - the server did not reduce `max_running_requests`;
 - no illegal memory access, device assertion, or graph replay fallback occurred;
 - formal serving did not enter an unplanned DeepGEMM precompile session.
+- page-major recurrent-state storage, ReplaySSM, streaming sessions, and int8
+  recurrent checkpoints were not enabled for GDN DVR.
 
 Attach `run_metadata.txt`, `summary.txt`, server logs, script overrides, and the
 exact commit to the qualification report.
 
-## 7. Decode-only profiler
+## 8. Decode-only profiler
 
 Profile already-running normal-sync, normal-overlap, DVR-sync, and DVR-overlap
 servers independently. Use a unique output directory for every trace:

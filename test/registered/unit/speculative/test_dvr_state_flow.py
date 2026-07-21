@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -145,6 +147,33 @@ def test_radix_enabled_reserves_two_checkpoint_slots_per_request():
     assert ModelRunnerKVCacheMixin._calculate_mamba_ratio(runner) == 5
 
 
+def test_dvr_mamba_first_decode_waits_for_prefill_cache_donation():
+    scheduler = SimpleNamespace(
+        require_mlp_sync=False,
+        last_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+        result_queue=[object()],
+        server_args=SimpleNamespace(enable_mamba_extra_buffer=lambda: True),
+    )
+
+    def needs_sync(spec_algorithm, *, extra_buffer=True):
+        scheduler.server_args.enable_mamba_extra_buffer = lambda: extra_buffer
+        batch = SimpleNamespace(
+            spec_algorithm=spec_algorithm,
+            forward_mode=ForwardMode.DECODE,
+            has_grammar=False,
+        )
+        return Scheduler.is_disable_overlap_for_batch(scheduler, batch)
+
+    assert needs_sync(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK)
+    assert needs_sync(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE)
+    assert not needs_sync(
+        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK, extra_buffer=False
+    )
+    assert not needs_sync(SpeculativeAlgorithm.EAGLE)
+    scheduler.last_batch.forward_mode = ForwardMode.DECODE
+    assert not needs_sync(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK)
+
+
 @pytest.mark.parametrize(
     ("seq_len", "last_track", "prefix_len", "expected_copy", "expected_tail"),
     [
@@ -229,6 +258,23 @@ def test_prepare_for_draft_uses_device_authoritative_boundary():
     assert ctx.boundary_track_indices.tolist() == [1]
 
 
+def test_prepare_for_draft_resolves_slots_after_radix_donation():
+    lifecycle, req, batch, *_ = _lifecycle_fixture(
+        seq_len=65, last_track=64, prefix_len=0
+    )
+    req.mamba_next_track_idx = 1
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
+
+    # Prefill result processing donates track 0 and installs a replacement.
+    req.mamba_ping_pong_track_buffer[0] = 99
+    batch.req_to_token_pool.slots[0] = 99
+    ctx = lifecycle.prepare_for_draft(batch)
+
+    assert ctx.boundary_indices.tolist() == [11]
+    assert ctx.next_boundary_indices.tolist() == [99]
+
+
 def test_rollback_advances_only_the_next_boundary_slot():
     calls = []
 
@@ -291,15 +337,27 @@ def test_release_publishes_latest_visible_boundary():
     assert req.mamba_next_track_idx == 0
 
 
-def test_release_fails_if_committed_boundary_was_lost():
+def test_release_skips_insert_if_committed_boundary_was_lost():
     lifecycle, _, batch, *_ = _lifecycle_fixture(
         seq_len=256, last_track=256, prefix_len=0
     )
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
+    req = _finished_req(kv_committed_len=128)
 
-    with pytest.raises(RuntimeError, match="lost the recurrent checkpoint"):
-        lifecycle.prepare_for_cache_release(_finished_req(kv_committed_len=128))
+    lifecycle.prepare_for_cache_release(req)
+
+    assert req.skip_radix_cache_insert
+    assert lifecycle.boundary_lens[req.req_pool_idx].tolist() == [-1, -1]
+
+
+def test_prepare_for_draft_fails_without_an_exact_boundary():
+    lifecycle, _, batch, *_ = _lifecycle_fixture(
+        seq_len=65, last_track=64, prefix_len=0
+    )
+
+    with pytest.raises(RuntimeError, match="exact recurrent checkpoint"):
+        lifecycle.prepare_for_draft(batch)
 
 
 def test_radix_disabled_release_drops_request_local_boundary():

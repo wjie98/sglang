@@ -158,13 +158,11 @@ class DVRLinearStateLifecycle:
                 if 0 < length <= publish_len
             ]
             if not candidates:
-                if publish_len == 0:
-                    req.skip_radix_cache_insert = True
-                    return
-                raise RuntimeError(
-                    "DVR lost the recurrent checkpoint for a committed prefix: "
-                    f"rid={req.rid}, publish={publish_len}, physical={track_lens}."
-                )
+                # Prefix caching is an optimization. A long stop/reasoning trim
+                # may publish before both retained boundaries; discard this
+                # request's uncached suffix instead of failing valid inference.
+                req.skip_radix_cache_insert = True
+                return
             checkpoint_len, checkpoint_track = max(candidates)
             req.mamba_last_track_seqlen = checkpoint_len
             req.mamba_next_track_idx = (
@@ -185,7 +183,13 @@ class DVRLinearStateLifecycle:
         track_slots = batch.req_to_token_pool.get_mamba_ping_pong_slots(
             batch.req_pool_indices
         ).to(device=live_indices.device, dtype=torch.long)
-        boundary_track_indices = self.boundary_lens[state_input_indices].argmax(dim=1)
+        selected_boundary_lens, boundary_track_indices = self.boundary_lens[
+            state_input_indices
+        ].max(dim=1)
+        torch._assert_async(
+            selected_boundary_lens.ge(0).all(),
+            "DVR draft started without an exact recurrent checkpoint.",
+        )
         boundary_indices = track_slots.gather(
             1, boundary_track_indices.unsqueeze(1)
         ).squeeze(1)

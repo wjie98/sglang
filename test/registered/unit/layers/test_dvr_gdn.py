@@ -9,6 +9,7 @@ from sglang.srt.layers.attention.linear.dvr_gdn import (
     DVRGDNStateAdapter,
     dvr_gdn_state_input_bytes_per_request,
 )
+from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputCache
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 
 
@@ -233,6 +234,25 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
     # them untouched avoids clearing the full q/k/v/g/beta window per verify.
     for tensor in layer_cache.tensors:
         assert torch.all(tensor[1, 2:] == 1)
+
+
+def test_gdn_state_input_window_shifts_only_crossed_requests():
+    values = torch.arange(2 * 80, dtype=torch.float32).view(2, 80, 1)
+    original = values.clone()
+    cache = DVRStateInputCache(
+        tensors=(values,),
+        tail_lens=torch.zeros(2, dtype=torch.int32),
+        has_layer_dim=False,
+    )
+
+    cache.shift_after_boundary(
+        indices=torch.tensor([0, 1]),
+        crosses_chunk_boundary=torch.tensor([False, True]),
+        chunk_size=64,
+    )
+
+    torch.testing.assert_close(values[0], original[0])
+    torch.testing.assert_close(values[1, :16], original[1, 64:80])
 
 
 def test_gdn_verify_uses_mamba_padding_sentinel():
