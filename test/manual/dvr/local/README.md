@@ -21,6 +21,9 @@ correctness, acceptance, or throughput:
 - `scripts/prepare_h20_deep_gemm.sh`: precompile verify GEMM shapes before graph
   capture on H20.
 - `scripts/profile_dvr_server.sh`: development-only server profiling.
+- `tools/export_qwen3_5_smoke_model.py`: exports a deliberately inaccurate
+  two-layer Qwen3.5 checkpoint containing one GDN layer, one full-attention
+  layer, and the original MTP layer for fast lifecycle and CUDA graph checks.
 
 `STATE_LIFECYCLE_REDESIGN.md` is the implementation contract for the isolated
 self-draft state lifecycle. It defines target/Radix checkpoint ownership,
