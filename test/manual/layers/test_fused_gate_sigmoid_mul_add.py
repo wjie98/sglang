@@ -67,6 +67,22 @@ def test_inplace_semantics():
     assert fhs.data_ptr() == original_ptr
 
 
+def test_token_count_does_not_change_reduction():
+    """The same row must not change when prefill crosses 1024 tokens."""
+    num_tokens, hidden_dim = 1024, 4096
+    hs = (torch.randn(num_tokens, hidden_dim, device="cuda") * 0.05).to(torch.bfloat16)
+    gw = (torch.randn(hidden_dim, device="cuda") * 0.05).to(torch.bfloat16)
+    so = (torch.randn(num_tokens, hidden_dim, device="cuda") * 100).to(torch.bfloat16)
+    initial = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16, device="cuda")
+    below_boundary = initial[:-1].clone()
+    at_boundary = initial.clone()
+
+    fused_gate_sigmoid_mul_add(hs[:-1], gw, so[:-1], below_boundary)
+    fused_gate_sigmoid_mul_add(hs, gw, so, at_boundary)
+
+    torch.testing.assert_close(below_boundary, at_boundary[:-1], rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     import sys
 
