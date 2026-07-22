@@ -189,6 +189,23 @@ produces:
 - `h64`, the exact recurrent state after the first 64 rows, written into the
   same one-state recurrent workspace that self-draft has finished using.
 
+The fixed-window data plumbing is DVR-private. At the start of target verify,
+the existing GDN metadata hook resolves request slots, boundary slots, tail
+lengths, padding, and possible boundary crossings once for the whole block.
+Every GDN layer reuses those graph-stable tensors. Three small Triton launches
+pack `q+k`, `v`, and `g+beta`: each launch both inserts the current candidate
+rows into the persistent transition window and materializes the contiguous
+`64 + D` input expected by the unchanged FLA dispatcher. A masked scatter
+stages `h64` only for lanes that could cross the boundary, and a direct gather
+writes only the `D` logical outputs in their final layout.
+
+This deliberately does not change the generic FLA producer, its public state
+index contract, or ordinary GDN execution. It also does not claim that the
+fixed `64 + D` materialization is the final performance design. A segmented
+verify path or direct producer write is allowed only after the private packing
+path is measured on H20 and the replacement proves bitwise equivalence for all
+physical chunk positions.
+
 `h64` is publishable only when accepted rows actually cross the boundary. It is
 valid in that case because every row before the boundary is accepted target
 history. A proposed crossing that is later rejected must not alter checkpoint
@@ -393,8 +410,10 @@ from 80 to 64. The first H20 target is to remove the 0.843 ms restore and
 materially reduce the 2.351 ms maintenance total; do not set a sub-millisecond
 release gate until the 64-row rebuild and compact kernels are measured. This
 optimization cannot remove deterministic target-verify compute; report
+`verify_state_pack`, `verify_boundary_stage`, `verify_output_gather`,
 `r_verify`, rebuild, compact, boundary publication, and total `r_maint`
-separately.
+separately. Do not modify shared FLA kernels or add graph-time host decisions
+until this decomposition identifies a remaining material cost.
 
 ## 9. Completion criteria
 

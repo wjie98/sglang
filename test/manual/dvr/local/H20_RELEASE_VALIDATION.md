@@ -183,6 +183,9 @@ Add these NVTX ranges to the existing profile report:
 ```text
 draft_state_copy
 target_verify
+verify_state_pack
+verify_boundary_stage
+verify_output_gather
 draft_state_rebuild
 state_window_compact
 boundary_publish
@@ -211,11 +214,23 @@ pass until proposal and metric accounting are independently validated.
 
 On the 35B H20 BS3 profile, report `draft_state_copy` only for target EXTEND;
 it must not appear once per steady-state decode block. Report
+`verify_state_pack`, `verify_boundary_stage`, `verify_output_gather`,
 `draft_state_rebuild`, `state_window_compact`, and `boundary_publish`
 separately. The old reference is 2.351 ms/block, including a 0.843 ms restore
-that must disappear. Establish the new maintenance threshold from the measured
-64-row-bounded rebuild and compact operations rather than assuming either is
-free.
+that must disappear. The pre-optimization verify state-I/O trace attributed
+about 1.764 ms/block and 570 launches to per-layer metadata, five window
+writes, five full-window reads, h64 staging, and output gather. The current
+DVR-private path resolves metadata once per verify, uses three pack launches
+per GDN layer, masks h64 staging to possible crossings, and directly gathers
+the logical outputs. Establish the new threshold from measurement rather than
+assuming those launches or the 64-row-bounded rebuild are free.
+
+Do not combine this remeasurement with a generic FLA API change. If state
+packing remains material, evaluate a segmented DVR verify or a direct h64
+producer write as a separate patch with bitwise state tests. If rebuild remains
+material, tune its existing private kernel against the observed tail-length
+histogram before adding multiple graph variants. Neither decision may add
+tail-length D2H, CPU branching, or assumptions about Radix being enabled.
 
 ## 4. DeepGEMM preparation
 
@@ -530,3 +545,33 @@ the same FlashInfer communication backend. The diagnostic normal-fusion-off run
 should remove any draft/normal difference caused by this feature. If patched
 DVR still has `r_draft > 1.03`, inspect residual NCCL fallback and custom-AR
 coverage before changing scheduler or state code.
+
+### 9.4 State-I/O optimization recheck
+
+For the first profile after the verify state-I/O change, use Qwen3.5-35B,
+Triton, TP1 or the previously measured topology, BS3, DVR16, and the same prompt
+and output corpus as the old trace. Report both per-block time and launch count
+for:
+
+```text
+verify_state_pack
+verify_boundary_stage
+verify_output_gather
+draft_state_rebuild
+state_window_compact
+boundary_publish
+```
+
+Also report the parent `target_verify` and full iteration period. Confirm that
+there are three state pack launches per GDN layer rather than ten generic
+advanced-index operations, and that padded graph lanes do not write dummy slot
+zero. Run BS1 and BS3 because reducing launch count may help small batches while
+state bandwidth dominates larger ones.
+
+Only proceed to a shared FLA producer change if `verify_boundary_stage` remains
+material after masked staging. Only proceed to segmented GDN verify if
+`verify_state_pack` plus unused-output compute remains material and a prototype
+preserves exact outputs and h64 for every tail length `0..63`. Only tune or
+bucket the private rebuild kernel if `draft_state_rebuild` remains a material
+fraction of the full block. This ordering keeps the optimization optional and
+prevents a machine-specific result from narrowing ordinary backend behavior.

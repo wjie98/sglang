@@ -300,6 +300,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self._prepare_dvr_target_verify(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -308,6 +309,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 forward_batch.mamba_track_indices[
                     self.forward_metadata.mamba_track_mask_indices
                 ]
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        self._prepare_dvr_target_verify(forward_batch)
+
+    def _prepare_dvr_target_verify(self, forward_batch: ForwardBatch):
+        if (
+            self.dvr_state_adapter is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self.dvr_state_adapter.prepare_target_verify(
+                forward_batch=forward_batch,
+                cache_indices=self.forward_metadata.mamba_cache_indices,
             )
 
     def forward_decode(
@@ -481,17 +496,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             draft_token_num = forward_batch.spec_info.draft_token_num
             verify_cache_indices = cache_indices[:batch_size]
             if dvr_state_adapter is not None:
-                boundary_indices, state_input_indices, valid_mask = (
-                    dvr_state_adapter.target_verify_indices(
-                        forward_batch=forward_batch,
-                        cache_indices=cache_indices,
-                    )
-                )
-                verify_cache_indices = torch.where(
-                    valid_mask,
+                (
+                    boundary_indices,
+                    state_input_indices,
                     verify_cache_indices,
-                    torch.zeros_like(verify_cache_indices),
-                )
+                    tail_lens,
+                    valid_mask,
+                    boundary_state_steps,
+                ) = dvr_state_adapter.target_verify_metadata()
 
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
@@ -583,7 +595,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     state_cache=mamba_cache_params,
                     boundary_indices=boundary_indices,
                     state_input_indices=state_input_indices,
+                    tail_lens=tail_lens,
                     valid_mask=valid_mask,
+                    boundary_state_steps=boundary_state_steps,
                     layer_idx=layer_idx,
                 )
         else:

@@ -279,8 +279,14 @@ def test_gdn_state_input_window_compacts_only_valid_crossing_tail():
 
 
 def test_gdn_verify_uses_mamba_padding_sentinel():
+    state_window = DVRStateInputCache(
+        tensors=(torch.zeros(3, 66, 1),),
+        tail_lens=torch.tensor([0, 7, 63], dtype=torch.int32),
+        has_layer_dim=False,
+    )
     adapter = DVRGDNStateAdapter(
         kernel_dispatcher=None,
+        state_input_cache=state_window,
         verify_boundary_indices=torch.tensor([0, 11, 12]),
     )
     forward_batch = SimpleNamespace(
@@ -289,14 +295,25 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
         spec_info=SimpleNamespace(draft_token_num=2),
     )
 
-    boundary_indices, state_input_indices, valid_mask = adapter.target_verify_indices(
+    adapter.prepare_target_verify(
         forward_batch=forward_batch,
         cache_indices=torch.tensor([7, PAD_SLOT_ID]),
     )
+    (
+        boundary_indices,
+        state_input_indices,
+        verify_cache_indices,
+        tail_lens,
+        valid_mask,
+        boundary_state_steps,
+    ) = adapter.target_verify_metadata()
 
     assert torch.equal(boundary_indices, torch.tensor([12, 0]))
     assert torch.equal(state_input_indices, torch.tensor([2, 0]))
+    assert torch.equal(verify_cache_indices, torch.tensor([7, 0]))
+    assert torch.equal(tail_lens, torch.tensor([63, 0]))
     assert torch.equal(valid_mask, torch.tensor([True, False]))
+    assert torch.equal(boundary_state_steps, torch.tensor([1, -1]))
 
 
 def test_gdn_verify_rejects_backend_without_boundary_states():
@@ -343,11 +360,73 @@ def test_gdn_verify_rejects_backend_without_boundary_states():
             state_cache=state_cache,
             boundary_indices=torch.tensor([0]),
             state_input_indices=torch.tensor([1]),
+            tail_lens=torch.tensor([0]),
             valid_mask=torch.tensor([True]),
+            boundary_state_steps=torch.tensor([-1]),
             layer_idx=0,
         )
     assert calls[0]["inplace_update"] is False
     assert torch.equal(calls[0]["cache_indices"], torch.tensor([0]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_gdn_verify_window_pack_matches_indexing_reference():
+    torch.manual_seed(3)
+    slots, window, draft_tokens = 4, 9, 3
+    cache0 = torch.randn(slots, window, 2, 4, device="cuda")
+    cache1 = torch.randn_like(cache0)
+    original0 = cache0.clone()
+    original1 = cache1.clone()
+    candidate0 = torch.randn(3, draft_tokens, 2, 4, device="cuda")
+    candidate1 = torch.randn_like(candidate0)
+    indices = torch.tensor([1, 3, 0], device="cuda")
+    tail_lens = torch.tensor([0, 5, 0], device="cuda")
+    valid = torch.tensor([True, True, False], device="cuda")
+
+    output0, output1 = dvr_gdn_module._pack_verify_window_pair(
+        cache0,
+        candidate0,
+        cache1=cache1,
+        candidate1=candidate1,
+        state_input_indices=indices,
+        tail_lens=tail_lens,
+        valid_mask=valid,
+    )
+
+    expected0 = original0.clone()
+    expected1 = original1.clone()
+    for req in range(2):
+        slot = int(indices[req])
+        tail = int(tail_lens[req])
+        expected0[slot, tail : tail + draft_tokens] = candidate0[req]
+        expected1[slot, tail : tail + draft_tokens] = candidate1[req]
+    expected_output0 = expected0[indices]
+    expected_output1 = expected1[indices]
+    expected_output0[2] = original0[0]
+    expected_output1[2] = original1[0]
+
+    torch.testing.assert_close(cache0, expected0)
+    torch.testing.assert_close(cache1, expected1)
+    torch.testing.assert_close(output0, expected_output0)
+    torch.testing.assert_close(output1, expected_output1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_gdn_verify_output_gather_matches_logical_rows():
+    source = torch.arange(2 * 9 * 3 * 4, device="cuda", dtype=torch.float32).view(
+        1, 2 * 9, 3, 4
+    )
+    tail_lens = torch.tensor([1, 5], device="cuda")
+
+    actual = dvr_gdn_module._gather_verify_output(
+        source, tail_lens=tail_lens, draft_tokens=3
+    )
+
+    source_by_req = source.view(2, 9, 3, 4)
+    expected = torch.cat((source_by_req[0, 1:4], source_by_req[1, 5:8])).view(
+        1, 6, 3, 4
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_gdn_self_draft_state_is_request_owned_and_keeps_target_unchanged():

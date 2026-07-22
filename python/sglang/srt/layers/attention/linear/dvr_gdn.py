@@ -31,6 +31,138 @@ if not is_cpu():
 if not is_cpu():
 
     @triton.jit
+    def _dvr_pack_verify_window_kernel(
+        cache0,
+        candidate0,
+        output0,
+        cache1,
+        candidate1,
+        output1,
+        state_input_indices,
+        tail_lens,
+        valid_mask,
+        cache0_slot_stride,
+        cache0_token_stride,
+        candidate0_batch_stride,
+        candidate0_token_stride,
+        output0_batch_stride,
+        output0_token_stride,
+        cache1_slot_stride,
+        cache1_token_stride,
+        candidate1_batch_stride,
+        candidate1_token_stride,
+        output1_batch_stride,
+        output1_token_stride,
+        DRAFT_TOKENS: tl.constexpr,
+        E0: tl.constexpr,
+        E1: tl.constexpr,
+        HAS_SECOND: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        i_req = tl.program_id(0).to(tl.int64)
+        i_token = tl.program_id(1).to(tl.int64)
+        offsets = tl.program_id(2).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+        slot = tl.load(state_input_indices + i_req).to(tl.int64)
+        tail = tl.load(tail_lens + i_req).to(tl.int64)
+        valid = tl.load(valid_mask + i_req)
+        candidate_token = i_token - tail
+        is_candidate = valid & (candidate_token >= 0) & (candidate_token < DRAFT_TOKENS)
+
+        cache0_ptr = (
+            cache0 + slot * cache0_slot_stride + i_token * cache0_token_stride + offsets
+        )
+        candidate0_ptr = (
+            candidate0
+            + i_req * candidate0_batch_stride
+            + candidate_token * candidate0_token_stride
+            + offsets
+        )
+        cache0_value = tl.load(cache0_ptr, mask=offsets < E0, other=0)
+        candidate0_value = tl.load(
+            candidate0_ptr, mask=(offsets < E0) & is_candidate, other=0
+        )
+        value0 = tl.where(is_candidate, candidate0_value, cache0_value)
+        tl.store(
+            output0
+            + i_req * output0_batch_stride
+            + i_token * output0_token_stride
+            + offsets,
+            value0,
+            mask=offsets < E0,
+        )
+        tl.store(
+            cache0_ptr,
+            candidate0_value,
+            mask=(offsets < E0) & is_candidate,
+        )
+
+        if HAS_SECOND:
+            cache1_ptr = (
+                cache1
+                + slot * cache1_slot_stride
+                + i_token * cache1_token_stride
+                + offsets
+            )
+            candidate1_ptr = (
+                candidate1
+                + i_req * candidate1_batch_stride
+                + candidate_token * candidate1_token_stride
+                + offsets
+            )
+            cache1_value = tl.load(cache1_ptr, mask=offsets < E1, other=0)
+            candidate1_value = tl.load(
+                candidate1_ptr, mask=(offsets < E1) & is_candidate, other=0
+            )
+            value1 = tl.where(is_candidate, candidate1_value, cache1_value)
+            tl.store(
+                output1
+                + i_req * output1_batch_stride
+                + i_token * output1_token_stride
+                + offsets,
+                value1,
+                mask=offsets < E1,
+            )
+            tl.store(
+                cache1_ptr,
+                candidate1_value,
+                mask=(offsets < E1) & is_candidate,
+            )
+
+    @triton.jit
+    def _dvr_gather_verify_output_kernel(
+        source,
+        output,
+        tail_lens,
+        source_batch_stride,
+        source_token_stride,
+        output_batch_stride,
+        output_token_stride,
+        DRAFT_TOKENS: tl.constexpr,
+        E: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        i_req = tl.program_id(0).to(tl.int64)
+        i_token = tl.program_id(1).to(tl.int64)
+        offsets = tl.program_id(2).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        source_token = tl.load(tail_lens + i_req).to(tl.int64) + i_token
+        values = tl.load(
+            source
+            + i_req * source_batch_stride
+            + source_token * source_token_stride
+            + offsets,
+            mask=offsets < E,
+        )
+        tl.store(
+            output
+            + i_req * output_batch_stride
+            + i_token * output_token_stride
+            + offsets,
+            values,
+            mask=offsets < E,
+        )
+
+    @triton.jit
     def _dvr_gdn_rebuild_draft_state_kernel(
         k,
         v,
@@ -97,6 +229,112 @@ if not is_cpu():
         state_offset = (i_l * CD + destination_idx) * HV * V * K + i_hv * V * K
         p_ht = state_dst + state_offset + o_v[:, None] * K + o_k[None, :]
         tl.store(p_ht, recurrent_state.to(p_ht.dtype.element_ty), mask=mask_h)
+
+
+def _pack_verify_window_pair(
+    cache0: torch.Tensor,
+    candidate0: torch.Tensor,
+    *,
+    state_input_indices: torch.Tensor,
+    tail_lens: torch.Tensor,
+    valid_mask: torch.Tensor,
+    cache1: Optional[torch.Tensor] = None,
+    candidate1: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Materialize one or two verify windows while persisting candidate rows."""
+
+    if not cache0.is_cuda:
+        raise RuntimeError("The fused DVR verify-window pack is CUDA-only.")
+    has_second = cache1 is not None
+    if has_second != (candidate1 is not None):
+        raise ValueError(
+            "A second cache and candidate tensor must be provided together."
+        )
+
+    batch_size, draft_tokens = candidate0.shape[:2]
+    output0 = cache0.new_empty((batch_size, *cache0.shape[1:]))
+    output1 = cache1.new_empty((batch_size, *cache1.shape[1:])) if has_second else None
+    tensors = (cache0, candidate0, output0)
+    if has_second:
+        tensors += (cache1, candidate1, output1)
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise RuntimeError("DVR verify-window tensors must be contiguous.")
+
+    e0 = math.prod(cache0.shape[2:])
+    e1 = math.prod(cache1.shape[2:]) if has_second else 1
+    if math.prod(candidate0.shape[2:]) != e0:
+        raise ValueError("DVR candidate and cache element shapes do not match.")
+    if has_second and math.prod(candidate1.shape[2:]) != e1:
+        raise ValueError("DVR candidate and cache element shapes do not match.")
+
+    block_size = 256
+    grid = (
+        batch_size,
+        cache0.shape[1],
+        triton.cdiv(max(e0, e1), block_size),
+    )
+    second_cache = cache1 if has_second else cache0
+    second_candidate = candidate1 if has_second else candidate0
+    second_output = output1 if has_second else output0
+    _dvr_pack_verify_window_kernel[grid](
+        cache0,
+        candidate0,
+        output0,
+        second_cache,
+        second_candidate,
+        second_output,
+        state_input_indices,
+        tail_lens,
+        valid_mask,
+        cache0.stride(0),
+        cache0.stride(1),
+        candidate0.stride(0),
+        candidate0.stride(1),
+        output0.stride(0),
+        output0.stride(1),
+        second_cache.stride(0),
+        second_cache.stride(1),
+        second_candidate.stride(0),
+        second_candidate.stride(1),
+        second_output.stride(0),
+        second_output.stride(1),
+        DRAFT_TOKENS=draft_tokens,
+        E0=e0,
+        E1=e1,
+        HAS_SECOND=has_second,
+        BLOCK_SIZE=block_size,
+    )
+    return output0, output1
+
+
+def _gather_verify_output(
+    source: torch.Tensor,
+    *,
+    tail_lens: torch.Tensor,
+    draft_tokens: int,
+) -> torch.Tensor:
+    """Gather logical candidate rows directly into the target output layout."""
+
+    batch_size = tail_lens.shape[0]
+    source = source.view(batch_size, -1, *source.shape[-2:])
+    output = source.new_empty((batch_size, draft_tokens, *source.shape[2:]))
+    elements = math.prod(source.shape[2:])
+    block_size = 256
+    _dvr_gather_verify_output_kernel[
+        (batch_size, draft_tokens, triton.cdiv(elements, block_size))
+    ](
+        source,
+        output,
+        tail_lens,
+        source.stride(0),
+        source.stride(1),
+        output.stride(0),
+        output.stride(1),
+        DRAFT_TOKENS=draft_tokens,
+        E=elements,
+        BLOCK_SIZE=block_size,
+    )
+    return output.reshape(1, batch_size * draft_tokens, *source.shape[2:])
 
 
 def _local_gdn_dimensions(state_shape):
@@ -235,6 +473,9 @@ class DVRGDNStateAdapter:
     draft_reuses_target_state: bool = False
     state_input_cache: Optional[DVRStateInputCache] = None
     verify_boundary_indices: Optional[torch.Tensor] = None
+    _verify_metadata: Optional[tuple[torch.Tensor, ...]] = field(
+        default=None, init=False, repr=False
+    )
     draft_conv_state: Optional[tuple[torch.Tensor, ...]] = field(
         default=None, init=False, repr=False
     )
@@ -488,8 +729,8 @@ class DVRGDNStateAdapter:
             chunk_size=self.chunk_size,
         )
 
-    def target_verify_indices(self, *, forward_batch, cache_indices: torch.Tensor):
-        """Map padded target-verify rows to exact boundaries and window slots."""
+    def prepare_target_verify(self, *, forward_batch, cache_indices: torch.Tensor):
+        """Resolve graph-stable request, boundary, tail, and padding metadata once."""
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = forward_batch.input_ids.shape[0] // draft_token_num
@@ -506,7 +747,39 @@ class DVRGDNStateAdapter:
         boundary_indices = torch.where(
             valid_mask, boundary_indices, torch.zeros_like(boundary_indices)
         )
-        return boundary_indices, state_input_indices, valid_mask
+        verify_cache_indices = torch.where(
+            valid_mask,
+            cache_indices[:batch_size],
+            torch.zeros_like(cache_indices[:batch_size]),
+        )
+        tail_lens = (
+            self.state_input_window()
+            .get_tail_lens(indices=state_input_indices)
+            .to(torch.long)
+        )
+        tail_lens = torch.where(
+            valid_mask,
+            tail_lens.clamp(min=0, max=self.chunk_size),
+            torch.zeros_like(tail_lens),
+        )
+        boundary_state_steps = torch.where(
+            valid_mask & (tail_lens + draft_token_num >= self.chunk_size),
+            torch.ones_like(tail_lens),
+            torch.full_like(tail_lens, -1),
+        )
+        self._verify_metadata = (
+            boundary_indices,
+            state_input_indices,
+            verify_cache_indices,
+            tail_lens,
+            valid_mask,
+            boundary_state_steps,
+        )
+
+    def target_verify_metadata(self) -> tuple[torch.Tensor, ...]:
+        if self._verify_metadata is None:
+            raise RuntimeError("DVR target-verify metadata was not prepared.")
+        return self._verify_metadata
 
     def forward_target_verify(
         self,
@@ -519,7 +792,9 @@ class DVRGDNStateAdapter:
         state_cache,
         boundary_indices: torch.Tensor,
         state_input_indices: torch.Tensor,
+        tail_lens: torch.Tensor,
         valid_mask: torch.Tensor,
+        boundary_state_steps: torch.Tensor,
         layer_idx: int,
     ) -> torch.Tensor:
         """Replay GDN state from cached prefill inputs and draft q/k/v/g/beta."""
@@ -535,30 +810,47 @@ class DVRGDNStateAdapter:
             beta.reshape(batch_size, draft_token_num, beta.shape[-1]),
         )
         state_window = self.state_input_window(layer_idx=layer_idx)
-        tail_lens = state_window.get_tail_lens(indices=state_input_indices).to(
-            torch.long
-        )
-        tail_lens = torch.where(
-            valid_mask,
-            tail_lens.clamp(min=0, max=self.chunk_size),
-            torch.zeros_like(tail_lens),
-        )
         # The fixed window may retain values after tail_lens + draft_token_num.
         # They are causally after every returned logit, a boundary is exported
         # only after all chunk rows are valid, and state rebuilds use token_count.
-        state_window.write_rows(
-            indices=state_input_indices.unsqueeze(1).expand(-1, draft_token_num),
-            cols=(
-                torch.arange(
-                    draft_token_num,
-                    dtype=torch.long,
-                    device=state_input_indices.device,
-                ).unsqueeze(0)
-                + tail_lens.unsqueeze(1)
-            ),
-            values=draft_state_inputs,
-        )
-        q, k, v, cached_g, cached_beta = state_window.read(indices=state_input_indices)
+        if query.is_cuda:
+            q_cache, k_cache, v_cache, g_cache, beta_cache = state_window.tensors
+            with profile_range("verify_state_pack"):
+                q, k = _pack_verify_window_pair(
+                    q_cache,
+                    draft_state_inputs[0],
+                    cache1=k_cache,
+                    candidate1=draft_state_inputs[1],
+                    state_input_indices=state_input_indices,
+                    tail_lens=tail_lens,
+                    valid_mask=valid_mask,
+                )
+                v, _ = _pack_verify_window_pair(
+                    v_cache,
+                    draft_state_inputs[2],
+                    state_input_indices=state_input_indices,
+                    tail_lens=tail_lens,
+                    valid_mask=valid_mask,
+                )
+                cached_g, cached_beta = _pack_verify_window_pair(
+                    g_cache,
+                    draft_state_inputs[3],
+                    cache1=beta_cache,
+                    candidate1=draft_state_inputs[4],
+                    state_input_indices=state_input_indices,
+                    tail_lens=tail_lens,
+                    valid_mask=valid_mask,
+                )
+        else:
+            cols = torch.arange(draft_token_num).unsqueeze(0) + tail_lens.unsqueeze(1)
+            state_window.write_rows(
+                indices=state_input_indices.unsqueeze(1).expand(-1, draft_token_num),
+                cols=cols,
+                values=draft_state_inputs,
+            )
+            q, k, v, cached_g, cached_beta = state_window.read(
+                indices=state_input_indices
+            )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -579,25 +871,36 @@ class DVRGDNStateAdapter:
         # Draft has finished, so the one-state workspace may now stage h64.
         # Rollback publishes it only for accepted crossings, then rebuilds the
         # self-draft endpoint in the same request-owned row.
-        state_cache.intermediate_ssm[state_input_indices, 0] = h[:batch_size, 1].to(
-            state_cache.intermediate_ssm.dtype
-        )
+        with profile_range("verify_boundary_stage"):
+            if h.is_cuda:
+                fused_mamba_state_scatter_with_mask(
+                    state_cache.intermediate_ssm[:, 0].unsqueeze(0),
+                    h[:batch_size].unsqueeze(0),
+                    state_input_indices,
+                    boundary_state_steps,
+                )
+            else:
+                may_cross = boundary_state_steps >= 0
+                state_cache.intermediate_ssm[state_input_indices[may_cross], 0] = h[
+                    :batch_size, 1
+                ][may_cross].to(state_cache.intermediate_ssm.dtype)
 
-        value_shape = core_attn_out.shape[-2:]
-        core_attn_out = core_attn_out.view(
-            batch_size, self.chunk_size + draft_token_num, *value_shape
-        )
-        rows = torch.arange(
-            batch_size, dtype=torch.long, device=core_attn_out.device
-        ).unsqueeze(1)
-        cols = torch.arange(
-            draft_token_num, dtype=torch.long, device=core_attn_out.device
-        ).unsqueeze(0) + tail_lens.unsqueeze(1)
-        return (
-            core_attn_out[rows.expand(-1, draft_token_num), cols]
-            .reshape(1, batch_size * draft_token_num, *value_shape)
-            .contiguous()
-        )
+        with profile_range("verify_output_gather"):
+            if core_attn_out.is_cuda:
+                return _gather_verify_output(
+                    core_attn_out,
+                    tail_lens=tail_lens,
+                    draft_tokens=draft_token_num,
+                )
+            value_shape = core_attn_out.shape[-2:]
+            core_attn_out = core_attn_out.view(
+                batch_size, self.chunk_size + draft_token_num, *value_shape
+            )
+            rows = torch.arange(batch_size).unsqueeze(1)
+            cols = torch.arange(draft_token_num).unsqueeze(0) + tail_lens.unsqueeze(1)
+            return core_attn_out[rows.expand(-1, draft_token_num), cols].reshape(
+                1, batch_size * draft_token_num, *value_shape
+            )
 
     def commit_after_verify(
         self,
