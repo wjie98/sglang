@@ -150,31 +150,83 @@ def test_radix_enabled_reserves_two_checkpoint_slots_per_request():
     assert ModelRunnerKVCacheMixin._calculate_mamba_ratio(runner) == 5
 
 
-def test_dvr_mamba_first_decode_waits_for_prefill_cache_donation():
+@pytest.mark.parametrize(
+    "spec_algorithm,extra_buffer,expected_order",
+    [
+        (
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+            True,
+            ["process_result", "schedule"],
+        ),
+        (
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
+            True,
+            ["process_result", "schedule"],
+        ),
+        (SpeculativeAlgorithm.EAGLE, True, ["schedule", "process_result"]),
+        (
+            SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+            False,
+            ["schedule", "process_result"],
+        ),
+    ],
+)
+def test_dvr_mamba_extend_result_is_processed_before_scheduling(
+    spec_algorithm, extra_buffer, expected_order
+):
+    events = []
+    req = SimpleNamespace(finished=False, mamba_next_track_idx=0)
+    scheduled_req_states = []
+    pending_batch = SimpleNamespace(
+        spec_algorithm=spec_algorithm,
+        forward_mode=ForwardMode.EXTEND,
+    )
+    pending_result = object()
     scheduler = SimpleNamespace(
-        require_mlp_sync=False,
-        last_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
-        result_queue=[object()],
-        server_args=SimpleNamespace(enable_mamba_extra_buffer=lambda: True),
+        gracefully_exit=False,
+        _engine_paused=False,
+        last_batch=pending_batch,
+        server_args=SimpleNamespace(
+            enable_mamba_extra_buffer=lambda: extra_buffer,
+            enable_unified_memory=False,
+        ),
+        is_generation=False,
     )
 
-    def needs_sync(spec_algorithm, *, extra_buffer=True):
-        scheduler.server_args.enable_mamba_extra_buffer = lambda: extra_buffer
-        batch = SimpleNamespace(
-            spec_algorithm=spec_algorithm,
-            forward_mode=ForwardMode.DECODE,
-            has_grammar=False,
-        )
-        return Scheduler.is_disable_overlap_for_batch(scheduler, batch)
+    def recv_requests():
+        scheduler.result_queue.append((pending_batch, pending_result))
+        return []
 
-    assert needs_sync(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK)
-    assert needs_sync(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE)
-    assert not needs_sync(
-        SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK, extra_buffer=False
+    def process_batch_result(batch, result):
+        assert (batch, result) == (pending_batch, pending_result)
+        events.append("process_result")
+        req.finished = True
+        req.mamba_next_track_idx = None
+
+    def get_next_batch_to_run():
+        events.append("schedule")
+        scheduled_req_states.append((req.finished, req.mamba_next_track_idx))
+        scheduler.gracefully_exit = True
+        return None
+
+    scheduler.request_receiver = SimpleNamespace(recv_requests=recv_requests)
+    scheduler.process_input_requests = lambda _reqs: None
+    scheduler._apply_war_barrier = lambda: None
+    scheduler.process_batch_result = process_batch_result
+    scheduler.get_next_batch_to_run = get_next_batch_to_run
+    # Cover both result-consumption sites after scheduling. Neither may consume
+    # the pre-schedule DVR result a second time.
+    scheduler.is_disable_overlap_for_batch = (
+        lambda _batch: spec_algorithm == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
     )
-    assert not needs_sync(SpeculativeAlgorithm.EAGLE)
-    scheduler.last_batch.forward_mode = ForwardMode.DECODE
-    assert not needs_sync(SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK)
+
+    Scheduler.event_loop_overlap.__wrapped__(scheduler)
+
+    assert events == expected_order
+    assert scheduled_req_states == [
+        (True, None) if expected_order[0] == "process_result" else (False, 0)
+    ]
+    assert not scheduler.result_queue
 
 
 def test_warm_prefix_boundary_copy_uses_current_physical_slots():

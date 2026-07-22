@@ -69,10 +69,12 @@ coverage.
 3. **Target EXTEND finish:** publish exactly one authoritative boundary from an
    aligned live state, an upstream tracked state, the zero state, or the
    captured Radix prefix. Missing all four sources is a correctness error.
-4. **First-decode donation fence:** under overlap, process the unfinished
-   prefill result before launching the first DVR decode. Donation transfers the
-   cached slot to Radix and installs a replacement in the request/device
-   mapping; draft preparation must observe that replacement.
+4. **First-decode lifecycle fence:** under overlap, process the unfinished
+   prefill result before `get_next_batch_to_run()` constructs another batch.
+   Result processing can either finish and release a request or donate its
+   cached slot to Radix and install a replacement in the request/device mapping.
+   Batch filtering, allocation, draft preparation, and verify must all observe
+   that final request state.
 5. **Draft:** select the newest logical boundary and resolve its current
    physical slot. Self-draft backs up convolution state before provisional fast
    decode; EAGLE/MTP advances only its separate draft state.
@@ -95,6 +97,8 @@ coverage.
 ### 3.3 Required invariants
 
 - Before every non-empty draft, each GDN request has an exact checkpoint.
+- A finished request is never captured in a subsequent DVR decode batch; its
+  prefill result is consumed exactly once before that batch is constructed.
 - At phase boundaries, `boundary_length + tail_length` equals the target's
   committed state length.
 - The boundary and `q/k/v/g/beta` window come from the same accepted target
@@ -121,6 +125,10 @@ donation (`prompt=126/127`, `max_new=17/65`), request-slot reuse, interleaved
 ownership, generated-prefix re-hit, stop/grammar trimming, and 512-token
 generation. Run them with Radix enabled first, then repeat with
 `DISABLE_RADIX_CACHE=1` to confirm full-prefill semantics.
+
+The explicit prefill-result lifecycle case concurrently submits prompt lengths
+`2/63/64/65` with `max_new_tokens=1`. Every request must finish during EXTEND;
+none may survive into draft/verify with released KV or Mamba state.
 
 ### 3.4 Warm-prefix prefill graph regression
 
