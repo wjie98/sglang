@@ -119,7 +119,12 @@ class DVRLinearStateLifecycle:
             self.boundary_lens.fill_(-1)
 
     def prepare_target_extend(self, batch: ScheduleBatch) -> None:
-        """Track DVR's request-local chunk boundary without enabling Radix."""
+        """Discard stale DVR ownership before target EXTEND publishes a boundary.
+
+        ScheduleBatch owns Mamba tracking while Radix is enabled. ChunkCache
+        intentionally disables that upstream path, so DVR supplies its single
+        request-local checkpoint from the stable per-batch extend lengths.
+        """
 
         if self._state_adapter is None or not batch.reqs:
             return
@@ -134,30 +139,29 @@ class DVRLinearStateLifecycle:
         track_indices = []
         track_mask = []
         track_seqlens = []
-        for req in batch.reqs:
+        for req, extend_len in zip(batch.reqs, batch.extend_lens):
             if req.mamba_ping_pong_track_buffer is None:
                 raise RuntimeError(
                     f"DVR request {req.rid} has no recurrent checkpoint slot."
                 )
             track_indices.append(req.mamba_ping_pong_track_buffer[0])
-            should_track = req.extend_input_len >= self.chunk_size
+            should_track = extend_len >= self.chunk_size
             track_mask.append(should_track)
-            track_seqlen = len(req.prefix_indices) + req.extend_input_len
+            track_seqlen = len(req.prefix_indices) + extend_len
             track_seqlens.append(track_seqlen if should_track else -1)
             if should_track:
                 req.mamba_last_track_seqlen = (
                     len(req.prefix_indices)
-                    + req.extend_input_len // self.chunk_size * self.chunk_size
+                    + extend_len // self.chunk_size * self.chunk_size
                 )
-        device = batch.device
         batch.mamba_track_indices = torch.stack(track_indices).to(
-            device=device, dtype=torch.int64
+            device=batch.device, dtype=torch.int64
         )
         batch.mamba_track_mask = torch.tensor(
-            track_mask, device=device, dtype=torch.bool
+            track_mask, device=batch.device, dtype=torch.bool
         )
         batch.mamba_track_seqlens = torch.tensor(
-            track_seqlens, device=device, dtype=torch.int64
+            track_seqlens, device=batch.device, dtype=torch.int64
         )
 
     def prepare_for_cache_release(self, req) -> None:

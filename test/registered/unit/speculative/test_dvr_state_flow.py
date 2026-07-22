@@ -92,7 +92,6 @@ def _lifecycle_fixture(
     req = SimpleNamespace(
         rid="r0",
         req_pool_idx=1,
-        extend_input_len=seq_len - prefix_len,
         prefix_indices=[0] * prefix_len,
         mamba_last_track_seqlen=last_track,
         mamba_next_track_idx=0,
@@ -106,6 +105,7 @@ def _lifecycle_fixture(
         seq_lens=torch.tensor([seq_len]),
         seq_lens_cpu=torch.tensor([seq_len]),
         prefix_lens=[prefix_len],
+        extend_lens=[seq_len - prefix_len],
         batch_size=lambda: 1,
     )
     return lifecycle, req, batch, copies, zeroed, tail_updates
@@ -336,7 +336,7 @@ def test_target_extend_fails_without_a_boundary_source():
         lifecycle.finish_target_extend(batch)
 
 
-def test_radix_disabled_uses_request_local_boundary():
+def test_radix_disabled_builds_tracking_from_schedule_batch_lengths():
     lifecycle, req, batch, _, _, _ = _lifecycle_fixture(
         seq_len=65,
         last_track=64,
