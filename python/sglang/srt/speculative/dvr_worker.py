@@ -757,10 +757,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 spec_info.draft_token.view(spec_info.retrieve_next_token.shape).cpu(),
             )
 
-        with spec_stage_span("dvr_state_restore"):
-            # Self-draft graph replay and target verify are both enqueued on
-            # Scheduler's forward stream, so CUDA stream order is their fence.
-            self.linear_state.restore_for_verify(linear_state_ctx)
         with spec_stage_span("verify"):
             forward_output = self.target_worker.forward_batch_generation(
                 batch=None,

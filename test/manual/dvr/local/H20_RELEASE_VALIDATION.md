@@ -50,9 +50,9 @@ coverage.
   discarded with the request; the next request must report no Radix reuse and
   perform an ordinary full prefill.
 - Each GDN layer retains at most one unclosed 64-token tail plus the current
-  draft rows as `q/k/v/g/beta`. Self-draft additionally saves request-owned
-  convolution state. EAGLE/MTP owns a separate draft cache and does not write
-  target state-input windows.
+  draft rows as `q/k/v/g/beta`. Self-draft additionally owns one request-indexed
+  recurrent workspace and private convolution state. EAGLE/MTP owns a separate
+  upstream draft cache and does not write target state-input windows.
 
 ### 3.2 Closed transition
 
@@ -76,17 +76,17 @@ coverage.
    Batch filtering, allocation, draft preparation, and verify must all observe
    that final request state.
 5. **Draft:** select the newest logical boundary and resolve its current
-   physical slot. Self-draft backs up convolution state before provisional fast
-   decode; EAGLE/MTP advances only its separate draft state.
-6. **Target verify:** restore the exact target boundary and self-draft
-   convolution state, then run deterministic GDN EXTEND over `64 + D`. The
-   Triton chunk kernel exports the state before each chunk, so `h[:, 1]` is the
-   exact state after the first 64 rows. Returned outputs correspond only to the
-   `D` logical verify rows.
+   physical slot. Self-draft advances only its request-owned recurrent and
+   convolution state; EAGLE/MTP advances only its upstream-owned draft state.
+6. **Target verify:** read the exact target boundary without overwriting it and
+   run deterministic GDN EXTEND over `64 + D`. The Triton chunk kernel exports
+   the state before each chunk, so `h[:, 1]` is the exact state after the first
+   64 rows. Returned outputs correspond only to the `D` logical verify rows.
 7. **Rollback/commit:** commit convolution state at the last accepted input.
    If `tail + accepted >= 64`, write `h[:, 1]` to the alternate checkpoint and
-   shift the state-input window by 64. Rebuild target live temporal state only
-   for self-draft; EAGLE/MTP keeps target and draft state separate.
+   compact the state-input window by 64. Rebuild the private self-draft
+   recurrent endpoint from the new boundary plus accepted tail; EAGLE/MTP keeps
+   target and draft state separate and skips this reconstruction.
 8. **Release/re-hit:** publish the newest exact checkpoint not later than the
    visible committed prefix. Radix truncates its stored token KV to the same
    length. A new request matches that aligned state and recomputes the remaining
@@ -154,6 +154,68 @@ state directly when diagnosing a failure. Disabling prefill graphs is a useful
 control but is not an acceptable release workaround. Strict divergence at the
 second generated token is characteristic of an uninitialized warm boundary;
 `max_new_tokens=1` alone cannot validate this transition.
+
+### 3.5 Isolated self-draft state lifecycle
+
+The implemented state lifecycle is specified in `STATE_LIFECYCLE_REDESIGN.md`.
+Do not qualify it by observing only unchanged logits: the intended performance
+result depends on removing the old target-state restore transaction, not
+reproducing it behind different names.
+
+One self-DVR block has these state boundaries:
+
+1. Target EXTEND seeds one request-indexed recurrent workspace and private
+   convolution state. This full-state initialization does not repeat in
+   steady-state DVR blocks. DVR allocates one workspace state per layer/request,
+   independent of `D`, not one state per proposal token.
+2. Run all provisional recurrent decode steps only on that workspace.
+3. Run target GDN verify read-only from the exact 64-token checkpoint over the
+   fixed `64 + D` transition-input window, then reuse the same workspace for
+   the exported `h64` after draft has finished.
+4. Commit accepted convolution state for both self and EAGLE.
+5. Rebuild the private self-draft recurrent state from the newest exact boundary plus
+   accepted `q/k/v/g/beta`, with at most 63 rows. EAGLE skips this target-
+   temporal operation and finalizes its own cache through the upstream worker.
+6. Publish and compact only when accepted history crosses 64 tokens.
+
+Add these NVTX ranges to the existing profile report:
+
+```text
+draft_state_copy
+target_verify
+draft_state_rebuild
+state_window_compact
+boundary_publish
+```
+
+The old `dvr_state_restore` range must disappear. `draft_state_rebuild` must
+never process more than 63 transition rows, and non-crossing requests must not
+move a full `64 + D` state-input window. All ranges remain on the forward
+stream without accept-length or tail-length host readback.
+
+The migration-specific correctness matrix must force:
+
+- `tail_len=0/1/48/63`;
+- `accept_len=1/D-1/D`;
+- crossing and non-crossing requests in the same batch;
+- prompt and generated-prefix boundaries at `1/63/64/65`;
+- cold prefill, warm Radix re-hit, donation, request-slot reuse, and Radix off;
+- self-DVR v1/v2 and EAGLE sync/overlap; and
+- `return_logprob=True/False` with 512- and 1024-token generations.
+
+For self-draft, compare the rebuilt private draft state before the next proposal block
+as well as target checkpoint and logits. For EAGLE, compare target checkpoint,
+accepted target hidden state, draft-cache finalization, proposal probabilities,
+and `accept_index`. A real-data EAGLE acceptance result of exactly 1.0 is not a
+pass until proposal and metric accounting are independently validated.
+
+On the 35B H20 BS3 profile, report `draft_state_copy` only for target EXTEND;
+it must not appear once per steady-state decode block. Report
+`draft_state_rebuild`, `state_window_compact`, and `boundary_publish`
+separately. The old reference is 2.351 ms/block, including a 0.843 ms restore
+that must disappear. Establish the new maintenance threshold from the measured
+64-row-bounded rebuild and compact operations rather than assuming either is
+free.
 
 ## 4. DeepGEMM preparation
 

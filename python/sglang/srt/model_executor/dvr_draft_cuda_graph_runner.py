@@ -292,12 +292,21 @@ def dvr_draft_decode_context(
                     )
 
             resolved_backend = False
+            draft_state_adapters = set()
             for backend in (
                 model_runner.attn_backend,
                 *(extra_attn_backends or ()),
             ):
                 if backend is None:
                     continue
+                if self_draft:
+                    _, state_adapter = _resolve_dvr_backends(backend)
+                    if (
+                        state_adapter is not None
+                        and id(state_adapter) not in draft_state_adapters
+                    ):
+                        draft_state_adapters.add(id(state_adapter))
+                        stack.enter_context(state_adapter.self_draft_decode())
                 overrides = _fast_decode_overrides(backend, model_runner, buffer_cache)
                 resolved_backend = True
                 for owner, name, value in overrides:

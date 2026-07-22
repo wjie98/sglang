@@ -70,7 +70,6 @@ class DVRLinearStateLifecycle:
         self.server_args = server_args
         self.model_runner = model_runner
         self._state_adapter = None
-        self.draft_state_backup = None
         self.boundary_lens = None
 
     def bind_state_adapter(self, state_adapter) -> None:
@@ -104,14 +103,9 @@ class DVRLinearStateLifecycle:
         )
         if state_adapter.draft_reuses_target_state:
             state_cache = self.model_runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-            # Self draft mutates only the target's live convolution state before
-            # verify. Keep one request-pool-indexed copy; recurrent boundaries
-            # remain in the existing ping-pong pool.
-            self.draft_state_backup = state_adapter.allocate_draft_state_backup(
+            state_adapter.allocate_self_draft_state(
                 state_cache=state_cache,
-                backup_size=int(
-                    self.model_runner.req_to_token_pool.req_to_token.shape[0]
-                ),
+                num_slots=state_cache.intermediate_ssm.shape[1],
             )
 
     @property
@@ -239,15 +233,10 @@ class DVRLinearStateLifecycle:
         next_boundary_indices = track_slots.gather(
             1, next_track_indices.unsqueeze(1)
         ).squeeze(1)
-        if self._state_adapter.draft_reuses_target_state:
-            if self.draft_state_backup is None:
-                raise RuntimeError("DVR self draft has no live-state backup storage.")
-            self.draft_state_backup = self._state_adapter.backup_draft_state(
-                state_cache=state_cache,
-                indices=live_indices,
-                backup_indices=state_input_indices,
-                out=self.draft_state_backup,
-            )
+        self._state_adapter.set_verify_boundaries(
+            state_input_indices=state_input_indices,
+            boundary_indices=boundary_indices,
+        )
         return DVRLinearStateContext(
             state_cache=state_cache,
             state_input_indices=state_input_indices,
@@ -329,21 +318,10 @@ class DVRLinearStateLifecycle:
             indices=state_input_indices,
             value=torch.tensor(tail_lens, device=live_indices.device),
         )
-
-    def restore_for_verify(self, ctx: Optional[DVRLinearStateContext]) -> None:
-        if ctx is None:
-            return
-        if (
-            self._state_adapter.draft_reuses_target_state
-            and self.draft_state_backup is None
-        ):
-            raise RuntimeError("DVR self draft is missing live-state backups.")
-        self._state_adapter.prepare_recurrent_state_for_verify(
-            state_cache=ctx.state_cache,
-            live_indices=ctx.live_indices,
-            boundary_indices=ctx.boundary_indices,
-            draft_state_backup=self.draft_state_backup,
-            backup_indices=ctx.state_input_indices,
+        self._state_adapter.initialize_self_draft_state(
+            state_cache=state_cache,
+            state_input_indices=state_input_indices,
+            live_indices=live_indices,
         )
 
     def rollback_after_verify(

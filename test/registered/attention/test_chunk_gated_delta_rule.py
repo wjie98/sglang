@@ -102,6 +102,34 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                 self.assertEqual(output.dtype, q.dtype)
                 self.assertEqual(boundary_states.dtype, initial_state.dtype)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_non_inplace_verify_preserves_initial_state(self):
+        q = torch.randn(1, 80, 1, 16, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, 80, 1, dtype=torch.float32, device="cuda")
+        )
+        beta = torch.sigmoid(torch.randn(1, 80, 1, dtype=torch.float32, device="cuda"))
+        initial_state = torch.randn(2, 1, 16, 16, device="cuda")
+        original = initial_state.clone()
+
+        output, _, boundary_states = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            initial_state_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            use_qk_l2norm_in_kernel=True,
+            inplace_update=False,
+        )
+
+        self.assertEqual(output.shape[1], 80)
+        self.assertEqual(boundary_states.shape[1], 2)
+        self.assertTrue(torch.equal(initial_state, original))
+
     def _check_shape(
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42
     ):

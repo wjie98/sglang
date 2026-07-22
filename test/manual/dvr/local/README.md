@@ -22,6 +22,11 @@ correctness, acceptance, or throughput:
   capture on H20.
 - `scripts/profile_dvr_server.sh`: development-only server profiling.
 
+`STATE_LIFECYCLE_REDESIGN.md` is the implementation contract for the isolated
+self-draft state lifecycle. It defines target/Radix checkpoint ownership,
+self-draft private state, the common self/EAGLE target transaction, and the
+state-level and H20 gates required for release qualification.
+
 The clients under `clients/` are intentionally not named `test_*.py`; they are
 command-line experiment drivers, not pytest collection targets.
 

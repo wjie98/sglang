@@ -255,20 +255,46 @@ def test_gdn_state_input_window_shifts_only_crossed_requests():
     torch.testing.assert_close(values[1, :16], original[1, 64:80])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_gdn_state_input_window_compacts_only_valid_crossing_tail():
+    values = torch.arange(2 * 80 * 2, dtype=torch.float32, device="cuda").view(
+        1, 2, 80, 2
+    )
+    original = values.clone()
+    cache = DVRStateInputCache(
+        tensors=(values,),
+        tail_lens=torch.zeros(2, dtype=torch.int32, device="cuda"),
+    )
+
+    cache.shift_after_boundary(
+        indices=torch.tensor([0, 1], device="cuda"),
+        crosses_chunk_boundary=torch.tensor([False, True], device="cuda"),
+        chunk_size=64,
+        tail_lens=torch.tensor([8, 3], device="cuda"),
+    )
+
+    torch.testing.assert_close(values[:, 0], original[:, 0])
+    torch.testing.assert_close(values[:, 1, :3], original[:, 1, 64:67])
+    torch.testing.assert_close(values[:, 1, 3:], original[:, 1, 3:])
+
+
 def test_gdn_verify_uses_mamba_padding_sentinel():
-    adapter = DVRGDNStateAdapter(kernel_dispatcher=None)
+    adapter = DVRGDNStateAdapter(
+        kernel_dispatcher=None,
+        verify_boundary_indices=torch.tensor([0, 11, 12]),
+    )
     forward_batch = SimpleNamespace(
         input_ids=torch.zeros(4, dtype=torch.long),
         req_pool_indices=torch.tensor([2, 0]),
         spec_info=SimpleNamespace(draft_token_num=2),
     )
 
-    dvr_indices, state_input_indices, valid_mask = adapter.target_verify_indices(
+    boundary_indices, state_input_indices, valid_mask = adapter.target_verify_indices(
         forward_batch=forward_batch,
         cache_indices=torch.tensor([7, PAD_SLOT_ID]),
     )
 
-    assert torch.equal(dvr_indices, torch.tensor([7, 0]))
+    assert torch.equal(boundary_indices, torch.tensor([12, 0]))
     assert torch.equal(state_input_indices, torch.tensor([2, 0]))
     assert torch.equal(valid_mask, torch.tensor([True, False]))
 
@@ -291,7 +317,13 @@ def test_gdn_verify_rejects_backend_without_boundary_states():
         dtype=torch.float32,
         device="cpu",
     )
-    dispatcher = SimpleNamespace(extend=lambda **kwargs: (torch.empty(0), None, None))
+    calls = []
+
+    def extend(**kwargs):
+        calls.append(kwargs)
+        return torch.empty(0), None, None
+
+    dispatcher = SimpleNamespace(extend=extend)
     adapter = DVRGDNStateAdapter(
         kernel_dispatcher=dispatcher,
         state_input_cache=cache,
@@ -309,40 +341,100 @@ def test_gdn_verify_rejects_backend_without_boundary_states():
             g=torch.zeros(1, 2, 16),
             beta=torch.zeros(1, 2, 16),
             state_cache=state_cache,
-            dvr_indices=torch.tensor([0]),
+            boundary_indices=torch.tensor([0]),
             state_input_indices=torch.tensor([1]),
             valid_mask=torch.tensor([True]),
-            intermediate_state_indices=torch.tensor([0]),
             layer_idx=0,
         )
+    assert calls[0]["inplace_update"] is False
+    assert torch.equal(calls[0]["cache_indices"], torch.tensor([0]))
 
 
-def test_gdn_self_draft_backup_and_restore_are_request_owned():
+def test_gdn_self_draft_state_is_request_owned_and_keeps_target_unchanged():
     conv = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
     temporal = torch.arange(18, dtype=torch.float32).reshape(1, 3, 6)
-    state_cache = SimpleNamespace(conv=(conv,), temporal=temporal)
-    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, draft_reuses_target_state=True)
-    backup = adapter.allocate_draft_state_backup(state_cache=state_cache, backup_size=4)
-    original_conv = conv[:, [0, 2]].clone()
-    boundary_state = temporal[:, [1, 1]].clone()
-
-    adapter.backup_draft_state(
-        state_cache=state_cache,
-        indices=torch.tensor([0, 2]),
-        backup_indices=torch.tensor([1, 3]),
-        out=backup,
+    workspace = torch.zeros(1, 4, 1, 6)
+    state_cache = SimpleNamespace(
+        conv=(conv,), temporal=temporal, intermediate_ssm=workspace
     )
-    conv[:, [0, 2]].fill_(99)
-    adapter.prepare_recurrent_state_for_verify(
+    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, draft_reuses_target_state=True)
+    adapter.allocate_self_draft_state(state_cache=state_cache, num_slots=4)
+    adapter.initialize_self_draft_state(
         state_cache=state_cache,
         live_indices=torch.tensor([0, 2]),
-        boundary_indices=torch.tensor([1, 1]),
-        draft_state_backup=backup,
-        backup_indices=torch.tensor([1, 3]),
+        state_input_indices=torch.tensor([1, 3]),
+    )
+    original_conv = conv.clone()
+    original_temporal = temporal.clone()
+    layer_cache = SimpleNamespace(temporal=temporal[0], intermediate_ssm=workspace[0])
+    forward_batch = SimpleNamespace(req_pool_indices=torch.tensor([1, 3]))
+
+    with adapter.self_draft_decode():
+        draft_conv, draft_temporal, indices = adapter.decode_state(
+            layer_cache=layer_cache, forward_batch=forward_batch, layer_idx=0
+        )
+        draft_conv[indices] = -1
+        draft_temporal[indices] = -2
+
+    torch.testing.assert_close(conv, original_conv)
+    torch.testing.assert_close(temporal, original_temporal)
+    assert torch.all(adapter.draft_conv_state[0][:, [1, 3]] == -1)
+    assert torch.all(workspace[:, [1, 3], 0] == -2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_gdn_self_draft_rebuild_reads_boundary_and_writes_workspace():
+    torch.manual_seed(1)
+    layers, slots, tokens, dim = 2, 5, 80, 16
+    q = torch.randn(layers, slots, tokens, 1, dim, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = torch.randn(layers, slots, tokens, 1, device="cuda") * 0.01
+    beta = torch.sigmoid(torch.randn_like(g))
+    window = DVRStateInputCache(
+        tensors=(q, k, v, g, beta),
+        tail_lens=torch.zeros(slots, dtype=torch.int32, device="cuda"),
+    )
+    temporal = torch.randn(layers, 7, 1, dim, dim, device="cuda") * 0.01
+    original = temporal.clone()
+    workspace = torch.zeros(layers, slots, 1, 1, dim, dim, device="cuda")
+    state_cache = SimpleNamespace(
+        temporal=temporal,
+        intermediate_ssm=workspace,
+    )
+    request_rows = torch.tensor([1, 4], device="cuda")
+    boundaries = torch.tensor([2, 6], device="cuda")
+    token_counts = torch.tensor([0, 5], device="cuda")
+
+    expected = torch.empty(layers, 2, 1, dim, dim, device="cuda")
+    for layer in range(layers):
+        for row, (request, boundary, count) in enumerate(
+            zip(request_rows, boundaries, token_counts, strict=True)
+        ):
+            state = temporal[layer, boundary].clone()
+            for step in range(int(count)):
+                key = k[layer, request, step, 0].float()
+                key /= torch.sqrt(torch.sum(key * key) + 1e-6)
+                value = v[layer, request, step, 0].float()
+                state *= torch.exp(g[layer, request, step, 0].float())
+                value = (
+                    value - torch.sum(state[0] * key.unsqueeze(0), dim=1)
+                ) * beta[layer, request, step, 0].float()
+                state += value[:, None] * key[None, :]
+            expected[layer, row] = state
+
+    dvr_gdn_module._rebuild_gdn_self_draft_state(
+        window,
+        state_cache=state_cache,
+        state_input_indices=request_rows,
+        boundary_indices=boundaries,
+        token_count=token_counts,
     )
 
-    torch.testing.assert_close(conv[:, [0, 2]], original_conv)
-    torch.testing.assert_close(temporal[:, [0, 2]], boundary_state)
+    torch.testing.assert_close(temporal, original)
+    torch.testing.assert_close(
+        workspace[:, request_rows, 0], expected, rtol=2e-4, atol=2e-4
+    )
 
 
 def test_gdn_commit_alternates_boundary_slots(monkeypatch):
@@ -351,8 +443,12 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
     monkeypatch.setattr(
         dvr_gdn_module,
         "fused_mamba_state_scatter_with_mask",
-        lambda _dst, _src, indices, steps: temporal_scatters.append(
-            (indices.tolist(), steps.tolist())
+        lambda _dst, _src, indices, steps, **kwargs: temporal_scatters.append(
+            (
+                indices.tolist(),
+                steps.tolist(),
+                kwargs.get("src_indices_raw").tolist(),
+            )
         ),
     )
     monkeypatch.setattr(
@@ -386,6 +482,6 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
     )
 
     assert crossed.tolist() == [True, False]
-    assert temporal_scatters == [([7, 8], [0, -1])]
+    assert temporal_scatters == [([7, 8], [0, -1], [1, 2])]
     assert conv_scatters == [([3, 4], [1, 1]), ([7, 8], [0, -1])]
     assert tail_updates == [[1, 3]]

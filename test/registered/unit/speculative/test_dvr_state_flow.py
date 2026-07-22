@@ -41,6 +41,8 @@ class _Adapter:
     def __init__(self, zeroed, tail_updates):
         self.zeroed = zeroed
         self.tail_updates = tail_updates
+        self.verify_boundaries = []
+        self.draft_initializations = []
 
     @staticmethod
     def batch_state(*, batch):
@@ -56,6 +58,22 @@ class _Adapter:
             )
         )
 
+    def set_verify_boundaries(self, **kwargs):
+        self.verify_boundaries.append(
+            (
+                kwargs["state_input_indices"].tolist(),
+                kwargs["boundary_indices"].tolist(),
+            )
+        )
+
+    def initialize_self_draft_state(self, **kwargs):
+        self.draft_initializations.append(
+            (
+                kwargs["state_input_indices"].tolist(),
+                kwargs["live_indices"].tolist(),
+            )
+        )
+
 
 def _lifecycle_fixture(
     *, seq_len, last_track, prefix_len, disable_radix=False, slots=(10, 11)
@@ -68,7 +86,6 @@ def _lifecycle_fixture(
         enable_mamba_extra_buffer=lambda: not disable_radix,
     )
     lifecycle._state_adapter = _Adapter(zeroed, tail_updates)
-    lifecycle.draft_state_backup = None
     lifecycle.boundary_lens = torch.full((8, len(slots)), -1, dtype=torch.int64)
     pool = _Pool(slots, copies)
     lifecycle.model_runner = SimpleNamespace(req_to_token_pool=pool)
@@ -216,8 +233,8 @@ def test_dvr_mamba_extend_result_is_processed_before_scheduling(
     scheduler.get_next_batch_to_run = get_next_batch_to_run
     # Cover both result-consumption sites after scheduling. Neither may consume
     # the pre-schedule DVR result a second time.
-    scheduler.is_disable_overlap_for_batch = (
-        lambda _batch: spec_algorithm == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+    scheduler.is_disable_overlap_for_batch = lambda _batch: (
+        spec_algorithm == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
     )
 
     Scheduler.event_loop_overlap.__wrapped__(scheduler)
@@ -289,6 +306,8 @@ def test_target_extend_publishes_exact_boundary(
 
     assert copies == ([] if expected_copy is None else [expected_copy])
     assert tails == [([1], [expected_tail])]
+    assert lifecycle._state_adapter.draft_initializations == [([1], [20])]
+    assert lifecycle._state_adapter.verify_boundaries == [([1], [10])]
     assert draft_ctx.boundary_indices.tolist() == [10]
     assert draft_ctx.next_boundary_indices.tolist() == [11]
 

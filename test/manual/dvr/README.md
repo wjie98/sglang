@@ -74,6 +74,11 @@ curl http://127.0.0.1:30000/generate \
 
 ## Recurrent-state lifecycle
 
+The isolated self-draft state lifecycle and its H20 qualification gates are
+recorded in `local/STATE_LIFECYCLE_REDESIGN.md`. The transition below describes
+the implemented lifecycle; release qualification still requires the documented
+NVLink correctness and performance matrix.
+
 For gated linear-attention models, the ordinary token KV cache and the
 recurrent state have different lifetimes. DVR keeps the full-attention KV in
 SGLang's existing request and Radix pools. It treats only a recurrent state at
@@ -88,15 +93,20 @@ The state transition is:
 2. Under overlap scheduling, unfinished-prefill result processing completes
    any Radix checkpoint donation before the first DVR decode resolves physical
    checkpoint slots.
-3. Draft execution is provisional. Self-draft may mutate the target live state
-   and therefore saves its convolution state; EAGLE/MTP uses its own draft
-   cache. Neither draft backend changes the authoritative target boundary.
-4. Target verify restores that boundary and runs deterministic EXTEND over one
-   fixed `64 + draft_tokens` window. The first 64 rows reproduce the original
-   chunk partition; only the logical draft rows are returned.
+3. Target EXTEND seeds one request-owned self-draft recurrent workspace and
+   convolution state. Self-draft mutates only this private state; EAGLE/MTP
+   advances its upstream-owned draft cache. Neither backend changes the
+   authoritative target boundary.
+4. Target verify reads the exact boundary without overwriting it and runs
+   deterministic EXTEND over one fixed `64 + draft_tokens` window. The first 64
+   rows reproduce the original chunk partition; only logical draft rows are
+   returned, and the exported boundary state is staged in the now-idle
+   self-draft workspace.
 5. Rollback commits only accepted rows. Crossing a 64-token boundary publishes
-   the exact intermediate recurrent state into the alternate checkpoint slot
-   and shifts the input window by one chunk.
+   the staged boundary state into the alternate checkpoint slot and compacts
+   the input window. Self-draft then rebuilds its private endpoint from the
+   newest exact boundary plus the accepted tail; EAGLE/MTP skips this target
+   recurrent-state reconstruction.
 6. Request release publishes the newest exact checkpoint no later than the
    visible committed prefix. Radix stores only that aligned prefix; a later
    request rebuilds the non-aligned suffix through ordinary EXTEND. If no such

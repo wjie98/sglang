@@ -103,9 +103,10 @@ with gzip.open(trace_path, "rt") as f:
     events = json.load(f)["traceEvents"]
 
 stage_names = {
-    "draft", "dvr_prepare", "verify_prepare", "dvr_state_restore", "verify",
-    "verify_sample", "verify_logprob", "dvr_rollback", "dvr_checkpoint",
-    "draft_extend",
+    "draft", "dvr_prepare", "verify_prepare", "verify", "verify_sample",
+    "verify_logprob", "dvr_rollback", "dvr_checkpoint", "draft_extend",
+    "draft_state_copy", "draft_state_rebuild", "state_window_compact",
+    "boundary_publish",
 }
 durations = collections.defaultdict(list)
 graph_launches = 0
@@ -198,7 +199,6 @@ if draft_events and len(draft_events) > 1 and verify_name is not None:
     )
     maintenance_names = (
         "verify_prepare",
-        "dvr_state_restore",
         "verify_sample",
         "verify_logprob",
         "dvr_rollback",
@@ -230,7 +230,8 @@ kernel_groups = {
         "recompute_w_u_fwd_kernel",
     ),
     "gdn_verify_output": ("chunk_fwd_kernel_o",),
-    "dvr_state_rebuild": ("_dvr_gdn_rebuild_live_state_kernel",),
+    "dvr_state_rebuild": ("_dvr_gdn_rebuild_draft_state_kernel",),
+    "dvr_window_compact": ("_dvr_compact_state_window_kernel",),
     "dvr_state_scatter": (
         "_fused_mamba_state_scatter_with_mask_kernel",
         "_fused_conv_window_scatter_with_mask_kernel",

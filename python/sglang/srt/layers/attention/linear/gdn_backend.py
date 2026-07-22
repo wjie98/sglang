@@ -324,6 +324,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        using_dvr_draft_state = False
+        if self.dvr_state_adapter is not None:
+            draft_state = self.dvr_state_adapter.decode_state(
+                layer_cache=layer_cache,
+                forward_batch=forward_batch,
+                layer_idx=self.req_to_token_pool.mamba_map[layer.layer_id],
+            )
+            if draft_state is not None:
+                conv_states, ssm_states, cache_indices = draft_state
+                using_dvr_draft_state = True
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
         # per-row write cursor. All None unless --enable-linear-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
@@ -366,9 +376,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
-            self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices
-            )
+            if not using_dvr_draft_state:
+                self._track_mamba_state_decode(
+                    forward_batch, conv_states, ssm_states, cache_indices
+                )
             return core_attn_out
 
         query, key, value = torch.split(
@@ -395,9 +406,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
-        )
+        if not using_dvr_draft_state:
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
 
         return core_attn_out
 
@@ -469,13 +481,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             draft_token_num = forward_batch.spec_info.draft_token_num
             verify_cache_indices = cache_indices[:batch_size]
             if dvr_state_adapter is not None:
-                dvr_indices, state_input_indices, valid_mask = (
+                boundary_indices, state_input_indices, valid_mask = (
                     dvr_state_adapter.target_verify_indices(
                         forward_batch=forward_batch,
                         cache_indices=cache_indices,
                     )
                 )
-                verify_cache_indices = dvr_indices
+                verify_cache_indices = torch.where(
+                    valid_mask,
+                    verify_cache_indices,
+                    torch.zeros_like(verify_cache_indices),
+                )
 
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
@@ -565,10 +581,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     g=g,
                     beta=beta,
                     state_cache=mamba_cache_params,
-                    dvr_indices=dvr_indices,
+                    boundary_indices=boundary_indices,
                     state_input_indices=state_input_indices,
                     valid_mask=valid_mask,
-                    intermediate_state_indices=intermediate_state_indices,
                     layer_idx=layer_idx,
                 )
         else:

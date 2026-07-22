@@ -132,6 +132,7 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Raw index arrays (before index_select)
     dst_indices_raw_ptr,  # [total_requests] - state_indices_tensor
     step_indices_raw_ptr,  # [total_requests] - last_correct_step_indices or mamba_steps_to_track
+    src_indices_raw_ptr,
     elem_per_entry: tl.constexpr,
     src_layer_stride,
     src_req_stride,
@@ -141,6 +142,7 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     src_req_size,
     src_step_size,
     dst_req_size,
+    USE_SRC_INDICES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -168,8 +170,11 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Load destination index
     dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
 
-    # Source index is just the request index itself
-    src_idx = pid_req
+    src_idx = (
+        tl.load(src_indices_raw_ptr + pid_req).to(tl.int64)
+        if USE_SRC_INDICES
+        else pid_req
+    )
 
     # Bounds check to avoid illegal memory access
     if not (
@@ -204,6 +209,8 @@ def fused_mamba_state_scatter_with_mask(
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
     dst_indices_raw: torch.Tensor,  # [total_requests] - raw indices (e.g., state_indices_tensor)
     step_indices_raw: torch.Tensor,  # [total_requests] - raw step indices (step >= 0 means valid)
+    *,
+    src_indices_raw: torch.Tensor | None = None,
 ):
     """
     Fully fused gather-scatter with built-in masking for mamba state updates.
@@ -220,6 +227,8 @@ def fused_mamba_state_scatter_with_mask(
         src: Source tensor [num_layers, spec_size, draft_tokens, *state_shape]
         dst_indices_raw: Raw destination indices for all requests [total_requests]
         step_indices_raw: Raw step indices; entry >= 0 means valid [total_requests]
+        src_indices_raw: Optional source row per request. The default preserves
+            the original batch-row source convention.
     """
     total_requests = step_indices_raw.shape[0]
     if total_requests == 0:
@@ -251,6 +260,11 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"indices length mismatch: {dst_indices_raw.shape[0]=} vs {step_indices_raw.shape[0]=}"
         )
+    if src_indices_raw is not None and src_indices_raw.shape != dst_indices_raw.shape:
+        raise ValueError(
+            "source and destination indices must have the same shape: "
+            f"{src_indices_raw.shape=} vs {dst_indices_raw.shape=}"
+        )
 
     num_layers = dst.shape[0]
     src_req_size = src.shape[1]
@@ -267,9 +281,15 @@ def fused_mamba_state_scatter_with_mask(
     dst_layer_stride = dst.stride(0)
     dst_req_stride = dst.stride(1)
 
+    use_src_indices = src_indices_raw is not None
+
     # Ensure indices are int32 and contiguous
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+    if src_indices_raw is None:
+        src_indices_raw = dst_indices_raw
+    else:
+        src_indices_raw = src_indices_raw.to(torch.int32).contiguous()
 
     # Ensure tensors are contiguous
     if not dst.is_contiguous():
@@ -288,6 +308,7 @@ def fused_mamba_state_scatter_with_mask(
         dst,
         dst_indices_raw,
         step_indices_raw,
+        src_indices_raw,
         elem_per_entry,
         src_layer_stride,
         src_req_stride,
@@ -297,6 +318,7 @@ def fused_mamba_state_scatter_with_mask(
         src_req_size,
         src_step_size,
         dst_req_size,
+        USE_SRC_INDICES=use_src_indices,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
