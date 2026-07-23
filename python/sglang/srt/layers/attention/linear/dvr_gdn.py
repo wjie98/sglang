@@ -57,6 +57,8 @@ if not is_cpu():
         E0: tl.constexpr,
         E1: tl.constexpr,
         HAS_SECOND: tl.constexpr,
+        READ_FIRST_CACHE: tl.constexpr,
+        WRITE_FIRST_CACHE: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         i_req = tl.program_id(0).to(tl.int64)
@@ -78,7 +80,10 @@ if not is_cpu():
             + candidate_token * candidate0_token_stride
             + offsets
         )
-        cache0_value = tl.load(cache0_ptr, mask=offsets < E0, other=0)
+        if READ_FIRST_CACHE:
+            cache0_value = tl.load(cache0_ptr, mask=offsets < E0, other=0)
+        else:
+            cache0_value = 0.0
         candidate0_value = tl.load(
             candidate0_ptr, mask=(offsets < E0) & is_candidate, other=0
         )
@@ -91,11 +96,12 @@ if not is_cpu():
             value0,
             mask=offsets < E0,
         )
-        tl.store(
-            cache0_ptr,
-            candidate0_value,
-            mask=(offsets < E0) & is_candidate,
-        )
+        if WRITE_FIRST_CACHE:
+            tl.store(
+                cache0_ptr,
+                candidate0_value,
+                mask=(offsets < E0) & is_candidate,
+            )
 
         if HAS_SECOND:
             cache1_ptr = (
@@ -240,6 +246,8 @@ def _pack_verify_window_pair(
     valid_mask: torch.Tensor,
     cache1: Optional[torch.Tensor] = None,
     candidate1: Optional[torch.Tensor] = None,
+    read_cache0: bool = True,
+    persist_cache0: bool = True,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Materialize one or two verify windows while persisting candidate rows."""
 
@@ -302,6 +310,8 @@ def _pack_verify_window_pair(
         E0=e0,
         E1=e1,
         HAS_SECOND=has_second,
+        READ_FIRST_CACHE=read_cache0,
+        WRITE_FIRST_CACHE=persist_cache0,
         BLOCK_SIZE=block_size,
     )
     return output0, output1
@@ -357,7 +367,7 @@ def _local_gdn_dimensions(state_shape):
 
 
 def dvr_gdn_state_input_bytes_per_request(cache_params, num_draft_tokens: int) -> int:
-    """Return persistent q/k/v/g/beta window bytes for one request slot."""
+    """Return persistent k/v/g/beta transition-window bytes per request."""
 
     local_key_heads, local_value_heads, key_dim, value_dim = _local_gdn_dimensions(
         cache_params.shape
@@ -365,7 +375,7 @@ def dvr_gdn_state_input_bytes_per_request(cache_params, num_draft_tokens: int) -
     window_len = FLA_CHUNK_SIZE + num_draft_tokens
     conv_bytes = cache_params.dtype.conv.itemsize
     values_per_token = (
-        2 * local_key_heads * key_dim * conv_bytes
+        local_key_heads * key_dim * conv_bytes
         + local_value_heads * value_dim * conv_bytes
         + 2 * local_value_heads * 4  # g and beta are fp32.
     )
@@ -417,7 +427,7 @@ def _rebuild_gdn_self_draft_state(
 ) -> None:
     """Rebuild request-owned self-draft state from an exact boundary and tail."""
 
-    _, k, v, g, beta = state_window.tensors
+    k, v, g, beta = state_window.tensors
     if is_cpu():
         raise NotImplementedError("DVR GDN self-draft state rebuild is GPU-only.")
     num_layers, num_slots, num_tokens, num_key_heads, key_dim = k.shape
@@ -530,7 +540,7 @@ class DVRGDNStateAdapter:
         # Mirror that indexing directly instead of maintaining a second offset.
         num_slots = state_cache.intermediate_ssm.shape[1]
         window_len = FLA_CHUNK_SIZE + num_draft_tokens
-        q = torch.zeros(
+        k = torch.zeros(
             num_layers,
             num_slots,
             window_len,
@@ -561,7 +571,7 @@ class DVRGDNStateAdapter:
             kernel_dispatcher,
             draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
             state_input_cache=DVRStateInputCache(
-                tensors=(q, torch.zeros_like(q), v, gate, torch.zeros_like(gate)),
+                tensors=(k, v, gate, torch.zeros_like(gate)),
                 # Slot 0 is the padded-row dummy; real rows use req_pool_idx.
                 tail_lens=torch.zeros(
                     num_slots, dtype=torch.int32, device=model_runner.device
@@ -711,15 +721,16 @@ class DVRGDNStateAdapter:
         ):
             return
 
+        # q affects only the output at its own token; it does not participate in
+        # the recurrent transition. Target verify receives candidate q directly.
         state_inputs = (
-            q.reshape(q.shape[1], q.shape[2], q.shape[3]),
             k.reshape(k.shape[1], k.shape[2], k.shape[3]),
             v.reshape(v.shape[1], v.shape[2], v.shape[3]),
             g.reshape(-1, g.shape[-1]),
             beta.reshape(-1, beta.shape[-1]),
         )
         state_input_indices = forward_batch.req_pool_indices.to(
-            device=q.device, dtype=torch.long
+            device=k.device, dtype=torch.long
         )
         state_window.write_extend_tail(
             values=state_inputs,
@@ -797,7 +808,7 @@ class DVRGDNStateAdapter:
         boundary_state_steps: torch.Tensor,
         layer_idx: int,
     ) -> torch.Tensor:
-        """Replay GDN state from cached prefill inputs and draft q/k/v/g/beta."""
+        """Replay GDN state from cached transitions and candidate q/k/v/g/beta."""
 
         assert self.state_input_cache is not None
         batch_size = boundary_indices.shape[0]
@@ -814,16 +825,21 @@ class DVRGDNStateAdapter:
         # They are causally after every returned logit, a boundary is exported
         # only after all chunk rows are valid, and state rebuilds use token_count.
         if query.is_cuda:
-            q_cache, k_cache, v_cache, g_cache, beta_cache = state_window.tensors
+            k_cache, v_cache, g_cache, beta_cache = state_window.tensors
             with profile_range("verify_state_pack"):
+                # Cached q rows would produce only discarded prefix outputs.
+                # Keep them zero while packing candidate q and persistent k in
+                # the same launch.
                 q, k = _pack_verify_window_pair(
-                    q_cache,
+                    k_cache,
                     draft_state_inputs[0],
                     cache1=k_cache,
                     candidate1=draft_state_inputs[1],
                     state_input_indices=state_input_indices,
                     tail_lens=tail_lens,
                     valid_mask=valid_mask,
+                    read_cache0=False,
+                    persist_cache0=False,
                 )
                 v, _ = _pack_verify_window_pair(
                     v_cache,
@@ -846,11 +862,16 @@ class DVRGDNStateAdapter:
             state_window.write_rows(
                 indices=state_input_indices.unsqueeze(1).expand(-1, draft_token_num),
                 cols=cols,
-                values=draft_state_inputs,
+                values=draft_state_inputs[1:],
             )
-            q, k, v, cached_g, cached_beta = state_window.read(
+            k, v, cached_g, cached_beta = state_window.read(
                 indices=state_input_indices
             )
+            q = query.new_zeros(
+                (batch_size, state_window.capacity, *query.shape[2:])
+            )
+            rows = torch.arange(batch_size).unsqueeze(1)
+            q[rows, cols] = draft_state_inputs[0]
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=q,
             k=k,

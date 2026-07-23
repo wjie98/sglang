@@ -48,7 +48,7 @@ Use these names only inside DVR. Do not redefine the meaning of upstream
 | `workspace` | One reusable full recurrent state per layer/request | `intermediate_ssm[..., 0]` | DVR state lifecycle | Draft endpoint, then `h64` staging, then rebuilt endpoint | No |
 | `draft_conv` | Private self-draft convolution state | Request-indexed DVR conv allocation | DVR self-draft | Seeded after EXTEND; advanced by draft; finalized from accepted verify state | No |
 | `target_conv` | Accepted convolution endpoint used by target verify | Existing target live convolution slot | Target | Updated from accepted verify state | No |
-| `W` | Exact transition inputs after `B_active` | Request-indexed `q/k/v/g/beta` window of length `64 + D` | Target verify | Append accepted rows; compact on a crossing | No |
+| `W` | Exact transition inputs after `B_active` | Request-indexed `k/v/g/beta` window of length `64 + D`; candidate `q` is verify-local | Target verify | Append accepted rows; compact on a crossing | No |
 | `V` | Non-recurrent verify outputs | Target logits, candidate conv windows, and EAGLE hidden states | Target verify | One proposal block | No |
 
 `draft_state` is a derived cache, not a second authoritative target state.

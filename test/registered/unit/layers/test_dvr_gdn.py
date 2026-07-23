@@ -61,21 +61,19 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
         device="cpu",
     )
 
-    q_cache, k_cache, v_cache, g_cache, beta_cache = cache.tensors
-    assert q_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 8, 128)
+    k_cache, v_cache, g_cache, beta_cache = cache.tensors
     assert k_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 8, 128)
     assert v_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16, 128)
     assert g_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
     assert beta_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
 
-    q = torch.randn(2, 8, 128)
     k = torch.randn(2, 8, 128)
     v = torch.randn(2, 16, 128)
     g = torch.randn(2, 16)
     beta = torch.randn(2, 16)
     layer_cache = cache[0]
     layer_cache.write_extend_tail(
-        values=(q, k, v, g, beta),
+        values=(k, v, g, beta),
         indices=torch.tensor([1]),
         extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
         extend_seq_lens_cpu=[2],
@@ -83,8 +81,7 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
     )
 
     assert torch.equal(layer_cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
-    q_cache, k_cache, v_cache, g_cache, beta_cache = layer_cache.tensors
-    assert torch.equal(q_cache[1, :2], q)
+    k_cache, v_cache, g_cache, beta_cache = layer_cache.tensors
     assert torch.equal(k_cache[1, :2], k)
     assert torch.equal(v_cache[1, :2], v)
     assert torch.equal(g_cache[1, :2], g)
@@ -224,14 +221,13 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
     )
     layer_cache = cache[0]
     assert torch.equal(layer_cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
-    q_cache, k_cache, v_cache, g_cache, beta_cache = layer_cache.tensors
-    assert torch.equal(q_cache[1, :2], q.reshape(2, 8, 128))
+    k_cache, v_cache, g_cache, beta_cache = layer_cache.tensors
     assert torch.equal(k_cache[1, :2], k.reshape(2, 8, 128))
     assert torch.equal(v_cache[1, :2], v.reshape(2, 16, 128))
     assert torch.equal(g_cache[1, :2], g)
     assert torch.equal(beta_cache[1, :2], beta)
     # Rows after tail_lens are outside every consumed causal prefix. Keeping
-    # them untouched avoids clearing the full q/k/v/g/beta window per verify.
+    # them untouched avoids clearing the full k/v/g/beta window per verify.
     for tensor in layer_cache.tensors:
         assert torch.all(tensor[1, 2:] == 1)
 
@@ -350,9 +346,10 @@ def test_gdn_verify_rejects_backend_without_boundary_states():
         intermediate_ssm=torch.zeros(3, 1, 16, 128, 128),
     )
 
+    query = torch.ones(1, 2, 8, 128)
     with pytest.raises(RuntimeError, match="exact chunk-boundary states"):
         adapter.forward_target_verify(
-            query=torch.zeros(1, 2, 8, 128),
+            query=query,
             key=torch.zeros(1, 2, 8, 128),
             value=torch.zeros(1, 2, 16, 128),
             g=torch.zeros(1, 2, 16),
@@ -360,13 +357,15 @@ def test_gdn_verify_rejects_backend_without_boundary_states():
             state_cache=state_cache,
             boundary_indices=torch.tensor([0]),
             state_input_indices=torch.tensor([1]),
-            tail_lens=torch.tensor([0]),
+            tail_lens=torch.tensor([2]),
             valid_mask=torch.tensor([True]),
             boundary_state_steps=torch.tensor([-1]),
             layer_idx=0,
         )
     assert calls[0]["inplace_update"] is False
     assert torch.equal(calls[0]["cache_indices"], torch.tensor([0]))
+    assert torch.count_nonzero(calls[0]["q"][:, :2]) == 0
+    assert torch.equal(calls[0]["q"][:, 2:4], query)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -409,6 +408,32 @@ def test_gdn_verify_window_pack_matches_indexing_reference():
     torch.testing.assert_close(cache1, expected1)
     torch.testing.assert_close(output0, expected_output0)
     torch.testing.assert_close(output1, expected_output1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_gdn_verify_window_pack_can_keep_query_candidate_only():
+    cache = torch.randn(2, 9, 2, 4, device="cuda")
+    original = cache.clone()
+    query = torch.randn(1, 3, 2, 4, device="cuda")
+    key = torch.randn_like(query)
+
+    packed_query, packed_key = dvr_gdn_module._pack_verify_window_pair(
+        cache,
+        query,
+        cache1=cache,
+        candidate1=key,
+        state_input_indices=torch.tensor([1], device="cuda"),
+        tail_lens=torch.tensor([4], device="cuda"),
+        valid_mask=torch.tensor([True], device="cuda"),
+        read_cache0=False,
+        persist_cache0=False,
+    )
+
+    assert torch.count_nonzero(packed_query[:, :4]) == 0
+    torch.testing.assert_close(packed_query[:, 4:7], query)
+    torch.testing.assert_close(cache[0], original[0])
+    torch.testing.assert_close(cache[1, 4:7], key[0])
+    torch.testing.assert_close(packed_key, cache[torch.tensor([1], device="cuda")])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -465,13 +490,12 @@ def test_gdn_self_draft_state_is_request_owned_and_keeps_target_unchanged():
 def test_gdn_self_draft_rebuild_reads_boundary_and_writes_workspace():
     torch.manual_seed(1)
     layers, slots, tokens, dim = 2, 5, 80, 16
-    q = torch.randn(layers, slots, tokens, 1, dim, device="cuda")
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    k = torch.randn(layers, slots, tokens, 1, dim, device="cuda")
+    v = torch.randn_like(k)
     g = torch.randn(layers, slots, tokens, 1, device="cuda") * 0.01
     beta = torch.sigmoid(torch.randn_like(g))
     window = DVRStateInputCache(
-        tensors=(q, k, v, g, beta),
+        tensors=(k, v, g, beta),
         tail_lens=torch.zeros(slots, dtype=torch.int32, device="cuda"),
     )
     temporal = torch.randn(layers, 7, 1, dim, dim, device="cuda") * 0.01

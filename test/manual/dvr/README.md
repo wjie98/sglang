@@ -83,7 +83,8 @@ For gated linear-attention models, the ordinary token KV cache and the
 recurrent state have different lifetimes. DVR keeps the full-attention KV in
 SGLang's existing request and Radix pools. It treats only a recurrent state at
 an exact 64-token boundary as a persistent checkpoint and keeps the unclosed
-tail as request-owned `q/k/v/g/beta` inputs.
+tail as request-owned `k/v/g/beta` transition inputs. Cached `q` is unnecessary:
+verify consumes `q` only for the current candidate outputs.
 
 The state transition is:
 

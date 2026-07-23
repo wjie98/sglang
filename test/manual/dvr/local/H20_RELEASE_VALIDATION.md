@@ -50,7 +50,8 @@ coverage.
   discarded with the request; the next request must report no Radix reuse and
   perform an ordinary full prefill.
 - Each GDN layer retains at most one unclosed 64-token tail plus the current
-  draft rows as `q/k/v/g/beta`. Self-draft additionally owns one request-indexed
+  draft rows as `k/v/g/beta` transition inputs; candidate `q` is supplied
+  directly to verify. Self-draft additionally owns one request-indexed
   recurrent workspace and private convolution state. EAGLE/MTP owns a separate
   upstream draft cache and does not write target state-input windows.
 
@@ -101,7 +102,7 @@ coverage.
   prefill result is consumed exactly once before that batch is constructed.
 - At phase boundaries, `boundary_length + tail_length` equals the target's
   committed state length.
-- The boundary and `q/k/v/g/beta` window come from the same accepted target
+- The boundary and `k/v/g/beta` window come from the same accepted target
   history; rejected rows never become authoritative.
 - A physical checkpoint mapping cannot change between draft preparation and
   rollback.
@@ -174,7 +175,7 @@ One self-DVR block has these state boundaries:
    the exported `h64` after draft has finished.
 4. Commit accepted convolution state for both self and EAGLE.
 5. Rebuild the private self-draft recurrent state from the newest exact boundary plus
-   accepted `q/k/v/g/beta`, with at most 63 rows. EAGLE skips this target-
+   accepted `k/v/g/beta`, with at most 63 rows. EAGLE skips this target-
    temporal operation and finalizes its own cache through the upstream worker.
 6. Publish and compact only when accepted history crosses 64 tokens.
 
