@@ -3,6 +3,8 @@ import itertools
 import pytest
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers import elementwise
 from sglang.srt.layers.elementwise import fused_gate_sigmoid_mul_add
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -77,10 +79,41 @@ def test_token_count_does_not_change_reduction():
     below_boundary = initial[:-1].clone()
     at_boundary = initial.clone()
 
-    fused_gate_sigmoid_mul_add(hs[:-1], gw, so[:-1], below_boundary)
-    fused_gate_sigmoid_mul_add(hs, gw, so, at_boundary)
+    with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True):
+        fused_gate_sigmoid_mul_add(hs[:-1], gw, so[:-1], below_boundary)
+        fused_gate_sigmoid_mul_add(hs, gw, so, at_boundary)
 
     torch.testing.assert_close(below_boundary, at_boundary[:-1], rtol=0, atol=0)
+
+
+def test_large_batch_warp_policy_follows_deterministic_mode(monkeypatch):
+    launches = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs["num_warps"])
+
+            return launch
+
+    monkeypatch.setattr(elementwise, "_fused_gate_sigmoid_mul_add_kernel", FakeKernel())
+    monkeypatch.setattr(elementwise, "is_arch_support_pdl", lambda: False)
+
+    hidden_states = torch.empty(1024, 4096)
+    gate_weight = torch.empty(4096)
+    shared_output = torch.empty_like(hidden_states)
+    final_hidden_states = torch.empty_like(hidden_states)
+
+    with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False):
+        fused_gate_sigmoid_mul_add(
+            hidden_states, gate_weight, shared_output, final_hidden_states
+        )
+    with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True):
+        fused_gate_sigmoid_mul_add(
+            hidden_states, gate_weight, shared_output, final_hidden_states
+        )
+
+    assert launches == [8, 16]
 
 
 if __name__ == "__main__":

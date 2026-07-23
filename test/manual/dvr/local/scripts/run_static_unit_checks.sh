@@ -17,6 +17,7 @@ DVR_PY_FILES=(
   python/sglang/srt/layers/attention/linear/gdn_backend.py
   python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
   python/sglang/srt/layers/attention/mamba/mamba_state_scatter_triton.py
+  python/sglang/srt/layers/elementwise.py
   python/sglang/srt/layers/moe/token_dispatcher/flashinfer.py
   python/sglang/srt/managers/scheduler.py
   python/sglang/srt/managers/tokenizer_manager.py
@@ -39,6 +40,7 @@ DVR_PY_FILES=(
   test/manual/dvr/local/clients/dvr_eagle_acceptance.py
   test/manual/dvr/local/clients/dvr_radix_lifecycle.py
   test/registered/unit/layers/test_dvr_gdn.py
+  test/manual/layers/test_fused_gate_sigmoid_mul_add.py
   test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py
   test/registered/unit/server_args/test_dvr_server_args.py
   test/registered/unit/speculative/test_dvr_state_flow.py
@@ -57,6 +59,7 @@ conda_python -m pytest \
   test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py \
   test/registered/unit/server_args/test_dvr_server_args.py \
   test/registered/unit/layers/test_dvr_gdn.py \
+  test/manual/layers/test_fused_gate_sigmoid_mul_add.py::test_large_batch_warp_policy_follows_deterministic_mode \
   test/registered/unit/layers/test_mamba_state_scatter_triton.py::TestMambaStateScatterCorrectness::test_fused_supports_explicit_source_rows \
   test/registered/attention/test_chunk_gated_delta_rule.py::TestChunkGatedDeltaRule::test_boundary_state_preserves_initial_state_dtype \
   test/registered/attention/test_chunk_gated_delta_rule.py::TestChunkGatedDeltaRule::test_non_inplace_verify_preserves_initial_state \
