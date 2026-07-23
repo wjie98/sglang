@@ -118,6 +118,133 @@ def _dvr_proposal_probs(probs, sampling_info, sampling_backend, repeat=1):
     return probs
 
 
+class _SelfDraftBackend:
+    """Self-draft operations around the common DVR target transaction."""
+
+    capture_hidden_mode = CaptureHiddenMode.NULL
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def context(self):
+        return dvr_draft_decode_context(
+            self.owner.model_runner,
+            self.owner._draft_decode_buffers,
+            self_draft=True,
+        )
+
+    def idle_input(self):
+        return EagleDraftInput.create_idle_input(
+            device=self.owner.device,
+            hidden_size=None,
+            dtype=None,
+            topk=self.owner.topk,
+            capture_hidden_mode=self.capture_hidden_mode,
+        )
+
+    def finish_prefill(self, batch, batch_result):
+        draft_input = self.owner._self_draft_input(batch_result.next_token_ids)
+        batch.spec_info = draft_input
+        return draft_input
+
+    def propose(self, batch):
+        return self.owner._draft_self(batch)
+
+    @staticmethod
+    def prepare_verify(batch, spec_info):
+        # ForwardBatch.init_new consumes this one-shot host-length mirror.
+        batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
+
+    @staticmethod
+    def record_verify_inputs(batch, current_stream):
+        pass
+
+    @staticmethod
+    def validate_verify_output(logits_output):
+        pass
+
+    def next_input(self, bonus_tokens):
+        return self.owner._self_draft_input(bonus_tokens)
+
+    @staticmethod
+    def finalize(batch, batch_result):
+        pass
+
+
+class _EagleDraftBackend:
+    """Upstream EAGLE/MTP draft operations around the DVR target transaction."""
+
+    capture_hidden_mode = CaptureHiddenMode.FULL
+
+    def __init__(self, owner, worker):
+        self.owner = owner
+        self.worker = worker
+
+    @contextmanager
+    def context(self):
+        with (
+            self.worker.draft_tp_context(self.worker.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            dvr_draft_decode_context(
+                self.worker.draft_runner,
+                self.owner._draft_decode_buffers,
+                extra_attn_backends=self.owner.spec_v2_attn_backends[1:],
+            ),
+        ):
+            yield
+
+    def idle_input(self):
+        return EagleDraftInput.create_idle_input(
+            device=self.owner.device,
+            hidden_size=EagleDraftInput.hidden_size_for(self.worker),
+            dtype=EagleDraftInput.dtype_for(self.worker),
+            topk=self.owner.topk,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            vocab_size=self.owner.target_worker.model_config.vocab_size,
+        )
+
+    def finish_prefill(self, batch, batch_result):
+        with self.context():
+            return self.worker._draft_extend_for_prefill(
+                batch,
+                batch_result.logits_output.hidden_states,
+                batch_result.next_token_ids,
+                batch_result.logits_output.mm_input_embeds,
+            )
+
+    def propose(self, batch):
+        return self.worker.draft(batch)
+
+    @staticmethod
+    def prepare_verify(batch, spec_info):
+        record_stream_for_v2_verify(
+            batch,
+            spec_info,
+            torch.get_device_module(batch.device).current_stream(),
+        )
+
+    @staticmethod
+    def record_verify_inputs(batch, current_stream):
+        record_stream_each((batch.input_ids, batch.out_cache_loc), current_stream)
+
+    @staticmethod
+    def validate_verify_output(logits_output):
+        if logits_output.hidden_states is None:
+            raise RuntimeError(
+                "DVR EAGLE target verify must return hidden states for the next "
+                "draft step."
+            )
+
+    @staticmethod
+    def next_input(bonus_tokens):
+        return EagleDraftInput(bonus_tokens=bonus_tokens)
+
+    def finalize(self, batch, batch_result):
+        with self.context(), spec_stage_span("dvr_rollback_draft"):
+            self.worker._draft_extend_for_decode(batch, batch_result)
+
+
 class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     """Self-decode draft worker with DVR target verify/rollback semantics.
 
@@ -204,10 +331,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
                 self.plan_stream = device_module.Stream()
                 self.plan_stream_ctx = device_module.stream(self.plan_stream)
+            self._draft_backend = _EagleDraftBackend(self, self._draft_worker)
             log_prefix = "DVR EAGLE"
         else:
             del dp_rank, moe_ep_rank, attn_cp_rank, moe_dp_rank, nccl_port
             self._draft_worker = None
+            self._draft_backend = _SelfDraftBackend(self)
             log_prefix = "DVR self-decode"
 
         logger.info(
@@ -217,48 +346,11 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             self.num_draft_tokens,
         )
 
-    @contextmanager
     def _draft_context(self):
-        if not self.is_dvr_eagle:
-            # Replay metadata must use the same fast attention policy captured
-            # by the dedicated self-draft graph.
-            with dvr_draft_decode_context(
-                self.model_runner,
-                self._draft_decode_buffers,
-                self_draft=True,
-            ):
-                yield
-            return
-        draft_worker = self._draft_worker
-        with (
-            draft_worker.draft_tp_context(draft_worker.draft_runner.tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-            dvr_draft_decode_context(
-                draft_worker.draft_runner,
-                self._draft_decode_buffers,
-                extra_attn_backends=self.spec_v2_attn_backends[1:],
-            ),
-        ):
-            yield
+        return self._draft_backend.context()
 
     def _idle_draft_input(self) -> EagleDraftInput:
-        if not self.is_dvr_eagle:
-            return EagleDraftInput.create_idle_input(
-                device=self.device,
-                hidden_size=None,
-                dtype=None,
-                topk=self.topk,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-            )
-        return EagleDraftInput.create_idle_input(
-            device=self.device,
-            hidden_size=EagleDraftInput.hidden_size_for(self._draft_worker),
-            dtype=EagleDraftInput.dtype_for(self._draft_worker),
-            topk=self.topk,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
-            vocab_size=self.target_worker.model_config.vocab_size,
-        )
+        return self._draft_backend.idle_input()
 
     @staticmethod
     def _self_draft_input(bonus_tokens: torch.Tensor) -> EagleDraftInput:
@@ -588,29 +680,16 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         batch = model_worker_batch
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            batch.capture_hidden_mode = (
-                CaptureHiddenMode.FULL if self.is_dvr_eagle else CaptureHiddenMode.NULL
-            )
+            batch.capture_hidden_mode = self._draft_backend.capture_hidden_mode
             self.linear_state.prepare_target_extend(batch)
             batch_result = self.target_worker.forward_batch_generation(batch)
             batch_result.new_seq_lens = batch.seq_lens
             self.linear_state.finish_target_extend(batch)
             if on_publish is not None:
                 on_publish(batch_result.new_seq_lens)
-            if self.is_dvr_eagle:
-                with self._draft_context():
-                    batch_result.next_draft_input = (
-                        self.draft_worker._draft_extend_for_prefill(
-                            batch,
-                            batch_result.logits_output.hidden_states,
-                            batch_result.next_token_ids,
-                            batch_result.logits_output.mm_input_embeds,
-                        )
-                    )
-            else:
-                next_token_ids = batch_result.next_token_ids
-                batch.spec_info = self._self_draft_input(next_token_ids)
-                batch_result.next_draft_input = batch.spec_info
+            batch_result.next_draft_input = self._draft_backend.finish_prefill(
+                batch, batch_result
+            )
             return batch_result
 
         # DVR decode has one shared core: draft -> target verify -> rollback.
@@ -629,11 +708,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             verify_input = self._build_one_root_verify_input(batch)
         else:
             with self._draft_context(), spec_stage_span("draft"):
-                verify_input = (
-                    self._draft_worker.draft(batch)
-                    if self.is_dvr_eagle
-                    else self._draft_self(batch)
-                )
+                verify_input = self._draft_backend.propose(batch)
         assert verify_input.is_verify_input()
         batch.spec_info = verify_input
         batch_result = self.verify(
@@ -646,12 +721,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # Discard a draft-phase or synchronous previous-iteration event. Only
         # the final rollback reader may release scheduler result writes.
         final_reader.war_fastpath_read_done_event = None
-        if self.is_dvr_eagle:
-            # EAGLE's draft-extend commits the accepted target result into the
-            # draft backend. It is therefore the final part of rollback, not a
-            # phase that may race scheduler result writes after target rollback.
-            with self._draft_context(), spec_stage_span("dvr_rollback_draft"):
-                self.draft_worker._draft_extend_for_decode(batch, batch_result)
+        # EAGLE's draft-extend catches its private cache up to the accepted
+        # target endpoint. Self-draft has no separate cache to finalize.
+        self._draft_backend.finalize(batch, batch_result)
 
         # Publish one fence for the complete rollback transaction. The EAGLE
         # graph records this as soon as draft-extend snapshots shared pools;
@@ -718,13 +790,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         spec_info.custom_mask = None
         verify_tokens = spec_info.draft_token_num
         spec_info.num_tokens_per_req = verify_tokens
-        if self.is_dvr_eagle:
-            fwd_stream = torch.get_device_module(self.device).current_stream()
-            record_stream_for_v2_verify(batch, spec_info, fwd_stream)
-        else:
-            # Self draft already resolved the host lengths needed by the target
-            # graph. ForwardBatch.init_new consumes this one-shot mirror.
-            batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
+        self._draft_backend.prepare_verify(batch, spec_info)
 
         with self.plan_stream_ctx, spec_stage_span("verify_prepare"):
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
@@ -736,8 +802,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             )
 
         current_stream = torch.get_device_module(self.device).current_stream()
-        if self.is_dvr_eagle:
-            record_stream_each((batch.input_ids, batch.out_cache_loc), current_stream)
+        self._draft_backend.record_verify_inputs(batch, current_stream)
         if self.plan_stream is not None:
             current_stream.wait_stream(self.plan_stream)
             runner = self.model_runner.decode_cuda_graph_runner
@@ -778,11 +843,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 batch.sampling_info.vocab_mask = None
 
         logits_output = forward_output.logits_output
-        if self.is_dvr_eagle and logits_output.hidden_states is None:
-            raise RuntimeError(
-                "DVR EAGLE target verify must return hidden states for the next "
-                "draft step."
-            )
+        self._draft_backend.validate_verify_output(logits_output)
 
         # Target acceptance semantics are independent of the draft backend.
         # Accumulated penalties and logit bias are applied by eagle_sample;
@@ -856,10 +917,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             on_publish(new_seq_lens)
         has_verify_tokens = not batch.forward_mode.is_idle() and accept_lens.numel() > 0
 
-        if self.is_dvr_eagle:
-            next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
-        else:
-            next_draft_input = self._self_draft_input(bonus_tokens)
+        next_draft_input = self._draft_backend.next_input(bonus_tokens)
 
         with spec_stage_span("dvr_rollback"):
             self.linear_state.rollback_after_verify(
