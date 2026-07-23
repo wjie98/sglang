@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.model_executor.dvr_draft_cuda_graph_runner as graph_module
+import sglang.srt.model_executor.dvr_cuda_graph_runner as graph_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -12,12 +12,20 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+from sglang.srt.model_executor.dvr_cuda_graph_runner import (
+    _draft_custom_allreduce_enabled,
     _fast_decode_overrides,
     _resolve_dvr_backends,
     _resolve_draft_flashinfer_allreduce_fusion,
     _validate_dvr_attention_backend,
     dvr_draft_decode_context,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -57,11 +65,13 @@ def test_draft_capture_is_fast_and_restores_target_state(
             events.append(("deterministic_env", True))
 
     class FakeGroup:
-        @contextmanager
-        def custom_allreduce_enabled(self, **kwargs):
-            events.append(("custom_all_reduce", True, kwargs))
-            yield True
-            events.append(("custom_all_reduce", False, kwargs))
+        pass
+
+    @contextmanager
+    def custom_allreduce_enabled(_group, **kwargs):
+        events.append(("custom_all_reduce", True, kwargs))
+        yield True
+        events.append(("custom_all_reduce", False, kwargs))
 
     monkeypatch.setattr(
         graph_module,
@@ -79,6 +89,9 @@ def test_draft_capture_is_fast_and_restores_target_state(
     )
     monkeypatch.setattr(
         graph_module, "_iter_decode_custom_all_reduce_groups", lambda _: [FakeGroup()]
+    )
+    monkeypatch.setattr(
+        graph_module, "_draft_custom_allreduce_enabled", custom_allreduce_enabled
     )
     import sglang.srt.batch_invariant_ops as batch_invariant_ops
 
@@ -238,11 +251,13 @@ def test_self_draft_preinitializes_fusion_before_custom_all_reduce(monkeypatch):
             yield
 
     class FakeGroup:
-        @contextmanager
-        def custom_allreduce_enabled(self, **_kwargs):
-            events.append("custom_ar_enter")
-            yield
-            events.append("custom_ar_exit")
+        pass
+
+    @contextmanager
+    def custom_allreduce_enabled(_group, **_kwargs):
+        events.append("custom_ar_enter")
+        yield
+        events.append("custom_ar_exit")
 
     monkeypatch.setattr(
         graph_module,
@@ -260,6 +275,9 @@ def test_self_draft_preinitializes_fusion_before_custom_all_reduce(monkeypatch):
     )
     monkeypatch.setattr(
         graph_module, "_iter_decode_custom_all_reduce_groups", lambda _: [FakeGroup()]
+    )
+    monkeypatch.setattr(
+        graph_module, "_draft_custom_allreduce_enabled", custom_allreduce_enabled
     )
 
     import sglang.srt.batch_invariant_ops as batch_invariant_ops
@@ -283,3 +301,57 @@ def test_self_draft_preinitializes_fusion_before_custom_all_reduce(monkeypatch):
     assert server_args.flashinfer_allreduce_fusion_backend is None
     assert global_server_args.flashinfer_allreduce_fusion_backend is None
     assert events[-1] == "custom_ar_exit"
+
+
+def test_draft_custom_allreduce_context_restores_target_policy():
+    communicator = SimpleNamespace(
+        disabled=True,
+        original_disabled=True,
+        full_nvlink=True,
+    )
+    group = SimpleNamespace(ca_comm=communicator, world_size=2)
+
+    with _draft_custom_allreduce_enabled(
+        group, create_if_missing=False, require_full_nvlink=True
+    ) as enabled:
+        assert enabled
+        assert not communicator.disabled
+
+    assert communicator.disabled
+    assert communicator.original_disabled
+
+    communicator.full_nvlink = False
+    with _draft_custom_allreduce_enabled(
+        group, create_if_missing=False, require_full_nvlink=True
+    ) as enabled:
+        assert not enabled
+        assert communicator.disabled
+
+
+def test_mlp_tp_gather_uses_capture_mode_for_speculative_batch_size():
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.require_mlp_tp_gather = True
+    runner.num_tokens_per_bs = 16
+    runner.enable_pdmux = False
+    runner.disable_padding = False
+    runner.max_bs = 2
+    runner.require_mlp_sync = False
+    runner.is_encoder_decoder = False
+    runner.capture_hidden_mode = CaptureHiddenMode.NULL
+    runner.enable_two_batch_overlap = False
+    runner.model_runner = SimpleNamespace(
+        spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
+    )
+    forward_batch = SimpleNamespace(
+        replace_embeds=None,
+        global_num_tokens_cpu=[32],
+        batch_size=2,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        spec_info=None,
+    )
+
+    runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
+    assert runner.can_run_graph(forward_batch)
+
+    runner.capture_forward_mode = ForwardMode.DLLM_EXTEND
+    assert not runner.can_run_graph(forward_batch)

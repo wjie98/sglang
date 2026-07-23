@@ -1,3 +1,5 @@
+"""CUDA graph integration kept local to DVR draft and target-verify phases."""
+
 from __future__ import annotations
 
 import logging
@@ -210,6 +212,46 @@ def _iter_decode_custom_all_reduce_groups(model_runner):
 
 
 @contextmanager
+def _draft_custom_allreduce_enabled(
+    group, *, create_if_missing=False, require_full_nvlink=False
+):
+    """Enable custom all-reduce only while DVR draft graphs are captured."""
+
+    communicator = group.ca_comm
+    if communicator is None and create_if_missing and group.world_size > 1:
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            dispatch_custom_allreduce,
+        )
+
+        try:
+            communicator = dispatch_custom_allreduce(
+                group=group.cpu_group, device=group.device
+            )(group=group.cpu_group, device=group.device)
+            group.ca_comm = communicator
+            # Deterministic target execution keeps the lazily-created
+            # communicator disabled after draft graph capture.
+            communicator.disabled = True
+            if hasattr(communicator, "original_disabled"):
+                communicator.original_disabled = True
+        except Exception as exc:
+            logger.warning("Setup Custom allreduce failed with %s.", exc)
+            communicator = None
+
+    if communicator is None or (
+        require_full_nvlink and not getattr(communicator, "full_nvlink", False)
+    ):
+        yield False
+        return
+
+    previous_disabled = communicator.disabled
+    communicator.disabled = False
+    try:
+        yield True
+    finally:
+        communicator.disabled = previous_disabled
+
+
+@contextmanager
 def dvr_draft_decode_context(
     model_runner,
     buffer_cache,
@@ -327,7 +369,8 @@ def dvr_draft_decode_context(
                 ):
                     for group in _iter_decode_custom_all_reduce_groups(model_runner):
                         stack.enter_context(
-                            group.custom_allreduce_enabled(
+                            _draft_custom_allreduce_enabled(
+                                group,
                                 create_if_missing=True,
                                 require_full_nvlink=True,
                             )

@@ -23,7 +23,7 @@ DVR_PY_FILES=(
   python/sglang/srt/managers/tokenizer_manager.py
   python/sglang/srt/mem_cache/kv_cache_builder.py
   python/sglang/srt/mem_cache/memory_pool.py
-  python/sglang/srt/model_executor/dvr_draft_cuda_graph_runner.py
+  python/sglang/srt/model_executor/dvr_cuda_graph_runner.py
   python/sglang/srt/model_executor/model_runner.py
   python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
   python/sglang/srt/model_executor/pool_configurator.py

@@ -319,7 +319,7 @@ correctness matrix pass.
 - Keep the recurrent decode kernel and ordinary GDN decode behavior unchanged.
 
 Primary files: `dvr_state_flow.py`, `dvr_gdn.py`, `gdn_backend.py`, and
-`dvr_draft_cuda_graph_runner.py`.
+`dvr_cuda_graph_runner.py`.
 
 Exit gate: workspace and the target EXTEND endpoint match after initialization;
 target recurrent/checkpoint state remains unchanged after all draft steps;

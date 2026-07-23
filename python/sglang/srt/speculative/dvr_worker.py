@@ -17,7 +17,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+from sglang.srt.model_executor.dvr_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     _validate_dvr_attention_backend,
     dvr_draft_decode_context,

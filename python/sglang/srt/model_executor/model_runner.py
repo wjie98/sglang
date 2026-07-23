@@ -2800,7 +2800,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and not self.is_draft_worker
                 and self.device == "cuda"
             ):
-                from sglang.srt.model_executor.dvr_draft_cuda_graph_runner import (
+                from sglang.srt.model_executor.dvr_cuda_graph_runner import (
                     DVRTargetVerifyCudaGraphRunner,
                 )
 

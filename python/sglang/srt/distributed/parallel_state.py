@@ -514,47 +514,6 @@ class GroupCoordinator:
         return self.ranks[(rank_in_group - 1) % world_size]
 
     @contextmanager
-    def custom_allreduce_enabled(
-        self, *, create_if_missing: bool = False, require_full_nvlink: bool = False
-    ):
-        """Temporarily enable this group's custom all-reduce communicator."""
-
-        communicator = self.ca_comm
-        if communicator is None and create_if_missing and self.world_size > 1:
-            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-                dispatch_custom_allreduce,
-            )
-
-            try:
-                communicator = dispatch_custom_allreduce(
-                    group=self.cpu_group, device=self.device
-                )(group=self.cpu_group, device=self.device)
-                self.ca_comm = communicator
-                # A lazily created communicator remains disabled outside this
-                # context; callers such as deterministic target execution keep
-                # their original collective policy.
-                communicator.disabled = True
-                if hasattr(communicator, "original_disabled"):
-                    communicator.original_disabled = True
-            except Exception as exc:
-                logger.warning("Setup Custom allreduce failed with %s.", exc)
-                communicator = None
-
-        if communicator is None or (
-            require_full_nvlink
-            and not getattr(communicator, "full_nvlink", False)
-        ):
-            yield False
-            return
-
-        previous_disabled = communicator.disabled
-        communicator.disabled = False
-        try:
-            yield True
-        finally:
-            communicator.disabled = previous_disabled
-
-    @contextmanager
     def graph_capture(
         self,
         graph_capture_context: Optional[GraphCaptureContext] = None,

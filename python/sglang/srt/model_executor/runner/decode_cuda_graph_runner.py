@@ -421,10 +421,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
-                or self.model_runner.spec_algorithm.is_dvr()
+                if self.capture_forward_mode.is_target_verify()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -960,11 +957,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
-                or self.model_runner.spec_algorithm.is_dvr()
+                max_num_tokens // self.num_tokens_per_bs
+                if self.capture_forward_mode.is_target_verify()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
