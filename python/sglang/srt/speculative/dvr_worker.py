@@ -86,6 +86,12 @@ class _SelfDraftBackend:
     def propose(self, batch):
         return self.owner._draft_self(batch)
 
+    def finish_verify(self, batch, batch_result):
+        del batch
+        batch_result.next_draft_input = self.owner._self_draft_input(
+            batch_result.next_draft_input.bonus_tokens
+        )
+
 
 class _EagleDraftBackend:
     """Upstream EAGLE/MTP draft operations around the DVR target transaction."""
@@ -129,6 +135,10 @@ class _EagleDraftBackend:
 
     def propose(self, batch):
         return self.worker.draft(batch)
+
+    def finish_verify(self, batch, batch_result):
+        with self.context(), spec_stage_span("dvr_rollback_draft"):
+            self.worker._draft_extend_for_decode(batch, batch_result)
 
 
 class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
@@ -641,10 +651,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # Discard a draft-phase or synchronous previous-iteration event. Only
         # the final rollback reader may release scheduler result writes.
         final_reader.war_fastpath_read_done_event = None
-        if self.uses_eagle_draft:
-            # Catch EAGLE's private KV/state up to the accepted target endpoint.
-            with self._draft_backend.context(), spec_stage_span("dvr_rollback_draft"):
-                self._draft_worker._draft_extend_for_decode(batch, batch_result)
+        # Self prepares its next chain input; EAGLE catches its private cache up
+        # to the same accepted target endpoint.
+        self._draft_backend.finish_verify(batch, batch_result)
 
         # Publish one fence for the complete rollback transaction. The EAGLE
         # graph records this as soon as draft-extend snapshots shared pools;
@@ -841,11 +850,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             on_publish(new_seq_lens)
         has_verify_tokens = not batch.forward_mode.is_idle() and accept_lens.numel() > 0
 
-        next_draft_input = (
-            EagleDraftInput(bonus_tokens=bonus_tokens)
-            if self.uses_eagle_draft
-            else self._self_draft_input(bonus_tokens)
-        )
+        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
         with spec_stage_span("dvr_rollback"):
             self.state_lifecycle.rollback_after_verify(

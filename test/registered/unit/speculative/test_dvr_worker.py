@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -168,6 +169,30 @@ def test_short_prefix_sentinel_marks_only_new_prefill_requests():
     assert result.next_draft_input == "next-draft"
     worker.prepare_for_kv_cache_release(new_req)
     assert not worker._seed_verify_slots
+
+
+def test_draft_backends_finalize_the_common_verify_result():
+    bonus_tokens = torch.tensor([3, 5])
+    result = SimpleNamespace(
+        next_draft_input=dvr_worker_module.EagleDraftInput(
+            bonus_tokens=bonus_tokens
+        )
+    )
+    owner = SimpleNamespace(
+        _self_draft_input=lambda tokens: ("self", tokens),
+    )
+    dvr_worker_module._SelfDraftBackend(owner).finish_verify(None, result)
+    assert result.next_draft_input == ("self", bonus_tokens)
+
+    calls = []
+    eagle_worker = SimpleNamespace(
+        _draft_extend_for_decode=lambda batch, output: calls.append((batch, output))
+    )
+    backend = dvr_worker_module._EagleDraftBackend(owner, eagle_worker)
+    backend.context = nullcontext
+    batch = object()
+    backend.finish_verify(batch, result)
+    assert calls == [(batch, result)]
 
 
 def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
