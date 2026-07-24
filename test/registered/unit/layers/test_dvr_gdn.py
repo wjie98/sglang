@@ -74,6 +74,25 @@ def create_test_adapter(
     )
 
 
+def prepare_prefill(adapter, *, prefix_lens, extend_lens, request_rows):
+    device = adapter.transition_windows[0].device
+    prefix_lens = torch.tensor(prefix_lens, dtype=torch.long, device=device)
+    extend_lens = torch.tensor(extend_lens, dtype=torch.long, device=device)
+    extend_start_loc = torch.cat((extend_lens.new_zeros(1), extend_lens.cumsum(0)[:-1]))
+    adapter.prepare_forward(
+        forward_batch=SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=torch.tensor(
+                request_rows, dtype=torch.long, device=device
+            ),
+            extend_prefix_lens=prefix_lens,
+            extend_seq_lens=extend_lens,
+            extend_start_loc=extend_start_loc,
+        ),
+        forward_metadata=SimpleNamespace(has_mamba_track_mask=False),
+    )
+
+
 def test_gdn_state_inputs_support_distinct_key_and_value_heads():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
@@ -104,12 +123,13 @@ def test_gdn_state_inputs_support_distinct_key_and_value_heads():
     v = torch.randn(2, 16, 128)
     g = torch.randn(2, 16)
     beta = torch.randn(2, 16)
+    prepare_prefill(
+        adapter,
+        prefix_lens=[FLA_CHUNK_SIZE],
+        extend_lens=[2],
+        request_rows=[1],
+    )
     adapter.cache_prefill_transitions(
-        forward_batch=SimpleNamespace(
-            extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
-            extend_seq_lens_cpu=[2],
-            req_pool_indices=torch.tensor([1]),
-        ),
         k=k.unsqueeze(0),
         v=v.unsqueeze(0),
         g=g,
@@ -126,18 +146,13 @@ def test_gdn_state_inputs_support_distinct_key_and_value_heads():
     assert torch.equal(beta_cache[1, :2], beta)
 
 
-def test_gdn_extend_requires_host_length_metadata():
+def test_gdn_extend_requires_prepared_metadata():
     adapter = create_test_adapter(
         transition_windows=tuple(torch.zeros(1, 2, 66, 1) for _ in range(4)),
     )
 
-    with pytest.raises(RuntimeError, match="CPU prefix and extend lengths"):
+    with pytest.raises(RuntimeError, match="metadata was not prepared"):
         adapter.cache_prefill_transitions(
-            forward_batch=SimpleNamespace(
-                extend_prefix_lens_cpu=None,
-                extend_seq_lens_cpu=None,
-                req_pool_indices=torch.tensor([1]),
-            ),
             k=torch.zeros(1, 1, 1),
             v=torch.zeros(1, 1, 1),
             g=torch.zeros(1, 1),
@@ -280,13 +295,13 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
     g = torch.randn(2, 16)
     beta = torch.randn(2, 16)
 
-    target_batch = SimpleNamespace(
-        extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
-        extend_seq_lens_cpu=[2],
-        req_pool_indices=torch.tensor([1]),
+    prepare_prefill(
+        adapter,
+        prefix_lens=[FLA_CHUNK_SIZE],
+        extend_lens=[2],
+        request_rows=[1],
     )
     adapter.cache_prefill_transitions(
-        forward_batch=target_batch,
         k=k,
         v=v,
         g=g,
@@ -304,6 +319,63 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
     # them untouched avoids clearing the full k/v/g/beta window per verify.
     for tensor in (k_cache, v_cache, g_cache, beta_cache):
         assert torch.all(tensor[1, 2:] == 1)
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu"] + (["cuda"] if torch.cuda.is_available() else []),
+)
+def test_gdn_prefill_transition_scatter_handles_mixed_chunk_boundaries(device):
+    adapter = create_test_adapter(
+        transition_windows=tuple(
+            torch.full((1, 6, 80, 2), -1.0, device=device) for _ in range(4)
+        ),
+    )
+    prefix_lens = [62, 63, 126, 5, 0]
+    extend_lens = [1, 3, 2, 130, 0]
+    request_rows = [1, 2, 3, 4, 0]
+    prepare_prefill(
+        adapter,
+        prefix_lens=prefix_lens,
+        extend_lens=extend_lens,
+        request_rows=request_rows,
+    )
+
+    total_tokens = sum(extend_lens)
+    values = [
+        torch.arange(total_tokens * 2, dtype=torch.float32, device=device).view(
+            total_tokens, 2
+        )
+        + offset
+        for offset in (0, 1000, 2000, 3000)
+    ]
+    adapter.cache_prefill_transitions(
+        k=values[0].view(1, total_tokens, 1, 2),
+        v=values[1].view(1, total_tokens, 1, 2),
+        g=values[2],
+        beta=values[3],
+        layer_idx=0,
+    )
+
+    starts = [0, 1, 4, 6, 136]
+    expected_ranges = (
+        (1, 62, 1, starts[0]),
+        (2, 0, 2, starts[1] + 1),
+        (3, 0, 0, starts[2]),
+        (4, 0, 7, starts[3] + 123),
+        (0, 0, 0, starts[4]),
+    )
+    for cache, value in zip(adapter.transition_windows, values, strict=True):
+        cache = cache[0]
+        for slot, destination_start, count, source_start in expected_ranges:
+            if count:
+                assert torch.equal(
+                    cache[slot, destination_start : destination_start + count],
+                    value[source_start : source_start + count],
+                )
+            untouched = torch.ones(cache.shape[1], dtype=torch.bool, device=device)
+            untouched[destination_start : destination_start + count] = False
+            assert torch.all(cache[slot, untouched] == -1)
 
 
 def test_gdn_state_input_window_rejects_invalid_tail():

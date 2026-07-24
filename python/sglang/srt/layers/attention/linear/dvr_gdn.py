@@ -59,6 +59,52 @@ if not is_cpu():
         tl.store(cache + base + token * token_stride + element, values, mask=mask)
 
     @triton.jit
+    def _dvr_scatter_prefill_transitions_kernel(
+        cache,
+        values,
+        request_rows,
+        prefix_lens,
+        extend_lens,
+        extend_start_loc,
+        cache_slot_stride,
+        cache_token_stride,
+        value_token_stride,
+        E: tl.constexpr,
+        CHUNK_SIZE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        i_req = tl.program_id(0).to(tl.int64)
+        offsets = tl.program_id(1).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        token = offsets // E
+        element = offsets % E
+
+        prefix_len = tl.load(prefix_lens + i_req).to(tl.int64)
+        extend_len = tl.load(extend_lens + i_req).to(tl.int64)
+        seq_len = prefix_len + extend_len
+        boundary = seq_len // CHUNK_SIZE * CHUNK_SIZE
+        write_start = tl.maximum(prefix_len, boundary)
+        token_count = seq_len - write_start
+        source_start = (
+            tl.load(extend_start_loc + i_req).to(tl.int64) + write_start - prefix_len
+        )
+        destination_start = write_start - boundary
+        mask = (token < token_count) & (element < E)
+
+        value = tl.load(
+            values + (source_start + token) * value_token_stride + element,
+            mask=mask,
+        )
+        slot = tl.load(request_rows + i_req).to(tl.int64)
+        tl.store(
+            cache
+            + slot * cache_slot_stride
+            + (destination_start + token) * cache_token_stride
+            + element,
+            value,
+            mask=mask,
+        )
+
+    @triton.jit
     def _dvr_pack_verify_window_kernel(
         cache0,
         candidate0,
@@ -362,6 +408,68 @@ def _gather_verify_output(
     return output.reshape(1, batch_size * draft_tokens, *source.shape[2:])
 
 
+def _scatter_prefill_transitions(
+    cache: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    request_rows: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    extend_start_loc: torch.Tensor,
+    chunk_size: int,
+) -> None:
+    """Cache the accepted tail after each request's latest chunk boundary."""
+
+    elements = math.prod(cache.shape[2:])
+    values = values.reshape(values.shape[0], -1)
+    if values.shape[1] != elements:
+        raise ValueError("DVR transition value and cache element shapes do not match.")
+
+    if cache.is_cuda:
+        block_size = 256
+        _dvr_scatter_prefill_transitions_kernel[
+            (
+                request_rows.numel(),
+                triton.cdiv(chunk_size * elements, block_size),
+            )
+        ](
+            cache,
+            values,
+            request_rows,
+            prefix_lens,
+            extend_lens,
+            extend_start_loc,
+            cache.stride(0),
+            cache.stride(1),
+            values.stride(0),
+            E=elements,
+            CHUNK_SIZE=chunk_size,
+            BLOCK_SIZE=block_size,
+        )
+        return
+
+    for request_row, prefix_len, extend_len, source_start in zip(
+        request_rows.tolist(),
+        prefix_lens.tolist(),
+        extend_lens.tolist(),
+        extend_start_loc.tolist(),
+        strict=True,
+    ):
+        seq_len = prefix_len + extend_len
+        boundary = seq_len // chunk_size * chunk_size
+        write_start = max(prefix_len, boundary)
+        token_count = seq_len - write_start
+        if token_count:
+            source_start += write_start - prefix_len
+            destination_start = write_start - boundary
+            destination = cache[
+                request_row, destination_start : destination_start + token_count
+            ]
+            destination.copy_(
+                values[source_start : source_start + token_count].view_as(destination)
+            )
+
+
 def _local_gdn_dimensions(state_shape):
     local_value_heads, value_dim, key_dim = state_shape.temporal
     local_key_heads = state_shape.num_k_heads_per_tp
@@ -538,6 +646,7 @@ class DVRGDNStateAdapter:
         self.verify_boundary_slots = verify_boundary_slots
         self.chunk_size = chunk_size
         self._verify_plan: Optional[tuple[torch.Tensor, ...]] = None
+        self._prefill_plan: Optional[tuple[torch.Tensor, ...]] = None
         self.self_draft_conv_state = (
             tuple(
                 tensor.new_zeros(
@@ -714,20 +823,14 @@ class DVRGDNStateAdapter:
     def cache_prefill_transitions(
         self,
         *,
-        forward_batch,
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
         layer_idx: int,
     ):
-        if (
-            forward_batch.extend_prefix_lens_cpu is None
-            or forward_batch.extend_seq_lens_cpu is None
-        ):
-            raise RuntimeError(
-                "DVR GDN target EXTEND requires CPU prefix and extend lengths."
-            )
+        if self._prefill_plan is None:
+            raise RuntimeError("DVR GDN target EXTEND metadata was not prepared.")
 
         # q affects only the output at its own token; it does not participate in
         # the recurrent transition. Target verify receives candidate q directly.
@@ -737,49 +840,46 @@ class DVRGDNStateAdapter:
             g.reshape(-1, g.shape[-1]),
             beta.reshape(-1, beta.shape[-1]),
         )
-        request_rows = forward_batch.req_pool_indices.to(
-            device=k.device, dtype=torch.long
-        )
         layer_transition_windows = tuple(
             cache[layer_idx] for cache in self.transition_windows
         )
-        src_base = 0
-        for req_i, (prefix_len, extend_len) in enumerate(
-            zip(
-                forward_batch.extend_prefix_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
-                strict=True,
-            )
+        request_rows, prefix_lens, extend_lens, extend_start_loc = self._prefill_plan
+        for cache, value in zip(
+            layer_transition_windows, transition_windows, strict=True
         ):
-            seq_len = prefix_len + extend_len
-            boundary = seq_len // self.chunk_size * self.chunk_size
-            write_start = max(prefix_len, boundary)
-            if write_start < seq_len:
-                src_start = src_base + write_start - prefix_len
-                src_end = src_start + seq_len - write_start
-                cols = torch.arange(
-                    write_start - boundary,
-                    seq_len - boundary,
-                    dtype=torch.long,
-                    device=request_rows.device,
-                )
-                slot = request_rows[req_i]
-                for cache, value in zip(
-                    layer_transition_windows, transition_windows, strict=True
-                ):
-                    cache[slot, cols] = value[src_start:src_end]
-            src_base += extend_len
+            _scatter_prefill_transitions(
+                cache,
+                value,
+                request_rows=request_rows,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+                extend_start_loc=extend_start_loc,
+                chunk_size=self.chunk_size,
+            )
 
     def prepare_forward(self, *, forward_batch, forward_metadata):
         """Prepare request metadata once before all GDN layers execute."""
 
         self._verify_plan = None
+        self._prefill_plan = None
         if forward_batch.forward_mode.is_target_verify():
             self.prepare_target_verify(
                 forward_batch=forward_batch,
                 cache_indices=forward_metadata.mamba_cache_indices,
             )
             return None
+        if forward_batch.forward_mode.is_extend():
+            prefill_metadata = (
+                forward_batch.req_pool_indices,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+            )
+            if any(tensor is None for tensor in prefill_metadata):
+                raise RuntimeError(
+                    "DVR GDN target EXTEND requires GPU request and length metadata."
+                )
+            self._prefill_plan = prefill_metadata
         if not (
             forward_batch.forward_mode.is_extend()
             and forward_metadata.has_mamba_track_mask

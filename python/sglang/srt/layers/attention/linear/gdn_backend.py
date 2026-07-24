@@ -617,7 +617,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if dvr_state_adapter is not None:
                 # Cache target-model GDN tail inputs for later DVR verify/replay.
                 dvr_state_adapter.cache_prefill_transitions(
-                    forward_batch=forward_batch,
                     k=key,
                     v=value,
                     g=g,
