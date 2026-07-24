@@ -38,10 +38,9 @@ class _Pool:
 class _Adapter:
     chunk_size = 64
 
-    def __init__(self, zeroed, tail_updates):
+    def __init__(self, zeroed):
         self.zeroed = zeroed
-        self.tail_updates = tail_updates
-        self.accepted_tail_lens = torch.zeros(8, dtype=torch.int32)
+        self.verify_boundary_slots = torch.zeros(8, dtype=torch.long)
         self.verify_boundaries = []
         self.draft_initializations = []
 
@@ -51,9 +50,6 @@ class _Adapter:
 
     def zero_boundary_state(self, *, indices):
         self.zeroed.extend(indices.tolist())
-
-    def set_accepted_tail_lens(self, **kwargs):
-        self.tail_updates.append((kwargs["indices"].tolist(), kwargs["value"].tolist()))
 
     def set_verify_boundaries(self, **kwargs):
         self.verify_boundaries.append(
@@ -81,14 +77,14 @@ def _lifecycle_fixture(
     slots=(10, 11),
     next_track=None,
 ):
-    copies, zeroed, tail_updates = [], [], []
+    copies, zeroed = [], []
     lifecycle = object.__new__(DVRStateLifecycle)
     lifecycle.server_args = SimpleNamespace(
         disable_radix_cache=disable_radix,
         strip_thinking_cache=False,
         enable_mamba_extra_buffer=lambda: not disable_radix,
     )
-    lifecycle._state_adapter = _Adapter(zeroed, tail_updates)
+    lifecycle._state_adapter = _Adapter(zeroed)
     lifecycle.boundary_seq_lens = torch.full((8, len(slots)), -1, dtype=torch.int64)
     pool = _Pool(slots, copies)
     lifecycle.model_runner = SimpleNamespace(req_to_token_pool=pool)
@@ -117,7 +113,7 @@ def _lifecycle_fixture(
         extend_lens=[seq_len - prefix_len],
         batch_size=lambda: 1,
     )
-    return lifecycle, req, batch, copies, zeroed, tail_updates
+    return lifecycle, req, batch, copies, zeroed
 
 
 def test_radix_disabled_reserves_one_active_boundary_per_request():
@@ -342,6 +338,7 @@ def test_copy_mamba_checkpoint_preserves_request_ping_pong_slots():
         "expected_tail",
     ),
     [
+        (63, None, 0, 11, 10, 63),
         (64, 64, 0, 10, 11, 0),
         (65, 64, 0, 10, 11, 1),
         (65, None, 64, 11, 10, 1),
@@ -355,7 +352,7 @@ def test_target_extend_publishes_exact_boundary(
     expected_next_boundary,
     expected_tail,
 ):
-    lifecycle, _, batch, copies, _, tails = _lifecycle_fixture(
+    lifecycle, _, batch, copies, _ = _lifecycle_fixture(
         seq_len=seq_len, last_track=last_track, prefix_len=prefix_len
     )
     lifecycle.boundary_seq_lens[1] = torch.tensor([999, 888])
@@ -365,7 +362,7 @@ def test_target_extend_publishes_exact_boundary(
     draft_ctx = lifecycle.prepare_for_draft(batch)
 
     assert copies == []
-    assert tails == [([1], [expected_tail])]
+    assert draft_ctx.tail_lens.tolist() == [expected_tail]
     assert lifecycle._state_adapter.draft_initializations == [([1], [20])]
     assert lifecycle._state_adapter.verify_boundaries == [([1], [expected_boundary])]
     assert draft_ctx.boundary_slots.tolist() == [expected_boundary]
@@ -373,7 +370,7 @@ def test_target_extend_publishes_exact_boundary(
 
 
 def test_target_extend_replaces_stale_request_state():
-    lifecycle, _, batch, _, zeroed, _ = _lifecycle_fixture(
+    lifecycle, _, batch, _, zeroed = _lifecycle_fixture(
         seq_len=1, last_track=None, prefix_len=0
     )
     lifecycle.boundary_seq_lens[1] = torch.tensor([128, 192])
@@ -407,7 +404,7 @@ def test_target_extend_requires_host_sequence_lengths():
 
 
 def test_radix_disabled_builds_tracking_from_schedule_batch_lengths():
-    lifecycle, req, batch, _, _, _ = _lifecycle_fixture(
+    lifecycle, req, batch, _, _ = _lifecycle_fixture(
         seq_len=65,
         last_track=64,
         prefix_len=0,
@@ -459,7 +456,7 @@ def test_rollback_advances_only_the_next_boundary_slot():
     calls = []
 
     lifecycle, _, batch, *_ = _lifecycle_fixture(
-        seq_len=65, last_track=64, prefix_len=0
+        seq_len=63, last_track=None, prefix_len=0
     )
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
@@ -474,13 +471,15 @@ def test_rollback_advances_only_the_next_boundary_slot():
     lifecycle.rollback_after_verify(
         batch=batch,
         transaction=ctx,
-        accept_lens=torch.tensor([5], dtype=torch.int32),
+        accept_lens=torch.tensor([2], dtype=torch.int32),
     )
+    batch.seq_lens = torch.tensor([65])
     next_ctx = lifecycle.prepare_for_draft(batch)
 
-    assert calls[0]["accepted_token_counts"].tolist() == [5]
-    assert next_ctx.boundary_slots.tolist() == [11]
-    assert next_ctx.alternate_boundary_slots.tolist() == [10]
+    assert calls[0]["tail_lens_before"].tolist() == [63]
+    assert calls[0]["accepted_token_counts"].tolist() == [2]
+    assert next_ctx.boundary_slots.tolist() == [10]
+    assert next_ctx.alternate_boundary_slots.tolist() == [11]
 
 
 def _finished_req(**overrides):
@@ -542,7 +541,19 @@ def test_prepare_for_draft_fails_without_an_exact_boundary():
         seq_len=65, last_track=64, prefix_len=0
     )
 
-    with pytest.raises(RuntimeError, match="exact recurrent checkpoint"):
+    with pytest.raises(RuntimeError, match="latest exact recurrent checkpoint"):
+        lifecycle.prepare_for_draft(batch)
+
+
+def test_prepare_for_draft_rejects_stale_boundary_for_current_endpoint():
+    lifecycle, _, batch, *_ = _lifecycle_fixture(
+        seq_len=65, last_track=64, prefix_len=0
+    )
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
+    batch.seq_lens = torch.tensor([129])
+
+    with pytest.raises(RuntimeError, match="latest exact recurrent checkpoint"):
         lifecycle.prepare_for_draft(batch)
 
 

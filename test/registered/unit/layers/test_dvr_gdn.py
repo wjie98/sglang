@@ -46,7 +46,6 @@ def create_gdn_adapter(
 def create_test_adapter(
     *,
     transition_windows,
-    accepted_tail_lens,
     state_cache=None,
     verify_boundary_slots=None,
     kernel_dispatcher=None,
@@ -61,12 +60,15 @@ def create_test_adapter(
             intermediate_conv_window=(),
         )
     if verify_boundary_slots is None:
-        verify_boundary_slots = torch.zeros_like(accepted_tail_lens, dtype=torch.long)
+        verify_boundary_slots = torch.zeros(
+            transition_windows[0].shape[1],
+            dtype=torch.long,
+            device=transition_windows[0].device,
+        )
     return DVRGDNStateAdapter(
         kernel_dispatcher,
         state_cache=state_cache,
         transition_windows=transition_windows,
-        accepted_tail_lens=accepted_tail_lens,
         verify_boundary_slots=verify_boundary_slots,
         draft_reuses_target_state=draft_reuses_target_state,
     )
@@ -127,7 +129,6 @@ def test_gdn_state_inputs_support_distinct_key_and_value_heads():
 def test_gdn_extend_requires_host_length_metadata():
     adapter = create_test_adapter(
         transition_windows=tuple(torch.zeros(1, 2, 66, 1) for _ in range(4)),
-        accepted_tail_lens=torch.zeros(2, dtype=torch.int32),
     )
 
     with pytest.raises(RuntimeError, match="CPU prefix and extend lengths"):
@@ -174,9 +175,6 @@ def test_gdn_memory_estimate_matches_allocation():
 
     allocated_per_request = sum(
         t.numel() * t.element_size() for t in adapter.transition_windows
-    )
-    allocated_per_request += (
-        adapter.accepted_tail_lens.numel() * adapter.accepted_tail_lens.element_size()
     )
     allocated_per_request += (
         adapter.verify_boundary_slots.numel()
@@ -343,12 +341,12 @@ def test_gdn_state_input_window_compacts_only_valid_crossing_tail():
 def test_gdn_verify_uses_mamba_padding_sentinel():
     adapter = create_test_adapter(
         transition_windows=(torch.zeros(1, 3, 66, 1),),
-        accepted_tail_lens=torch.tensor([0, 7, 63], dtype=torch.int32),
         verify_boundary_slots=torch.tensor([0, 11, 12]),
     )
     forward_batch = SimpleNamespace(
         input_ids=torch.zeros(4, dtype=torch.long),
         req_pool_indices=torch.tensor([2, 0]),
+        seq_lens=torch.tensor([63, 0]),
         spec_info=SimpleNamespace(draft_token_num=2),
     )
 
@@ -374,24 +372,6 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
     conv_slots, intermediate_rows = adapter.verify_conv_indices()
     assert torch.equal(conv_slots, torch.tensor([7, 0]))
     assert torch.equal(intermediate_rows, torch.tensor([2, 0]))
-
-
-def test_gdn_verify_rejects_invalid_tail():
-    adapter = create_test_adapter(
-        transition_windows=(torch.zeros(1, 2, 66, 1),),
-        accepted_tail_lens=torch.tensor([0, 64], dtype=torch.int32),
-        verify_boundary_slots=torch.tensor([0, 1]),
-    )
-
-    with pytest.raises(RuntimeError, match="invalid linear-state tail"):
-        adapter.prepare_target_verify(
-            forward_batch=SimpleNamespace(
-                input_ids=torch.zeros(2, dtype=torch.long),
-                req_pool_indices=torch.tensor([1]),
-                spec_info=SimpleNamespace(draft_token_num=2),
-            ),
-            cache_indices=torch.tensor([1]),
-        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -560,7 +540,6 @@ def test_gdn_self_draft_state_is_request_owned_and_keeps_target_unchanged():
     adapter = create_test_adapter(
         state_cache=state_cache,
         transition_windows=(torch.empty(1, 4, 1),) * 4,
-        accepted_tail_lens=torch.zeros(4, dtype=torch.int32),
         draft_reuses_target_state=True,
     )
     adapter.initialize_self_draft_state(
@@ -672,10 +651,13 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
             )
         ),
     )
+    compacted_tails = []
     monkeypatch.setattr(
         dvr_gdn_module,
         "_compact_gdn_transition_windows",
-        lambda *_args, **_kwargs: None,
+        lambda *_args, **kwargs: compacted_tails.append(
+            kwargs["accepted_tail_lens"].tolist()
+        ),
     )
     state_cache = SimpleNamespace(
         temporal=torch.empty(1),
@@ -686,7 +668,6 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
     adapter = create_test_adapter(
         state_cache=state_cache,
         transition_windows=(torch.empty(1, 3, 80, 1),) * 4,
-        accepted_tail_lens=torch.tensor([0, 63, 1], dtype=torch.int32),
     )
 
     crossed = adapter.commit_accepted_state(
@@ -694,6 +675,7 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
         endpoint_slots=torch.tensor([3, 4]),
         boundary_slots=torch.tensor([5, 6]),
         alternate_boundary_slots=torch.tensor([7, 8]),
+        tail_lens_before=torch.tensor([63, 1]),
         accepted_token_counts=torch.tensor([2, 2]),
     )
 
@@ -703,4 +685,4 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
         ([3, 4], [1, 1], [1, 2]),
         ([7, 8], [0, -1], [1, 2]),
     ]
-    assert adapter.accepted_tail_lens.tolist() == [0, 1, 3]
+    assert compacted_tails == [[1, 3]]

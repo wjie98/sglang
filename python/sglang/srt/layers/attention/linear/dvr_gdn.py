@@ -406,10 +406,9 @@ def dvr_gdn_intermediate_bytes_per_request(
         + local_value_heads * value_dim * cache_params.dtype.conv.itemsize
         + 2 * local_value_heads * torch.float32.itemsize
     )
-    # Persistent k/v/g/beta transition windows plus int32 tail length and
-    # int64 boundary slot.
+    # Persistent k/v/g/beta transition windows plus the int64 boundary slot.
     return (
-        total + num_layers * (FLA_CHUNK_SIZE + num_draft_tokens) * values_per_token + 12
+        total + num_layers * (FLA_CHUNK_SIZE + num_draft_tokens) * values_per_token + 8
     )
 
 
@@ -529,7 +528,6 @@ class DVRGDNStateAdapter:
         *,
         state_cache: Any,
         transition_windows: tuple[torch.Tensor, ...],
-        accepted_tail_lens: torch.Tensor,
         verify_boundary_slots: torch.Tensor,
         draft_reuses_target_state: bool,
         chunk_size: int = FLA_CHUNK_SIZE,
@@ -537,7 +535,6 @@ class DVRGDNStateAdapter:
         self.kernel_dispatcher = kernel_dispatcher
         self.state_cache = state_cache
         self.transition_windows = transition_windows
-        self.accepted_tail_lens = accepted_tail_lens
         self.verify_boundary_slots = verify_boundary_slots
         self.chunk_size = chunk_size
         self._verify_plan: Optional[tuple[torch.Tensor, ...]] = None
@@ -633,10 +630,6 @@ class DVRGDNStateAdapter:
             kernel_dispatcher,
             state_cache=state_cache,
             transition_windows=(k, v, gate, torch.zeros_like(gate)),
-            # Slot 0 is the padded-row dummy; real rows use req_pool_idx.
-            accepted_tail_lens=torch.zeros(
-                num_slots, dtype=torch.int32, device=model_runner.device
-            ),
             verify_boundary_slots=torch.zeros(
                 num_slots, dtype=torch.long, device=model_runner.device
             ),
@@ -652,17 +645,6 @@ class DVRGDNStateAdapter:
             device=endpoint_slots.device, dtype=torch.long
         )
         return request_rows, endpoint_slots
-
-    def set_accepted_tail_lens(
-        self, *, indices: torch.Tensor, value: int | torch.Tensor
-    ) -> None:
-        indices = indices.to(device=self.accepted_tail_lens.device, dtype=torch.long)
-        value = torch.as_tensor(
-            value,
-            device=self.accepted_tail_lens.device,
-            dtype=self.accepted_tail_lens.dtype,
-        )
-        self.accepted_tail_lens[indices] = value
 
     def zero_boundary_state(self, *, indices: torch.Tensor):
         indices = indices.to(device=self.state_cache.temporal.device, dtype=torch.long)
@@ -836,14 +818,11 @@ class DVRGDNStateAdapter:
             cache_indices[:batch_size],
             torch.zeros_like(cache_indices[:batch_size]),
         )
-        accepted_tail_lens = self.accepted_tail_lens[request_rows].to(torch.long)
-        torch._assert_async(
-            (
-                (~valid_mask)
-                | ((accepted_tail_lens >= 0) & (accepted_tail_lens < self.chunk_size))
-            ).all(),
-            "DVR verify received an invalid linear-state tail length.",
-        )
+        # TARGET_VERIFY keeps seq_lens at the accepted endpoint while its
+        # speculative cache rows are appended separately.
+        accepted_tail_lens = forward_batch.seq_lens[:batch_size].to(
+            device=cache_indices.device, dtype=torch.long
+        ) % self.chunk_size
         accepted_tail_lens = torch.where(
             valid_mask,
             accepted_tail_lens,
@@ -969,9 +948,10 @@ class DVRGDNStateAdapter:
         endpoint_slots: torch.Tensor,
         boundary_slots: torch.Tensor,
         alternate_boundary_slots: torch.Tensor,
+        tail_lens_before: torch.Tensor,
         accepted_token_counts: torch.Tensor,
     ) -> torch.Tensor:
-        tail_lens_before = self.accepted_tail_lens[request_rows].to(
+        tail_lens_before = tail_lens_before.to(
             device=endpoint_slots.device, dtype=torch.long
         )
         accepted_token_counts = accepted_token_counts.to(
@@ -1055,7 +1035,4 @@ class DVRGDNStateAdapter:
                 )
         # EAGLE/MTP owns separate draft state and skips this reconstruction.
 
-        self.set_accepted_tail_lens(
-            indices=request_rows, value=tail_lens_after.to(torch.int32)
-        )
         return crosses_chunk_boundary
