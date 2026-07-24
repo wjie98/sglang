@@ -61,6 +61,8 @@ class _SelfDraftBackend:
 
     def __init__(self, owner):
         self.owner = owner
+        self.graph_runner = None
+        self.proposal_prob_buffer = None
 
     def context(self):
         return dvr_draft_decode_context(
@@ -78,17 +80,197 @@ class _SelfDraftBackend:
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+    @staticmethod
+    def input(bonus_tokens: torch.Tensor) -> EagleDraftInput:
+        return EagleDraftInput(
+            hidden_states=None,
+            bonus_tokens=bonus_tokens,
+            topk_p=torch.ones(
+                (bonus_tokens.shape[0], 1),
+                dtype=torch.float32,
+                device=bonus_tokens.device,
+            ),
+            topk_index=bonus_tokens.to(torch.long).unsqueeze(-1),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+
     def finish_prefill(self, batch, batch_result):
-        draft_input = self.owner._self_draft_input(batch_result.next_token_ids)
+        draft_input = self.input(batch_result.next_token_ids)
         batch.spec_info = draft_input
         return draft_input
 
-    def propose(self, batch):
-        return self.owner._draft_self(batch)
+    def propose(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        owner = self.owner
+        if batch.forward_mode.is_idle():
+            batch.spec_info = self.idle_input()
+            return EagleVerifyInput.create_idle_input(
+                1, owner.num_draft_steps, owner.num_draft_tokens
+            )
+
+        spec_info = batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
+
+        # ScheduleBatch.prepare_for_decode already reserved the speculative
+        # window. Self draft and target verify share it.
+        offsets = batch.seq_lens.to(torch.long).unsqueeze(
+            1
+        ) + owner._chain_position_offsets.unsqueeze(0)
+        rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
+        batch.out_cache_loc = batch.req_to_token_pool.req_to_token[
+            rows, offsets
+        ].reshape(-1)
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
+        spec_info.positions = batch.seq_lens.clone()
+        spec_info.num_tokens_per_req = 1
+        spec_info.num_tokens_for_logprob_per_req = 1
+        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+        saved_return_logprob = batch.return_logprob
+        saved_return_hidden_states = batch.return_hidden_states
+        batch.return_logprob = False
+        batch.return_hidden_states = False
+        try:
+            forward_batch = ForwardBatch.init_new(batch, owner.model_runner)
+            draft_tokens, draft_probs = self._draft_tokens(forward_batch)
+        finally:
+            batch.return_logprob = saved_return_logprob
+            batch.return_hidden_states = saved_return_hidden_states
+
+        batch_size = draft_tokens.shape[0]
+        positions = (
+            batch.seq_lens[:, None] + owner._chain_position_offsets[None, :]
+        ).flatten()
+        return EagleVerifyInput(
+            draft_token=draft_tokens.flatten(),
+            custom_mask=None,
+            positions=positions,
+            retrieve_index=owner._chain_retrieve_index[:batch_size],
+            retrieve_next_token=owner._chain_retrieve_next[:batch_size],
+            retrieve_next_sibling=owner._chain_retrieve_sibling[:batch_size],
+            retrieve_cum_len=None,
+            spec_steps=owner.num_draft_steps,
+            topk=1,
+            draft_token_num=owner.num_draft_tokens,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            draft_probs=draft_probs,
+        )
+
+    def _draft_tokens(self, forward_batch: ForwardBatch):
+        owner = self.owner
+        spec_info = forward_batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
+
+        out_cache_loc = (
+            forward_batch.out_cache_loc.reshape(
+                forward_batch.batch_size, owner.num_draft_tokens
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+        draft_tokens = [spec_info.bonus_tokens.to(torch.long)]
+        draft_probs = None
+
+        origin_seq_lens = forward_batch.seq_lens
+        origin_seq_lens_cpu = forward_batch.seq_lens_cpu
+        origin_seq_lens_sum = forward_batch.seq_lens_sum
+        origin_spec_info = forward_batch.spec_info
+        origin_out_cache_loc = forward_batch.out_cache_loc
+        forward_batch.spec_info = None
+        position_offset = 0
+
+        try:
+            # The target model drafts a fixed topk=1 chain; no tree ranking or
+            # parent bookkeeping is needed between decode steps.
+            for step in range(owner.num_draft_steps):
+                if step:
+                    forward_batch.positions.add_(1)
+                    position_offset += 1
+                forward_batch.input_ids = draft_tokens[-1]
+                forward_batch.out_cache_loc = out_cache_loc[step]
+                forward_batch.seq_lens = origin_seq_lens + step + 1
+                forward_batch.seq_lens_cpu = (
+                    None
+                    if origin_seq_lens_cpu is None
+                    else origin_seq_lens_cpu + step + 1
+                )
+                forward_batch.seq_lens_sum = (
+                    None
+                    if origin_seq_lens_sum is None
+                    else origin_seq_lens_sum + (step + 1) * forward_batch.batch_size
+                )
+                logits_output = self._decode_forward(forward_batch)
+                maybe_detect_nan(
+                    logits_output.next_token_logits, f"dvr draft step {step}"
+                )
+                next_token_ids = owner.model_runner.sample(logits_output, forward_batch)
+                if not forward_batch.sampling_info.is_all_greedy:
+                    sampling_probs = logits_output.next_token_logits
+                    sampling_info = forward_batch.sampling_info
+                    if (
+                        owner.model_runner.sampler.use_log_softmax_logprob
+                        and not sampling_info.need_top_p_sampling
+                        and not sampling_info.need_top_k_sampling
+                        and not sampling_info.need_min_p_sampling
+                    ):
+                        sampling_probs = torch.softmax(sampling_probs, dim=-1)
+                    proposal = owner.model_runner.sampler.normalize_probs(
+                        sampling_probs,
+                        sampling_info,
+                    )
+                    if self.proposal_prob_buffer is None:
+                        self.proposal_prob_buffer = torch.empty(
+                            (
+                                owner._chain_retrieve_index.shape[0],
+                                owner.num_draft_steps,
+                                proposal.shape[-1],
+                            ),
+                            dtype=torch.float32,
+                            device=proposal.device,
+                        )
+                    proposal_buffer = self.proposal_prob_buffer
+                    proposal_buffer[: forward_batch.batch_size, step].copy_(proposal)
+                    draft_probs = proposal_buffer[
+                        : forward_batch.batch_size, : owner.num_draft_steps
+                    ]
+                draft_tokens.append(next_token_ids.to(torch.long))
+        finally:
+            forward_batch.seq_lens = origin_seq_lens
+            forward_batch.seq_lens_cpu = origin_seq_lens_cpu
+            forward_batch.seq_lens_sum = origin_seq_lens_sum
+            forward_batch.spec_info = origin_spec_info
+            if position_offset:
+                forward_batch.positions.sub_(position_offset)
+            forward_batch.out_cache_loc = origin_out_cache_loc
+
+        return torch.stack(draft_tokens, dim=1), draft_probs
+
+    def _decode_forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        if self.graph_runner is not None and self.graph_runner.can_run_graph(
+            forward_batch
+        ):
+            return self.graph_runner.execute(forward_batch)
+
+        seq_lens = forward_batch.seq_lens_cpu
+        min_seq_len = int(seq_lens.min()) if seq_lens is not None else "GPU-only"
+        capture_bs = [] if self.graph_runner is None else self.graph_runner.capture_bs
+        raise RuntimeError(
+            "DVR self-draft decode requires the dedicated CUDA graph; no eager "
+            "fallback is used. The current batch cannot run it: "
+            f"batch_size={forward_batch.batch_size}, min_seq_len={min_seq_len}, "
+            f"capture_bs={capture_bs}. For batch-size misses, use the default "
+            "CUDA graph batch sizes or include the running batch size "
+            "in --cuda-graph-bs/--cuda-graph-max-bs."
+        )
 
     def finish_verify(self, batch, batch_result):
         del batch
-        batch_result.next_draft_input = self.owner._self_draft_input(
+        batch_result.next_draft_input = self.input(
             batch_result.next_draft_input.bonus_tokens
         )
 
@@ -184,7 +366,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # every prefill, so stale request identities cannot survive slot reuse.
         self._seed_verify_slots = set()
         self._draft_graph_buffers = {}
-        self._self_draft_graph_runner = None
         max_bs = max(
             server_args.cuda_graph_config.decode.max_bs or 0,
             server_args.max_running_requests or 0,
@@ -205,7 +386,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         self._chain_position_offsets = torch.arange(
             num_tokens, dtype=torch.long, device=self.device
         )
-        self._proposal_prob_buffer = None
         if self.uses_eagle_draft:
             server_args.context_length = (
                 target_worker.model_runner.model_config.context_len
@@ -243,22 +423,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             self.num_draft_tokens,
         )
 
-    @staticmethod
-    def _self_draft_input(bonus_tokens: torch.Tensor) -> EagleDraftInput:
-        return EagleDraftInput(
-            hidden_states=None,
-            bonus_tokens=bonus_tokens,
-            topk_p=torch.ones(
-                (bonus_tokens.shape[0], 1),
-                dtype=torch.float32,
-                device=bonus_tokens.device,
-            ),
-            topk_index=bonus_tokens.to(torch.long).unsqueeze(-1),
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
-        )
-
     @property
     def target_worker(self):
         return self._target_worker
@@ -290,8 +454,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
         # Capture the dedicated self-draft decode graph after target attention
         # backends exist. This matches upstream's separated init order.
+        draft_backend = self._draft_backend
         if (
-            self._self_draft_graph_runner is None
+            draft_backend.graph_runner is None
             and self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
             and not self.server_args.disable_draft_cuda_graph
         ):
@@ -306,7 +471,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 capture=True,
                 self_draft=True,
             ):
-                self._self_draft_graph_runner = DVRDraftDecodeCudaGraphRunner(
+                draft_backend.graph_runner = DVRDraftDecodeCudaGraphRunner(
                     self.model_runner
                 )
             after_mem = get_available_gpu_memory(self.device, self.model_runner.gpu_id)
@@ -342,182 +507,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-
-    # Self-draft path. DVR uses the target model's decode path as a draft model,
-    # but keeps EAGLE-compatible tree/retrieve metadata for verification.
-    def _draft_self(self, batch: ScheduleBatch) -> EagleVerifyInput:
-        if batch.forward_mode.is_idle():
-            batch.spec_info = self._draft_backend.idle_input()
-            return EagleVerifyInput.create_idle_input(
-                1, self.num_draft_steps, self.num_draft_tokens
-            )
-
-        spec_info = batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
-
-        # ScheduleBatch.prepare_for_decode already reserved the speculative
-        # window. Self draft and target verify share it; allocating again would
-        # split KV ownership between two paths.
-        offsets = batch.seq_lens.to(torch.long).unsqueeze(
-            1
-        ) + self._chain_position_offsets.unsqueeze(0)
-        rows = batch.req_pool_indices.to(torch.long).unsqueeze(1)
-        batch.out_cache_loc = batch.req_to_token_pool.req_to_token[
-            rows, offsets
-        ].reshape(-1)
-        batch.mamba_track_indices = None
-        batch.mamba_track_mask = None
-        batch.mamba_track_seqlens = None
-        # Draft advances positions in place; seq_lens remains the KV-length
-        # base used to derive every step in this block.
-        spec_info.positions = batch.seq_lens.clone()
-        spec_info.num_tokens_per_req = 1
-        spec_info.num_tokens_for_logprob_per_req = 1
-        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-
-        saved_return_logprob = batch.return_logprob
-        saved_return_hidden_states = batch.return_hidden_states
-        batch.return_logprob = False
-        batch.return_hidden_states = False
-        try:
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
-            draft_tokens, draft_probs = self._draft_self_tokens(forward_batch)
-        finally:
-            batch.return_logprob = saved_return_logprob
-            batch.return_hidden_states = saved_return_hidden_states
-
-        batch_size = draft_tokens.shape[0]
-        positions = (
-            batch.seq_lens[:, None] + self._chain_position_offsets[None, :]
-        ).flatten()
-        return EagleVerifyInput(
-            draft_token=draft_tokens.flatten(),
-            custom_mask=None,
-            positions=positions,
-            retrieve_index=self._chain_retrieve_index[:batch_size],
-            retrieve_next_token=self._chain_retrieve_next[:batch_size],
-            retrieve_next_sibling=self._chain_retrieve_sibling[:batch_size],
-            retrieve_cum_len=None,
-            spec_steps=self.num_draft_steps,
-            topk=1,
-            draft_token_num=self.num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-            draft_probs=draft_probs,
-        )
-
-    def _draft_self_tokens(self, forward_batch: ForwardBatch):
-        spec_info = forward_batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
-
-        out_cache_loc = (
-            forward_batch.out_cache_loc.reshape(
-                forward_batch.batch_size, self.num_draft_tokens
-            )
-            .transpose(0, 1)
-            .contiguous()
-        )
-        draft_tokens = [spec_info.bonus_tokens.to(torch.long)]
-        draft_probs = None
-
-        origin_seq_lens = forward_batch.seq_lens
-        origin_seq_lens_cpu = forward_batch.seq_lens_cpu
-        origin_seq_lens_sum = forward_batch.seq_lens_sum
-        origin_spec_info = forward_batch.spec_info
-        origin_out_cache_loc = forward_batch.out_cache_loc
-        forward_batch.spec_info = None
-        position_offset = 0
-
-        try:
-            # The target model drafts a fixed topk=1 chain; no tree ranking or
-            # parent bookkeeping is needed between decode steps.
-            for step in range(self.num_draft_steps):
-                if step:
-                    forward_batch.positions.add_(1)
-                    position_offset += 1
-                forward_batch.input_ids = draft_tokens[-1]
-                forward_batch.out_cache_loc = out_cache_loc[step]
-                forward_batch.seq_lens = origin_seq_lens + step + 1
-                forward_batch.seq_lens_cpu = (
-                    None
-                    if origin_seq_lens_cpu is None
-                    else origin_seq_lens_cpu + step + 1
-                )
-                forward_batch.seq_lens_sum = (
-                    None
-                    if origin_seq_lens_sum is None
-                    else origin_seq_lens_sum + (step + 1) * forward_batch.batch_size
-                )
-                logits_output = self._draft_decode_forward(forward_batch)
-                maybe_detect_nan(
-                    logits_output.next_token_logits, f"dvr draft step {step}"
-                )
-                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
-                if not forward_batch.sampling_info.is_all_greedy:
-                    sampling_probs = logits_output.next_token_logits
-                    sampling_info = forward_batch.sampling_info
-                    if (
-                        self.model_runner.sampler.use_log_softmax_logprob
-                        and not sampling_info.need_top_p_sampling
-                        and not sampling_info.need_top_k_sampling
-                        and not sampling_info.need_min_p_sampling
-                    ):
-                        sampling_probs = torch.softmax(sampling_probs, dim=-1)
-                    proposal = self.model_runner.sampler.normalize_probs(
-                        sampling_probs,
-                        sampling_info,
-                    )
-                    if self._proposal_prob_buffer is None:
-                        self._proposal_prob_buffer = torch.empty(
-                            (
-                                self._chain_retrieve_index.shape[0],
-                                self.num_draft_steps,
-                                proposal.shape[-1],
-                            ),
-                            dtype=torch.float32,
-                            device=proposal.device,
-                        )
-                    proposal_buffer = self._proposal_prob_buffer
-                    proposal_buffer[: forward_batch.batch_size, step].copy_(proposal)
-                    draft_probs = proposal_buffer[
-                        : forward_batch.batch_size, : self.num_draft_steps
-                    ]
-                draft_tokens.append(next_token_ids.to(torch.long))
-        finally:
-            forward_batch.seq_lens = origin_seq_lens
-            forward_batch.seq_lens_cpu = origin_seq_lens_cpu
-            forward_batch.seq_lens_sum = origin_seq_lens_sum
-            forward_batch.spec_info = origin_spec_info
-            if position_offset:
-                forward_batch.positions.sub_(position_offset)
-            forward_batch.out_cache_loc = origin_out_cache_loc
-
-        return torch.stack(draft_tokens, dim=1), draft_probs
-
-    def _draft_decode_forward(
-        self, forward_batch: ForwardBatch
-    ) -> LogitsProcessorOutput:
-        can_cuda_graph = (
-            self._self_draft_graph_runner is not None
-            and self._self_draft_graph_runner.can_run_graph(forward_batch)
-        )
-        if can_cuda_graph:
-            return self._self_draft_graph_runner.execute(forward_batch)
-
-        seq_lens = forward_batch.seq_lens_cpu
-        min_seq_len = int(seq_lens.min()) if seq_lens is not None else "GPU-only"
-        capture_bs = []
-        if self._self_draft_graph_runner is not None:
-            capture_bs = self._self_draft_graph_runner.capture_bs
-        raise RuntimeError(
-            "DVR self-draft decode requires the dedicated CUDA graph; no eager "
-            "fallback is used. The current batch cannot run it: "
-            f"batch_size={forward_batch.batch_size}, min_seq_len={min_seq_len}, "
-            f"capture_bs={capture_bs}. For batch-size misses, use the default "
-            "CUDA graph batch sizes or include the running batch size "
-            "in --cuda-graph-bs/--cuda-graph-max-bs."
-        )
 
     # Target verify. DVR keeps the forward call in TARGET_VERIFY mode like EAGLE,
     # then locally adapts GDN's physical window and state restore/commit.
@@ -733,7 +722,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 self.req_to_token_pool,
                 batch,
                 self.target_worker,
-                capture_hidden_mode=spec_info.capture_hidden_mode,
             )
 
         current_stream = torch.get_device_module(self.device).current_stream()
@@ -826,7 +814,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 batch,
                 logits_output,
                 vocab_mask,
-                use_rejection_sampling=spec_info.spec_steps > 0,
                 target_prob_filter=self.model_runner.sampler.normalize_probs,
             )
             if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:

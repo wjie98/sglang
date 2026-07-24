@@ -38,7 +38,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -461,8 +460,6 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
-    *,
-    capture_hidden_mode: Optional[CaptureHiddenMode] = None,
 ):
     from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -511,13 +508,15 @@ def eagle_prepare_for_verify(
     batch.forward_mode = (
         ForwardMode.IDLE if batch.forward_mode.is_idle() else ForwardMode.TARGET_VERIFY
     )
-    if capture_hidden_mode is None:
-        capture_hidden_mode = (
+    batch.capture_hidden_mode = (
+        verify_input.capture_hidden_mode
+        if verify_input.capture_hidden_mode is not None
+        else (
             CaptureHiddenMode.NULL
             if target_worker.model_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
-    batch.capture_hidden_mode = capture_hidden_mode
+    )
     verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
     # Run attention backend plan and cuda graph preparation
@@ -545,7 +544,6 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
     *,
-    use_rejection_sampling: Optional[bool] = None,
     target_prob_filter=None,
 ):
     """
@@ -649,10 +647,10 @@ def eagle_sample(
             chain_speculative_sampling_triton,
         )
 
-        if use_rejection_sampling is None:
-            use_rejection_sampling = (
-                get_global_server_args().speculative_use_rejection_sampling
-            )
+        use_rejection_sampling = (
+            get_global_server_args().speculative_use_rejection_sampling
+            and verify_input.spec_steps > 0
+        )
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(

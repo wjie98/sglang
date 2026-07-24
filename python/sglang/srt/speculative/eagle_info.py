@@ -26,7 +26,7 @@ class EagleVerifyInput(SpecInput):
     spec_steps: int
     topk: int
     draft_token_num: int
-    capture_hidden_mode: CaptureHiddenMode
+    capture_hidden_mode: Optional[CaptureHiddenMode]
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
