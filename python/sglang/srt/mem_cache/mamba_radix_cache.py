@@ -463,6 +463,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def supports_mamba(self) -> bool:
         return True
 
+    def preserves_mamba_request_slots(self) -> bool:
+        return True
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = RadixKey(array("q"), None)

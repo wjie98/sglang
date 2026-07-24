@@ -2,7 +2,10 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.srt.layers.attention.fla.chunk import (
+    chunk_gated_delta_rule,
+    chunk_gated_delta_rule_fwd,
+)
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
@@ -11,6 +14,22 @@ from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_xpu_ci(est_time=900, suite="stage-b-test-1-gpu-xpu")
+
+
+class TestChunkBoundaryOutputArgs(unittest.TestCase):
+    def test_boundary_outputs_are_all_or_none(self):
+        with self.assertRaisesRegex(ValueError, "must be provided together"):
+            chunk_gated_delta_rule_fwd(
+                None,
+                None,
+                None,
+                None,
+                None,
+                1.0,
+                None,
+                None,
+                boundary_state=object(),
+            )
 
 
 @unittest.skipIf(

@@ -59,6 +59,7 @@ class _Args:
     enable_page_major_kv_layout = False
     enable_linear_replayssm = False
     enable_unified_memory = False
+    enable_two_batch_overlap = False
 
     def __init__(self):
         self.cuda_graph_config = SimpleNamespace(
@@ -105,21 +106,57 @@ class TestDVRServerArgs(unittest.TestCase):
         registry_path = (
             "sglang.srt.configs.linear_attn_model_registry.get_linear_attn_config"
         )
-        for backend, expected in (
-            ("sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend", True),
-            ("sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend", False),
+        backend = "sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend"
+        with patch(
+            registry_path,
+            return_value=(
+                SimpleNamespace(backend_class_name=backend),
+                object(),
+            ),
         ):
-            with (
-                self.subTest(backend=backend),
-                patch(
-                    registry_path,
-                    return_value=(
-                        SimpleNamespace(backend_class_name=backend),
-                        object(),
-                    ),
+            self.assertTrue(_is_dvr_gated_linear_state_model(args))
+
+        backend = "sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend"
+        with (
+            patch(
+                registry_path,
+                return_value=(
+                    SimpleNamespace(backend_class_name=backend),
+                    object(),
                 ),
-            ):
-                self.assertEqual(_is_dvr_gated_linear_state_model(args), expected)
+            ),
+            self.assertRaisesRegex(ValueError, "registered linear-state backend"),
+        ):
+            _is_dvr_gated_linear_state_model(args)
+
+    def test_dvr_rejects_unregistered_non_gdn_linear_state_model(self):
+        class UnsupportedLinearConfig:
+            @property
+            def mamba2_cache_params(self):
+                return object()
+
+        args = SimpleNamespace(
+            get_model_config=lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    get_text_config=lambda: UnsupportedLinearConfig()
+                )
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "not linear-state config"):
+            _is_dvr_gated_linear_state_model(args)
+
+    def test_dvr_gdn_rejects_two_batch_overlap(self):
+        args = _Args()
+        args.enable_two_batch_overlap = True
+        with (
+            patch(
+                "sglang.srt.speculative.dvr_server_args."
+                "_is_dvr_gated_linear_state_model",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(ValueError, "two-batch overlap"),
+        ):
+            handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_zero_step_chain_mode(self):
         args = _Args()

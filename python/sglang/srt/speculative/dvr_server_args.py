@@ -146,6 +146,10 @@ def handle_dvr_speculative_decoding(server_args):
         )
 
     uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
+    if uses_gated_linear_state and server_args.enable_two_batch_overlap:
+        raise ValueError(
+            "DVR gated linear-state models do not support two-batch overlap."
+        )
     if uses_gated_linear_state and server_args.enable_page_major_kv_layout:
         raise ValueError(
             "DVR gated linear-state verify requires contiguous recurrent-state "
@@ -326,8 +330,24 @@ def _is_dvr_gated_linear_state_model(server_args):
     hf_config = server_args.get_model_config().hf_config
     registered = get_linear_attn_config(hf_config)
     if registered is not None:
-        return registered[0].backend_class_name.endswith(".gdn_backend.GDNAttnBackend")
+        backend = registered[0].backend_class_name
+        if backend.endswith(".gdn_backend.GDNAttnBackend"):
+            return True
+        raise ValueError(
+            "DVR does not support the registered linear-state backend "
+            f"{backend!r}."
+        )
 
     # Qwen3.5/InternS2 text configs inherit Qwen3NextConfig; JetVLM unwraps
     # to JetNemotronConfig. Keep built-ins until they move to the registry.
-    return isinstance(hf_config.get_text_config(), Qwen3NextConfig | JetNemotronConfig)
+    text_config = hf_config.get_text_config()
+    if isinstance(text_config, Qwen3NextConfig | JetNemotronConfig):
+        return True
+    if hasattr(type(text_config), "mamba2_cache_params") or getattr(
+        text_config, "linear_attn_config", None
+    ):
+        raise ValueError(
+            "DVR currently supports GDN or pure-attention models, not linear-state "
+            f"config {type(text_config).__name__}."
+        )
+    return False

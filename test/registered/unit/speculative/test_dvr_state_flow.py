@@ -161,6 +161,40 @@ def test_radix_disabled_reserves_one_active_boundary_per_request():
     assert server_args.max_mamba_cache_size == 16
 
 
+def test_dvr_memory_budget_includes_cuda_graph_dummy_row(monkeypatch):
+    intermediate_per_row = 1 << 20
+    monkeypatch.setattr(
+        "sglang.srt.layers.attention.linear.dvr_gdn."
+        "dvr_gdn_intermediate_bytes_per_request",
+        lambda *args, **kwargs: intermediate_per_row,
+    )
+    server_args = SimpleNamespace(
+        speculative_num_draft_tokens=16,
+        speculative_eagle_topk=1,
+        max_running_requests=2,
+        max_mamba_cache_size=8,
+        disable_radix_cache=False,
+        dp_size=1,
+        enable_dp_attention=False,
+    )
+    runner = SimpleNamespace(
+        server_args=server_args,
+        mambaish_config=SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1024)
+        ),
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+        dp_size=1,
+        _calculate_mamba_ratio=lambda: 2,
+    )
+
+    remaining = ModelRunnerKVCacheMixin.handle_max_mamba_cache(
+        runner, total_rest_memory=1.0
+    )
+
+    expected_bytes = 3 * intermediate_per_row + 8 * 1024
+    assert remaining == pytest.approx(1.0 - expected_bytes / (1 << 30))
+
+
 def test_radix_enabled_reserves_two_checkpoint_slots_per_request():
     server_args = SimpleNamespace(
         disable_radix_cache=False,

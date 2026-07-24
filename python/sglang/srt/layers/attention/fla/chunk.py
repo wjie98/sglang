@@ -49,6 +49,19 @@ def chunk_gated_delta_rule_fwd(
     boundary_state_indices: Optional[torch.Tensor] = None,
     boundary_state_steps: Optional[torch.Tensor] = None,
 ):
+    boundary_outputs = (
+        boundary_state,
+        boundary_state_indices,
+        boundary_state_steps,
+    )
+    if any(value is not None for value in boundary_outputs) and not all(
+        value is not None for value in boundary_outputs
+    ):
+        raise ValueError(
+            "boundary_state, boundary_state_indices, and boundary_state_steps "
+            "must be provided together."
+        )
+
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
