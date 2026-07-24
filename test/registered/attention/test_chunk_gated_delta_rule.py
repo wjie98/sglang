@@ -70,7 +70,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         return o, pool
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_boundary_state_preserves_initial_state_dtype(self):
+    def test_inplace_boundary_state_keeps_activation_dtype(self):
         for state_dtype in (torch.bfloat16, torch.float32):
             with self.subTest(state_dtype=state_dtype):
                 q = torch.randn(1, 64, 1, 16, dtype=torch.bfloat16, device="cuda")
@@ -100,7 +100,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                 )
 
                 self.assertEqual(output.dtype, q.dtype)
-                self.assertEqual(boundary_states.dtype, initial_state.dtype)
+                self.assertEqual(boundary_states.dtype, q.dtype)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_non_inplace_verify_preserves_initial_state(self):
@@ -113,6 +113,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         beta = torch.sigmoid(torch.randn(1, 80, 1, dtype=torch.float32, device="cuda"))
         initial_state = torch.randn(2, 1, 16, 16, device="cuda")
         original = initial_state.clone()
+        boundary_state = torch.zeros_like(initial_state)
 
         output, _, boundary_states = chunk_gated_delta_rule(
             q,
@@ -124,11 +125,28 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             initial_state_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
             use_qk_l2norm_in_kernel=True,
             inplace_update=False,
+            boundary_state=boundary_state,
+            boundary_state_indices=torch.tensor([0], dtype=torch.int32, device="cuda"),
+            boundary_state_steps=torch.tensor([1], dtype=torch.int32, device="cuda"),
         )
 
         self.assertEqual(output.shape[1], 80)
         self.assertEqual(boundary_states.shape[1], 2)
+        self.assertEqual(boundary_states.dtype, q.dtype)
         self.assertTrue(torch.equal(initial_state, original))
+
+        reference_state = original.clone()
+        chunk_gated_delta_rule(
+            q[:, :64],
+            k[:, :64],
+            v[:, :64],
+            g[:, :64],
+            beta[:, :64],
+            initial_state=reference_state,
+            initial_state_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            use_qk_l2norm_in_kernel=True,
+        )
+        self.assertTrue(torch.equal(boundary_state[0], reference_state[1]))
 
     def _check_shape(
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42

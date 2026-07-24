@@ -95,6 +95,9 @@ of `W`.
    Radix state.
 10. `return_logprob=True` and `False` execute the same draft, verify, and state
     transaction. Output materialization cannot trigger another target replay.
+11. For an active request, upstream ping-pong roles remain authoritative:
+    `keep = other(next)` is the latest exact boundary and `next` is the only
+    boundary write target. Radix insertion cannot rebind either physical slot.
 
 ## 4. Closed execution transaction
 
@@ -107,10 +110,17 @@ inputs after the last 64-token boundary in `W`, and seeds request-local
 `draft_state` from the resulting accepted endpoint.
 
 If no checkpoint exists, use the zero boundary and ordinary EXTEND. If a cached
-physical slot was donated, resolve the new physical mapping before constructing
-the DVR state context. If the requested suffix is newer than the available
-checkpoint, recompute it instead of manufacturing a state backup or disabling
-Radix.
+prefix exists, deferred COW restores it to target live state and DVR copies it
+once into the request's `keep` slot before EXTEND consumes the unclosed tail.
+If the requested suffix is newer than the available checkpoint, recompute it
+instead of manufacturing a state backup or disabling Radix.
+
+Unfinished Radix insertion allocates an independent checkpoint and copies
+`keep` into it. It does not donate or rebind either request ping-pong slot. The
+copy may overlap the next target transaction because both operations only read
+`keep`, while a crossing verify writes exclusively to `next`. This ownership
+rule lets Spec V2 retain the ordinary FutureMap order: launch the next GPU batch
+before processing the previous CPU result.
 
 Radix-disabled execution uses the same transaction with a request-local
 boundary slot. It omits only cross-request publication and reuse.
@@ -195,16 +205,19 @@ lengths, padding, and possible boundary crossings once for the whole block.
 Every GDN layer reuses those graph-stable tensors. Three small Triton launches
 pack `q+k`, `v`, and `g+beta`: each launch both inserts the current candidate
 rows into the persistent transition window and materializes the contiguous
-`64 + D` input expected by the unchanged FLA dispatcher. A masked scatter
-stages `h64` only for lanes that could cross the boundary, and a direct gather
-writes only the `D` logical outputs in their final layout.
+`64 + D` input expected by FLA. The FLA recurrence producer optionally writes
+the selected chunk accumulator directly into the request-owned FP32 boundary
+workspace, avoiding a BF16 round trip and a second full-state scatter. Its
+ordinary public `h` output remains in the activation dtype, and all new producer
+arguments default to disabled, so non-DVR GDN follows its existing path. A
+direct gather writes only the `D` logical outputs in their final layout.
 
-This deliberately does not change the generic FLA producer, its public state
-index contract, or ordinary GDN execution. It also does not claim that the
-fixed `64 + D` materialization is the final performance design. A segmented
-verify path or direct producer write is allowed only after the private packing
-path is measured on H20 and the replacement proves bitwise equivalence for all
-physical chunk positions.
+This narrow side output does not change FLA recurrence arithmetic, public state
+indices, or ordinary in-place execution. XPU accepts the default-compatible
+signature and rejects the optional side output explicitly. The fixed `64 + D`
+materialization is still not necessarily the final performance design; a
+segmented verify path remains conditional on H20 profiling and bitwise proof
+for every physical chunk position.
 
 `h64` is publishable only when accepted rows actually cross the boundary. It is
 valid in that case because every row before the boundary is accepted target
@@ -264,7 +277,13 @@ ordinary target EXTEND, which also reconstructs `draft_state` and `W`.
 
 `draft_state`, `W`, candidate verify state, and EAGLE draft cache
 are request-local or worker-local and are never published. This keeps physical
-checkpoint donation independent from provisional draft execution.
+checkpoint storage independent from provisional draft execution. An unfinished
+request keeps both physical ping-pong slots; Radix owns a copied checkpoint.
+Only a finished request may transfer ownership of its final retained slot,
+because no later GPU transaction can access that request. Overlap can enqueue
+one final speculative round before CPU result processing observes completion;
+cache release therefore waits for that round's existing rollback event on the
+schedule stream before selecting or donating a checkpoint.
 
 ## 5. Worker structure
 
@@ -422,7 +441,7 @@ The implementation is release-qualified only when:
 - state-level boundary, draft-state, workspace, window, and conv checks pass;
 - self-DVR v1/v2 and EAGLE sync/overlap preserve strict long-sequence KL=0;
 - `return_logprob=True` and `False` share identical state transitions;
-- prompt/output boundaries around `1/63/64/65`, mixed batches, Radix donation,
+- prompt/output boundaries around `1/63/64/65`, mixed batches, Radix copy,
   generated-prefix re-hit, and Radix-disabled execution pass;
 - 0.8B, 35B MTP, and 80B real-data acceptance remain within the established
   ranges;

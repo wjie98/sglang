@@ -294,13 +294,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.kernel_dispatcher,
                 model_runner=model_runner,
             )
+        self._dvr_extend_boundary_metadata = None
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        self._prepare_dvr_target_verify(forward_batch)
+        self._prepare_dvr_forward(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -313,17 +314,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         super().init_forward_metadata_in_graph(forward_batch)
-        self._prepare_dvr_target_verify(forward_batch)
+        self._prepare_dvr_forward(forward_batch)
 
-    def _prepare_dvr_target_verify(self, forward_batch: ForwardBatch):
-        if (
-            self.dvr_state_adapter is not None
-            and forward_batch.forward_mode.is_target_verify()
-        ):
-            self.dvr_state_adapter.prepare_target_verify(
+    def _prepare_dvr_forward(self, forward_batch: ForwardBatch):
+        self._dvr_extend_boundary_metadata = (
+            None
+            if self.dvr_state_adapter is None
+            else self.dvr_state_adapter.prepare_forward(
                 forward_batch=forward_batch,
-                cache_indices=self.forward_metadata.mamba_cache_indices,
+                forward_metadata=self.forward_metadata,
             )
+        )
 
     def forward_decode(
         self,
@@ -494,16 +495,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            verify_cache_indices = cache_indices[:batch_size]
+            verify_conv_slots = cache_indices[:batch_size]
             if dvr_state_adapter is not None:
                 (
-                    boundary_indices,
-                    state_input_indices,
-                    verify_cache_indices,
-                    tail_lens,
-                    valid_mask,
-                    boundary_state_steps,
-                ) = dvr_state_adapter.target_verify_metadata()
+                    verify_conv_slots,
+                    intermediate_state_indices,
+                ) = dvr_state_adapter.verify_conv_indices()
 
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
@@ -514,7 +511,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.conv_weights,
                 layer.bias,
                 layer.activation,
-                conv_state_indices=verify_cache_indices,
+                conv_state_indices=verify_conv_slots,
                 intermediate_conv_window=intermediate_conv_window_cache,
                 intermediate_state_indices=intermediate_state_indices[:batch_size],
                 retrieve_next_token=retrieve_next_token,
@@ -592,16 +589,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     value=value,
                     g=g,
                     beta=beta,
-                    state_cache=mamba_cache_params,
-                    boundary_indices=boundary_indices,
-                    state_input_indices=state_input_indices,
-                    tail_lens=tail_lens,
-                    valid_mask=valid_mask,
-                    boundary_state_steps=boundary_state_steps,
                     layer_idx=layer_idx,
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            boundary_state_args = {}
+            if self._dvr_extend_boundary_metadata is not None:
+                boundary_state_indices, boundary_state_steps = (
+                    self._dvr_extend_boundary_metadata
+                )
+                boundary_state_args = {
+                    "boundary_state": ssm_states,
+                    "boundary_state_indices": boundary_state_indices,
+                    "boundary_state_steps": boundary_state_steps,
+                }
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -611,12 +612,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                **boundary_state_args,
             )
             if dvr_state_adapter is not None:
                 # Cache target-model GDN tail inputs for later DVR verify/replay.
-                dvr_state_adapter.cache_extend_tail(
+                dvr_state_adapter.cache_prefill_transitions(
                     forward_batch=forward_batch,
-                    q=query,
                     k=key,
                     v=value,
                     g=g,
@@ -637,8 +638,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states[cache_indices] = ssm_states_contig
 
             if h is not None:
-                self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
-                )
+                if self._dvr_extend_boundary_metadata is None:
+                    self._track_mamba_state_extend(
+                        forward_batch, h, ssm_states, forward_metadata
+                    )
+                elif forward_metadata.track_ssm_final_src.numel() > 0:
+                    # Unaligned DVR boundaries were written directly in fp32 by
+                    # the producer. Aligned rows still use the final live state.
+                    ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
+                        forward_metadata.track_ssm_final_src
+                    ]
 
         return core_attn_out

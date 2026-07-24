@@ -1605,20 +1605,6 @@ class Scheduler(
 
             self._apply_war_barrier()
 
-            # A DVR prefill result may finish requests or donate their Mamba
-            # checkpoint slots to Radix. Apply it before the next batch captures
-            # Req references and physical state indices.
-            processed_last_batch_result = False
-            if self.result_queue:
-                pending_batch = self.result_queue[0][0]
-                if (
-                    pending_batch.spec_algorithm.is_dvr()
-                    and pending_batch.forward_mode.is_extend()
-                    and self.server_args.enable_mamba_extra_buffer()
-                ):
-                    pop_and_process()
-                    processed_last_batch_result = True
-
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1627,8 +1613,7 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                if not processed_last_batch_result:
-                    pop_and_process()
+                pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1647,7 +1632,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch and not processed_last_batch_result:
+                if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states

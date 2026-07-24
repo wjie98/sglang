@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -7,16 +8,17 @@ from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.linear.dvr_gdn import (
     DVRGDNStateAdapter,
-    dvr_gdn_state_input_bytes_per_request,
+    dvr_gdn_intermediate_bytes_per_request,
 )
-from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputCache
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
-def create_gdn_state_input_cache(
+def create_gdn_adapter(
     *, num_layers, num_slots, num_draft_tokens, state_shape, dtype, device
 ):
     state_cache = SimpleNamespace(
+        conv=(),
         temporal=torch.empty(num_layers, 1, dtype=torch.float32),
         intermediate_ssm=torch.empty(num_layers, num_slots, 1, dtype=torch.float32),
     )
@@ -38,10 +40,39 @@ def create_gdn_state_input_cache(
             device=device,
         ),
     )
-    return adapter.state_input_cache
+    return adapter
 
 
-def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
+def create_test_adapter(
+    *,
+    transition_windows,
+    accepted_tail_lens,
+    state_cache=None,
+    verify_boundary_slots=None,
+    kernel_dispatcher=None,
+    draft_reuses_target_state=False,
+):
+    if state_cache is None:
+        layers, slots = transition_windows[0].shape[:2]
+        state_cache = SimpleNamespace(
+            conv=(),
+            temporal=torch.empty(layers, slots, 1),
+            intermediate_ssm=torch.empty(layers, slots, 1, 1),
+            intermediate_conv_window=(),
+        )
+    if verify_boundary_slots is None:
+        verify_boundary_slots = torch.zeros_like(accepted_tail_lens, dtype=torch.long)
+    return DVRGDNStateAdapter(
+        kernel_dispatcher,
+        state_cache=state_cache,
+        transition_windows=transition_windows,
+        accepted_tail_lens=accepted_tail_lens,
+        verify_boundary_slots=verify_boundary_slots,
+        draft_reuses_target_state=draft_reuses_target_state,
+    )
+
+
+def test_gdn_state_inputs_support_distinct_key_and_value_heads():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
         intermediate_size=32 * 128,
@@ -52,7 +83,7 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
         conv_kernel=4,
     )
 
-    cache = create_gdn_state_input_cache(
+    adapter = create_gdn_adapter(
         num_layers=1,
         num_slots=3,
         num_draft_tokens=16,
@@ -61,7 +92,7 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
         device="cpu",
     )
 
-    k_cache, v_cache, g_cache, beta_cache = cache.tensors
+    k_cache, v_cache, g_cache, beta_cache = adapter.transition_windows
     assert k_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 8, 128)
     assert v_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16, 128)
     assert g_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
@@ -71,24 +102,50 @@ def test_gdn_state_input_cache_supports_distinct_key_and_value_heads():
     v = torch.randn(2, 16, 128)
     g = torch.randn(2, 16)
     beta = torch.randn(2, 16)
-    layer_cache = cache[0]
-    layer_cache.write_extend_tail(
-        values=(k, v, g, beta),
-        indices=torch.tensor([1]),
-        extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
-        extend_seq_lens_cpu=[2],
-        chunk_size=FLA_CHUNK_SIZE,
+    adapter.cache_prefill_transitions(
+        forward_batch=SimpleNamespace(
+            extend_prefix_lens_cpu=[FLA_CHUNK_SIZE],
+            extend_seq_lens_cpu=[2],
+            req_pool_indices=torch.tensor([1]),
+        ),
+        k=k.unsqueeze(0),
+        v=v.unsqueeze(0),
+        g=g,
+        beta=beta,
+        layer_idx=0,
     )
 
-    assert torch.equal(layer_cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
-    k_cache, v_cache, g_cache, beta_cache = layer_cache.tensors
+    k_cache, v_cache, g_cache, beta_cache = (
+        state_input[0] for state_input in adapter.transition_windows
+    )
     assert torch.equal(k_cache[1, :2], k)
     assert torch.equal(v_cache[1, :2], v)
     assert torch.equal(g_cache[1, :2], g)
     assert torch.equal(beta_cache[1, :2], beta)
 
 
-def test_gdn_state_input_memory_estimate_matches_allocation():
+def test_gdn_extend_requires_host_length_metadata():
+    adapter = create_test_adapter(
+        transition_windows=tuple(torch.zeros(1, 2, 66, 1) for _ in range(4)),
+        accepted_tail_lens=torch.zeros(2, dtype=torch.int32),
+    )
+
+    with pytest.raises(RuntimeError, match="CPU prefix and extend lengths"):
+        adapter.cache_prefill_transitions(
+            forward_batch=SimpleNamespace(
+                extend_prefix_lens_cpu=None,
+                extend_seq_lens_cpu=None,
+                req_pool_indices=torch.tensor([1]),
+            ),
+            k=torch.zeros(1, 1, 1),
+            v=torch.zeros(1, 1, 1),
+            g=torch.zeros(1, 1),
+            beta=torch.zeros(1, 1),
+            layer_idx=0,
+        )
+
+
+def test_gdn_memory_estimate_matches_allocation():
     state_shape = Mamba2StateShape.create(
         tp_world_size=4,
         intermediate_size=32 * 128,
@@ -101,7 +158,7 @@ def test_gdn_state_input_memory_estimate_matches_allocation():
     num_layers = 3
     num_slots = 5
     num_draft_tokens = 16
-    cache = create_gdn_state_input_cache(
+    adapter = create_gdn_adapter(
         num_layers=num_layers,
         num_slots=num_slots,
         num_draft_tokens=num_draft_tokens,
@@ -112,13 +169,33 @@ def test_gdn_state_input_memory_estimate_matches_allocation():
     params = SimpleNamespace(
         layers=tuple(range(num_layers)),
         shape=state_shape,
-        dtype=SimpleNamespace(conv=torch.bfloat16),
+        dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
     )
 
-    allocated = sum(t.numel() * t.element_size() for t in cache.tensors)
-    allocated += cache.tail_lens.numel() * cache.tail_lens.element_size()
-    assert allocated // num_slots == dvr_gdn_state_input_bytes_per_request(
-        params, num_draft_tokens
+    allocated_per_request = sum(
+        t.numel() * t.element_size() for t in adapter.transition_windows
+    )
+    allocated_per_request += (
+        adapter.accepted_tail_lens.numel() * adapter.accepted_tail_lens.element_size()
+    )
+    allocated_per_request += (
+        adapter.verify_boundary_slots.numel()
+        * adapter.verify_boundary_slots.element_size()
+    )
+    allocated_per_request //= num_slots
+    allocated_per_request += num_layers * (
+        math.prod(state_shape.temporal) * torch.float32.itemsize
+        + sum(
+            conv_dim * (num_draft_tokens + window_size - 1)
+            for conv_dim, window_size in state_shape.conv
+        )
+        * torch.bfloat16.itemsize
+    )
+    assert allocated_per_request == dvr_gdn_intermediate_bytes_per_request(
+        params,
+        num_draft_tokens,
+        dedup_conv_window=True,
+        draft_reuses_target_state=False,
     )
 
 
@@ -165,16 +242,18 @@ def test_dvr_gdn_adapter_maps_request_and_state_slots():
         ),
     )
 
-    returned_state_cache, state_input_indices, live_indices = adapter.batch_state(
-        batch=batch
-    )
+    request_rows, endpoint_slots = adapter.resolve_request_slots(batch=batch)
 
-    assert returned_state_cache is all_layers_state_cache
-    assert state_input_indices.tolist() == [2]
-    assert live_indices.tolist() == [0]
-    window = adapter.state_input_window(layer_idx=0)
-    assert window.capacity == FLA_CHUNK_SIZE + 4
-    assert window.tensors[0].shape == (3, FLA_CHUNK_SIZE + 4, 8, 128)
+    assert adapter.state_cache is all_layers_state_cache
+    assert request_rows.tolist() == [2]
+    assert endpoint_slots.tolist() == [0]
+    assert adapter.transition_windows[0].shape[2] == FLA_CHUNK_SIZE + 4
+    assert adapter.transition_windows[0][0].shape == (
+        3,
+        FLA_CHUNK_SIZE + 4,
+        8,
+        128,
+    )
 
 
 def test_gdn_extend_tail_cache_uses_target_request_slots():
@@ -187,7 +266,7 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
         state_size=128,
         conv_kernel=4,
     )
-    cache = create_gdn_state_input_cache(
+    adapter = create_gdn_adapter(
         num_layers=1,
         num_slots=3,
         num_draft_tokens=16,
@@ -195,11 +274,9 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
         dtype=torch.float32,
         device="cpu",
     )
-    for tensor in cache.tensors:
+    for tensor in adapter.transition_windows:
         tensor[:, 1] = 1
-    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, state_input_cache=cache)
 
-    q = torch.randn(1, 2, 8, 128)
     k = torch.randn(1, 2, 8, 128)
     v = torch.randn(1, 2, 16, 128)
     g = torch.randn(2, 16)
@@ -210,45 +287,36 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
         extend_seq_lens_cpu=[2],
         req_pool_indices=torch.tensor([1]),
     )
-    adapter.cache_extend_tail(
+    adapter.cache_prefill_transitions(
         forward_batch=target_batch,
-        q=q,
         k=k,
         v=v,
         g=g,
         beta=beta,
         layer_idx=0,
     )
-    layer_cache = cache[0]
-    assert torch.equal(layer_cache.tail_lens[1], torch.tensor(2, dtype=torch.int32))
-    k_cache, v_cache, g_cache, beta_cache = layer_cache.tensors
+    k_cache, v_cache, g_cache, beta_cache = (
+        state_input[0] for state_input in adapter.transition_windows
+    )
     assert torch.equal(k_cache[1, :2], k.reshape(2, 8, 128))
     assert torch.equal(v_cache[1, :2], v.reshape(2, 16, 128))
     assert torch.equal(g_cache[1, :2], g)
     assert torch.equal(beta_cache[1, :2], beta)
-    # Rows after tail_lens are outside every consumed causal prefix. Keeping
+    # Rows after accepted_tail_lens are outside every consumed causal prefix. Keeping
     # them untouched avoids clearing the full k/v/g/beta window per verify.
-    for tensor in layer_cache.tensors:
+    for tensor in (k_cache, v_cache, g_cache, beta_cache):
         assert torch.all(tensor[1, 2:] == 1)
 
 
-def test_gdn_state_input_window_shifts_only_crossed_requests():
-    values = torch.arange(2 * 80, dtype=torch.float32).view(2, 80, 1)
-    original = values.clone()
-    cache = DVRStateInputCache(
-        tensors=(values,),
-        tail_lens=torch.zeros(2, dtype=torch.int32),
-        has_layer_dim=False,
-    )
-
-    cache.shift_after_boundary(
-        indices=torch.tensor([0, 1]),
-        crosses_chunk_boundary=torch.tensor([False, True]),
-        chunk_size=64,
-    )
-
-    torch.testing.assert_close(values[0], original[0])
-    torch.testing.assert_close(values[1, :16], original[1, 64:80])
+def test_gdn_state_input_window_rejects_invalid_tail():
+    with pytest.raises(RuntimeError, match="invalid linear-state tail"):
+        dvr_gdn_module._compact_gdn_transition_windows(
+            (torch.zeros(1, 1, 80, 1),),
+            indices=torch.tensor([0]),
+            crosses_chunk_boundary=torch.tensor([True]),
+            chunk_size=64,
+            accepted_tail_lens=torch.tensor([17]),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -257,16 +325,14 @@ def test_gdn_state_input_window_compacts_only_valid_crossing_tail():
         1, 2, 80, 2
     )
     original = values.clone()
-    cache = DVRStateInputCache(
-        tensors=(values,),
-        tail_lens=torch.zeros(2, dtype=torch.int32, device="cuda"),
-    )
-
-    cache.shift_after_boundary(
+    dvr_gdn_module._compact_gdn_transition_windows(
+        (values,),
         indices=torch.tensor([0, 1], device="cuda"),
         crosses_chunk_boundary=torch.tensor([False, True], device="cuda"),
         chunk_size=64,
-        tail_lens=torch.tensor([8, 3], device="cuda"),
+        # A non-crossing lane may retain nearly a full chunk; only the compacted
+        # crossing lane is constrained by the 16-row post-boundary capacity.
+        accepted_tail_lens=torch.tensor([63, 3], device="cuda"),
     )
 
     torch.testing.assert_close(values[:, 0], original[:, 0])
@@ -275,15 +341,10 @@ def test_gdn_state_input_window_compacts_only_valid_crossing_tail():
 
 
 def test_gdn_verify_uses_mamba_padding_sentinel():
-    state_window = DVRStateInputCache(
-        tensors=(torch.zeros(3, 66, 1),),
-        tail_lens=torch.tensor([0, 7, 63], dtype=torch.int32),
-        has_layer_dim=False,
-    )
-    adapter = DVRGDNStateAdapter(
-        kernel_dispatcher=None,
-        state_input_cache=state_window,
-        verify_boundary_indices=torch.tensor([0, 11, 12]),
+    adapter = create_test_adapter(
+        transition_windows=(torch.zeros(1, 3, 66, 1),),
+        accepted_tail_lens=torch.tensor([0, 7, 63], dtype=torch.int32),
+        verify_boundary_slots=torch.tensor([0, 11, 12]),
     )
     forward_batch = SimpleNamespace(
         input_ids=torch.zeros(4, dtype=torch.long),
@@ -296,23 +357,45 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
         cache_indices=torch.tensor([7, PAD_SLOT_ID]),
     )
     (
-        boundary_indices,
-        state_input_indices,
-        verify_cache_indices,
-        tail_lens,
+        boundary_slots,
+        request_rows,
+        verify_conv_slots,
+        accepted_tail_lens,
         valid_mask,
         boundary_state_steps,
-    ) = adapter.target_verify_metadata()
+    ) = adapter._verify_plan
 
-    assert torch.equal(boundary_indices, torch.tensor([12, 0]))
-    assert torch.equal(state_input_indices, torch.tensor([2, 0]))
-    assert torch.equal(verify_cache_indices, torch.tensor([7, 0]))
-    assert torch.equal(tail_lens, torch.tensor([63, 0]))
+    assert torch.equal(boundary_slots, torch.tensor([12, 0]))
+    assert torch.equal(request_rows, torch.tensor([2, 0]))
+    assert torch.equal(verify_conv_slots, torch.tensor([7, 0]))
+    assert torch.equal(accepted_tail_lens, torch.tensor([63, 0]))
     assert torch.equal(valid_mask, torch.tensor([True, False]))
     assert torch.equal(boundary_state_steps, torch.tensor([1, -1]))
+    conv_slots, intermediate_rows = adapter.verify_conv_indices()
+    assert torch.equal(conv_slots, torch.tensor([7, 0]))
+    assert torch.equal(intermediate_rows, torch.tensor([2, 0]))
 
 
-def test_gdn_verify_rejects_backend_without_boundary_states():
+def test_gdn_verify_rejects_invalid_tail():
+    adapter = create_test_adapter(
+        transition_windows=(torch.zeros(1, 2, 66, 1),),
+        accepted_tail_lens=torch.tensor([0, 64], dtype=torch.int32),
+        verify_boundary_slots=torch.tensor([0, 1]),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid linear-state tail"):
+        adapter.prepare_target_verify(
+            forward_batch=SimpleNamespace(
+                input_ids=torch.zeros(2, dtype=torch.long),
+                req_pool_indices=torch.tensor([1]),
+                spec_info=SimpleNamespace(draft_token_num=2),
+            ),
+            cache_indices=torch.tensor([1]),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_gdn_verify_exports_boundary_into_workspace():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
         intermediate_size=32 * 128,
@@ -322,48 +405,61 @@ def test_gdn_verify_rejects_backend_without_boundary_states():
         state_size=128,
         conv_kernel=4,
     )
-    cache = create_gdn_state_input_cache(
+    adapter = create_gdn_adapter(
         num_layers=1,
         num_slots=3,
         num_draft_tokens=2,
         state_shape=state_shape,
         dtype=torch.float32,
-        device="cpu",
+        device="cuda",
     )
     calls = []
 
     def extend(**kwargs):
         calls.append(kwargs)
-        return torch.empty(0), None, None
+        kwargs["boundary_state"][kwargs["boundary_state_indices"]] = 7
+        return (
+            torch.zeros(1, 66, 16, 128, device="cuda"),
+            None,
+            torch.empty(0, device="cuda"),
+        )
 
     dispatcher = SimpleNamespace(extend=extend)
-    adapter = DVRGDNStateAdapter(
-        kernel_dispatcher=dispatcher,
-        state_input_cache=cache,
-    )
     state_cache = SimpleNamespace(
-        temporal=torch.zeros(3, 16, 128, 128),
-        intermediate_ssm=torch.zeros(3, 1, 16, 128, 128),
+        conv=(),
+        temporal=torch.zeros(1, 3, 16, 128, 128, device="cuda"),
+        intermediate_ssm=torch.zeros(1, 3, 1, 16, 128, 128, device="cuda"),
+    )
+    adapter.kernel_dispatcher = dispatcher
+    adapter.state_cache = state_cache
+    adapter._verify_plan = (
+        torch.tensor([0], device="cuda"),
+        torch.tensor([1], device="cuda"),
+        torch.tensor([0], device="cuda"),
+        torch.tensor([2], device="cuda"),
+        torch.tensor([True], device="cuda"),
+        torch.tensor([-1], device="cuda"),
     )
 
-    query = torch.ones(1, 2, 8, 128)
-    with pytest.raises(RuntimeError, match="exact chunk-boundary states"):
-        adapter.forward_target_verify(
-            query=query,
-            key=torch.zeros(1, 2, 8, 128),
-            value=torch.zeros(1, 2, 16, 128),
-            g=torch.zeros(1, 2, 16),
-            beta=torch.zeros(1, 2, 16),
-            state_cache=state_cache,
-            boundary_indices=torch.tensor([0]),
-            state_input_indices=torch.tensor([1]),
-            tail_lens=torch.tensor([2]),
-            valid_mask=torch.tensor([True]),
-            boundary_state_steps=torch.tensor([-1]),
-            layer_idx=0,
-        )
+    query = torch.ones(1, 2, 8, 128, device="cuda")
+    output = adapter.forward_target_verify(
+        query=query,
+        key=torch.zeros(1, 2, 8, 128, device="cuda"),
+        value=torch.zeros(1, 2, 16, 128, device="cuda"),
+        g=torch.zeros(1, 2, 16, device="cuda"),
+        beta=torch.zeros(1, 2, 16, device="cuda"),
+        layer_idx=0,
+    )
+    assert output.shape == (1, 2, 16, 128)
     assert calls[0]["inplace_update"] is False
-    assert torch.equal(calls[0]["cache_indices"], torch.tensor([0]))
+    assert torch.equal(calls[0]["cache_indices"], torch.tensor([0], device="cuda"))
+    assert torch.equal(
+        calls[0]["boundary_state_indices"], torch.tensor([1], device="cuda")
+    )
+    assert torch.equal(
+        calls[0]["boundary_state_steps"], torch.tensor([-1], device="cuda")
+    )
+    assert torch.count_nonzero(state_cache.intermediate_ssm[:, 1]) > 0
     assert torch.count_nonzero(calls[0]["q"][:, :2]) == 0
     assert torch.equal(calls[0]["q"][:, 2:4], query)
 
@@ -379,7 +475,7 @@ def test_gdn_verify_window_pack_matches_indexing_reference():
     candidate0 = torch.randn(3, draft_tokens, 2, 4, device="cuda")
     candidate1 = torch.randn_like(candidate0)
     indices = torch.tensor([1, 3, 0], device="cuda")
-    tail_lens = torch.tensor([0, 5, 0], device="cuda")
+    accepted_tail_lens = torch.tensor([0, 5, 0], device="cuda")
     valid = torch.tensor([True, True, False], device="cuda")
 
     output0, output1 = dvr_gdn_module._pack_verify_window_pair(
@@ -387,8 +483,8 @@ def test_gdn_verify_window_pack_matches_indexing_reference():
         candidate0,
         cache1=cache1,
         candidate1=candidate1,
-        state_input_indices=indices,
-        tail_lens=tail_lens,
+        request_rows=indices,
+        accepted_tail_lens=accepted_tail_lens,
         valid_mask=valid,
     )
 
@@ -396,7 +492,7 @@ def test_gdn_verify_window_pack_matches_indexing_reference():
     expected1 = original1.clone()
     for req in range(2):
         slot = int(indices[req])
-        tail = int(tail_lens[req])
+        tail = int(accepted_tail_lens[req])
         expected0[slot, tail : tail + draft_tokens] = candidate0[req]
         expected1[slot, tail : tail + draft_tokens] = candidate1[req]
     expected_output0 = expected0[indices]
@@ -422,8 +518,8 @@ def test_gdn_verify_window_pack_can_keep_query_candidate_only():
         query,
         cache1=cache,
         candidate1=key,
-        state_input_indices=torch.tensor([1], device="cuda"),
-        tail_lens=torch.tensor([4], device="cuda"),
+        request_rows=torch.tensor([1], device="cuda"),
+        accepted_tail_lens=torch.tensor([4], device="cuda"),
         valid_mask=torch.tensor([True], device="cuda"),
         read_cache0=False,
         persist_cache0=False,
@@ -441,10 +537,10 @@ def test_gdn_verify_output_gather_matches_logical_rows():
     source = torch.arange(2 * 9 * 3 * 4, device="cuda", dtype=torch.float32).view(
         1, 2 * 9, 3, 4
     )
-    tail_lens = torch.tensor([1, 5], device="cuda")
+    accepted_tail_lens = torch.tensor([1, 5], device="cuda")
 
     actual = dvr_gdn_module._gather_verify_output(
-        source, tail_lens=tail_lens, draft_tokens=3
+        source, accepted_tail_lens=accepted_tail_lens, draft_tokens=3
     )
 
     source_by_req = source.view(2, 9, 3, 4)
@@ -461,28 +557,43 @@ def test_gdn_self_draft_state_is_request_owned_and_keeps_target_unchanged():
     state_cache = SimpleNamespace(
         conv=(conv,), temporal=temporal, intermediate_ssm=workspace
     )
-    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, draft_reuses_target_state=True)
-    adapter.allocate_self_draft_state(state_cache=state_cache, num_slots=4)
-    adapter.initialize_self_draft_state(
+    adapter = create_test_adapter(
         state_cache=state_cache,
-        live_indices=torch.tensor([0, 2]),
-        state_input_indices=torch.tensor([1, 3]),
+        transition_windows=(torch.empty(1, 4, 1),) * 4,
+        accepted_tail_lens=torch.zeros(4, dtype=torch.int32),
+        draft_reuses_target_state=True,
+    )
+    adapter.initialize_self_draft_state(
+        endpoint_slots=torch.tensor([0, 2]),
+        request_rows=torch.tensor([1, 3]),
     )
     original_conv = conv.clone()
     original_temporal = temporal.clone()
     layer_cache = SimpleNamespace(temporal=temporal[0], intermediate_ssm=workspace[0])
-    forward_batch = SimpleNamespace(req_pool_indices=torch.tensor([1, 3]))
-
-    with adapter.self_draft_decode():
-        draft_conv, draft_temporal, indices = adapter.decode_state(
-            layer_cache=layer_cache, forward_batch=forward_batch, layer_idx=0
+    forward_batch = SimpleNamespace(
+        req_pool_indices=torch.tensor([1, 3]), forward_mode=ForwardMode.DECODE
+    )
+    assert (
+        adapter.decode_state(
+            layer_cache=layer_cache,
+            forward_batch=SimpleNamespace(
+                req_pool_indices=torch.tensor([1, 3]),
+                forward_mode=ForwardMode.EXTEND,
+            ),
+            layer_idx=0,
         )
-        draft_conv[indices] = -1
-        draft_temporal[indices] = -2
+        is None
+    )
+
+    draft_conv, draft_temporal, indices = adapter.decode_state(
+        layer_cache=layer_cache, forward_batch=forward_batch, layer_idx=0
+    )
+    draft_conv[indices] = -1
+    draft_temporal[indices] = -2
 
     torch.testing.assert_close(conv, original_conv)
     torch.testing.assert_close(temporal, original_temporal)
-    assert torch.all(adapter.draft_conv_state[0][:, [1, 3]] == -1)
+    assert torch.all(adapter.self_draft_conv_state[0][:, [1, 3]] == -1)
     assert torch.all(workspace[:, [1, 3], 0] == -2)
 
 
@@ -494,10 +605,6 @@ def test_gdn_self_draft_rebuild_reads_boundary_and_writes_workspace():
     v = torch.randn_like(k)
     g = torch.randn(layers, slots, tokens, 1, device="cuda") * 0.01
     beta = torch.sigmoid(torch.randn_like(g))
-    window = DVRStateInputCache(
-        tensors=(k, v, g, beta),
-        tail_lens=torch.zeros(slots, dtype=torch.int32, device="cuda"),
-    )
     temporal = torch.randn(layers, 7, 1, dim, dim, device="cuda") * 0.01
     original = temporal.clone()
     workspace = torch.zeros(layers, slots, 1, 1, dim, dim, device="cuda")
@@ -520,17 +627,17 @@ def test_gdn_self_draft_rebuild_reads_boundary_and_writes_workspace():
                 key /= torch.sqrt(torch.sum(key * key) + 1e-6)
                 value = v[layer, request, step, 0].float()
                 state *= torch.exp(g[layer, request, step, 0].float())
-                value = (
-                    value - torch.sum(state[0] * key.unsqueeze(0), dim=1)
-                ) * beta[layer, request, step, 0].float()
+                value = (value - torch.sum(state[0] * key.unsqueeze(0), dim=1)) * beta[
+                    layer, request, step, 0
+                ].float()
                 state += value[:, None] * key[None, :]
             expected[layer, row] = state
 
     dvr_gdn_module._rebuild_gdn_self_draft_state(
-        window,
+        (k, v, g, beta),
         state_cache=state_cache,
-        state_input_indices=request_rows,
-        boundary_indices=boundaries,
+        request_rows=request_rows,
+        boundary_slots=boundaries,
         token_count=token_counts,
     )
 
@@ -557,34 +664,43 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
     monkeypatch.setattr(
         dvr_gdn_module,
         "fused_conv_window_scatter_with_mask",
-        lambda _dst, _src, indices, steps: conv_scatters.append(
-            (indices.tolist(), steps.tolist())
+        lambda _dst, _src, indices, steps, **kwargs: conv_scatters.append(
+            (
+                indices.tolist(),
+                steps.tolist(),
+                kwargs.get("src_indices_raw").tolist(),
+            )
         ),
     )
-    tail_updates = []
-    window = SimpleNamespace(
-        get_tail_lens=lambda **_kwargs: torch.tensor([63, 1]),
-        shift_after_boundary=lambda **_kwargs: None,
-        set_tail_lens=lambda **kwargs: tail_updates.append(kwargs["value"].tolist()),
+    monkeypatch.setattr(
+        dvr_gdn_module,
+        "_compact_gdn_transition_windows",
+        lambda *_args, **_kwargs: None,
     )
-    adapter = DVRGDNStateAdapter(kernel_dispatcher=None, state_input_cache=window)
     state_cache = SimpleNamespace(
         temporal=torch.empty(1),
         intermediate_ssm=torch.empty(1),
         conv=(torch.empty(1),),
         intermediate_conv_window=(torch.empty(1),),
     )
-
-    crossed = adapter.commit_after_verify(
+    adapter = create_test_adapter(
         state_cache=state_cache,
-        state_input_indices=torch.tensor([1, 2]),
-        live_indices=torch.tensor([3, 4]),
-        boundary_indices=torch.tensor([5, 6]),
-        next_boundary_indices=torch.tensor([7, 8]),
+        transition_windows=(torch.empty(1, 3, 80, 1),) * 4,
+        accepted_tail_lens=torch.tensor([0, 63, 1], dtype=torch.int32),
+    )
+
+    crossed = adapter.commit_accepted_state(
+        request_rows=torch.tensor([1, 2]),
+        endpoint_slots=torch.tensor([3, 4]),
+        boundary_slots=torch.tensor([5, 6]),
+        alternate_boundary_slots=torch.tensor([7, 8]),
         accepted_token_counts=torch.tensor([2, 2]),
     )
 
     assert crossed.tolist() == [True, False]
     assert temporal_scatters == [([7, 8], [0, -1], [1, 2])]
-    assert conv_scatters == [([3, 4], [1, 1]), ([7, 8], [0, -1])]
-    assert tail_updates == [[1, 3]]
+    assert conv_scatters == [
+        ([3, 4], [1, 1], [1, 2]),
+        ([7, 8], [0, -1], [1, 2]),
+    ]
+    assert adapter.accepted_tail_lens.tolist() == [0, 1, 3]

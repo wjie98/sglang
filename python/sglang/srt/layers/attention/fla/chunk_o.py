@@ -94,9 +94,7 @@ def chunk_fwd_kernel_o(
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
-        # h may be stored in fp32 for deterministic recurrent checkpoints; dot
-        # still follows q/k's math dtype for prefill-equivalent output.
-        b_o += tl.dot(b_q, tl.trans(b_h.to(b_q.dtype)))
+        b_o += tl.dot(b_q, tl.trans(b_h))
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)
 

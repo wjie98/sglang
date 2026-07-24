@@ -137,7 +137,7 @@ run_one_mode() {
     --ignore-eos \
     2>&1 | tee -a "${client_log}"
 
-  echo "==> Running ${label} first-decode radix-donation boundary cases"
+  echo "==> Running ${label} first-decode radix-copy boundary cases"
   conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
     --base-url "${BASE_URL}" \
     --request-modes concurrent,batch \

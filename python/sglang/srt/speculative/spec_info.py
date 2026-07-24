@@ -329,7 +329,11 @@ def create_dummy_verify_input(
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
     spec_info = None
-    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+    if (
+        spec_algorithm.uses_eagle_draft_backend()
+        or spec_algorithm.is_dvr_self_draft()
+        or spec_algorithm.is_standalone()
+    ):
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         if is_draft_worker:
@@ -346,7 +350,11 @@ def create_dummy_verify_input(
                 spec_steps=server_args.speculative_num_steps,
                 topk=server_args.speculative_eagle_topk,
                 draft_token_num=server_args.speculative_num_draft_tokens,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if spec_algorithm.is_dvr_self_draft()
+                    else CaptureHiddenMode.FULL
+                ),
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )

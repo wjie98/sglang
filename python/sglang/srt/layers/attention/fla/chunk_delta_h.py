@@ -60,6 +60,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    boundary_state,
+    boundary_state_indices,
+    boundary_state_steps,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -73,6 +76,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     INPLACE_UPDATE: tl.constexpr,
+    WRITE_BOUNDARY_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
@@ -161,6 +165,56 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
             )
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+
+        if WRITE_BOUNDARY_STATE:
+            boundary_index = tl.load(boundary_state_indices + i_n).to(tl.int64)
+            boundary_step = tl.load(boundary_state_steps + i_n).to(tl.int32)
+            boundary_ptr = (
+                boundary_state + (boundary_index * H + i_h) * V * K + i_v * BV * K
+            )
+            boundary_mask = i_t == boundary_step
+            tl.store(
+                boundary_ptr
+                + tl.arange(0, BV)[:, None] * K
+                + tl.arange(0, 64)[None, :],
+                b_h1,
+                mask=boundary_mask
+                & (i_v * BV + tl.arange(0, BV)[:, None] < V)
+                & (tl.arange(0, 64)[None, :] < K),
+            )
+            if K > 64:
+                tl.store(
+                    boundary_ptr
+                    + tl.arange(0, BV)[:, None] * K
+                    + 64
+                    + tl.arange(0, 64)[None, :],
+                    b_h2,
+                    mask=boundary_mask
+                    & (i_v * BV + tl.arange(0, BV)[:, None] < V)
+                    & (64 + tl.arange(0, 64)[None, :] < K),
+                )
+            if K > 128:
+                tl.store(
+                    boundary_ptr
+                    + tl.arange(0, BV)[:, None] * K
+                    + 128
+                    + tl.arange(0, 64)[None, :],
+                    b_h3,
+                    mask=boundary_mask
+                    & (i_v * BV + tl.arange(0, BV)[:, None] < V)
+                    & (128 + tl.arange(0, 64)[None, :] < K),
+                )
+            if K > 192:
+                tl.store(
+                    boundary_ptr
+                    + tl.arange(0, BV)[:, None] * K
+                    + 192
+                    + tl.arange(0, 64)[None, :],
+                    b_h4,
+                    mask=boundary_mask
+                    & (i_v * BV + tl.arange(0, BV)[:, None] < V)
+                    & (192 + tl.arange(0, 64)[None, :] < K),
+                )
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -304,6 +358,9 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
     inplace_update: bool = True,
+    boundary_state: Optional[torch.Tensor] = None,
+    boundary_state_indices: Optional[torch.Tensor] = None,
+    boundary_state_steps: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -322,10 +379,15 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    # Boundary states must keep the recurrent-state dtype; DVR compares and
-    # reuses them as prefill-equivalent checkpoints.
-    h_dtype = initial_state.dtype if initial_state is not None else k.dtype
-    h = torch.empty(B, NT, H, V, K, dtype=h_dtype, device=k.device)
+    write_boundary_state = boundary_state is not None
+    if write_boundary_state and (
+        boundary_state_indices is None or boundary_state_steps is None
+    ):
+        raise ValueError(
+            "boundary_state_indices and boundary_state_steps are required when "
+            "boundary_state is provided."
+        )
+    h = k.new_empty(B, NT, H, V, K)
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -342,6 +404,9 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        boundary_state=boundary_state,
+        boundary_state_indices=boundary_state_indices,
+        boundary_state_steps=boundary_state_steps,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -354,6 +419,7 @@ def chunk_gated_delta_rule_fwd_h(
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=inplace_update,
+        WRITE_BOUNDARY_STATE=write_boundary_state,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),

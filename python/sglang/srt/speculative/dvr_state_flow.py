@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -10,7 +10,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 def copy_cached_prefix_boundary(
     *, forward_batch, req_to_token_pool, chunk_size: int
 ) -> None:
-    """Copy a warm Radix boundary into DVR's request-owned checkpoint slot.
+    """Copy a warm Radix boundary into DVR's request-owned keep slot.
 
     This runs eagerly after deferred Mamba COW and before target EXTEND enters a
     prefill graph. Keeping the whole-pool copy outside model layers avoids
@@ -29,48 +29,55 @@ def copy_cached_prefix_boundary(
     batch_size = forward_batch._original_batch_size or forward_batch.batch_size
     prefix_lens = forward_batch.extend_prefix_lens[:batch_size]
     seq_lens = forward_batch.seq_lens[:batch_size]
-    copy_mask = (prefix_lens > 0) & (
-        prefix_lens == seq_lens // chunk_size * chunk_size
-    )
+    copy_mask = (prefix_lens > 0) & (prefix_lens == seq_lens // chunk_size * chunk_size)
     if forward_batch.mamba_track_mask is not None:
         copy_mask &= ~forward_batch.mamba_track_mask[:batch_size]
 
     translate = req_to_token_pool.translate_mamba_indices
     source = translate(
-        req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices[:batch_size]
-        )
+        req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices[:batch_size])
     )
-    destination = translate(forward_batch.mamba_track_indices[:batch_size])
+    next_slots = forward_batch.mamba_track_indices[:batch_size]
+    track_slots = req_to_token_pool.get_mamba_ping_pong_slots(
+        forward_batch.req_pool_indices[:batch_size]
+    )
+    if track_slots.shape[1] == 2:
+        destination = torch.where(
+            track_slots[:, 0] == next_slots, track_slots[:, 1], track_slots[:, 0]
+        )
+    else:
+        destination = next_slots
+    destination = translate(destination)
     req_to_token_pool.mamba_pool.copy_from(
         source[copy_mask].to(torch.long), destination[copy_mask].to(torch.long)
     )
 
 
 @dataclass
-class DVRLinearStateContext:
-    state_cache: Any
-    state_input_indices: torch.Tensor
-    live_indices: torch.Tensor
-    boundary_indices: torch.Tensor
-    next_boundary_indices: torch.Tensor
-    boundary_track_indices: torch.Tensor
+class DVRStateTransaction:
+    request_rows: torch.Tensor
+    endpoint_slots: torch.Tensor
+    boundary_slots: torch.Tensor
+    alternate_boundary_slots: torch.Tensor
+    boundary_lanes: torch.Tensor
 
 
-class DVRLinearStateLifecycle:
+class DVRStateLifecycle:
     """Own DVR's target boundary and self-draft rollback state.
 
-    The recurrent boundary itself stays in SGLang's existing Mamba state pools:
-    an aligned live state is preferred, otherwise the latest tracked state is
-    reused. A radix miss is rebuilt by the ordinary match-prefix + EXTEND path;
-    DVR does not maintain a second temporal checkpoint store.
+    Temporal and convolution state intentionally have different authoritative
+    positions. The large temporal state is checkpointed at the latest exact
+    chunk boundary and replayed with the accepted transition tail. Convolution
+    state is small and remains authoritative at the accepted endpoint. Self
+    draft mutates a private copy of both. A radix miss is rebuilt by the ordinary
+    match-prefix + EXTEND path; DVR does not maintain another checkpoint store.
     """
 
     def __init__(self, *, server_args, model_runner):
         self.server_args = server_args
         self.model_runner = model_runner
         self._state_adapter = None
-        self.boundary_lens = None
+        self.boundary_seq_lens = None
 
     def bind_state_adapter(self, state_adapter) -> None:
         self._state_adapter = state_adapter
@@ -94,19 +101,15 @@ class DVRLinearStateLifecycle:
                 f"match the adapter chunk size {state_adapter.chunk_size}, got "
                 f"{self.server_args.mamba_cache_chunk_size}."
             )
-        tail_lens = state_adapter.state_input_window().tail_lens
+        accepted_tail_lens = state_adapter.accepted_tail_lens
         track_count = int(
             self.model_runner.req_to_token_pool.mamba_ping_pong_track_buffer_size
         )
-        self.boundary_lens = tail_lens.new_full(
-            (tail_lens.numel(), track_count), -1, dtype=torch.int64
+        # Columns map directly to the request's ping-pong checkpoint slots. Keep
+        # both lengths: stop/reasoning trimming may publish the older visible one.
+        self.boundary_seq_lens = accepted_tail_lens.new_full(
+            (accepted_tail_lens.numel(), track_count), -1, dtype=torch.int64
         )
-        if state_adapter.draft_reuses_target_state:
-            state_cache = self.model_runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-            state_adapter.allocate_self_draft_state(
-                state_cache=state_cache,
-                num_slots=state_cache.intermediate_ssm.shape[1],
-            )
 
     @property
     def chunk_size(self) -> int:
@@ -115,8 +118,8 @@ class DVRLinearStateLifecycle:
         return self._state_adapter.chunk_size
 
     def clear_cache_state(self) -> None:
-        if self.boundary_lens is not None:
-            self.boundary_lens.fill_(-1)
+        if self.boundary_seq_lens is not None:
+            self.boundary_seq_lens.fill_(-1)
 
     def prepare_target_extend(self, batch: ScheduleBatch) -> None:
         """Discard stale DVR ownership before target EXTEND publishes a boundary.
@@ -129,10 +132,10 @@ class DVRLinearStateLifecycle:
         if self._state_adapter is None or not batch.reqs:
             return
 
-        state_input_indices = batch.req_pool_indices.to(
-            device=self.boundary_lens.device, dtype=torch.long
+        request_rows = batch.req_pool_indices.to(
+            device=self.boundary_seq_lens.device, dtype=torch.long
         )
-        self.boundary_lens.index_fill_(0, state_input_indices, -1)
+        self.boundary_seq_lens.index_fill_(0, request_rows, -1)
         if not self.server_args.disable_radix_cache:
             return
 
@@ -178,12 +181,8 @@ class DVRLinearStateLifecycle:
 
             # Publish the newest exact boundary no later than the visible prefix.
             # Radix truncates to it; ordinary EXTEND rebuilds the remaining tail.
-            track_lens = [
-                int(length) for length in self.boundary_lens[request_slot].tolist()
-            ]
-            committed_len = int(req.kv_committed_len)
-            if self.server_args.strip_thinking_cache and req.reasoning_tokens > 0:
-                committed_len = min(committed_len, len(req.origin_input_ids))
+            track_lens = self.boundary_seq_lens[request_slot].tolist()
+            committed_len = req._cache_commit_len()
             if req.finished_reason is not None:
                 visible_kv_len = (
                     len(req.origin_input_ids) + len(req.output_ids_through_stop) - 1
@@ -209,45 +208,42 @@ class DVRLinearStateLifecycle:
                 )
             )
         finally:
-            self.boundary_lens[request_slot].fill_(-1)
+            self.boundary_seq_lens[request_slot].fill_(-1)
 
-    def prepare_for_draft(self, batch) -> Optional[DVRLinearStateContext]:
+    def prepare_for_draft(self, batch) -> Optional[DVRStateTransaction]:
         if self._state_adapter is None or batch.batch_size() == 0:
             return None
 
-        state_cache, state_input_indices, live_indices = (
-            self._state_adapter.batch_state(batch=batch)
+        request_rows, endpoint_slots = self._state_adapter.resolve_request_slots(
+            batch=batch
         )
         track_slots = batch.req_to_token_pool.get_mamba_ping_pong_slots(
             batch.req_pool_indices
-        ).to(device=live_indices.device, dtype=torch.long)
-        selected_boundary_lens, boundary_track_indices = self.boundary_lens[
-            state_input_indices
+        ).to(device=endpoint_slots.device, dtype=torch.long)
+        selected_boundary_lens, boundary_lanes = self.boundary_seq_lens[
+            request_rows
         ].max(dim=1)
         torch._assert_async(
             selected_boundary_lens.ge(0).all(),
             "DVR draft started without an exact recurrent checkpoint.",
         )
-        boundary_indices = track_slots.gather(
-            1, boundary_track_indices.unsqueeze(1)
-        ).squeeze(1)
-        next_track_indices = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-            boundary_track_indices
+        boundary_slots = track_slots.gather(1, boundary_lanes.unsqueeze(1)).squeeze(1)
+        alternate_lanes = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+            boundary_lanes
         )
-        next_boundary_indices = track_slots.gather(
-            1, next_track_indices.unsqueeze(1)
+        alternate_boundary_slots = track_slots.gather(
+            1, alternate_lanes.unsqueeze(1)
         ).squeeze(1)
         self._state_adapter.set_verify_boundaries(
-            state_input_indices=state_input_indices,
-            boundary_indices=boundary_indices,
+            request_rows=request_rows,
+            boundary_slots=boundary_slots,
         )
-        return DVRLinearStateContext(
-            state_cache=state_cache,
-            state_input_indices=state_input_indices,
-            live_indices=live_indices,
-            boundary_indices=boundary_indices,
-            next_boundary_indices=next_boundary_indices,
-            boundary_track_indices=boundary_track_indices,
+        return DVRStateTransaction(
+            request_rows=request_rows,
+            endpoint_slots=endpoint_slots,
+            boundary_slots=boundary_slots,
+            alternate_boundary_slots=alternate_boundary_slots,
+            boundary_lanes=boundary_lanes,
         )
 
     def finish_target_extend(self, batch: ScheduleBatch) -> None:
@@ -255,106 +251,102 @@ class DVRLinearStateLifecycle:
 
         if self._state_adapter is None or batch.batch_size() == 0:
             return
-        state_cache, state_input_indices, live_indices = (
-            self._state_adapter.batch_state(batch=batch)
+        request_rows, endpoint_slots = self._state_adapter.resolve_request_slots(
+            batch=batch
         )
-        seq_lens_cpu = (
-            [int(x) for x in batch.seq_lens_cpu.tolist()]
-            if batch.seq_lens_cpu is not None
-            else [int(x) for x in batch.seq_lens.detach().cpu().tolist()]
-        )
+        if batch.seq_lens_cpu is None:
+            raise RuntimeError(
+                "DVR linear-state target EXTEND requires seq_lens_cpu; "
+                "mixed chunk scheduling must remain disabled for this model."
+            )
+        seq_lens_cpu = [int(x) for x in batch.seq_lens_cpu.tolist()]
         prefix_lens = [int(x) for x in batch.prefix_lens]
         zero_indices = []
-        tail_lens = []
+        accepted_tail_lens = []
         boundary_lens = []
         boundary_tracks = []
         for i, req in enumerate(batch.reqs):
             seq_len = seq_lens_cpu[i]
             boundary_len = seq_len // self.chunk_size * self.chunk_size
-            track_idx = req.mamba_next_track_idx
-            if track_idx is None or req.mamba_ping_pong_track_buffer is None:
+            if (
+                req.mamba_next_track_idx is None
+                or req.mamba_ping_pong_track_buffer is None
+            ):
                 raise RuntimeError(
                     f"DVR request {req.rid} has no recurrent checkpoint slot."
                 )
-            boundary_index = req.mamba_ping_pong_track_buffer[track_idx]
+            keep_idx = batch.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+            boundary_index = req.mamba_ping_pong_track_buffer[keep_idx]
 
-            if boundary_len == seq_len and boundary_len > 0:
-                batch.req_to_token_pool.mamba_pool.copy_from(
-                    live_indices[i].reshape(1), boundary_index.reshape(1)
-                )
-            elif req.mamba_last_track_seqlen == boundary_len and boundary_len > 0:
-                keep_idx = batch.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
-                source = req.mamba_ping_pong_track_buffer[keep_idx]
-                if int(keep_idx) != int(track_idx):
-                    batch.req_to_token_pool.mamba_pool.copy_from(
-                        source.reshape(1), boundary_index.reshape(1)
-                    )
-            elif boundary_len == 0:
+            if boundary_len == 0:
                 zero_indices.append(boundary_index)
-            elif self.server_args.disable_radix_cache or prefix_lens[i] != boundary_len:
+            elif req.mamba_last_track_seqlen != boundary_len and (
+                self.server_args.disable_radix_cache or prefix_lens[i] != boundary_len
+            ):
                 raise RuntimeError(
                     "DVR target EXTEND did not restore the latest chunk boundary: "
                     f"rid={req.rid}, boundary={boundary_len}, "
                     f"last_track={req.mamba_last_track_seqlen}, "
                     f"prefix={prefix_lens[i]}."
                 )
-            # Otherwise GDN captured the radix-owned prefix boundary before
-            # target EXTEND consumed the unclosed tail.
+            # Ordinary tracking writes the latest boundary to keep. A short warm
+            # EXTEND copies its Radix checkpoint there before model execution.
 
-            tail_lens.append(seq_len - boundary_len)
+            accepted_tail_lens.append(seq_len - boundary_len)
             boundary_lens.append(boundary_len)
-            boundary_tracks.append(track_idx)
+            boundary_tracks.append(keep_idx)
 
         if zero_indices:
-            self._state_adapter.zero_recurrent_state(
-                state_cache=state_cache,
+            self._state_adapter.zero_boundary_state(
                 indices=torch.stack(zero_indices).to(
-                    device=live_indices.device, dtype=torch.long
+                    device=endpoint_slots.device, dtype=torch.long
                 ),
             )
         boundary_tracks = torch.tensor(
-            boundary_tracks, device=live_indices.device, dtype=torch.int64
+            boundary_tracks, device=endpoint_slots.device, dtype=torch.int64
         )
-        self.boundary_lens[state_input_indices, boundary_tracks] = torch.tensor(
-            boundary_lens, device=live_indices.device, dtype=torch.int64
+        self.boundary_seq_lens[request_rows, boundary_tracks] = torch.tensor(
+            boundary_lens, device=endpoint_slots.device, dtype=torch.int64
         )
-        self._state_adapter.state_input_window().set_tail_lens(
-            indices=state_input_indices,
-            value=torch.tensor(tail_lens, device=live_indices.device),
+        self._state_adapter.set_accepted_tail_lens(
+            indices=request_rows,
+            value=torch.tensor(accepted_tail_lens, device=endpoint_slots.device),
         )
         self._state_adapter.initialize_self_draft_state(
-            state_cache=state_cache,
-            state_input_indices=state_input_indices,
-            live_indices=live_indices,
+            request_rows=request_rows,
+            endpoint_slots=endpoint_slots,
         )
 
     def rollback_after_verify(
         self,
         *,
         batch: ScheduleBatch,
-        ctx: Optional[DVRLinearStateContext],
+        transaction: Optional[DVRStateTransaction],
         accept_lens: torch.Tensor,
     ) -> None:
-        if ctx is None:
+        if transaction is None:
             return
         if accept_lens.numel() > 0:
-            crosses_chunk_boundary = self._state_adapter.commit_after_verify(
-                state_cache=ctx.state_cache,
-                state_input_indices=ctx.state_input_indices,
-                live_indices=ctx.live_indices,
-                boundary_indices=ctx.boundary_indices,
-                next_boundary_indices=ctx.next_boundary_indices,
+            crosses_chunk_boundary = self._state_adapter.commit_accepted_state(
+                request_rows=transaction.request_rows,
+                endpoint_slots=transaction.endpoint_slots,
+                boundary_slots=transaction.boundary_slots,
+                alternate_boundary_slots=transaction.alternate_boundary_slots,
                 accepted_token_counts=accept_lens.to(torch.long),
             )
-            next_tracks = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                ctx.boundary_track_indices
+            alternate_lanes = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                transaction.boundary_lanes
             )
-            current_lens = self.boundary_lens[
-                ctx.state_input_indices, ctx.boundary_track_indices
+            current_lens = self.boundary_seq_lens[
+                transaction.request_rows, transaction.boundary_lanes
             ]
-            next_lens = self.boundary_lens[ctx.state_input_indices, next_tracks]
-            self.boundary_lens[ctx.state_input_indices, next_tracks] = torch.where(
-                crosses_chunk_boundary,
-                current_lens + self.chunk_size,
-                next_lens,
+            alternate_lens = self.boundary_seq_lens[
+                transaction.request_rows, alternate_lanes
+            ]
+            self.boundary_seq_lens[transaction.request_rows, alternate_lanes] = (
+                torch.where(
+                    crosses_chunk_boundary,
+                    current_lens + self.chunk_size,
+                    alternate_lens,
+                )
             )

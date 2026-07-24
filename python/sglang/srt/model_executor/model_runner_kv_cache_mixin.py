@@ -116,6 +116,17 @@ class ModelRunnerKVCacheMixin:
         rest_memory = available_gpu_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
+        if self.spec_algorithm.is_dvr_self_draft():
+            # Exact rejection sampling retains one proposal distribution per
+            # draft edge. Reserve it before sizing the KV/state pools.
+            graph_max_bs = self.server_args.cuda_graph_config.decode.max_bs or 1
+            proposal_bytes = (
+                graph_max_bs
+                * self.server_args.speculative_num_steps
+                * self.model_config.vocab_size
+                * torch.float32.itemsize
+            )
+            rest_memory -= proposal_bytes / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
@@ -314,15 +325,15 @@ class ModelRunnerKVCacheMixin:
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
         if self.server_args.disable_radix_cache:
-            # No prefix state survives a request. DVR needs only the live state
-            # and one request-local rollback boundary; ordinary decode needs the
-            # live state alone.
+            # No prefix state survives a request. DVR needs the target endpoint
+            # slot and one request-local boundary; ordinary decode needs only
+            # the endpoint slot.
             return 2 if self.spec_algorithm.is_dvr() else 1
 
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
-            # Radix may donate one DVR boundary while overlap advances the
-            # request, so both request-owned checkpoint slots are required.
+            # DVR keeps both request-owned checkpoint slots stable while Radix
+            # stores an independent copy of the current boundary.
             if self.spec_algorithm.is_dvr():
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             elif not self.server_args.disable_overlap_schedule:
@@ -602,14 +613,13 @@ class ModelRunnerKVCacheMixin:
                     )
             elif config := self.mambaish_config:
                 is_dvr = self.spec_algorithm.is_dvr()
-                dvr_track_buffer_size = None
-                if is_dvr:
-                    dvr_track_buffer_size = (
-                        1 if self.server_args.disable_radix_cache else 2
-                    )
+                dvr_track_buffer_size = (
+                    (1 if self.server_args.disable_radix_cache else 2)
+                    if is_dvr
+                    else None
+                )
                 enable_mamba_track_buffer = (
-                    self.server_args.enable_mamba_extra_buffer()
-                    or dvr_track_buffer_size is not None
+                    self.server_args.enable_mamba_extra_buffer() or is_dvr
                 )
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
@@ -636,6 +646,11 @@ class ModelRunnerKVCacheMixin:
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     mamba_ping_pong_track_buffer_size=dvr_track_buffer_size,
+                    # Radix must copy, not donate, checkpoints that an overlapped
+                    # DVR transaction still addresses through request slots.
+                    preserve_mamba_request_slots=(
+                        is_dvr and not self.server_args.disable_radix_cache
+                    ),
                     start_layer=self.start_layer,
                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,
                     linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,

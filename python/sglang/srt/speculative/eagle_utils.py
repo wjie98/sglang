@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -544,8 +545,8 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
     *,
-    target_prob_filter=None,
     use_rejection_sampling: Optional[bool] = None,
+    target_prob_filter=None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -700,9 +701,7 @@ def eagle_sample(
         # coins for rejection sampling
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
         # coins for final sampling
-        coins_for_final_sampling = torch.rand(
-            (bs,), dtype=torch.float32, device=device
-        )
+        coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
 
         sampling_fn = (
             chain_speculative_sampling_triton
@@ -813,20 +812,14 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
-    # Fail fast if the page>1 + topk>1 draft over-allocation
-    # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
-    # would OOB and free would leak KV. The row is widened to hold it in _init_pools
-    # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
     from sglang.srt.server_args import get_global_server_args
 
-    if page_size > 1 and (get_global_server_args().speculative_eagle_topk or 1) > 1:
-        max_alloc_len = int(nxt_kv_lens_cpu.max())
-        row_width = batch.req_to_token_pool.req_to_token.shape[1]
-        assert max_alloc_len <= row_width, (
-            f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
-            f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
-            f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
-        )
+    max_alloc_len = int(nxt_kv_lens_cpu.max())
+    row_width = batch.req_to_token_pool.req_to_token.shape[1]
+    assert max_alloc_len <= row_width, (
+        f"Speculative draft over-allocation ({max_alloc_len}) exceeds "
+        f"req_to_token row width ({row_width}); page_size={page_size}."
+    )
 
     # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
     # barrier has chained to the prev forward -> host stalls a full forward.

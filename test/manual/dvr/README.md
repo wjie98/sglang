@@ -91,9 +91,10 @@ The state transition is:
 1. Target EXTEND establishes the latest exact boundary and caches the inputs
    after that boundary. With Radix disabled, this is a request-local checkpoint
    and a later request performs an ordinary full prefill.
-2. Under overlap scheduling, unfinished-prefill result processing completes
-   any Radix checkpoint donation before the first DVR decode resolves physical
-   checkpoint slots.
+2. Under overlap scheduling, the request's two physical checkpoint slots stay
+   fixed. Unfinished-prefill result processing copies the latest `keep`
+   checkpoint into an independent Radix slot, so the first DVR decode can be
+   scheduled before that CPU result is consumed.
 3. Target EXTEND seeds one request-owned self-draft recurrent workspace and
    convolution state. Self-draft mutates only this private state; EAGLE/MTP
    advances its upstream-owned draft cache. Neither backend changes the
@@ -112,12 +113,14 @@ The state transition is:
    visible committed prefix. Radix stores only that aligned prefix; a later
    request rebuilds the non-aligned suffix through ordinary EXTEND. If no such
    checkpoint is available, insertion is skipped rather than changing the
-   inference result.
+   inference result. Under overlap, release first orders itself after the
+   already-enqueued rollback event; this is a GPU stream dependency on the
+   finishing request, not a steady-state host synchronization.
 
 At every draft boundary, `checkpoint_length + tail_length` must equal the
 committed target history. The checkpoint and cached state inputs must originate
-from that same history, and physical slot replacement must finish before DVR
-captures the slot indices used by verify and rollback.
+from that same history. An active request's physical checkpoint mapping is
+immutable from target EXTEND through draft, verify, and rollback.
 
 ## Compatibility contracts
 
@@ -134,8 +137,9 @@ In particular:
 - custom all-reduce may be captured for provisional draft execution but is not
   enabled for target prefill or verify;
 - Triton and FA3 draft decode retain their normal split configuration;
-- recurrent checkpoints are request-owned and survive Radix donation or slot
-  reuse without changing ordinary Radix-disabled semantics.
+- recurrent checkpoints are request-owned; unfinished Radix insertion copies
+  `keep` instead of rebinding those slots, without changing ordinary
+  Radix-disabled semantics.
 
 GDN DVR does not currently support page-major recurrent-state storage,
 ReplaySSM, streaming sessions, or int8 recurrent checkpoints. These modes

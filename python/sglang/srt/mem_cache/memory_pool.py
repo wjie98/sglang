@@ -845,6 +845,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_eagle_topk: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         mamba_ping_pong_track_buffer_size: Optional[int] = None,
+        preserve_mamba_request_slots: bool = False,
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
@@ -858,14 +859,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
         if mamba_ping_pong_track_buffer_size is None:
-            mamba_ping_pong_track_buffer_size = (
-                2 if enable_overlap_schedule else 1
-            )
+            mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         if mamba_ping_pong_track_buffer_size not in (1, 2):
             raise ValueError("Mamba ping-pong tracking requires one or two slots.")
         self.mamba_ping_pong_track_buffer_size = mamba_ping_pong_track_buffer_size
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
+        self.preserve_mamba_request_slots = preserve_mamba_request_slots
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
@@ -1103,6 +1103,21 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
+
+    def export_mamba_ping_pong_checkpoint(
+        self,
+        req: Req,
+        destination: torch.Tensor,
+    ) -> torch.Tensor:
+        """Give a tracked checkpoint to cache, preserving its request slot if needed."""
+        if not self.preserve_mamba_request_slots:
+            return self.donate_mamba_ping_pong_slot(req, destination)
+
+        keep_idx = self.get_mamba_ping_pong_keep_idx(req)
+        source = req.mamba_ping_pong_track_buffer[keep_idx].reshape(1)
+        translate = self.translate_mamba_indices
+        self.mamba_pool.copy_from(translate(source), translate(destination))
+        return destination
 
     def free_mamba_cache(
         self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None

@@ -4,12 +4,17 @@ import pytest
 import torch
 
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorkerV2,
     _dvr_proposal_probs,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    create_dummy_verify_input,
+)
 
 
 def _sampling_info(top_ks, top_ps, min_ps):
@@ -109,10 +114,10 @@ def test_pytorch_proposal_filter_matches_sampler(monkeypatch, top_ks, top_ps, mi
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("is_dvr_eagle", [False, True])
-def test_short_prefix_uses_one_root_verify_sentinel(is_dvr_eagle):
+@pytest.mark.parametrize("uses_eagle_draft", [False, True])
+def test_short_prefix_uses_one_root_verify_sentinel(uses_eagle_draft):
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
-    worker.is_dvr_eagle = is_dvr_eagle
+    worker.uses_eagle_draft = uses_eagle_draft
     worker.device = "cpu"
     worker.num_draft_tokens = 4
     worker._chain_retrieve_index = torch.arange(8).view(2, 4)
@@ -125,9 +130,201 @@ def test_short_prefix_uses_one_root_verify_sentinel(is_dvr_eagle):
         seq_lens_sum=66,
     )
 
-    verify_input = worker._build_one_root_verify_input(batch)
+    verify_input = worker._build_seed_verify_input(batch)
 
     assert verify_input.draft_token.tolist() == [6] * 4 + [7] * 4
     assert verify_input.spec_steps == 0
     assert verify_input.retrieve_next_token.eq(-1).all()
     assert verify_input.positions.tolist() == [1, 2, 3, 4, 65, 66, 67, 68]
+
+
+def test_short_prefix_sentinel_marks_only_new_prefill_requests():
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.uses_eagle_draft = False
+    worker._seed_verify_slots = set()
+    worker._draft_backend = SimpleNamespace(
+        finish_prefill=lambda _batch, _result: "next-draft",
+    )
+    worker.state_lifecycle = SimpleNamespace(
+        prepare_target_extend=lambda _batch: None,
+        finish_target_extend=lambda _batch: None,
+        prepare_for_cache_release=lambda _req: None,
+    )
+    worker._target_worker = SimpleNamespace(
+        forward_batch_generation=lambda _batch: SimpleNamespace()
+    )
+    new_req = SimpleNamespace(rid="new", req_pool_idx=1, origin_input_ids=[7])
+    running_req = SimpleNamespace(rid="running", req_pool_idx=2, origin_input_ids=[8])
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        is_extend_in_batch=True,
+        reqs=[new_req, running_req],
+        decoding_reqs=[running_req],
+        seq_lens=torch.tensor([1, 1]),
+    )
+
+    result = worker.forward_batch_generation(batch)
+
+    assert worker._seed_verify_slots == {1}
+    assert result.new_seq_lens is batch.seq_lens
+    assert result.next_draft_input == "next-draft"
+    worker.prepare_for_kv_cache_release(new_req)
+    assert not worker._seed_verify_slots
+
+
+def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
+    calls = []
+    event = object()
+    stream = SimpleNamespace(wait_event=lambda value: calls.append(("wait", value)))
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda _device: SimpleNamespace(current_stream=lambda: stream),
+    )
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.device = "cuda"
+    worker.uses_eagle_draft = False
+    worker._seed_verify_slots = {3}
+    worker._target_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(war_fastpath_read_done_event=event)
+    )
+    worker.state_lifecycle = SimpleNamespace(
+        prepare_for_cache_release=lambda req: calls.append(("release", req.rid))
+    )
+    req = SimpleNamespace(rid="done", req_pool_idx=3)
+
+    worker.prepare_for_kv_cache_release(req)
+
+    assert calls == [("wait", event), ("release", "done")]
+    assert not worker._seed_verify_slots
+
+
+def test_self_draft_copies_each_graph_proposal_before_next_replay():
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.num_draft_tokens = 3
+    worker.num_draft_steps = 2
+    worker.server_args = SimpleNamespace(sampling_backend="pytorch")
+    worker._proposal_prob_buffer = torch.empty((1, 2, 3))
+
+    sampling_info = _sampling_info([3], [1.0], [0.0])
+    sampling_info.is_all_greedy = False
+    worker.model_runner = SimpleNamespace(
+        sampler=SimpleNamespace(use_log_softmax_logprob=False),
+        sample=lambda output, _batch: output.next_token_logits.argmax(dim=-1),
+    )
+    static_logits = torch.empty((1, 3))
+    per_step = iter(
+        (
+            torch.tensor([[0.6, 0.3, 0.1]]),
+            torch.tensor([[0.1, 0.2, 0.7]]),
+        )
+    )
+
+    def draft_forward(_batch):
+        static_logits.copy_(next(per_step))
+        return LogitsProcessorOutput(next_token_logits=static_logits)
+
+    worker._draft_decode_forward = draft_forward
+    forward_batch = SimpleNamespace(
+        spec_info=dvr_worker_module.EagleDraftInput(bonus_tokens=torch.tensor([1])),
+        out_cache_loc=torch.arange(3),
+        batch_size=1,
+        seq_lens=torch.tensor([10]),
+        seq_lens_cpu=torch.tensor([10]),
+        seq_lens_sum=10,
+        positions=torch.tensor([10]),
+        sampling_info=sampling_info,
+    )
+
+    _, proposals = worker._draft_self_tokens(forward_batch)
+
+    torch.testing.assert_close(proposals[0, 0], torch.tensor([0.6, 0.3, 0.1]))
+    torch.testing.assert_close(proposals[0, 1], torch.tensor([0.1, 0.2, 0.7]))
+
+
+def test_self_draft_restores_batch_output_flags(monkeypatch):
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.num_draft_tokens = 2
+    worker.topk = 1
+    worker.model_runner = object()
+    worker._chain_position_offsets = torch.arange(2)
+    worker._chain_retrieve_index = torch.arange(2).view(1, 2)
+    worker._chain_retrieve_next = torch.tensor([[1, -1]])
+    worker._chain_retrieve_sibling = torch.full((1, 2), -1)
+    worker._draft_self_tokens = lambda _forward_batch: (_ for _ in ()).throw(
+        RuntimeError("draft failed")
+    )
+    monkeypatch.setattr(
+        dvr_worker_module.ForwardBatch,
+        "init_new",
+        lambda _batch, _runner: object(),
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        spec_info=dvr_worker_module.EagleDraftInput(bonus_tokens=torch.tensor([1])),
+        seq_lens=torch.tensor([4]),
+        req_pool_indices=torch.tensor([0]),
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(8).view(1, 8)),
+        return_logprob=True,
+        return_hidden_states=True,
+    )
+
+    with pytest.raises(RuntimeError, match="draft failed"):
+        worker._draft_self(batch)
+
+    assert batch.return_logprob is True
+    assert batch.return_hidden_states is True
+
+
+def test_self_draft_positions_do_not_alias_sequence_lengths(monkeypatch):
+    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker.num_draft_tokens = 2
+    worker.topk = 1
+    worker.model_runner = object()
+    worker._chain_position_offsets = torch.arange(2)
+    worker._chain_retrieve_index = torch.arange(2).view(1, 2)
+    worker._chain_retrieve_next = torch.tensor([[1, -1]])
+    worker._chain_retrieve_sibling = torch.full((1, 2), -1)
+    def init_new(batch, _runner):
+        assert batch.spec_info.positions.data_ptr() != batch.seq_lens.data_ptr()
+        batch.spec_info.positions.add_(1)
+        torch.testing.assert_close(batch.seq_lens, torch.tensor([4]))
+        raise RuntimeError("stop after initialization")
+
+    monkeypatch.setattr(dvr_worker_module.ForwardBatch, "init_new", init_new)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        spec_info=dvr_worker_module.EagleDraftInput(bonus_tokens=torch.tensor([1])),
+        seq_lens=torch.tensor([4]),
+        req_pool_indices=torch.tensor([0]),
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(8).view(1, 8)),
+        return_logprob=False,
+        return_hidden_states=False,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after initialization"):
+        worker._draft_self(batch)
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "expected_hidden"),
+    [
+        (SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK, "NULL"),
+        (SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE, "FULL"),
+    ],
+)
+def test_dvr_dummy_verify_input_matches_draft_backend(algorithm, expected_hidden):
+    spec_info = create_dummy_verify_input(
+        spec_algorithm=algorithm,
+        server_args=SimpleNamespace(
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+        ),
+        custom_mask=torch.ones(1, dtype=torch.bool),
+        num_tokens_per_bs=4,
+        is_draft_worker=False,
+    )
+
+    assert spec_info is not None
+    assert spec_info.capture_hidden_mode.name == expected_hidden

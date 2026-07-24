@@ -2714,10 +2714,11 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
 
-        if (self.speculative_algorithm or "").upper() in {
+        is_dvr_algorithm = (self.speculative_algorithm or "").upper() in {
             "DECODE_VERIFY_ROLLBACK",
             "DECODE_VERIFY_ROLLBACK_EAGLE",
-        }:
+        }
+        if is_dvr_algorithm:
             # Resolve DVR state tracking before generic Mamba/Radix validation.
             # Keep the import lazy so ordinary servers do not load FLA/Triton.
             from sglang.srt.speculative.dvr_server_args import handle_dvr_defaults
@@ -2741,6 +2742,13 @@ class ServerArgs:
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
+        if is_dvr_algorithm:
+            # Apply DVR constraints after generic graph batch defaults are final.
+            from sglang.srt.speculative.dvr_server_args import (
+                handle_dvr_cuda_graph_config,
+            )
+
+            handle_dvr_cuda_graph_config(self)
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()

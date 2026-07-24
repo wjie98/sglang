@@ -329,6 +329,7 @@ def _fused_conv_window_scatter_with_mask_kernel(
     dst_ptr,
     dst_indices_raw_ptr,  # [total_requests]
     step_indices_raw_ptr,  # [total_requests], entry >= 0 means valid
+    src_indices_raw_ptr,
     elem_per_entry: tl.constexpr,  # dim * (K-1)
     KM1: tl.constexpr,  # K-1 (conv window width)
     src_layer_stride,
@@ -341,6 +342,7 @@ def _fused_conv_window_scatter_with_mask_kernel(
     src_req_size,
     src_step_size,
     dst_req_size,
+    USE_SRC_INDICES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Scatter accepted conv windows from the deduplicated sliding-window source.
@@ -362,11 +364,16 @@ def _fused_conv_window_scatter_with_mask_kernel(
         return
 
     dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
-    src_idx = pid_req
+    src_idx = (
+        tl.load(src_indices_raw_ptr + pid_req).to(tl.int64)
+        if USE_SRC_INDICES
+        else pid_req
+    )
 
     if not (
         (dst_idx >= 0)
         & (dst_idx < dst_req_size)
+        & (src_idx >= 0)
         & (src_idx < src_req_size)
         & (step_idx < src_step_size)
     ):
@@ -399,6 +406,8 @@ def fused_conv_window_scatter_with_mask(
     src: torch.Tensor,  # deduped conv-window view [num_layers, spec_size, draft_tokens, dim, K-1]
     dst_indices_raw: torch.Tensor,  # [total_requests]
     step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
+    *,
+    src_indices_raw: torch.Tensor | None = None,
 ):
     """Conv-window variant of :func:`fused_mamba_state_scatter_with_mask`.
 
@@ -432,6 +441,11 @@ def fused_conv_window_scatter_with_mask(
         raise ValueError(
             f"indices length mismatch: {dst_indices_raw.shape[0]=} vs {step_indices_raw.shape[0]=}"
         )
+    if src_indices_raw is not None and src_indices_raw.shape != dst_indices_raw.shape:
+        raise ValueError(
+            "source and destination indices must have the same shape: "
+            f"{src_indices_raw.shape=} vs {dst_indices_raw.shape=}"
+        )
 
     num_layers = dst.shape[0]
     dim = dst.shape[2]
@@ -451,6 +465,11 @@ def fused_conv_window_scatter_with_mask(
 
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+    use_src_indices = src_indices_raw is not None
+    if src_indices_raw is None:
+        src_indices_raw = dst_indices_raw
+    else:
+        src_indices_raw = src_indices_raw.to(torch.int32).contiguous()
 
     BLOCK_SIZE = 1024
     grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
@@ -460,6 +479,7 @@ def fused_conv_window_scatter_with_mask(
         dst,
         dst_indices_raw,
         step_indices_raw,
+        src_indices_raw,
         elem_per_entry,
         km1,
         src.stride(0),
@@ -472,5 +492,6 @@ def fused_conv_window_scatter_with_mask(
         src_req_size,
         src_step_size,
         dst_req_size,
+        USE_SRC_INDICES=use_src_indices,
         BLOCK_SIZE=BLOCK_SIZE,
     )

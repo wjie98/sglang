@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.model_executor.dvr_cuda_graph_runner import (
+    DVRTargetVerifyCudaGraphRunner,
     _draft_custom_allreduce_enabled,
     _fast_decode_overrides,
     _resolve_dvr_backends,
@@ -20,13 +21,7 @@ from sglang.srt.model_executor.dvr_cuda_graph_runner import (
     _validate_dvr_attention_backend,
     dvr_draft_decode_context,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
-)
-from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-    DecodeCudaGraphRunner,
-)
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -36,16 +31,7 @@ def test_draft_capture_is_fast_and_restores_target_state(
 ):
     events = []
 
-    class FakeStateAdapter:
-        @contextmanager
-        def self_draft_decode(self):
-            events.append(("draft_state", True))
-            yield
-            events.append(("draft_state", False))
-
-    backend = SimpleNamespace(
-        enable_deterministic=True, dvr_state_adapter=FakeStateAdapter()
-    )
+    backend = SimpleNamespace(enable_deterministic=True)
     server_args = SimpleNamespace(
         enable_deterministic_inference=True,
         _dvr_enable_draft_custom_all_reduce=draft_custom_all_reduce,
@@ -103,8 +89,9 @@ def test_draft_capture_is_fast_and_restores_target_state(
         assert not backend.enable_deterministic
         assert not server_args.enable_deterministic_inference
         assert not global_server_args.enable_deterministic_inference
-        assert model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
-        assert ("draft_state", True) in events
+        assert (
+            model_runner.spec_algorithm == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+        )
         if draft_custom_all_reduce:
             assert events[-1][0] == "custom_all_reduce"
 
@@ -112,7 +99,6 @@ def test_draft_capture_is_fast_and_restores_target_state(
     assert server_args.enable_deterministic_inference
     assert global_server_args.enable_deterministic_inference
     assert model_runner.spec_algorithm == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-    assert ("draft_state", False) in events
     assert events[-1][0:2] == ("deterministic_env", True)
     assert (("custom_all_reduce", False) in [event[:2] for event in events]) == (
         draft_custom_all_reduce
@@ -146,7 +132,7 @@ def test_triton_fast_decode_override_contract(monkeypatch):
     backend.cuda_graph_swa_attn_logits = None
     backend.cuda_graph_num_kv_splits = torch.full((4,), 32, dtype=torch.int32)
 
-    for owner, name, value in _fast_decode_overrides(backend, model_runner):
+    for owner, name, value in _fast_decode_overrides(backend, model_runner, {}):
         setattr(owner, name, value)
 
     assert not backend.enable_deterministic
@@ -189,6 +175,24 @@ def test_backend_resolution_returns_attention_and_linear_state_once():
 
     assert leaves == [full_attention, *children]
     assert resolved_adapter is adapter
+
+
+def test_backend_resolution_rejects_distinct_linear_state_adapters():
+    class Backend:
+        token_to_kv_pool = object()
+        req_to_token_pool = object()
+        needs_cpu_seq_lens = False
+
+        def __init__(self, adapter=None):
+            self.dvr_state_adapter = adapter
+
+    backend = TboAttnBackend(
+        primary=Backend(object()),
+        children=[Backend(object())],
+    )
+
+    with pytest.raises(RuntimeError, match="multiple linear-state adapters"):
+        _resolve_dvr_backends(backend)
 
 
 def test_backend_validation_accepts_triton_and_rejects_non_fa3():
@@ -328,8 +332,8 @@ def test_draft_custom_allreduce_context_restores_target_policy():
         assert communicator.disabled
 
 
-def test_mlp_tp_gather_uses_capture_mode_for_speculative_batch_size():
-    runner = object.__new__(DecodeCudaGraphRunner)
+def test_mlp_tp_gather_uses_runner_layout_for_speculative_batch_size():
+    runner = object.__new__(DVRTargetVerifyCudaGraphRunner)
     runner.require_mlp_tp_gather = True
     runner.num_tokens_per_bs = 16
     runner.enable_pdmux = False
@@ -340,7 +344,7 @@ def test_mlp_tp_gather_uses_capture_mode_for_speculative_batch_size():
     runner.capture_hidden_mode = CaptureHiddenMode.NULL
     runner.enable_two_batch_overlap = False
     runner.model_runner = SimpleNamespace(
-        spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
     )
     forward_batch = SimpleNamespace(
         replace_embeds=None,
@@ -350,8 +354,7 @@ def test_mlp_tp_gather_uses_capture_mode_for_speculative_batch_size():
         spec_info=None,
     )
 
-    runner.capture_forward_mode = ForwardMode.TARGET_VERIFY
     assert runner.can_run_graph(forward_batch)
 
-    runner.capture_forward_mode = ForwardMode.DLLM_EXTEND
+    runner.global_num_tokens_are_expanded = False
     assert not runner.can_run_graph(forward_batch)

@@ -321,7 +321,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # full-attn layers; budget into the full term.
         self._draft_full_layers_num = 0
         if (
-            mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+            mr.spec_algorithm.uses_eagle_draft_backend()
+            or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
             draft_layers = getattr(mr, "eagle_draft_num_layers", None)
             if draft_layers is not None and int(draft_layers) > 0:

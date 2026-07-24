@@ -25,8 +25,7 @@ def _distributed_req(selector="all"):
 
 
 def _manager(tp_worker, draft_worker):
-    # metrics_collector defaults to None, so _observe_weight_load is a no-op and the
-    # unused disagg/memory hooks below are never exercised by these tests.
+    # metrics_collector and scheduler default to None; neither is exercised here.
     manager = SchedulerWeightUpdaterManager(
         tp_worker=tp_worker,
         draft_worker=draft_worker,
@@ -34,9 +33,6 @@ def _manager(tp_worker, draft_worker):
         memory_saver_adapter=Mock(),
         flush_cache=Mock(return_value=True),
         is_fully_idle=Mock(return_value=True),
-        disaggregation_mode=None,
-        get_disagg_decode_prealloc_queue=Mock(return_value=None),
-        get_disagg_prefill_bootstrap_queue=Mock(return_value=None),
     )
     # update_weights_from_* assert an open begin_weight_update session.
     manager._weight_update_in_progress = True
@@ -97,6 +93,61 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
     target_runner.receive_weights_from_distributed.assert_called_once()
     target_runner.load_weights.assert_called_once_with(weights)
     draft_worker.iter_runners.assert_not_called()
+
+
+def test_save_remote_model_does_not_treat_self_draft_target_as_draft():
+    target_runner = Mock()
+    manager = _manager(
+        tp_worker=SimpleNamespace(
+            model_runner=target_runner,
+            iter_runners=lambda: [("", target_runner)],
+        ),
+        draft_worker=SimpleNamespace(iter_runners=lambda: []),
+    )
+
+    manager.save_remote_model({"url": "target"})
+
+    target_runner.save_remote_model.assert_called_once_with("target")
+
+
+def test_save_remote_model_uses_enumerated_draft_runner():
+    target_runner = Mock()
+    draft_runner = Mock()
+    manager = _manager(
+        tp_worker=SimpleNamespace(
+            model_runner=target_runner,
+            iter_runners=lambda: [("", target_runner)],
+        ),
+        draft_worker=SimpleNamespace(iter_runners=lambda: [("draft", draft_runner)]),
+    )
+
+    manager.save_remote_model({"url": "target", "draft_url": "draft"})
+
+    target_runner.save_remote_model.assert_called_once_with("target")
+    draft_runner.save_remote_model.assert_called_once_with("draft")
+
+
+def test_save_remote_model_rejects_multiple_draft_runners():
+    target_runner = Mock()
+    draft_runners = [Mock(), Mock()]
+    manager = _manager(
+        tp_worker=SimpleNamespace(
+            model_runner=target_runner,
+            iter_runners=lambda: [("", target_runner)],
+        ),
+        draft_worker=SimpleNamespace(
+            iter_runners=lambda: [
+                ("draft_step_0", draft_runners[0]),
+                ("draft_step_1", draft_runners[1]),
+            ]
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="multiple draft model runners"):
+        manager.save_remote_model({"url": "target", "draft_url": "draft"})
+
+    for runner in draft_runners:
+        runner.save_remote_model.assert_not_called()
 
 
 def _session_manager(target_runner, draft_runner):

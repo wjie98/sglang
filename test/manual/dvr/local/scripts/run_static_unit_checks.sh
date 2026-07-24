@@ -13,16 +13,21 @@ DVR_PY_FILES=(
   python/sglang/srt/layers/attention/fla/chunk.py
   python/sglang/srt/layers/attention/fla/chunk_o.py
   python/sglang/srt/layers/attention/linear/dvr_gdn.py
-  python/sglang/srt/layers/attention/linear/dvr_state.py
   python/sglang/srt/layers/attention/linear/gdn_backend.py
   python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
   python/sglang/srt/layers/attention/mamba/mamba_state_scatter_triton.py
   python/sglang/srt/layers/elementwise.py
   python/sglang/srt/layers/moe/token_dispatcher/flashinfer.py
   python/sglang/srt/managers/scheduler.py
+  python/sglang/srt/managers/scheduler_components/weight_updater.py
   python/sglang/srt/managers/tokenizer_manager.py
+  python/sglang/srt/mem_cache/cache_init_params.py
+  python/sglang/srt/mem_cache/common.py
   python/sglang/srt/mem_cache/kv_cache_builder.py
+  python/sglang/srt/mem_cache/mamba_radix_cache.py
   python/sglang/srt/mem_cache/memory_pool.py
+  python/sglang/srt/mem_cache/unified_cache_components/mamba_component.py
+  python/sglang/srt/mem_cache/unified_memory_pool.py
   python/sglang/srt/model_executor/dvr_cuda_graph_runner.py
   python/sglang/srt/model_executor/model_runner.py
   python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
@@ -45,6 +50,7 @@ DVR_PY_FILES=(
   test/registered/unit/server_args/test_dvr_server_args.py
   test/registered/unit/speculative/test_dvr_state_flow.py
   test/registered/unit/speculative/test_dvr_worker.py
+  test/srt/test_distributed_weight_update_spec_worker.py
 )
 
 DVR_DIFF_BASE="${DVR_DIFF_BASE:-upstream/sglang-miles}"
@@ -59,8 +65,9 @@ conda_python -m pytest \
   test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py \
   test/registered/unit/server_args/test_dvr_server_args.py \
   test/registered/unit/layers/test_dvr_gdn.py \
+  test/srt/test_distributed_weight_update_spec_worker.py \
   test/manual/layers/test_fused_gate_sigmoid_mul_add.py::test_large_batch_warp_policy_follows_deterministic_mode \
   test/registered/unit/layers/test_mamba_state_scatter_triton.py::TestMambaStateScatterCorrectness::test_fused_supports_explicit_source_rows \
-  test/registered/attention/test_chunk_gated_delta_rule.py::TestChunkGatedDeltaRule::test_boundary_state_preserves_initial_state_dtype \
+  test/registered/attention/test_chunk_gated_delta_rule.py::TestChunkGatedDeltaRule::test_inplace_boundary_state_keeps_activation_dtype \
   test/registered/attention/test_chunk_gated_delta_rule.py::TestChunkGatedDeltaRule::test_non_inplace_verify_preserves_initial_state \
   test/registered/unit/model_executor/test_pool_configurator.py::TestEagleConfigurator::test_dvr_eagle_does_not_exceed_budget

@@ -6,6 +6,7 @@ import logging
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,11 @@ def handle_dvr_defaults(server_args):
     if algorithm not in DVR_SPECULATIVE_ALGORITHMS:
         return
     server_args.speculative_algorithm = algorithm
+
+    # Resolve the supported base before deterministic-inference defaults can
+    # select FlashInfer on newer GPUs. Explicit phase backends still win.
+    if server_args.attention_backend is None:
+        server_args.attention_backend = "triton"
 
     # Deterministic target setup disables FlashInfer communication fusion.
     # Keep the user's original request so the provisional self-draft graph can
@@ -52,6 +58,11 @@ def handle_dvr_defaults(server_args):
 
     if not _is_dvr_gated_linear_state_model(server_args):
         return
+
+    if server_args.enable_unified_memory:
+        raise ValueError(
+            "DVR gated linear-state models do not support --enable-unified-memory."
+        )
 
     if server_args.page_size is None:
         server_args.page_size = FLA_CHUNK_SIZE
@@ -103,6 +114,8 @@ def handle_dvr_speculative_decoding(server_args):
 
     if not server_args.device.startswith("cuda"):
         raise ValueError("DVR currently only supports CUDA device.")
+    if is_hip():
+        raise ValueError("DVR currently supports NVIDIA CUDA, not ROCm/HIP.")
     if server_args.enable_dp_attention:
         raise ValueError("DVR currently does not support DP attention.")
     if server_args.enable_pdmux:
@@ -111,8 +124,10 @@ def handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR currently does not support disaggregation mode.")
     if server_args.pp_size != 1:
         raise ValueError("DVR currently supports only pp_size == 1.")
-    if server_args.speculative_adaptive:
-        raise ValueError("DVR does not support adaptive speculative decoding.")
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_out_of_tree():
+        raise ValueError("DVR requires SGLang's CUDA graph runner.")
     if (
         server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is not None
@@ -150,16 +165,20 @@ def handle_dvr_speculative_decoding(server_args):
             "DVR requires exact recurrent checkpoints and does not support "
             "--enable-int8-mamba-checkpoint."
         )
-    for field in (
-        "attention_backend",
-        "prefill_attention_backend",
-        "decode_attention_backend",
+    for phase, backend in (
+        (
+            "prefill",
+            server_args.prefill_attention_backend or server_args.attention_backend,
+        ),
+        (
+            "decode",
+            server_args.decode_attention_backend or server_args.attention_backend,
+        ),
     ):
-        backend = getattr(server_args, field, None)
-        if backend is not None and backend not in _DVR_FULL_ATTENTION_BACKENDS:
+        if backend not in _DVR_FULL_ATTENTION_BACKENDS:
             raise ValueError(
                 "DVR currently supports only Triton and FA3 full-attention "
-                f"backends, got --{field.replace('_', '-')} {backend}."
+                f"backends, got effective {phase} backend {backend}."
             )
     linear_prefill_backend = (
         server_args.linear_attn_prefill_backend or server_args.linear_attn_backend
@@ -226,9 +245,34 @@ def handle_dvr_speculative_decoding(server_args):
             "DVR EAGLE rejection sampling does not support multi-layer EAGLE."
         )
 
-    _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
+    if uses_gated_linear_state or (
+        server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
+    ):
+        # GDN boundary publication and the reused EAGLE draft backend both
+        # require an unambiguous prefill/decode phase boundary.
+        server_args.enable_mixed_chunk = False
 
-    server_args.enable_mixed_chunk = False
+
+def handle_dvr_cuda_graph_config(server_args):
+    """Apply DVR constraints after the generic CUDA graph config is resolved."""
+
+    if server_args.speculative_algorithm not in DVR_SPECULATIVE_ALGORITHMS:
+        return
+
+    if _is_dvr_gated_linear_state_model(server_args):
+        prefill_graph = server_args.cuda_graph_config.prefill
+        if prefill_graph.backend != Backend.DISABLED:
+            if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
+                raise ValueError(
+                    "DVR gated linear-state prefill is incompatible with prefill "
+                    "CUDA graphs; set cuda_graph_config[prefill].backend='disabled'."
+                )
+            logger.warning(
+                "Prefill CUDA graph is disabled for DVR gated linear-state models."
+            )
+            prefill_graph.backend = Backend.DISABLED
+
+    _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
 
 
 def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
@@ -253,49 +297,26 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
         )
 
     decode_graph = server_args.cuda_graph_config.decode
-    locked = getattr(server_args, "_cuda_graph_config_locked", set())
     max_running_requests = int(server_args.max_running_requests or 0)
+    graph_bs = {int(bs) for bs in (decode_graph.bs or ()) if int(bs) > 0}
+    graph_capacity = max(graph_bs, default=int(decode_graph.max_bs or 0))
     if max_running_requests <= 0:
+        if graph_capacity > 0:
+            server_args.max_running_requests = graph_capacity
         return
 
-    if decode_graph.bs is None:
-        if decode_graph.max_bs is None or decode_graph.max_bs >= max_running_requests:
-            return
-        if (Phase.DECODE, "max_bs") in locked:
-            raise ValueError(
-                "Explicit cuda_graph_config[decode].max_bs does not cover "
-                f"DVR self-draft max_running_requests={max_running_requests}."
-            )
-        decode_graph.max_bs = max_running_requests
-        return
-
-    graph_bs = {int(bs) for bs in decode_graph.bs if int(bs) > 0}
     if server_args.disable_cuda_graph_padding:
         missing_bs = set(range(1, max_running_requests + 1)) - graph_bs
     else:
         missing_bs = (
-            set()
-            if graph_bs and max(graph_bs) >= max_running_requests
-            else {max_running_requests}
+            set() if graph_capacity >= max_running_requests else {max_running_requests}
         )
-    if not missing_bs:
-        return
-    if (Phase.DECODE, "bs") in locked:
+    if missing_bs:
         raise ValueError(
-            "Explicit cuda_graph_config[decode].bs does not cover DVR "
-            f"self-draft batch sizes {sorted(missing_bs)}."
+            "Configured cuda_graph_config[decode] does not cover DVR self-draft "
+            f"batch sizes {sorted(missing_bs)}. Keep max_running_requests within "
+            "the decode graph capacity."
         )
-    if (Phase.DECODE, "max_bs") in locked and int(decode_graph.max_bs or 0) < max(
-        missing_bs
-    ):
-        raise ValueError(
-            "Explicit cuda_graph_config[decode].max_bs does not cover DVR "
-            f"self-draft batch size {max(missing_bs)}."
-        )
-    graph_bs.update(missing_bs)
-
-    decode_graph.bs = sorted(graph_bs)
-    decode_graph.max_bs = max(decode_graph.bs)
 
 
 def _is_dvr_gated_linear_state_model(server_args):

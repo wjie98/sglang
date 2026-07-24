@@ -43,9 +43,9 @@ coverage.
 - The target live recurrent slot contains the state used by ordinary target
   execution. It is not a cross-request checkpoint by itself.
 - With Radix enabled, the existing Mamba extra-buffer pool provides two
-  physical checkpoint slots. DVR records which exact 64-token boundary each
-  request-owned logical slot contains. Radix donation may replace a physical
-  slot, so physical indices are resolved only after donation is processed.
+  request-owned physical checkpoint slots. DVR records which exact 64-token
+  boundary each slot contains. Unfinished Radix insertion copies `keep` into
+  its own slot and never rebinds either active request slot.
 - With Radix disabled, one request-local checkpoint is sufficient. It is
   discarded with the request; the next request must report no Radix reuse and
   perform an ordinary full prefill.
@@ -62,22 +62,20 @@ coverage.
    execution installs the request-local tracking slot.
 2. **Target EXTEND state initialization:** after deferred Mamba COW resolves a
    warm Radix hit into the request's live slot, copy that exact boundary into
-   DVR's request-owned checkpoint on the forward stream. This whole-pool copy
+   the request's `keep` checkpoint on the forward stream. This whole-pool copy
    runs eagerly before a prefill CUDA Graph; it must not be captured as
    data-dependent indexing inside each GDN layer. Target EXTEND then consumes
    the unclosed suffix and retains only the target inputs after the last
    64-token boundary.
 3. **Target EXTEND finish:** publish exactly one authoritative boundary from an
-   aligned live state, an upstream tracked state, the zero state, or the
-   captured Radix prefix. Missing all four sources is a correctness error.
-4. **First-decode lifecycle fence:** under overlap, process the unfinished
-   prefill result before `get_next_batch_to_run()` constructs another batch.
-   Result processing can either finish and release a request or donate its
-   cached slot to Radix and install a replacement in the request/device mapping.
-   Batch filtering, allocation, draft preparation, and verify must all observe
-   that final request state.
-5. **Draft:** select the newest logical boundary and resolve its current
-   physical slot. Self-draft advances only its request-owned recurrent and
+   upstream tracked state, the zero state, or the copied Radix prefix. Missing
+   all three sources is a correctness error.
+4. **Overlap publication:** preserve the standard FutureMap order:
+   `get_next_batch_to_run()` may construct the next batch before the previous
+   CPU result is consumed. Result processing may copy `keep` to Radix, but it
+   cannot change either request checkpoint address.
+5. **Draft:** select the newest exact boundary from the device-side boundary
+   table. Self-draft advances only its request-owned recurrent and
    convolution state; EAGLE/MTP advances only its upstream-owned draft state.
 6. **Target verify:** read the exact target boundary without overwriting it and
    run deterministic GDN EXTEND over `64 + D`. The Triton chunk kernel exports
@@ -98,14 +96,15 @@ coverage.
 ### 3.3 Required invariants
 
 - Before every non-empty draft, each GDN request has an exact checkpoint.
-- A finished request is never captured in a subsequent DVR decode batch; its
-  prefill result is consumed exactly once before that batch is constructed.
+- Result processing may finish a request after overlap has constructed one
+  extra batch. Existing WAR/result-lifetime fencing must protect its request
+  slots until that forward no longer reads them.
 - At phase boundaries, `boundary_length + tail_length` equals the target's
   committed state length.
 - The boundary and `k/v/g/beta` window come from the same accepted target
   history; rejected rows never become authoritative.
-- A physical checkpoint mapping cannot change between draft preparation and
-  rollback.
+- An active request's physical checkpoint mapping cannot change between target
+  EXTEND and cache release.
 - Warm-prefix boundary initialization uses the final physical source and
   destination slots after COW. It executes before both eager and graphed target
   EXTEND and covers every layer's temporal and convolution state.
@@ -122,7 +121,7 @@ KV convention for the sampled bonus token. Do not weaken this check to the old
 prompt checkpoint: doing so hides a failure to publish generated boundaries.
 
 The boundary-focused cases in `run_0p8b_self_dvr_kl.sh` cover first-decode
-donation (`prompt=126/127`, `max_new=17/65`), request-slot reuse, interleaved
+Radix copy (`prompt=126/127`, `max_new=17/65`), request-slot reuse, interleaved
 ownership, generated-prefix re-hit, stop/grammar trimming, and 512-token
 generation. Run them with Radix enabled first, then repeat with
 `DISABLE_RADIX_CACHE=1` to confirm full-prefill semantics.
@@ -133,13 +132,12 @@ none may survive into draft/verify with released KV or Mamba state.
 
 ### 3.4 Warm-prefix prefill graph regression
 
-Boundary initialization and donation ownership are independent contracts. A
-donation fence can resolve the correct physical slots while a captured
-per-layer copy still initializes no state: the dummy prefill batch has zero
-prefix lengths, so boolean indexing captures a zero-element operation whose
-shape cannot become nonzero at replay time. Replacing the indexing with a
-fixed-grid kernel is also insufficient unless every captured input has a
-stable address.
+Boundary initialization and Radix ownership are independent contracts. Stable
+request slots remove the slot-rebinding race, but a captured per-layer copy can
+still initialize no state: the dummy prefill batch has zero prefix lengths, so
+boolean indexing captures a zero-element operation whose shape cannot become
+nonzero at replay time. Replacing the indexing with a fixed-grid kernel is also
+insufficient unless every captured input has a stable address.
 
 The implementation therefore performs one eager whole-pool copy after deferred
 COW and before dispatching either eager target EXTEND or its prefill graph. The
@@ -203,7 +201,8 @@ The migration-specific correctness matrix must force:
 - `accept_len=1/D-1/D`;
 - crossing and non-crossing requests in the same batch;
 - prompt and generated-prefix boundaries at `1/63/64/65`;
-- cold prefill, warm Radix re-hit, donation, request-slot reuse, and Radix off;
+- cold prefill, warm Radix re-hit, Radix checkpoint copy, request-slot reuse,
+  and Radix off;
 - self-DVR v1/v2 and EAGLE sync/overlap; and
 - `return_logprob=True/False` with 512- and 1024-token generations.
 
@@ -215,23 +214,23 @@ pass until proposal and metric accounting are independently validated.
 
 On the 35B H20 BS3 profile, report `draft_state_copy` only for target EXTEND;
 it must not appear once per steady-state decode block. Report
-`verify_state_pack`, `verify_boundary_stage`, `verify_output_gather`,
+`verify_state_pack`, `boundary_state_write`, `verify_output_gather`,
 `draft_state_rebuild`, `state_window_compact`, and `boundary_publish`
 separately. The old reference is 2.351 ms/block, including a 0.843 ms restore
 that must disappear. The pre-optimization verify state-I/O trace attributed
-about 1.764 ms/block and 570 launches to per-layer metadata, five window
-writes, five full-window reads, h64 staging, and output gather. The current
-DVR-private path resolves metadata once per verify, uses three pack launches
-per GDN layer, masks h64 staging to possible crossings, and directly gathers
-the logical outputs. Establish the new threshold from measurement rather than
-assuming those launches or the 64-row-bounded rebuild are free.
+about 1.764 ms/block and 570 launches to per-layer metadata, five window writes,
+five full-window reads, h64 staging, and output gather. The current path resolves
+metadata once per verify, uses three pack launches per GDN layer, writes the
+selected FP32 chunk accumulator directly from the FLA producer, and directly
+gathers the logical outputs. Establish the new threshold from measurement
+rather than assuming those launches or the 64-row-bounded rebuild are free.
 
-Do not combine this remeasurement with a generic FLA API change. If state
-packing remains material, evaluate a segmented DVR verify or a direct h64
-producer write as a separate patch with bitwise state tests. If rebuild remains
-material, tune its existing private kernel against the observed tail-length
-histogram before adding multiple graph variants. Neither decision may add
-tail-length D2H, CPU branching, or assumptions about Radix being enabled.
+The direct producer side output is now part of the test snapshot and must be
+profiled rather than reimplemented. If state packing remains material, evaluate
+a segmented DVR verify separately. If rebuild remains material, tune its
+existing private kernel against the observed tail-length histogram before
+adding multiple graph variants. Neither decision may add tail-length D2H, CPU
+branching, or assumptions about Radix being enabled.
 
 ## 4. DeepGEMM preparation
 
@@ -556,7 +555,7 @@ for:
 
 ```text
 verify_state_pack
-verify_boundary_stage
+boundary_state_write
 verify_output_gather
 draft_state_rebuild
 state_window_compact
@@ -569,10 +568,11 @@ advanced-index operations, and that padded graph lanes do not write dummy slot
 zero. Run BS1 and BS3 because reducing launch count may help small batches while
 state bandwidth dominates larger ones.
 
-Only proceed to a shared FLA producer change if `verify_boundary_stage` remains
-material after masked staging. Only proceed to segmented GDN verify if
-`verify_state_pack` plus unused-output compute remains material and a prototype
-preserves exact outputs and h64 for every tail length `0..63`. Only tune or
-bucket the private rebuild kernel if `draft_state_rebuild` remains a material
-fraction of the full block. This ordering keeps the optimization optional and
-prevents a machine-specific result from narrowing ordinary backend behavior.
+The shared FLA producer change is limited to the optional FP32 boundary output;
+verify that ordinary calls do not execute it. Only proceed to segmented GDN
+verify if `verify_state_pack` plus unused-output compute remains material and a
+prototype preserves exact outputs and h64 for every tail length `0..63`. Only
+tune or bucket the private rebuild kernel if `draft_state_rebuild` remains a
+material fraction of the full block. This ordering keeps further optimization
+optional and prevents a machine-specific result from narrowing ordinary backend
+behavior.

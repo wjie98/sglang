@@ -313,7 +313,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        if speculative_algorithm.uses_eagle_draft_backend():
+        if (
+            speculative_algorithm.uses_eagle_draft_backend()
+            or speculative_algorithm.is_dvr_self_draft()
+        ):
             # In the current eagle implementation, we store the draft tokens in the output token slots,
             # so we need to reserve the space for the draft tokens.
             self.num_reserved_tokens = max(

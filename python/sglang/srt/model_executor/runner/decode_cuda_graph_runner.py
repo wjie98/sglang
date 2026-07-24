@@ -183,7 +183,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     record_war_fastpath_event = True
     initialize_attention_backend_state = True
-    enable_mamba_tracking = True
+    global_num_tokens_are_expanded = False
+    force_decode_capture = False
 
     def __init__(
         self,
@@ -247,10 +248,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = model_runner.decode_num_tokens_per_bs(
-            num_draft_tokens=self.speculative_num_draft_tokens
+        self.num_tokens_per_bs = (
+            1
+            if self.force_decode_capture
+            else model_runner.decode_num_tokens_per_bs(
+                num_draft_tokens=self.speculative_num_draft_tokens
+            )
         )
-        if model_runner.spec_algorithm.is_speculative():
+        if (
+            model_runner.spec_algorithm.is_speculative()
+            and not self.force_decode_capture
+        ):
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
                 if (
@@ -306,8 +314,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         enable_mamba_track = (
-            self.enable_mamba_tracking
-            and self.model_runner.server_args.enable_mamba_extra_buffer()
+            self.model_runner.server_args.enable_mamba_extra_buffer()
             and self.model_runner.spec_algorithm.is_none()
         )
 
@@ -421,7 +428,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.capture_forward_mode.is_target_verify()
+                if self.global_num_tokens_are_expanded
+                or self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_dflash()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -957,8 +967,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens // self.num_tokens_per_bs
-                if self.capture_forward_mode.is_target_verify()
+                max_num_tokens / self.num_tokens_per_bs
+                if self.global_num_tokens_are_expanded
+                or self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_dflash()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -1038,14 +1051,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Publish a read-done event for the WAR barrier: a cuda-graph forward
             # finishes its shared req_to_token / SWA reads at this pre-replay
             # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
-            if (
-                self.record_war_fastpath_event
-                and (
-                    forward_batch.forward_mode.is_decode()
-                    or (
-                        forward_batch.forward_mode.is_target_verify()
-                        and self.model_runner.spec_algorithm.is_dflash()
-                    )
+            if self.record_war_fastpath_event and (
+                forward_batch.forward_mode.is_decode()
+                or (
+                    forward_batch.forward_mode.is_target_verify()
+                    and self.model_runner.spec_algorithm.is_dflash()
                 )
             ):
                 read_done = self.device_module.Event()

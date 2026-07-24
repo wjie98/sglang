@@ -1,14 +1,11 @@
 """GDN-specific DVR state allocation, replay kernels, and lifecycle adapter."""
 
 import math
-from contextlib import contextmanager
-from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
-from sglang.srt.layers.attention.linear.dvr_state import DVRStateInputCache
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_conv_window_scatter_with_mask,
@@ -20,7 +17,6 @@ from sglang.srt.utils.nvtx_utils import profile_range
 __all__ = [
     "DVRGDNStateAdapter",
     "dvr_gdn_intermediate_bytes_per_request",
-    "dvr_gdn_state_input_bytes_per_request",
 ]
 
 if not is_cpu():
@@ -31,6 +27,38 @@ if not is_cpu():
 if not is_cpu():
 
     @triton.jit
+    def _dvr_compact_state_window_kernel(
+        cache,
+        indices,
+        crosses_boundary,
+        accepted_tail_lens,
+        layer_stride,
+        slot_stride,
+        token_stride,
+        E: tl.constexpr,
+        CHUNK_SIZE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        i_req = tl.program_id(0)
+        i_layer = tl.program_id(1).to(tl.int64)
+        i_block = tl.program_id(2).to(tl.int64)
+        if not tl.load(crosses_boundary + i_req):
+            return
+
+        slot = tl.load(indices + i_req).to(tl.int64)
+        count = tl.load(accepted_tail_lens + i_req).to(tl.int64) * E
+        offsets = i_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < count
+        token = offsets // E
+        element = offsets % E
+        base = i_layer * layer_stride + slot * slot_stride
+        values = tl.load(
+            cache + base + (CHUNK_SIZE + token) * token_stride + element,
+            mask=mask,
+        )
+        tl.store(cache + base + token * token_stride + element, values, mask=mask)
+
+    @triton.jit
     def _dvr_pack_verify_window_kernel(
         cache0,
         candidate0,
@@ -38,8 +66,8 @@ if not is_cpu():
         cache1,
         candidate1,
         output1,
-        state_input_indices,
-        tail_lens,
+        request_rows,
+        accepted_tail_lens,
         valid_mask,
         cache0_slot_stride,
         cache0_token_stride,
@@ -65,8 +93,8 @@ if not is_cpu():
         i_token = tl.program_id(1).to(tl.int64)
         offsets = tl.program_id(2).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
-        slot = tl.load(state_input_indices + i_req).to(tl.int64)
-        tail = tl.load(tail_lens + i_req).to(tl.int64)
+        slot = tl.load(request_rows + i_req).to(tl.int64)
+        tail = tl.load(accepted_tail_lens + i_req).to(tl.int64)
         valid = tl.load(valid_mask + i_req)
         candidate_token = i_token - tail
         is_candidate = valid & (candidate_token >= 0) & (candidate_token < DRAFT_TOKENS)
@@ -139,19 +167,18 @@ if not is_cpu():
     def _dvr_gather_verify_output_kernel(
         source,
         output,
-        tail_lens,
+        accepted_tail_lens,
         source_batch_stride,
         source_token_stride,
         output_batch_stride,
         output_token_stride,
-        DRAFT_TOKENS: tl.constexpr,
         E: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         i_req = tl.program_id(0).to(tl.int64)
         i_token = tl.program_id(1).to(tl.int64)
         offsets = tl.program_id(2).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        source_token = tl.load(tail_lens + i_req).to(tl.int64) + i_token
+        source_token = tl.load(accepted_tail_lens + i_req).to(tl.int64) + i_token
         values = tl.load(
             source
             + i_req * source_batch_stride
@@ -176,8 +203,8 @@ if not is_cpu():
         beta,
         state_src,
         state_dst,
-        state_input_indices,
-        boundary_indices,
+        request_rows,
+        boundary_slots,
         destination_indices,
         token_count,
         N: tl.constexpr,
@@ -204,8 +231,8 @@ if not is_cpu():
         mask_v = o_v < V
         mask_h = mask_v[:, None] & mask_k[None, :]
 
-        state_input_idx = tl.load(state_input_indices + i_n).to(tl.int64)
-        boundary_idx = tl.load(boundary_indices + i_n).to(tl.int64)
+        state_input_idx = tl.load(request_rows + i_n).to(tl.int64)
+        boundary_idx = tl.load(boundary_slots + i_n).to(tl.int64)
         destination_idx = tl.load(destination_indices + i_n).to(tl.int64)
         state_offset = (i_l * CS + boundary_idx) * HV * V * K + i_hv * V * K
         p_h0 = state_src + state_offset + o_v[:, None] * K + o_k[None, :]
@@ -241,8 +268,8 @@ def _pack_verify_window_pair(
     cache0: torch.Tensor,
     candidate0: torch.Tensor,
     *,
-    state_input_indices: torch.Tensor,
-    tail_lens: torch.Tensor,
+    request_rows: torch.Tensor,
+    accepted_tail_lens: torch.Tensor,
     valid_mask: torch.Tensor,
     cache1: Optional[torch.Tensor] = None,
     candidate1: Optional[torch.Tensor] = None,
@@ -251,23 +278,12 @@ def _pack_verify_window_pair(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Materialize one or two verify windows while persisting candidate rows."""
 
-    if not cache0.is_cuda:
-        raise RuntimeError("The fused DVR verify-window pack is CUDA-only.")
     has_second = cache1 is not None
-    if has_second != (candidate1 is not None):
-        raise ValueError(
-            "A second cache and candidate tensor must be provided together."
-        )
+    assert has_second == (candidate1 is not None)
 
     batch_size, draft_tokens = candidate0.shape[:2]
     output0 = cache0.new_empty((batch_size, *cache0.shape[1:]))
     output1 = cache1.new_empty((batch_size, *cache1.shape[1:])) if has_second else None
-    tensors = (cache0, candidate0, output0)
-    if has_second:
-        tensors += (cache1, candidate1, output1)
-    if any(not tensor.is_contiguous() for tensor in tensors):
-        raise RuntimeError("DVR verify-window tensors must be contiguous.")
-
     e0 = math.prod(cache0.shape[2:])
     e1 = math.prod(cache1.shape[2:]) if has_second else 1
     if math.prod(candidate0.shape[2:]) != e0:
@@ -291,8 +307,8 @@ def _pack_verify_window_pair(
         second_cache,
         second_candidate,
         second_output,
-        state_input_indices,
-        tail_lens,
+        request_rows,
+        accepted_tail_lens,
         valid_mask,
         cache0.stride(0),
         cache0.stride(1),
@@ -320,12 +336,12 @@ def _pack_verify_window_pair(
 def _gather_verify_output(
     source: torch.Tensor,
     *,
-    tail_lens: torch.Tensor,
+    accepted_tail_lens: torch.Tensor,
     draft_tokens: int,
 ) -> torch.Tensor:
     """Gather logical candidate rows directly into the target output layout."""
 
-    batch_size = tail_lens.shape[0]
+    batch_size = accepted_tail_lens.shape[0]
     source = source.view(batch_size, -1, *source.shape[-2:])
     output = source.new_empty((batch_size, draft_tokens, *source.shape[2:]))
     elements = math.prod(source.shape[2:])
@@ -335,12 +351,11 @@ def _gather_verify_output(
     ](
         source,
         output,
-        tail_lens,
+        accepted_tail_lens,
         source.stride(0),
         source.stride(1),
         output.stride(0),
         output.stride(1),
-        DRAFT_TOKENS=draft_tokens,
         E=elements,
         BLOCK_SIZE=block_size,
     )
@@ -349,37 +364,9 @@ def _gather_verify_output(
 
 def _local_gdn_dimensions(state_shape):
     local_value_heads, value_dim, key_dim = state_shape.temporal
-    key_group_width = 2 * state_shape.state_size
-    assert key_group_width > 0
-    assert state_shape.conv_dim >= state_shape.intermediate_size
-    assert (
-        state_shape.conv_dim - state_shape.intermediate_size
-    ) % key_group_width == 0
-    padded_key_groups = (
-        state_shape.conv_dim - state_shape.intermediate_size
-    ) // key_group_width
-    assert local_value_heads > 0
-    assert state_shape.num_heads % local_value_heads == 0
-    tp_world_size = state_shape.num_heads // local_value_heads
-    assert padded_key_groups % tp_world_size == 0
-    local_key_heads = padded_key_groups // tp_world_size
+    local_key_heads = state_shape.num_k_heads_per_tp
+    assert local_key_heads > 0 and local_value_heads > 0
     return local_key_heads, local_value_heads, key_dim, value_dim
-
-
-def dvr_gdn_state_input_bytes_per_request(cache_params, num_draft_tokens: int) -> int:
-    """Return persistent k/v/g/beta transition-window bytes per request."""
-
-    local_key_heads, local_value_heads, key_dim, value_dim = _local_gdn_dimensions(
-        cache_params.shape
-    )
-    window_len = FLA_CHUNK_SIZE + num_draft_tokens
-    conv_bytes = cache_params.dtype.conv.itemsize
-    values_per_token = (
-        local_key_heads * key_dim * conv_bytes
-        + local_value_heads * value_dim * conv_bytes
-        + 2 * local_value_heads * 4  # g and beta are fp32.
-    )
-    return len(cache_params.layers) * window_len * values_per_token + 4
 
 
 def dvr_gdn_intermediate_bytes_per_request(
@@ -403,8 +390,7 @@ def dvr_gdn_intermediate_bytes_per_request(
     num_layers = len(cache_params.layers)
     total = num_layers * (
         intermediate_conv_numel * cache_params.dtype.conv.itemsize
-        + math.prod(cache_params.shape.temporal)
-        * cache_params.dtype.temporal.itemsize
+        + math.prod(cache_params.shape.temporal) * cache_params.dtype.temporal.itemsize
     )
     if draft_reuses_target_state:
         total += (
@@ -412,27 +398,87 @@ def dvr_gdn_intermediate_bytes_per_request(
             * sum(math.prod(shape) for shape in cache_params.shape.conv)
             * cache_params.dtype.conv.itemsize
         )
-    return total + dvr_gdn_state_input_bytes_per_request(
-        cache_params, num_draft_tokens
+    local_key_heads, local_value_heads, key_dim, value_dim = _local_gdn_dimensions(
+        cache_params.shape
+    )
+    values_per_token = (
+        local_key_heads * key_dim * cache_params.dtype.conv.itemsize
+        + local_value_heads * value_dim * cache_params.dtype.conv.itemsize
+        + 2 * local_value_heads * torch.float32.itemsize
+    )
+    # Persistent k/v/g/beta transition windows plus int32 tail length and
+    # int64 boundary slot.
+    return (
+        total + num_layers * (FLA_CHUNK_SIZE + num_draft_tokens) * values_per_token + 12
     )
 
 
+def _compact_gdn_transition_windows(
+    transition_windows: tuple[torch.Tensor, ...],
+    *,
+    indices: torch.Tensor,
+    crosses_chunk_boundary: torch.Tensor,
+    accepted_tail_lens: torch.Tensor,
+    chunk_size: int,
+) -> None:
+    """Move the accepted post-boundary tail to the start of each GDN window."""
+
+    tail_capacity = transition_windows[0].shape[2] - chunk_size
+    if tail_capacity <= 0 or indices.numel() == 0:
+        return
+
+    crosses_chunk_boundary = crosses_chunk_boundary.to(torch.bool)
+    accepted_tail_lens = accepted_tail_lens.to(
+        device=crosses_chunk_boundary.device, dtype=torch.long
+    ).contiguous()
+    torch._assert_async(
+        (
+            ~crosses_chunk_boundary
+            | ((accepted_tail_lens >= 0) & (accepted_tail_lens <= tail_capacity))
+        ).all(),
+        "DVR compact received an invalid linear-state tail length.",
+    )
+    indices = indices.to(
+        device=crosses_chunk_boundary.device, dtype=torch.long
+    ).contiguous()
+    crosses_chunk_boundary = crosses_chunk_boundary.contiguous()
+
+    for cache in transition_windows:
+        elements_per_token = cache[0, 0, 0].numel()
+        _dvr_compact_state_window_kernel[
+            (
+                indices.numel(),
+                cache.shape[0],
+                triton.cdiv(tail_capacity * elements_per_token, 256),
+            )
+        ](
+            cache,
+            indices,
+            crosses_chunk_boundary,
+            accepted_tail_lens,
+            cache.stride(0),
+            cache.stride(1),
+            cache.stride(2),
+            E=elements_per_token,
+            CHUNK_SIZE=chunk_size,
+            BLOCK_SIZE=256,
+        )
+
+
 def _rebuild_gdn_self_draft_state(
-    state_window: DVRStateInputCache,
+    transition_windows: tuple[torch.Tensor, ...],
     *,
     state_cache,
-    state_input_indices: torch.Tensor,
-    boundary_indices: torch.Tensor,
+    request_rows: torch.Tensor,
+    boundary_slots: torch.Tensor,
     token_count: torch.Tensor,
 ) -> None:
     """Rebuild request-owned self-draft state from an exact boundary and tail."""
 
-    k, v, g, beta = state_window.tensors
-    if is_cpu():
-        raise NotImplementedError("DVR GDN self-draft state rebuild is GPU-only.")
+    k, v, g, beta = transition_windows
     num_layers, num_slots, num_tokens, num_key_heads, key_dim = k.shape
     _, _, _, num_value_heads, value_dim = v.shape
-    num_reqs = state_input_indices.numel()
+    num_reqs = request_rows.numel()
     if num_reqs == 0:
         return
     block_k = triton.next_power_of_2(key_dim)
@@ -449,9 +495,9 @@ def _rebuild_gdn_self_draft_state(
         beta=beta,
         state_src=state_cache.temporal,
         state_dst=state_cache.intermediate_ssm[:, :, 0],
-        state_input_indices=state_input_indices,
-        boundary_indices=boundary_indices,
-        destination_indices=state_input_indices,
+        request_rows=request_rows,
+        boundary_slots=boundary_slots,
+        destination_indices=request_rows,
         token_count=token_count.contiguous(),
         N=num_reqs,
         S=num_slots,
@@ -470,7 +516,6 @@ def _rebuild_gdn_self_draft_state(
     )
 
 
-@dataclass
 class DVRGDNStateAdapter:
     """Adapter for DVR state replay in gated linear-state layers.
 
@@ -478,21 +523,38 @@ class DVRGDNStateAdapter:
     do not need to know the verify/post-verify lifecycle details.
     """
 
-    kernel_dispatcher: Any
-    chunk_size: int = FLA_CHUNK_SIZE
-    draft_reuses_target_state: bool = False
-    state_input_cache: Optional[DVRStateInputCache] = None
-    verify_boundary_indices: Optional[torch.Tensor] = None
-    _verify_metadata: Optional[tuple[torch.Tensor, ...]] = field(
-        default=None, init=False, repr=False
-    )
-    draft_conv_state: Optional[tuple[torch.Tensor, ...]] = field(
-        default=None, init=False, repr=False
-    )
-    _layer_state_input_caches: Optional[tuple[DVRStateInputCache, ...]] = field(
-        default=None, init=False, repr=False
-    )
-    _self_draft_decode_active: bool = field(default=False, init=False, repr=False)
+    def __init__(
+        self,
+        kernel_dispatcher: Any,
+        *,
+        state_cache: Any,
+        transition_windows: tuple[torch.Tensor, ...],
+        accepted_tail_lens: torch.Tensor,
+        verify_boundary_slots: torch.Tensor,
+        draft_reuses_target_state: bool,
+        chunk_size: int = FLA_CHUNK_SIZE,
+    ):
+        self.kernel_dispatcher = kernel_dispatcher
+        self.state_cache = state_cache
+        self.transition_windows = transition_windows
+        self.accepted_tail_lens = accepted_tail_lens
+        self.verify_boundary_slots = verify_boundary_slots
+        self.chunk_size = chunk_size
+        self._verify_plan: Optional[tuple[torch.Tensor, ...]] = None
+        self.self_draft_conv_state = (
+            tuple(
+                tensor.new_zeros(
+                    (
+                        tensor.shape[0],
+                        state_cache.intermediate_ssm.shape[1],
+                        *tensor.shape[2:],
+                    )
+                )
+                for tensor in state_cache.conv
+            )
+            if draft_reuses_target_state
+            else None
+        )
 
     @classmethod
     def for_gdn(
@@ -569,69 +631,50 @@ class DVRGDNStateAdapter:
 
         return cls(
             kernel_dispatcher,
-            draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
-            state_input_cache=DVRStateInputCache(
-                tensors=(k, v, gate, torch.zeros_like(gate)),
-                # Slot 0 is the padded-row dummy; real rows use req_pool_idx.
-                tail_lens=torch.zeros(
-                    num_slots, dtype=torch.int32, device=model_runner.device
-                ),
+            state_cache=state_cache,
+            transition_windows=(k, v, gate, torch.zeros_like(gate)),
+            # Slot 0 is the padded-row dummy; real rows use req_pool_idx.
+            accepted_tail_lens=torch.zeros(
+                num_slots, dtype=torch.int32, device=model_runner.device
             ),
-            verify_boundary_indices=torch.zeros(
+            verify_boundary_slots=torch.zeros(
                 num_slots, dtype=torch.long, device=model_runner.device
             ),
+            draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
         )
 
-    def batch_state(self, *, batch):
-        """Resolve physical state and request-owned rows for one target batch."""
+    def resolve_request_slots(self, *, batch) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve request-owned rows and accepted-endpoint state rows."""
 
         pool = batch.req_to_token_pool
-        live_indices = pool.get_mamba_indices(batch.req_pool_indices).to(torch.long)
-        state_input_indices = batch.req_pool_indices.to(
-            device=live_indices.device, dtype=torch.long
+        endpoint_slots = pool.get_mamba_indices(batch.req_pool_indices).to(torch.long)
+        request_rows = batch.req_pool_indices.to(
+            device=endpoint_slots.device, dtype=torch.long
         )
-        return (
-            pool.get_speculative_mamba2_params_all_layers(),
-            state_input_indices,
-            live_indices,
+        return request_rows, endpoint_slots
+
+    def set_accepted_tail_lens(
+        self, *, indices: torch.Tensor, value: int | torch.Tensor
+    ) -> None:
+        indices = indices.to(device=self.accepted_tail_lens.device, dtype=torch.long)
+        value = torch.as_tensor(
+            value,
+            device=self.accepted_tail_lens.device,
+            dtype=self.accepted_tail_lens.dtype,
         )
+        self.accepted_tail_lens[indices] = value
 
-    def state_input_window(
-        self, *, layer_idx: Optional[int] = None
-    ) -> DVRStateInputCache:
-        cache = self.state_input_cache
-        if cache is None:
-            raise RuntimeError("DVR linear state-input cache is not initialized.")
-        if layer_idx is not None:
-            if self._layer_state_input_caches is None:
-                self._layer_state_input_caches = tuple(
-                    cache[layer] for layer in range(cache.tensors[0].shape[0])
-                )
-            cache = self._layer_state_input_caches[layer_idx]
-        return cache
-
-    def zero_recurrent_state(self, *, state_cache, indices: torch.Tensor):
-        indices = indices.to(device=state_cache.temporal.device, dtype=torch.long)
-        for conv in state_cache.conv:
+    def zero_boundary_state(self, *, indices: torch.Tensor):
+        indices = indices.to(device=self.state_cache.temporal.device, dtype=torch.long)
+        for conv in self.state_cache.conv:
             conv[:, indices] = 0
-        state_cache.temporal[:, indices] = 0
-
-    def allocate_self_draft_state(self, *, state_cache, num_slots: int) -> None:
-        """Allocate the small convolution half of self-draft's private state."""
-
-        if not self.draft_reuses_target_state:
-            return
-        self.draft_conv_state = tuple(
-            tensor.new_zeros((tensor.shape[0], num_slots, *tensor.shape[2:]))
-            for tensor in state_cache.conv
-        )
+        self.state_cache.temporal[:, indices] = 0
 
     def initialize_self_draft_state(
         self,
         *,
-        state_cache,
-        state_input_indices: torch.Tensor,
-        live_indices: torch.Tensor,
+        request_rows: torch.Tensor,
+        endpoint_slots: torch.Tensor,
     ) -> None:
         """Seed private self-draft state after target EXTEND.
 
@@ -640,157 +683,192 @@ class DVRGDNStateAdapter:
         from the authoritative boundary plus accepted transition rows.
         """
 
-        if not self.draft_reuses_target_state:
+        if self.self_draft_conv_state is None:
             return
-        if self.draft_conv_state is None:
-            raise RuntimeError("DVR self draft has no private convolution state.")
-        live_indices = live_indices.to(
-            device=state_cache.temporal.device, dtype=torch.long
+        endpoint_slots = endpoint_slots.to(
+            device=self.state_cache.temporal.device, dtype=torch.long
         )
-        state_input_indices = state_input_indices.to(
-            device=state_cache.temporal.device, dtype=torch.long
+        request_rows = request_rows.to(
+            device=self.state_cache.temporal.device, dtype=torch.long
         )
         with profile_range("draft_state_copy"):
-            state_cache.intermediate_ssm[:, state_input_indices, 0] = (
-                state_cache.temporal[:, live_indices]
+            self.state_cache.intermediate_ssm[:, request_rows, 0] = (
+                self.state_cache.temporal[:, endpoint_slots]
             )
             for target_conv, draft_conv in zip(
-                state_cache.conv, self.draft_conv_state, strict=True
+                self.state_cache.conv, self.self_draft_conv_state, strict=True
             ):
-                draft_conv[:, state_input_indices] = target_conv[:, live_indices]
-
-    @contextmanager
-    def self_draft_decode(self):
-        """Route only self-draft GDN decode to request-owned private state."""
-
-        if not self.draft_reuses_target_state:
-            yield
-            return
-        if self.draft_conv_state is None:
-            raise RuntimeError("DVR self draft state is not initialized.")
-        previous = self._self_draft_decode_active
-        self._self_draft_decode_active = True
-        try:
-            yield
-        finally:
-            self._self_draft_decode_active = previous
+                draft_conv[:, request_rows] = target_conv[:, endpoint_slots]
 
     def decode_state(self, *, layer_cache, forward_batch, layer_idx: int):
-        """Return private GDN state only while self-draft decode is captured/eager."""
+        """Return request-owned state for provisional DVR-self decode."""
 
-        if not self._self_draft_decode_active:
+        if (
+            self.self_draft_conv_state is None
+            or not forward_batch.forward_mode.is_decode()
+        ):
             return None
-        state_input_indices = forward_batch.req_pool_indices.to(
+        request_rows = forward_batch.req_pool_indices.to(
             device=layer_cache.temporal.device, dtype=torch.long
         )
         return (
-            self.draft_conv_state[0][layer_idx],
+            self.self_draft_conv_state[0][layer_idx],
             layer_cache.intermediate_ssm[:, 0],
-            state_input_indices,
+            request_rows,
         )
 
     def set_verify_boundaries(
-        self, *, state_input_indices: torch.Tensor, boundary_indices: torch.Tensor
+        self, *, request_rows: torch.Tensor, boundary_slots: torch.Tensor
     ) -> None:
         """Bind logical request rows to the physical exact boundary for verify."""
 
-        if self.verify_boundary_indices is None:
-            raise RuntimeError("DVR verify boundary table is not initialized.")
-        state_input_indices = state_input_indices.to(
-            device=self.verify_boundary_indices.device, dtype=torch.long
+        request_rows = request_rows.to(
+            device=self.verify_boundary_slots.device, dtype=torch.long
         )
-        self.verify_boundary_indices[state_input_indices] = boundary_indices.to(
-            device=self.verify_boundary_indices.device, dtype=torch.long
+        self.verify_boundary_slots[request_rows] = boundary_slots.to(
+            device=self.verify_boundary_slots.device, dtype=torch.long
         )
 
-    def cache_extend_tail(
+    def cache_prefill_transitions(
         self,
         *,
         forward_batch,
-        q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
         layer_idx: int,
     ):
-        state_window = self.state_input_window(layer_idx=layer_idx)
         if (
             forward_batch.extend_prefix_lens_cpu is None
             or forward_batch.extend_seq_lens_cpu is None
         ):
-            return
+            raise RuntimeError(
+                "DVR GDN target EXTEND requires CPU prefix and extend lengths."
+            )
 
         # q affects only the output at its own token; it does not participate in
         # the recurrent transition. Target verify receives candidate q directly.
-        state_inputs = (
+        transition_windows = (
             k.reshape(k.shape[1], k.shape[2], k.shape[3]),
             v.reshape(v.shape[1], v.shape[2], v.shape[3]),
             g.reshape(-1, g.shape[-1]),
             beta.reshape(-1, beta.shape[-1]),
         )
-        state_input_indices = forward_batch.req_pool_indices.to(
+        request_rows = forward_batch.req_pool_indices.to(
             device=k.device, dtype=torch.long
         )
-        state_window.write_extend_tail(
-            values=state_inputs,
-            indices=state_input_indices,
-            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            chunk_size=self.chunk_size,
+        layer_transition_windows = tuple(
+            cache[layer_idx] for cache in self.transition_windows
         )
+        src_base = 0
+        for req_i, (prefix_len, extend_len) in enumerate(
+            zip(
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                strict=True,
+            )
+        ):
+            seq_len = prefix_len + extend_len
+            boundary = seq_len // self.chunk_size * self.chunk_size
+            write_start = max(prefix_len, boundary)
+            if write_start < seq_len:
+                src_start = src_base + write_start - prefix_len
+                src_end = src_start + seq_len - write_start
+                cols = torch.arange(
+                    write_start - boundary,
+                    seq_len - boundary,
+                    dtype=torch.long,
+                    device=request_rows.device,
+                )
+                slot = request_rows[req_i]
+                for cache, value in zip(
+                    layer_transition_windows, transition_windows, strict=True
+                ):
+                    cache[slot, cols] = value[src_start:src_end]
+            src_base += extend_len
+
+    def prepare_forward(self, *, forward_batch, forward_metadata):
+        """Prepare request metadata once before all GDN layers execute."""
+
+        self._verify_plan = None
+        if forward_batch.forward_mode.is_target_verify():
+            self.prepare_target_verify(
+                forward_batch=forward_batch,
+                cache_indices=forward_metadata.mamba_cache_indices,
+            )
+            return None
+        if not (
+            forward_batch.forward_mode.is_extend()
+            and forward_metadata.has_mamba_track_mask
+        ):
+            return None
+
+        lengths_to_track = (
+            forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
+        )
+        boundary_steps = torch.where(
+            forward_batch.mamba_track_mask
+            & (lengths_to_track.remainder(self.chunk_size) != 0),
+            lengths_to_track // self.chunk_size,
+            torch.full_like(lengths_to_track, -1),
+        )
+        return forward_metadata.mamba_track_indices, boundary_steps
 
     def prepare_target_verify(self, *, forward_batch, cache_indices: torch.Tensor):
         """Resolve graph-stable request, boundary, tail, and padding metadata once."""
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = forward_batch.input_ids.shape[0] // draft_token_num
-        state_input_indices = forward_batch.req_pool_indices[:batch_size].to(
+        request_rows = forward_batch.req_pool_indices[:batch_size].to(
             device=cache_indices.device, dtype=torch.long
         )
         valid_mask = cache_indices[:batch_size] != PAD_SLOT_ID
-        state_input_indices = torch.where(
-            valid_mask, state_input_indices, torch.zeros_like(state_input_indices)
+        request_rows = torch.where(
+            valid_mask, request_rows, torch.zeros_like(request_rows)
         )
-        if self.verify_boundary_indices is None:
-            raise RuntimeError("DVR verify boundary table is not initialized.")
-        boundary_indices = self.verify_boundary_indices[state_input_indices]
-        boundary_indices = torch.where(
-            valid_mask, boundary_indices, torch.zeros_like(boundary_indices)
+        boundary_slots = self.verify_boundary_slots[request_rows]
+        boundary_slots = torch.where(
+            valid_mask, boundary_slots, torch.zeros_like(boundary_slots)
         )
-        verify_cache_indices = torch.where(
+        verify_conv_slots = torch.where(
             valid_mask,
             cache_indices[:batch_size],
             torch.zeros_like(cache_indices[:batch_size]),
         )
-        tail_lens = (
-            self.state_input_window()
-            .get_tail_lens(indices=state_input_indices)
-            .to(torch.long)
+        accepted_tail_lens = self.accepted_tail_lens[request_rows].to(torch.long)
+        torch._assert_async(
+            (
+                (~valid_mask)
+                | ((accepted_tail_lens >= 0) & (accepted_tail_lens < self.chunk_size))
+            ).all(),
+            "DVR verify received an invalid linear-state tail length.",
         )
-        tail_lens = torch.where(
+        accepted_tail_lens = torch.where(
             valid_mask,
-            tail_lens.clamp(min=0, max=self.chunk_size),
-            torch.zeros_like(tail_lens),
+            accepted_tail_lens,
+            torch.zeros_like(accepted_tail_lens),
         )
         boundary_state_steps = torch.where(
-            valid_mask & (tail_lens + draft_token_num >= self.chunk_size),
-            torch.ones_like(tail_lens),
-            torch.full_like(tail_lens, -1),
+            valid_mask & (accepted_tail_lens + draft_token_num >= self.chunk_size),
+            torch.ones_like(accepted_tail_lens),
+            torch.full_like(accepted_tail_lens, -1),
         )
-        self._verify_metadata = (
-            boundary_indices,
-            state_input_indices,
-            verify_cache_indices,
-            tail_lens,
+        self._verify_plan = (
+            boundary_slots,
+            request_rows,
+            verify_conv_slots,
+            accepted_tail_lens,
             valid_mask,
             boundary_state_steps,
         )
 
-    def target_verify_metadata(self) -> tuple[torch.Tensor, ...]:
-        if self._verify_metadata is None:
+    def verify_conv_indices(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return target conv slots and request-owned intermediate rows."""
+
+        if self._verify_plan is None:
             raise RuntimeError("DVR target-verify metadata was not prepared.")
-        return self._verify_metadata
+        return self._verify_plan[2], self._verify_plan[1]
 
     def forward_target_verify(
         self,
@@ -800,145 +878,104 @@ class DVRGDNStateAdapter:
         value: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        state_cache,
-        boundary_indices: torch.Tensor,
-        state_input_indices: torch.Tensor,
-        tail_lens: torch.Tensor,
-        valid_mask: torch.Tensor,
-        boundary_state_steps: torch.Tensor,
         layer_idx: int,
     ) -> torch.Tensor:
         """Replay GDN state from cached transitions and candidate q/k/v/g/beta."""
 
-        assert self.state_input_cache is not None
-        batch_size = boundary_indices.shape[0]
+        if self._verify_plan is None:
+            raise RuntimeError("DVR target-verify metadata was not prepared.")
+        if not query.is_cuda:
+            raise RuntimeError("DVR GDN target verify requires CUDA tensors.")
+        (
+            boundary_slots,
+            request_rows,
+            _,
+            accepted_tail_lens,
+            valid_mask,
+            boundary_state_steps,
+        ) = self._verify_plan
+        batch_size = boundary_slots.shape[0]
         draft_token_num = query.shape[1] // batch_size
-        draft_state_inputs = (
+        candidate_inputs = (
             query.reshape(batch_size, draft_token_num, *query.shape[2:]),
             key.reshape(batch_size, draft_token_num, *key.shape[2:]),
             value.reshape(batch_size, draft_token_num, *value.shape[2:]),
             g.reshape(batch_size, draft_token_num, g.shape[-1]),
             beta.reshape(batch_size, draft_token_num, beta.shape[-1]),
         )
-        state_window = self.state_input_window(layer_idx=layer_idx)
-        # The fixed window may retain values after tail_lens + draft_token_num.
+        k_cache, v_cache, g_cache, beta_cache = (
+            cache[layer_idx] for cache in self.transition_windows
+        )
+        # The fixed window may retain values after accepted_tail_lens + draft_token_num.
         # They are causally after every returned logit, a boundary is exported
         # only after all chunk rows are valid, and state rebuilds use token_count.
-        if query.is_cuda:
-            k_cache, v_cache, g_cache, beta_cache = state_window.tensors
-            with profile_range("verify_state_pack"):
-                # Cached q rows would produce only discarded prefix outputs.
-                # Keep them zero while packing candidate q and persistent k in
-                # the same launch.
-                q, k = _pack_verify_window_pair(
-                    k_cache,
-                    draft_state_inputs[0],
-                    cache1=k_cache,
-                    candidate1=draft_state_inputs[1],
-                    state_input_indices=state_input_indices,
-                    tail_lens=tail_lens,
-                    valid_mask=valid_mask,
-                    read_cache0=False,
-                    persist_cache0=False,
-                )
-                v, _ = _pack_verify_window_pair(
-                    v_cache,
-                    draft_state_inputs[2],
-                    state_input_indices=state_input_indices,
-                    tail_lens=tail_lens,
-                    valid_mask=valid_mask,
-                )
-                cached_g, cached_beta = _pack_verify_window_pair(
-                    g_cache,
-                    draft_state_inputs[3],
-                    cache1=beta_cache,
-                    candidate1=draft_state_inputs[4],
-                    state_input_indices=state_input_indices,
-                    tail_lens=tail_lens,
-                    valid_mask=valid_mask,
-                )
-        else:
-            cols = torch.arange(draft_token_num).unsqueeze(0) + tail_lens.unsqueeze(1)
-            state_window.write_rows(
-                indices=state_input_indices.unsqueeze(1).expand(-1, draft_token_num),
-                cols=cols,
-                values=draft_state_inputs[1:],
+        with profile_range("verify_state_pack"):
+            # Cached q rows would produce only discarded prefix outputs.
+            # Keep them zero while packing candidate q and persistent k in
+            # the same launch.
+            q, k = _pack_verify_window_pair(
+                k_cache,
+                candidate_inputs[0],
+                cache1=k_cache,
+                candidate1=candidate_inputs[1],
+                request_rows=request_rows,
+                accepted_tail_lens=accepted_tail_lens,
+                valid_mask=valid_mask,
+                read_cache0=False,
+                persist_cache0=False,
             )
-            k, v, cached_g, cached_beta = state_window.read(
-                indices=state_input_indices
+            v, _ = _pack_verify_window_pair(
+                v_cache,
+                candidate_inputs[2],
+                request_rows=request_rows,
+                accepted_tail_lens=accepted_tail_lens,
+                valid_mask=valid_mask,
             )
-            q = query.new_zeros(
-                (batch_size, state_window.capacity, *query.shape[2:])
+            cached_g, cached_beta = _pack_verify_window_pair(
+                g_cache,
+                candidate_inputs[3],
+                cache1=beta_cache,
+                candidate1=candidate_inputs[4],
+                request_rows=request_rows,
+                accepted_tail_lens=accepted_tail_lens,
+                valid_mask=valid_mask,
             )
-            rows = torch.arange(batch_size).unsqueeze(1)
-            q[rows, cols] = draft_state_inputs[0]
-        core_attn_out, _, h = self.kernel_dispatcher.extend(
+        core_attn_out, _, _ = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
             g=cached_g,
             beta=cached_beta,
-            ssm_states=state_cache.temporal,
-            cache_indices=boundary_indices,
+            ssm_states=self.state_cache.temporal[layer_idx],
+            cache_indices=boundary_slots,
             query_start_loc=None,
             inplace_update=False,
+            boundary_state=self.state_cache.intermediate_ssm[layer_idx, :, 0],
+            boundary_state_indices=request_rows,
+            boundary_state_steps=boundary_state_steps,
         )
-        if h is None or h.shape[1] <= 1:
-            raise RuntimeError(
-                "DVR GDN verify requires a linear-attention prefill backend "
-                "that exports exact chunk-boundary states; use Triton for "
-                "linear-attention prefill."
-            )
-        # Draft has finished, so the one-state workspace may now stage h64.
-        # Rollback publishes it only for accepted crossings, then rebuilds the
-        # self-draft endpoint in the same request-owned row.
-        with profile_range("verify_boundary_stage"):
-            if h.is_cuda:
-                fused_mamba_state_scatter_with_mask(
-                    state_cache.intermediate_ssm[:, 0].unsqueeze(0),
-                    h[:batch_size].unsqueeze(0),
-                    state_input_indices,
-                    boundary_state_steps,
-                )
-            else:
-                may_cross = boundary_state_steps >= 0
-                state_cache.intermediate_ssm[state_input_indices[may_cross], 0] = h[
-                    :batch_size, 1
-                ][may_cross].to(state_cache.intermediate_ssm.dtype)
 
         with profile_range("verify_output_gather"):
-            if core_attn_out.is_cuda:
-                return _gather_verify_output(
-                    core_attn_out,
-                    tail_lens=tail_lens,
-                    draft_tokens=draft_token_num,
-                )
-            value_shape = core_attn_out.shape[-2:]
-            core_attn_out = core_attn_out.view(
-                batch_size, self.chunk_size + draft_token_num, *value_shape
-            )
-            rows = torch.arange(batch_size).unsqueeze(1)
-            cols = torch.arange(draft_token_num).unsqueeze(0) + tail_lens.unsqueeze(1)
-            return core_attn_out[rows.expand(-1, draft_token_num), cols].reshape(
-                1, batch_size * draft_token_num, *value_shape
+            return _gather_verify_output(
+                core_attn_out,
+                accepted_tail_lens=accepted_tail_lens,
+                draft_tokens=draft_token_num,
             )
 
-    def commit_after_verify(
+    def commit_accepted_state(
         self,
         *,
-        state_cache,
-        state_input_indices: torch.Tensor,
-        live_indices: torch.Tensor,
-        boundary_indices: torch.Tensor,
-        next_boundary_indices: torch.Tensor,
+        request_rows: torch.Tensor,
+        endpoint_slots: torch.Tensor,
+        boundary_slots: torch.Tensor,
+        alternate_boundary_slots: torch.Tensor,
         accepted_token_counts: torch.Tensor,
     ) -> torch.Tensor:
-        state_window = self.state_input_window()
-        tail_lens_before = state_window.get_tail_lens(indices=state_input_indices).to(
-            device=live_indices.device, dtype=torch.long
+        tail_lens_before = self.accepted_tail_lens[request_rows].to(
+            device=endpoint_slots.device, dtype=torch.long
         )
         accepted_token_counts = accepted_token_counts.to(
-            device=live_indices.device, dtype=torch.long
+            device=endpoint_slots.device, dtype=torch.long
         )
         tail_lens_after = tail_lens_before + accepted_token_counts
         crosses_chunk_boundary = tail_lens_after >= self.chunk_size
@@ -946,19 +983,21 @@ class DVRGDNStateAdapter:
         # accept_lens includes the bonus token, so every non-idle request has a
         # valid accepted step. The fused scatter already handles the empty batch.
         fused_conv_window_scatter_with_mask(
-            state_cache.conv[0],
-            state_cache.intermediate_conv_window[0],
-            live_indices,
+            self.state_cache.conv[0],
+            self.state_cache.intermediate_conv_window[0],
+            endpoint_slots,
             accepted_token_counts - 1,
+            src_indices_raw=request_rows,
         )
-        if self.draft_reuses_target_state:
-            if self.draft_conv_state is None:
-                raise RuntimeError("DVR self draft has no private convolution state.")
+        # Convolution state is authoritative at the accepted endpoint; unlike
+        # temporal state, it is cheap and necessary to resume the next conv.
+        if self.self_draft_conv_state is not None:
             fused_conv_window_scatter_with_mask(
-                self.draft_conv_state[0],
-                state_cache.intermediate_conv_window[0],
-                state_input_indices,
+                self.self_draft_conv_state[0],
+                self.state_cache.intermediate_conv_window[0],
+                request_rows,
                 accepted_token_counts - 1,
+                src_indices_raw=request_rows,
             )
 
         # Commit to the pool-selected next checkpoint slot. Radix execution uses
@@ -966,55 +1005,57 @@ class DVRGDNStateAdapter:
         # the sole request-local slot is updated in place.
         with profile_range("boundary_publish"):
             fused_mamba_state_scatter_with_mask(
-                state_cache.temporal,
-                state_cache.intermediate_ssm,
-                next_boundary_indices,
+                self.state_cache.temporal,
+                self.state_cache.intermediate_ssm,
+                alternate_boundary_slots,
                 torch.where(
                     crosses_chunk_boundary,
                     torch.zeros_like(tail_lens_before),
                     no_commit_step,
                 ),
-                src_indices_raw=state_input_indices,
+                src_indices_raw=request_rows,
             )
             fused_conv_window_scatter_with_mask(
-                state_cache.conv[0],
-                state_cache.intermediate_conv_window[0],
-                next_boundary_indices,
+                self.state_cache.conv[0],
+                self.state_cache.intermediate_conv_window[0],
+                alternate_boundary_slots,
                 torch.where(
                     crosses_chunk_boundary,
                     self.chunk_size - 1 - tail_lens_before,
                     no_commit_step,
                 ),
+                src_indices_raw=request_rows,
             )
         new_tail_lens = tail_lens_after - self.chunk_size
         tail_lens_after = torch.where(
             crosses_chunk_boundary, new_tail_lens, tail_lens_after
         )
         with profile_range("state_window_compact"):
-            state_window.shift_after_boundary(
-                indices=state_input_indices,
+            _compact_gdn_transition_windows(
+                self.transition_windows,
+                indices=request_rows,
                 crosses_chunk_boundary=crosses_chunk_boundary,
                 chunk_size=self.chunk_size,
-                tail_lens=tail_lens_after,
+                accepted_tail_lens=tail_lens_after,
             )
-        if self.draft_reuses_target_state:
+        if self.self_draft_conv_state is not None:
             # Reconstruct only self-draft's private endpoint. Target recurrent
             # state remains boundary-owned and target verify reads it directly.
             with profile_range("draft_state_rebuild"):
                 _rebuild_gdn_self_draft_state(
-                    state_window,
-                    state_cache=state_cache,
-                    state_input_indices=state_input_indices,
-                    boundary_indices=torch.where(
+                    self.transition_windows,
+                    state_cache=self.state_cache,
+                    request_rows=request_rows,
+                    boundary_slots=torch.where(
                         crosses_chunk_boundary,
-                        next_boundary_indices,
-                        boundary_indices,
+                        alternate_boundary_slots,
+                        boundary_slots,
                     ),
                     token_count=tail_lens_after,
                 )
         # EAGLE/MTP owns separate draft state and skips this reconstruction.
 
-        state_window.set_tail_lens(
-            indices=state_input_indices, value=tail_lens_after.to(torch.int32)
+        self.set_accepted_tail_lens(
+            indices=request_rows, value=tail_lens_after.to(torch.int32)
         )
         return crosses_chunk_boundary

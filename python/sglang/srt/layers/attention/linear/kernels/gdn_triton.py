@@ -196,6 +196,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
             head_first=False,
             use_qk_l2norm_in_kernel=True,
             inplace_update=kwargs.get("inplace_update", True),
+            boundary_state=kwargs.get("boundary_state"),
+            boundary_state_indices=kwargs.get("boundary_state_indices"),
+            boundary_state_steps=kwargs.get("boundary_state_steps"),
             **recurrent_state_indices_args,
         )
 

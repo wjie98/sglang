@@ -45,6 +45,9 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     inplace_update: bool = True,
+    boundary_state: Optional[torch.Tensor] = None,
+    boundary_state_indices: Optional[torch.Tensor] = None,
+    boundary_state_steps: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -60,7 +63,23 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
-    state_update_args = {} if inplace_update else {"inplace_update": False}
+    boundary_output_args = {}
+    if (
+        not inplace_update
+        or boundary_state is not None
+        or boundary_state_indices is not None
+        or boundary_state_steps is not None
+    ):
+        if is_intel:
+            raise NotImplementedError(
+                "XPU FLA does not support out-of-place or boundary-state output."
+            )
+        boundary_output_args = {
+            "inplace_update": inplace_update,
+            "boundary_state": boundary_state,
+            "boundary_state_indices": boundary_state_indices,
+            "boundary_state_steps": boundary_state_steps,
+        }
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -70,7 +89,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        **state_update_args,
+        **boundary_output_args,
     )
     o = chunk_fwd_o(
         q=q,
@@ -105,6 +124,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         inplace_update: bool = True,
+        boundary_state: Optional[torch.Tensor] = None,
+        boundary_state_indices: Optional[torch.Tensor] = None,
+        boundary_state_steps: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -130,6 +152,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             inplace_update=inplace_update,
+            boundary_state=boundary_state,
+            boundary_state_indices=boundary_state_indices,
+            boundary_state_steps=boundary_state_steps,
         )
         return o.to(q.dtype), h
 
@@ -148,6 +173,9 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     inplace_update: bool = True,
+    boundary_state: Optional[torch.Tensor] = None,
+    boundary_state_indices: Optional[torch.Tensor] = None,
+    boundary_state_steps: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -263,6 +291,9 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         inplace_update,
+        boundary_state,
+        boundary_state_indices,
+        boundary_state_steps,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
