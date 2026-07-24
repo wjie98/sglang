@@ -56,67 +56,6 @@ from sglang.srt.utils.common import get_available_gpu_memory
 logger = logging.getLogger(__name__)
 
 
-def _dvr_proposal_probs(probs, sampling_info, sampling_backend, repeat=1):
-    """Reconstruct the distribution used by the target-model draft sampler."""
-
-    need_top_k = sampling_info.need_top_k_sampling
-    need_top_p = sampling_info.need_top_p_sampling
-    need_min_p = sampling_info.need_min_p_sampling
-    top_ks = sampling_info.top_ks
-    top_ps = sampling_info.top_ps
-    min_ps = sampling_info.min_ps
-    if repeat != 1:
-        top_ks = torch.repeat_interleave(top_ks, repeat, dim=0)
-        top_ps = torch.repeat_interleave(top_ps, repeat, dim=0)
-        min_ps = torch.repeat_interleave(min_ps, repeat, dim=0)
-    if need_top_k or need_top_p:
-        if sampling_backend == "flashinfer" and probs.is_cuda:
-            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
-
-            if need_min_p:
-                if need_top_k:
-                    probs = top_k_renorm_prob(probs, top_ks)
-                if need_top_p:
-                    probs = top_p_renorm_prob(probs, top_ps)
-            else:
-                if need_top_p:
-                    probs = top_p_renorm_prob(probs, top_ps)
-                if need_top_k:
-                    probs = top_k_renorm_prob(probs, top_ks)
-        else:
-            # Match the ordinary PyTorch sampler's joint top-k/top-p filtering
-            # even when the tensors live on CUDA. Rejection sampling needs the
-            # proposal distribution, not merely an equivalent sampled token.
-            sorted_probs, indices = probs.sort(dim=-1, descending=True)
-            cumulative = sorted_probs.cumsum(dim=-1)
-            if need_top_k:
-                ranks = torch.arange(probs.shape[-1], device=probs.device).unsqueeze(0)
-                sorted_probs.masked_fill_(ranks >= top_ks.unsqueeze(1), 0)
-            if need_top_p:
-                sorted_probs.masked_fill_(
-                    cumulative - sorted_probs > top_ps.unsqueeze(1), 0
-                )
-            probs = torch.zeros_like(probs).scatter_(-1, indices, sorted_probs)
-            probs /= probs.sum(dim=-1, keepdim=True)
-    if need_min_p:
-        thresholds = probs.amax(dim=-1, keepdim=True) * min_ps.unsqueeze(1)
-        probs = torch.where(probs >= thresholds, probs, torch.zeros_like(probs))
-        probs /= probs.sum(dim=-1, keepdim=True)
-
-    # Mixed batches still sample top_k == 1 rows greedily. Their proposal q
-    # must therefore be one-hot even when neighboring rows are stochastic.
-    greedy_rows = top_ks == 1
-    greedy_indices = probs.argmax(dim=-1, keepdim=True)
-    selected = probs.gather(1, greedy_indices)
-    probs.mul_((~greedy_rows).unsqueeze(1))
-    probs.scatter_(
-        1,
-        greedy_indices,
-        torch.where(greedy_rows.unsqueeze(1), 1.0, selected),
-    )
-    return probs
-
-
 class _SelfDraftBackend:
     """Self-draft operations around the common DVR target transaction."""
 
@@ -515,10 +454,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                         and not sampling_info.need_min_p_sampling
                     ):
                         sampling_probs = torch.softmax(sampling_probs, dim=-1)
-                    proposal = _dvr_proposal_probs(
+                    proposal = self.model_runner.sampler.normalize_probs(
                         sampling_probs,
                         sampling_info,
-                        self.server_args.sampling_backend,
                     )
                     if self._proposal_prob_buffer is None:
                         self._proposal_prob_buffer = torch.empty(
@@ -880,14 +818,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 logits_output,
                 vocab_mask,
                 use_rejection_sampling=spec_info.spec_steps > 0,
-                target_prob_filter=lambda probs, sampling_info, repeat: (
-                    _dvr_proposal_probs(
-                        probs,
-                        sampling_info,
-                        self.server_args.sampling_backend,
-                        repeat,
-                    )
-                ),
+                target_prob_filter=self.model_runner.sampler.normalize_probs,
             )
             if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
                 accept_tokens = predict[accept_index]
