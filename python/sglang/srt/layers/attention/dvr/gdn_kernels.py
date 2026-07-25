@@ -334,6 +334,54 @@ def _dvr_chunk_gated_delta_rule_fwd_kernel_h(
             b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
+    if WRITE_BOUNDARY_STATE:
+        boundary_index = tl.load(boundary_state_indices + i_n).to(tl.int64)
+        boundary_step = tl.load(boundary_state_steps + i_n).to(tl.int32)
+        boundary_ptr = (
+            boundary_state + (boundary_index * H + i_h) * V * K + i_v * BV * K
+        )
+        boundary_mask = boundary_step == NT
+        tl.store(
+            boundary_ptr + tl.arange(0, BV)[:, None] * K + tl.arange(0, 64)[None, :],
+            b_h1,
+            mask=boundary_mask
+            & (i_v * BV + tl.arange(0, BV)[:, None] < V)
+            & (tl.arange(0, 64)[None, :] < K),
+        )
+        if K > 64:
+            tl.store(
+                boundary_ptr
+                + tl.arange(0, BV)[:, None] * K
+                + 64
+                + tl.arange(0, 64)[None, :],
+                b_h2,
+                mask=boundary_mask
+                & (i_v * BV + tl.arange(0, BV)[:, None] < V)
+                & (64 + tl.arange(0, 64)[None, :] < K),
+            )
+        if K > 128:
+            tl.store(
+                boundary_ptr
+                + tl.arange(0, BV)[:, None] * K
+                + 128
+                + tl.arange(0, 64)[None, :],
+                b_h3,
+                mask=boundary_mask
+                & (i_v * BV + tl.arange(0, BV)[:, None] < V)
+                & (128 + tl.arange(0, 64)[None, :] < K),
+            )
+        if K > 192:
+            tl.store(
+                boundary_ptr
+                + tl.arange(0, BV)[:, None] * K
+                + 192
+                + tl.arange(0, 64)[None, :],
+                b_h4,
+                mask=boundary_mask
+                & (i_v * BV + tl.arange(0, BV)[:, None] < V)
+                & (192 + tl.arange(0, 64)[None, :] < K),
+            )
+
     if INPLACE_UPDATE:
         p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))

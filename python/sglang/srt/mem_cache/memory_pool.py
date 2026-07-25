@@ -361,7 +361,6 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
-        speculative_ssm_state_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
@@ -488,16 +487,6 @@ class MambaPool:
                 )
 
             if speculative_num_draft_tokens is not None:
-                ssm_state_steps = (
-                    speculative_num_draft_tokens
-                    if speculative_ssm_state_steps is None
-                    else speculative_ssm_state_steps
-                )
-                if not 1 <= ssm_state_steps <= speculative_num_draft_tokens:
-                    raise ValueError(
-                        "speculative_ssm_state_steps must be between 1 and "
-                        "speculative_num_draft_tokens"
-                    )
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
                     temporal_state_shape = (
@@ -511,7 +500,7 @@ class MambaPool:
                     size=(
                         num_mamba_layers,
                         spec_state_size + 1,
-                        ssm_state_steps,
+                        speculative_num_draft_tokens,
                         temporal_state_shape[0],
                         temporal_state_shape[1],
                         temporal_state_shape[2],
@@ -841,11 +830,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
-        speculative_ssm_state_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_overlap_schedule: bool = True,
-        mamba_ping_pong_track_buffer_size: Optional[int] = None,
-        preserve_mamba_request_slots: bool = False,
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
@@ -858,14 +844,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
         )
 
-        if mamba_ping_pong_track_buffer_size is None:
-            mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
-        if mamba_ping_pong_track_buffer_size not in (1, 2):
-            raise ValueError("Mamba ping-pong tracking requires one or two slots.")
-        self.mamba_ping_pong_track_buffer_size = mamba_ping_pong_track_buffer_size
+        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
-        self.preserve_mamba_request_slots = preserve_mamba_request_slots
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
@@ -877,7 +858,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
-            speculative_ssm_state_steps=speculative_ssm_state_steps,
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
@@ -893,7 +873,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
-        speculative_ssm_state_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
@@ -907,7 +886,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
-            speculative_ssm_state_steps=speculative_ssm_state_steps,
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
@@ -1007,9 +985,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         / get_cpu_copy / load_cpu_copy)."""
         return mamba_indices
 
-    def get_mamba_ping_pong_slots(self, req_indices: torch.Tensor) -> torch.Tensor:
-        return self.req_index_to_mamba_ping_pong_track_buffer_mapping[req_indices]
-
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
@@ -1025,13 +1000,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
 
-    def get_mamba_ping_pong_other_idx(
-        self, mamba_next_track_idx: Union[int, torch.Tensor]
-    ) -> Union[int, torch.Tensor]:
-        """Return the adjacent tracked slot, or the same index for one slot."""
+    def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
             return 1 - mamba_next_track_idx
-        return mamba_next_track_idx
+        else:
+            return mamba_next_track_idx
 
     def get_mamba_ping_pong_keep_idx(self, req: Req) -> int:
         """Return the ping-pong index holding the most recent tracked state.
@@ -1103,21 +1076,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
-
-    def export_mamba_ping_pong_checkpoint(
-        self,
-        req: Req,
-        destination: torch.Tensor,
-    ) -> torch.Tensor:
-        """Give a tracked checkpoint to cache, preserving its request slot if needed."""
-        if not self.preserve_mamba_request_slots:
-            return self.donate_mamba_ping_pong_slot(req, destination)
-
-        keep_idx = self.get_mamba_ping_pong_keep_idx(req)
-        source = req.mamba_ping_pong_track_buffer[keep_idx].reshape(1)
-        translate = self.translate_mamba_indices
-        self.mamba_pool.copy_from(translate(source), translate(destination))
-        return destination
 
     def free_mamba_cache(
         self, req: Req, mamba_ping_pong_track_buffer_to_keep: Optional[int] = None

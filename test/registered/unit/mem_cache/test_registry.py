@@ -5,10 +5,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
@@ -32,19 +30,14 @@ def _make_ctx(
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
     full_tokens_per_layer=None,
-    preserve_mamba_request_slots=False,
 ):
     server_args = MagicMock()
     server_args.radix_cache_backend = backend
     server_args.enable_streaming_session = enable_streaming
     server_args.enable_lmcache = enable_lmcache
-    params = MagicMock()
-    params.req_to_token_pool = SimpleNamespace(
-        preserve_mamba_request_slots=preserve_mamba_request_slots
-    )
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=params,
+        params=MagicMock(),
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         enable_hierarchical_cache=enable_hierarchical_cache,
@@ -151,46 +144,6 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
 
         self.assertIs(result, inner)
-
-    def test_rejects_cache_that_cannot_preserve_mamba_request_slots(self):
-        cache = MagicMock()
-        cache.preserves_mamba_request_slots.return_value = False
-        register_radix_cache_backend("unstable_mamba", MagicMock(return_value=cache))
-
-        with self.assertRaisesRegex(ValueError, "request-owned Mamba checkpoint slots"):
-            create_tree_cache(
-                _make_ctx(
-                    backend="unstable_mamba",
-                    is_hybrid_ssm=True,
-                    preserve_mamba_request_slots=True,
-                )
-            )
-
-    def test_accepts_cache_that_preserves_mamba_request_slots(self):
-        cache = MagicMock()
-        cache.supports_streaming_session.return_value = True
-        cache.preserves_mamba_request_slots.return_value = True
-        register_radix_cache_backend("stable_mamba", MagicMock(return_value=cache))
-
-        result = create_tree_cache(
-            _make_ctx(
-                backend="stable_mamba",
-                is_hybrid_ssm=True,
-                preserve_mamba_request_slots=True,
-            )
-        )
-
-        self.assertIs(result, cache)
-
-
-class TestMambaRadixCapabilities(CustomTestCase):
-    def test_int8_checkpoint_pool_does_not_preserve_request_slots(self):
-        cache = object.__new__(MambaRadixCache)
-        cache.req_to_token_pool = SimpleNamespace(mamba_ckpt_pool=None)
-        self.assertTrue(cache.preserves_mamba_request_slots())
-
-        cache.req_to_token_pool.mamba_ckpt_pool = object()
-        self.assertFalse(cache.preserves_mamba_request_slots())
 
 
 class TestDefaultRadixCacheFactory(CustomTestCase):

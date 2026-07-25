@@ -463,9 +463,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def supports_mamba(self) -> bool:
         return True
 
-    def preserves_mamba_request_slots(self) -> bool:
-        return self.int8_ckpt_pool is None
-
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = RadixKey(array("q"), None)
@@ -683,8 +680,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
-        # The ordinary path donates the checkpoint slot. DVR keeps request
-        # ping-pong addresses stable and gives Radix an independent copy instead.
+        # Donate the mamba index to the radix cache instead of copying.
+        # This avoids a data copy that would race with the forward stream.
         if self.int8_ckpt_pool is not None:
             # int8 path: quantize the to-be-cached active state into an int8 slot
             # (strategy-agnostic donate hook).
@@ -701,7 +698,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
         elif self.enable_mamba_extra_buffer:
             new_slot = self._alloc_mamba_slot()
-            mamba_value_donated = self.req_to_token_pool.export_mamba_ping_pong_checkpoint(
+            mamba_value_donated = self.req_to_token_pool.donate_mamba_ping_pong_slot(
                 req, new_slot
             )
         else:

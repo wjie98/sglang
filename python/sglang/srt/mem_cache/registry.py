@@ -198,16 +198,6 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         cache = default_radix_cache_factory(ctx)
         source = "default"
 
-    requires_stable_mamba_slots = (
-        getattr(ctx.params.req_to_token_pool, "preserve_mamba_request_slots", False)
-        is True
-    )
-    if requires_stable_mamba_slots and not cache.preserves_mamba_request_slots():
-        raise ValueError(
-            f"Radix cache {type(cache).__name__} cannot preserve request-owned "
-            "Mamba checkpoint slots required by this execution mode."
-        )
-
     streaming_wrapped = False
     if (
         ctx.server_args.enable_streaming_session

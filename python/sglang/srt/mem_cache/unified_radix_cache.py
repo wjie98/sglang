@@ -2488,9 +2488,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def supports_mamba(self) -> bool:
         return ComponentType.MAMBA in self.components
 
-    def preserves_mamba_request_slots(self) -> bool:
-        return self.supports_mamba()
-
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 
     def supports_streaming_session(self) -> bool:

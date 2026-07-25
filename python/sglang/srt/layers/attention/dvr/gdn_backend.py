@@ -15,7 +15,6 @@ from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -564,7 +563,8 @@ def _compact_gdn_transition_windows(
 def _rebuild_gdn_self_draft_state(
     transition_windows: tuple[torch.Tensor, ...],
     *,
-    state_cache,
+    boundary_state: torch.Tensor,
+    draft_state: torch.Tensor,
     request_rows: torch.Tensor,
     boundary_slots: torch.Tensor,
     token_count: torch.Tensor,
@@ -589,16 +589,16 @@ def _rebuild_gdn_self_draft_state(
         v=v,
         g=g,
         beta=beta,
-        state_src=state_cache.temporal,
-        state_dst=state_cache.intermediate_ssm[:, :, 0],
+        state_src=boundary_state,
+        state_dst=draft_state[:, :, 0],
         request_rows=request_rows,
         boundary_slots=boundary_slots,
         destination_indices=request_rows,
         token_count=token_count.contiguous(),
         N=num_reqs,
         S=num_slots,
-        CS=state_cache.temporal.shape[1],
-        CD=state_cache.intermediate_ssm.shape[1],
+        CS=boundary_state.shape[1],
+        CD=draft_state.shape[1],
         WINDOW=num_tokens,
         MAX_STEPS=FLA_CHUNK_SIZE,
         H=num_key_heads,
@@ -624,21 +624,23 @@ class DVRGDNStateAdapter:
         kernel_dispatcher: Any,
         *,
         state_cache: Any,
+        draft_state: torch.Tensor,
+        intermediate_conv_window: torch.Tensor,
         transition_windows: tuple[torch.Tensor, ...],
-        verify_checkpoint_slots: torch.Tensor,
         draft_reuses_target_state: bool,
         chunk_size: int = FLA_CHUNK_SIZE,
     ):
         self.kernel_dispatcher = kernel_dispatcher
         self.state_cache = state_cache
+        self.draft_state = draft_state
+        self.intermediate_conv_window = intermediate_conv_window
         self.transition_windows = transition_windows
-        self.verify_checkpoint_slots = verify_checkpoint_slots
         self.chunk_size = chunk_size
         self._verify_metadata: Optional[tuple[torch.Tensor, ...]] = None
         self.verify_conv = state_cache.conv[0].new_zeros(
             (
                 state_cache.conv[0].shape[0],
-                state_cache.intermediate_ssm.shape[1],
+                draft_state.shape[1],
                 *state_cache.conv[0].shape[2:],
             )
         )
@@ -652,9 +654,7 @@ class DVRGDNStateAdapter:
         model_runner: Any,
     ) -> "DVRGDNStateAdapter":
         mamba_cache_params = model_runner.mambaish_config.mamba2_cache_params
-        state_cache = (
-            model_runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        state_cache = model_runner.req_to_token_pool.mamba_pool.mamba_cache
         if len(state_cache.conv) != 1:
             raise RuntimeError(
                 "DVR GDN currently supports exactly one convolution state per layer."
@@ -669,18 +669,9 @@ class DVRGDNStateAdapter:
             for name in ("replayssm_d", "replayssm_k", "replayssm_g")
         ):
             raise RuntimeError("DVR GDN rollback does not support ReplaySSM state.")
-        if (
-            state_cache.temporal.dtype != torch.float32
-            or state_cache.intermediate_ssm.dtype != torch.float32
-        ):
-            raise RuntimeError(
-                "DVR GDN verify requires fp32 recurrent and intermediate states."
-            )
-        if state_cache.intermediate_ssm.shape[2] != 1:
-            raise RuntimeError(
-                "DVR self-draft requires one reusable recurrent workspace per request."
-            )
-        num_layers = state_cache.intermediate_ssm.shape[0]
+        if state_cache.temporal.dtype != torch.float32:
+            raise RuntimeError("DVR GDN verify requires fp32 recurrent states.")
+        num_layers = state_cache.temporal.shape[0]
         num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         if num_draft_tokens is None:
             raise RuntimeError("DVR requires speculative_num_draft_tokens.")
@@ -690,9 +681,42 @@ class DVRGDNStateAdapter:
             state_shape
         )
 
-        # ReqToTokenPool already reserves row 0 for padded CUDA graph requests.
-        # Mirror that indexing directly instead of maintaining a second offset.
-        num_slots = state_cache.intermediate_ssm.shape[1]
+        # Request row 0 is the CUDA-graph padding row. DVR workspaces use request
+        # rows, not Mamba slots, so Radix may donate/rebind cache slots normally.
+        num_slots = model_runner.req_to_token_pool.req_to_token.shape[0]
+        draft_state = torch.zeros(
+            num_layers,
+            num_slots,
+            1,
+            *state_cache.temporal.shape[2:],
+            dtype=state_cache.temporal.dtype,
+            device=model_runner.device,
+        )
+        conv_dim, conv_window = state_cache.conv[0].shape[2:]
+        intermediate_conv_storage = torch.zeros(
+            num_layers,
+            num_slots,
+            conv_dim,
+            num_draft_tokens + conv_window - 1,
+            dtype=state_cache.conv[0].dtype,
+            device=model_runner.device,
+        )
+        intermediate_conv_window = intermediate_conv_storage.as_strided(
+            (
+                num_layers,
+                num_slots,
+                num_draft_tokens,
+                conv_dim,
+                conv_window,
+            ),
+            (
+                intermediate_conv_storage.stride(0),
+                intermediate_conv_storage.stride(1),
+                intermediate_conv_storage.stride(3),
+                intermediate_conv_storage.stride(2),
+                intermediate_conv_storage.stride(3),
+            ),
+        )
         window_len = FLA_CHUNK_SIZE + num_draft_tokens
         k = torch.zeros(
             num_layers,
@@ -724,10 +748,9 @@ class DVRGDNStateAdapter:
         return cls(
             kernel_dispatcher,
             state_cache=state_cache,
+            draft_state=draft_state,
+            intermediate_conv_window=intermediate_conv_window,
             transition_windows=(k, v, gate, torch.zeros_like(gate)),
-            verify_checkpoint_slots=torch.zeros(
-                num_slots, dtype=torch.long, device=model_runner.device
-            ),
             draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
         )
 
@@ -743,10 +766,8 @@ class DVRGDNStateAdapter:
         )
         return request_rows, accepted_conv_slots
 
-    def zero_checkpoint_state(self, *, indices: torch.Tensor):
+    def zero_boundary_state(self, *, indices: torch.Tensor):
         indices = indices.to(device=self.state_cache.temporal.device, dtype=torch.long)
-        for conv in self.state_cache.conv:
-            conv[:, indices] = 0
         self.state_cache.temporal[:, indices] = 0
 
     def initialize_self_draft_state(
@@ -754,12 +775,13 @@ class DVRGDNStateAdapter:
         *,
         request_rows: torch.Tensor,
         accepted_conv_slots: torch.Tensor,
+        accepted_tail_lens: torch.Tensor,
     ) -> None:
         """Seed private self-draft state after target EXTEND.
 
-        This full-state copy runs only when EXTEND establishes a new accepted
-        endpoint. Steady-state decode reconstructs the same workspace directly
-        from the authoritative boundary plus accepted transition rows.
+        Target live temporal state remains at the latest exact chunk boundary.
+        Replaying only its accepted tail gives self draft the current endpoint
+        without letting provisional decode mutate target or Radix-owned state.
         """
 
         if self.self_draft_conv is None:
@@ -771,12 +793,17 @@ class DVRGDNStateAdapter:
             device=self.state_cache.temporal.device, dtype=torch.long
         )
         with profile_range("draft_state_copy"):
-            self.state_cache.intermediate_ssm[:, request_rows, 0] = (
-                self.state_cache.temporal[:, accepted_conv_slots]
-            )
             self.self_draft_conv[:, request_rows] = self.state_cache.conv[0][
                 :, accepted_conv_slots
             ]
+            _rebuild_gdn_self_draft_state(
+                self.transition_windows,
+                boundary_state=self.state_cache.temporal,
+                draft_state=self.draft_state,
+                request_rows=request_rows,
+                boundary_slots=accepted_conv_slots,
+                token_count=accepted_tail_lens,
+            )
 
     def decode_state(self, *, layer_cache, forward_batch, layer_idx: int):
         """Return request-owned state for provisional DVR-self decode."""
@@ -788,20 +815,8 @@ class DVRGDNStateAdapter:
         )
         return (
             self.self_draft_conv[layer_idx],
-            layer_cache.intermediate_ssm[:, 0],
+            self.draft_state[layer_idx, :, 0],
             request_rows,
-        )
-
-    def set_verify_checkpoints(
-        self, *, request_rows: torch.Tensor, checkpoint_slots: torch.Tensor
-    ) -> None:
-        """Bind logical request rows to the physical exact boundary for verify."""
-
-        request_rows = request_rows.to(
-            device=self.verify_checkpoint_slots.device, dtype=torch.long
-        )
-        self.verify_checkpoint_slots[request_rows] = checkpoint_slots.to(
-            device=self.verify_checkpoint_slots.device, dtype=torch.long
         )
 
     def cache_prefill_transitions(
@@ -858,22 +873,23 @@ class DVRGDNStateAdapter:
                 cache_indices=forward_metadata.mamba_cache_indices,
             )
             return None
-        if not (
-            forward_batch.forward_mode.is_extend()
-            and forward_metadata.has_mamba_track_mask
-        ):
+        if not forward_batch.forward_mode.is_extend():
             return None
 
-        lengths_to_track = (
-            forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
-        )
+        prefix_lens = forward_batch.extend_prefix_lens
+        extend_lens = forward_batch.extend_seq_lens
+        if prefix_lens is None or extend_lens is None:
+            raise RuntimeError("DVR GDN target EXTEND metadata was not prepared.")
+        aligned_prefix = prefix_lens.remainder(self.chunk_size).eq(0)
+        boundary_offsets = (
+            prefix_lens + extend_lens
+        ) // self.chunk_size * self.chunk_size - prefix_lens
         boundary_steps = torch.where(
-            forward_batch.mamba_track_mask
-            & (lengths_to_track.remainder(self.chunk_size) != 0),
-            lengths_to_track // self.chunk_size,
-            torch.full_like(lengths_to_track, -1),
+            aligned_prefix & (boundary_offsets > 0),
+            boundary_offsets // self.chunk_size,
+            torch.full_like(boundary_offsets, -1),
         )
-        return forward_metadata.mamba_track_indices, boundary_steps
+        return forward_metadata.mamba_cache_indices, boundary_steps
 
     def prepare_target_verify(self, *, forward_batch, cache_indices: torch.Tensor):
         """Resolve graph-stable request, boundary, tail, and padding metadata once."""
@@ -887,15 +903,12 @@ class DVRGDNStateAdapter:
         request_rows = torch.where(
             valid_mask, request_rows, torch.zeros_like(request_rows)
         )
-        checkpoint_slots = self.verify_checkpoint_slots[request_rows]
-        checkpoint_slots = torch.where(
-            valid_mask, checkpoint_slots, torch.zeros_like(checkpoint_slots)
-        )
         verify_conv_slots = torch.where(
             valid_mask,
             cache_indices[:batch_size],
             torch.zeros_like(cache_indices[:batch_size]),
         )
+        checkpoint_slots = verify_conv_slots
         # The stock conv kernel is intentionally in-place. Run it on this tiny
         # request-owned copy so target verify cannot mutate accepted endpoints.
         self.verify_conv[:, request_rows] = self.state_cache.conv[0][
@@ -1016,7 +1029,7 @@ class DVRGDNStateAdapter:
             beta=cached_beta,
             initial_state=self.state_cache.temporal[layer_idx],
             initial_state_indices=checkpoint_slots,
-            boundary_state=self.state_cache.intermediate_ssm[layer_idx, :, 0],
+            boundary_state=self.draft_state[layer_idx, :, 0],
             boundary_state_indices=request_rows,
             boundary_state_steps=boundary_state_steps,
         )
@@ -1028,13 +1041,33 @@ class DVRGDNStateAdapter:
                 draft_tokens=draft_token_num,
             )
 
+    def publish_boundary_state(
+        self,
+        *,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+        publish_mask: torch.Tensor,
+    ) -> None:
+        """Copy exact live boundaries to the ordinary Radix tracking slots."""
+
+        dvr_scatter_state(
+            self.state_cache.temporal,
+            self.state_cache.temporal.unsqueeze(2),
+            source_rows=source_slots,
+            destination_rows=destination_slots,
+            source_steps=torch.where(
+                publish_mask,
+                torch.zeros_like(source_slots),
+                torch.full_like(source_slots, -1),
+            ),
+        )
+
     def commit_accepted_state(
         self,
         *,
         request_rows: torch.Tensor,
         accepted_conv_slots: torch.Tensor,
-        checkpoint_slots: torch.Tensor,
-        next_checkpoint_slots: torch.Tensor,
+        publish_boundary_slots: Optional[torch.Tensor],
         tail_lens_before: torch.Tensor,
         accepted_token_counts: torch.Tensor,
     ) -> torch.Tensor:
@@ -1051,7 +1084,7 @@ class DVRGDNStateAdapter:
         # valid accepted step. The fused scatter already handles the empty batch.
         dvr_scatter_conv_window(
             self.state_cache.conv[0],
-            self.state_cache.intermediate_conv_window[0],
+            self.intermediate_conv_window,
             source_rows=request_rows,
             destination_rows=accepted_conv_slots,
             source_steps=accepted_token_counts - 1,
@@ -1061,38 +1094,49 @@ class DVRGDNStateAdapter:
         if self.self_draft_conv is not None:
             dvr_scatter_conv_window(
                 self.self_draft_conv,
-                self.state_cache.intermediate_conv_window[0],
+                self.intermediate_conv_window,
                 source_rows=request_rows,
                 destination_rows=request_rows,
                 source_steps=accepted_token_counts - 1,
             )
 
-        # Commit to the pool-selected next checkpoint slot. Radix execution uses
-        # two slots so finish can publish either overlap boundary; without Radix,
-        # the sole request-local slot is updated in place.
+        # The target live slot owns the exact recurrent boundary. Radix tracking
+        # receives a copy only when accepted tokens cross that boundary.
         with profile_range("boundary_publish"):
             dvr_scatter_state(
                 self.state_cache.temporal,
-                self.state_cache.intermediate_ssm,
+                self.draft_state,
                 source_rows=request_rows,
-                destination_rows=next_checkpoint_slots,
+                destination_rows=accepted_conv_slots,
                 source_steps=torch.where(
                     crosses_chunk_boundary,
                     torch.zeros_like(tail_lens_before),
                     no_commit_step,
                 ),
             )
-            dvr_scatter_conv_window(
-                self.state_cache.conv[0],
-                self.state_cache.intermediate_conv_window[0],
-                source_rows=request_rows,
-                destination_rows=next_checkpoint_slots,
-                source_steps=torch.where(
-                    crosses_chunk_boundary,
-                    self.chunk_size - 1 - tail_lens_before,
-                    no_commit_step,
-                ),
-            )
+            if publish_boundary_slots is not None:
+                dvr_scatter_state(
+                    self.state_cache.temporal,
+                    self.draft_state,
+                    source_rows=request_rows,
+                    destination_rows=publish_boundary_slots,
+                    source_steps=torch.where(
+                        crosses_chunk_boundary,
+                        torch.zeros_like(tail_lens_before),
+                        no_commit_step,
+                    ),
+                )
+                dvr_scatter_conv_window(
+                    self.state_cache.conv[0],
+                    self.intermediate_conv_window,
+                    source_rows=request_rows,
+                    destination_rows=publish_boundary_slots,
+                    source_steps=torch.where(
+                        crosses_chunk_boundary,
+                        self.chunk_size - 1 - tail_lens_before,
+                        no_commit_step,
+                    ),
+                )
         new_tail_lens = tail_lens_after - self.chunk_size
         tail_lens_after = torch.where(
             crosses_chunk_boundary, new_tail_lens, tail_lens_after
@@ -1111,13 +1155,10 @@ class DVRGDNStateAdapter:
             with profile_range("draft_state_rebuild"):
                 _rebuild_gdn_self_draft_state(
                     self.transition_windows,
-                    state_cache=self.state_cache,
+                    boundary_state=self.state_cache.temporal,
+                    draft_state=self.draft_state,
                     request_rows=request_rows,
-                    boundary_slots=torch.where(
-                        crosses_chunk_boundary,
-                        next_checkpoint_slots,
-                        checkpoint_slots,
-                    ),
+                    boundary_slots=accepted_conv_slots,
                     token_count=tail_lens_after,
                 )
         # EAGLE/MTP owns separate draft state and skips this reconstruction.
@@ -1240,8 +1281,9 @@ class DVRGDNAttnBackend(GDNAttnBackend):
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         if is_target_verify:
-            assert isinstance(layer_cache, MambaPool.SpeculativeState)
-            intermediate_conv_window = layer_cache.intermediate_conv_window[0]
+            intermediate_conv_window = self.dvr_state_adapter.intermediate_conv_window[
+                layer_idx
+            ]
             (
                 conv_states,
                 conv_indices,
@@ -1352,8 +1394,4 @@ class DVRGDNAttnBackend(GDNAttnBackend):
         if h is not None:
             if self.dvr_extend_boundary_metadata is None:
                 self._track_mamba_state_extend(forward_batch, h, ssm_states, metadata)
-            elif metadata.track_ssm_final_src.numel() > 0:
-                ssm_states[metadata.track_ssm_final_dst] = ssm_states[
-                    metadata.track_ssm_final_src
-                ]
         return core_attn_out

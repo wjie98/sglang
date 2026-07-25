@@ -331,10 +331,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_mamba(self) -> bool:
         return False
 
-    def preserves_mamba_request_slots(self) -> bool:
-        """Whether Mamba checkpoint insertion keeps request-owned slots stable."""
-        return False
-
     def supports_streaming_session(self) -> bool:
         return False
 

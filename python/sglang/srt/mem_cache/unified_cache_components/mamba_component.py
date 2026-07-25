@@ -323,11 +323,11 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
-            # DVR preserves request ping-pong addresses; other paths donate.
+            # Donate the mamba index to the radix cache instead of copying.
             if self.enable_mamba_extra_buffer:
                 new_slot = self._alloc_mamba_slot()
                 mamba_value_donated = (
-                    self.cache.req_to_token_pool.export_mamba_ping_pong_checkpoint(
+                    self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
                         req, new_slot
                     )
                 )
