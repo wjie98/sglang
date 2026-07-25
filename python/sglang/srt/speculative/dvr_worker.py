@@ -60,6 +60,8 @@ logger = logging.getLogger(__name__)
 class _SelfDraftBackend:
     """Self-draft operations around the common DVR target transaction."""
 
+    target_capture_hidden_mode = CaptureHiddenMode.NULL
+
     def __init__(self, owner):
         self.owner = owner
         self.graph_runner = None
@@ -278,6 +280,8 @@ class _SelfDraftBackend:
 
 class _EagleDraftBackend:
     """Upstream EAGLE/MTP draft operations around the DVR target transaction."""
+
+    target_capture_hidden_mode = CaptureHiddenMode.FULL
 
     def __init__(self, owner, worker):
         self.owner = owner
@@ -594,11 +598,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         batch = model_worker_batch
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            batch.capture_hidden_mode = (
-                CaptureHiddenMode.FULL
-                if self.uses_eagle_draft
-                else CaptureHiddenMode.NULL
-            )
+            batch.capture_hidden_mode = self._draft_backend.target_capture_hidden_mode
             self.state_lifecycle.prepare_target_extend(batch)
             batch_result = self.target_worker.forward_batch_generation(batch)
             batch_result.new_seq_lens = batch.seq_lens
@@ -692,11 +692,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             spec_steps=0,
             topk=1,
             draft_token_num=width,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.uses_eagle_draft
-                else CaptureHiddenMode.NULL
-            ),
+            capture_hidden_mode=self._draft_backend.target_capture_hidden_mode,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=batch.seq_lens_cpu,
         )

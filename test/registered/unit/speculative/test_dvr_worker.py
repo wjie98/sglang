@@ -119,6 +119,13 @@ def test_pytorch_proposal_filter_matches_sampler(monkeypatch, top_ks, top_ps, mi
 def test_short_prefix_uses_one_root_verify_sentinel(uses_eagle_draft):
     worker = object.__new__(DecodeVerifyRollbackWorkerV2)
     worker.uses_eagle_draft = uses_eagle_draft
+    worker._draft_backend = SimpleNamespace(
+        target_capture_hidden_mode=(
+            dvr_worker_module.CaptureHiddenMode.FULL
+            if uses_eagle_draft
+            else dvr_worker_module.CaptureHiddenMode.NULL
+        )
+    )
     worker.device = "cpu"
     worker.num_draft_tokens = 4
     worker._chain_retrieve_index = torch.arange(8).view(2, 4)
@@ -144,6 +151,7 @@ def test_short_prefix_sentinel_marks_only_new_prefill_requests():
     worker.uses_eagle_draft = False
     worker._seed_verify_slots = set()
     worker._draft_backend = SimpleNamespace(
+        target_capture_hidden_mode=dvr_worker_module.CaptureHiddenMode.NULL,
         finish_prefill=lambda _batch, _result: "next-draft",
     )
     worker.state_lifecycle = SimpleNamespace(
