@@ -40,13 +40,13 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
+    eagle_forward_target_verify,
     eagle_prepare_for_verify,
     eagle_sample,
 )
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
-    generate_token_bitmask,
     record_stream_each,
     record_stream_for_v2_verify,
     spec_stage_span,
@@ -748,33 +748,13 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                     spec_info, cuda_graph_bs
                 )
 
-        grammar_inputs = None
-        if batch.has_grammar:
-            grammar_inputs = (
-                spec_info.retrieve_next_token.cpu(),
-                spec_info.retrieve_next_sibling.cpu(),
-                spec_info.draft_token.view(spec_info.retrieve_next_token.shape).cpu(),
-            )
-
         with spec_stage_span("verify"):
-            forward_output = self.target_worker.forward_batch_generation(
-                batch=None,
-                forward_batch=verify_forward_batch,
-                is_verify=True,
-            )
-
-        vocab_mask = None
-        if grammar_inputs is not None:
-            vocab_mask = generate_token_bitmask(
-                batch.reqs,
+            forward_output, vocab_mask = eagle_forward_target_verify(
                 spec_info,
-                *grammar_inputs,
-                batch.sampling_info.vocab_size,
+                batch,
+                self.target_worker,
+                verify_forward_batch,
             )
-            if vocab_mask is not None:
-                assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
-                batch.sampling_info.vocab_mask = None
 
         logits_output = forward_output.logits_output
         if self.uses_eagle_draft and logits_output.hidden_states is None:

@@ -538,6 +538,47 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+def eagle_forward_target_verify(
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    target_worker: TpModelWorker,
+    verify_forward_batch,
+):
+    """Run target verify and build the optional constrained-decoding mask."""
+
+    grammar_inputs = None
+    if batch.has_grammar:
+        grammar_inputs = (
+            verify_input.retrieve_next_token.cpu(),
+            verify_input.retrieve_next_sibling.cpu(),
+            verify_input.draft_token.view(verify_input.retrieve_next_token.shape).cpu(),
+        )
+
+    forward_output = target_worker.forward_batch_generation(
+        batch=None,
+        forward_batch=verify_forward_batch,
+        is_verify=True,
+    )
+
+    vocab_mask = None
+    if grammar_inputs is not None:
+        from sglang.srt.speculative.spec_utils import generate_token_bitmask
+
+        vocab_mask = generate_token_bitmask(
+            batch.reqs,
+            verify_input,
+            *grammar_inputs,
+            batch.sampling_info.vocab_size,
+        )
+        if vocab_mask is not None:
+            assert verify_input.grammar is not None
+            vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+            # Do not reuse the mask from the preceding EXTEND.
+            batch.sampling_info.vocab_mask = None
+
+    return forward_output, vocab_mask
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,

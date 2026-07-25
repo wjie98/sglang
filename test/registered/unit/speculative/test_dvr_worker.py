@@ -196,6 +196,51 @@ def test_draft_backends_finalize_the_common_verify_result():
     assert calls == [(batch, result)]
 
 
+def test_common_target_verify_builds_and_clears_grammar_mask(monkeypatch):
+    from sglang.srt.speculative import spec_utils
+
+    calls = []
+    verify_input = SimpleNamespace(
+        retrieve_next_token=torch.tensor([[1, -1]]),
+        retrieve_next_sibling=torch.tensor([[-1, -1]]),
+        draft_token=torch.tensor([3, 4]),
+        grammar=object(),
+    )
+    sampling_info = SimpleNamespace(vocab_size=8, vocab_mask=object())
+    batch = SimpleNamespace(
+        has_grammar=True,
+        reqs=[object()],
+        sampling_info=sampling_info,
+    )
+    target_worker = SimpleNamespace(
+        forward_batch_generation=lambda **kwargs: calls.append(kwargs) or "output"
+    )
+    expected_mask = torch.tensor([[True, False]])
+    monkeypatch.setattr(
+        spec_utils,
+        "generate_token_bitmask",
+        lambda *args: expected_mask,
+    )
+
+    output, vocab_mask = dvr_worker_module.eagle_forward_target_verify(
+        verify_input,
+        batch,
+        target_worker,
+        "forward-batch",
+    )
+
+    assert output == "output"
+    assert vocab_mask is expected_mask
+    assert sampling_info.vocab_mask is None
+    assert calls == [
+        {
+            "batch": None,
+            "forward_batch": "forward-batch",
+            "is_verify": True,
+        }
+    ]
+
+
 def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     calls = []
     event = object()
