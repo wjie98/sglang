@@ -54,13 +54,13 @@ def copy_cached_prefix_boundary(
 
 
 @dataclass
-class DVRStateTransaction:
+class DVRStateCommitPlan:
     request_rows: torch.Tensor
-    endpoint_slots: torch.Tensor
-    boundary_slots: torch.Tensor
-    alternate_boundary_slots: torch.Tensor
-    boundary_lanes: torch.Tensor
-    tail_lens: torch.Tensor
+    accepted_conv_slots: torch.Tensor
+    checkpoint_slots: torch.Tensor
+    next_checkpoint_slots: torch.Tensor
+    checkpoint_lanes: torch.Tensor
+    accepted_tail_lens: torch.Tensor
 
 
 class DVRStateLifecycle:
@@ -78,7 +78,7 @@ class DVRStateLifecycle:
         self.server_args = server_args
         self.model_runner = model_runner
         self._state_adapter = None
-        self.boundary_seq_lens = None
+        self.checkpoint_seq_lens = None
 
     def bind_state_adapter(self, state_adapter) -> None:
         self._state_adapter = state_adapter
@@ -108,7 +108,7 @@ class DVRStateLifecycle:
         # Columns map directly to the request's ping-pong checkpoint slots. Keep
         # both lengths: stop/reasoning trimming may publish the older visible one.
         boundary_slots = state_adapter.verify_boundary_slots
-        self.boundary_seq_lens = boundary_slots.new_full(
+        self.checkpoint_seq_lens = boundary_slots.new_full(
             (boundary_slots.numel(), track_count), -1
         )
 
@@ -119,8 +119,8 @@ class DVRStateLifecycle:
         return self._state_adapter.chunk_size
 
     def clear_cache_state(self) -> None:
-        if self.boundary_seq_lens is not None:
-            self.boundary_seq_lens.fill_(-1)
+        if self.checkpoint_seq_lens is not None:
+            self.checkpoint_seq_lens.fill_(-1)
 
     def prepare_target_extend(self, batch: ScheduleBatch) -> None:
         """Discard stale DVR ownership before target EXTEND publishes a boundary.
@@ -134,9 +134,9 @@ class DVRStateLifecycle:
             return
 
         request_rows = batch.req_pool_indices.to(
-            device=self.boundary_seq_lens.device, dtype=torch.long
+            device=self.checkpoint_seq_lens.device, dtype=torch.long
         )
-        self.boundary_seq_lens.index_fill_(0, request_rows, -1)
+        self.checkpoint_seq_lens.index_fill_(0, request_rows, -1)
         if not self.server_args.disable_radix_cache:
             return
 
@@ -182,7 +182,7 @@ class DVRStateLifecycle:
 
             # Publish the newest exact boundary no later than the visible prefix.
             # Radix truncates to it; ordinary EXTEND rebuilds the remaining tail.
-            track_lens = self.boundary_seq_lens[request_slot].tolist()
+            track_lens = self.checkpoint_seq_lens[request_slot].tolist()
             committed_len = req._cache_commit_len()
             if req.finished_reason is not None:
                 visible_kv_len = (
@@ -209,44 +209,46 @@ class DVRStateLifecycle:
                 )
             )
         finally:
-            self.boundary_seq_lens[request_slot].fill_(-1)
+            self.checkpoint_seq_lens[request_slot].fill_(-1)
 
-    def prepare_for_draft(self, batch) -> Optional[DVRStateTransaction]:
+    def prepare_for_draft(self, batch) -> Optional[DVRStateCommitPlan]:
         if self._state_adapter is None or batch.batch_size() == 0:
             return None
 
-        request_rows, endpoint_slots = self._state_adapter.resolve_request_slots(
-            batch=batch
+        request_rows, accepted_conv_slots = (
+            self._state_adapter.resolve_request_slots(batch=batch)
         )
         track_slots = batch.req_to_token_pool.get_mamba_ping_pong_slots(
             batch.req_pool_indices
-        ).to(device=endpoint_slots.device, dtype=torch.long)
-        selected_boundary_lens, boundary_lanes = self.boundary_seq_lens[
+        ).to(device=accepted_conv_slots.device, dtype=torch.long)
+        selected_checkpoint_lens, checkpoint_lanes = self.checkpoint_seq_lens[
             request_rows
         ].max(dim=1)
-        tail_lens = batch.seq_lens.remainder(self.chunk_size).to(torch.long)
+        accepted_tail_lens = batch.seq_lens.remainder(self.chunk_size).to(torch.long)
         torch._assert_async(
-            selected_boundary_lens.eq(batch.seq_lens - tail_lens).all(),
+            selected_checkpoint_lens.eq(batch.seq_lens - accepted_tail_lens).all(),
             "DVR draft started without the latest exact recurrent checkpoint.",
         )
-        boundary_slots = track_slots.gather(1, boundary_lanes.unsqueeze(1)).squeeze(1)
-        alternate_lanes = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-            boundary_lanes
+        checkpoint_slots = track_slots.gather(
+            1, checkpoint_lanes.unsqueeze(1)
+        ).squeeze(1)
+        next_checkpoint_lanes = (
+            batch.req_to_token_pool.get_mamba_ping_pong_other_idx(checkpoint_lanes)
         )
-        alternate_boundary_slots = track_slots.gather(
-            1, alternate_lanes.unsqueeze(1)
+        next_checkpoint_slots = track_slots.gather(
+            1, next_checkpoint_lanes.unsqueeze(1)
         ).squeeze(1)
         self._state_adapter.set_verify_boundaries(
             request_rows=request_rows,
-            boundary_slots=boundary_slots,
+            boundary_slots=checkpoint_slots,
         )
-        return DVRStateTransaction(
+        return DVRStateCommitPlan(
             request_rows=request_rows,
-            endpoint_slots=endpoint_slots,
-            boundary_slots=boundary_slots,
-            alternate_boundary_slots=alternate_boundary_slots,
-            boundary_lanes=boundary_lanes,
-            tail_lens=tail_lens,
+            accepted_conv_slots=accepted_conv_slots,
+            checkpoint_slots=checkpoint_slots,
+            next_checkpoint_slots=next_checkpoint_slots,
+            checkpoint_lanes=checkpoint_lanes,
+            accepted_tail_lens=accepted_tail_lens,
         )
 
     def finish_target_extend(self, batch: ScheduleBatch) -> None:
@@ -306,7 +308,7 @@ class DVRStateLifecycle:
         boundary_tracks = torch.tensor(
             boundary_tracks, device=endpoint_slots.device, dtype=torch.int64
         )
-        self.boundary_seq_lens[request_rows, boundary_tracks] = torch.tensor(
+        self.checkpoint_seq_lens[request_rows, boundary_tracks] = torch.tensor(
             boundary_lens, device=endpoint_slots.device, dtype=torch.int64
         )
         self._state_adapter.initialize_self_draft_state(
@@ -314,37 +316,39 @@ class DVRStateLifecycle:
             endpoint_slots=endpoint_slots,
         )
 
-    def rollback_after_verify(
+    def commit_verified_state(
         self,
         *,
         batch: ScheduleBatch,
-        transaction: Optional[DVRStateTransaction],
+        plan: Optional[DVRStateCommitPlan],
         accept_lens: torch.Tensor,
     ) -> None:
-        if transaction is None:
+        if plan is None:
             return
         if accept_lens.numel() > 0:
             crosses_chunk_boundary = self._state_adapter.commit_accepted_state(
-                request_rows=transaction.request_rows,
-                endpoint_slots=transaction.endpoint_slots,
-                boundary_slots=transaction.boundary_slots,
-                alternate_boundary_slots=transaction.alternate_boundary_slots,
-                tail_lens_before=transaction.tail_lens,
+                request_rows=plan.request_rows,
+                endpoint_slots=plan.accepted_conv_slots,
+                boundary_slots=plan.checkpoint_slots,
+                alternate_boundary_slots=plan.next_checkpoint_slots,
+                tail_lens_before=plan.accepted_tail_lens,
                 accepted_token_counts=accept_lens.to(torch.long),
             )
-            alternate_lanes = batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                transaction.boundary_lanes
+            next_checkpoint_lanes = (
+                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    plan.checkpoint_lanes
+                )
             )
-            current_lens = self.boundary_seq_lens[
-                transaction.request_rows, transaction.boundary_lanes
+            current_lens = self.checkpoint_seq_lens[
+                plan.request_rows, plan.checkpoint_lanes
             ]
-            alternate_lens = self.boundary_seq_lens[
-                transaction.request_rows, alternate_lanes
+            next_checkpoint_lens = self.checkpoint_seq_lens[
+                plan.request_rows, next_checkpoint_lanes
             ]
-            self.boundary_seq_lens[transaction.request_rows, alternate_lanes] = (
+            self.checkpoint_seq_lens[plan.request_rows, next_checkpoint_lanes] = (
                 torch.where(
                     crosses_chunk_boundary,
                     current_lens + self.chunk_size,
-                    alternate_lens,
+                    next_checkpoint_lens,
                 )
             )

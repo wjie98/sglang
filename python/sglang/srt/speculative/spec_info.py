@@ -238,10 +238,10 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dvr():
             from sglang.srt.speculative.dvr_worker import (
-                DecodeVerifyRollbackWorkerV2,
+                DecodeVerifyRollbackWorker,
             )
 
-            return DecodeVerifyRollbackWorkerV2
+            return DecodeVerifyRollbackWorker
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).

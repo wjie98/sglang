@@ -625,6 +625,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     g=g,
                     beta=beta,
                     layer_idx=layer_idx,
+                    forward_batch=forward_batch,
                 )
 
             if is_npu() and last_recurrent_state is not None:

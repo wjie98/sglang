@@ -397,10 +397,6 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     spec_info data object.
     """
 
-    # Both self-draft and EAGLE use deterministic target verification. Prevent
-    # prefill-only determinism from restoring ordinary decode split heuristics
-    # while this dedicated graph is captured.
-    dvr_target_verify_cuda_graph = True
     global_num_tokens_are_expanded = True
 
     def get_spec_info(self, num_tokens: int):

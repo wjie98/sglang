@@ -89,20 +89,21 @@ def prepare_prefill(adapter, *, prefix_lens, extend_lens, request_rows):
     prefix_lens = torch.tensor(prefix_lens, dtype=torch.long, device=device)
     extend_lens = torch.tensor(extend_lens, dtype=torch.long, device=device)
     extend_start_loc = torch.cat((extend_lens.new_zeros(1), extend_lens.cumsum(0)[:-1]))
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        req_pool_indices=torch.tensor(request_rows, dtype=torch.long, device=device),
+        extend_prefix_lens=prefix_lens,
+        extend_seq_lens=extend_lens,
+        extend_start_loc=extend_start_loc,
+    )
     adapter.prepare_forward(
-        forward_batch=SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            req_pool_indices=torch.tensor(
-                request_rows, dtype=torch.long, device=device
-            ),
-            extend_prefix_lens=prefix_lens,
-            extend_seq_lens=extend_lens,
-            extend_start_loc=extend_start_loc,
-        ),
+        forward_batch=forward_batch,
         forward_metadata=SimpleNamespace(has_mamba_track_mask=False),
     )
+    return forward_batch
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_gdn_state_inputs_support_distinct_key_and_value_heads():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
@@ -120,7 +121,7 @@ def test_gdn_state_inputs_support_distinct_key_and_value_heads():
         num_draft_tokens=16,
         state_shape=state_shape,
         dtype=torch.float32,
-        device="cpu",
+        device="cuda",
     )
 
     k_cache, v_cache, g_cache, beta_cache = adapter.transition_windows
@@ -129,11 +130,11 @@ def test_gdn_state_inputs_support_distinct_key_and_value_heads():
     assert g_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
     assert beta_cache.shape == (1, 3, FLA_CHUNK_SIZE + 16, 16)
 
-    k = torch.randn(2, 8, 128)
-    v = torch.randn(2, 16, 128)
-    g = torch.randn(2, 16)
-    beta = torch.randn(2, 16)
-    prepare_prefill(
+    k = torch.randn(2, 8, 128, device="cuda")
+    v = torch.randn(2, 16, 128, device="cuda")
+    g = torch.randn(2, 16, device="cuda")
+    beta = torch.randn(2, 16, device="cuda")
+    forward_batch = prepare_prefill(
         adapter,
         prefix_lens=[FLA_CHUNK_SIZE],
         extend_lens=[2],
@@ -145,6 +146,7 @@ def test_gdn_state_inputs_support_distinct_key_and_value_heads():
         g=g,
         beta=beta,
         layer_idx=0,
+        forward_batch=forward_batch,
     )
 
     k_cache, v_cache, g_cache, beta_cache = (
@@ -156,7 +158,7 @@ def test_gdn_state_inputs_support_distinct_key_and_value_heads():
     assert torch.equal(beta_cache[1, :2], beta)
 
 
-def test_gdn_extend_requires_prepared_metadata():
+def test_gdn_extend_requires_forward_metadata():
     adapter = create_test_adapter(
         transition_windows=tuple(torch.zeros(1, 2, 66, 1) for _ in range(4)),
     )
@@ -168,6 +170,12 @@ def test_gdn_extend_requires_prepared_metadata():
             g=torch.zeros(1, 1),
             beta=torch.zeros(1, 1),
             layer_idx=0,
+            forward_batch=SimpleNamespace(
+                req_pool_indices=None,
+                extend_prefix_lens=None,
+                extend_seq_lens=None,
+                extend_start_loc=None,
+            ),
         )
 
 
@@ -283,6 +291,7 @@ def test_dvr_gdn_adapter_maps_request_and_state_slots():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_gdn_extend_tail_cache_uses_target_request_slots():
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
@@ -299,17 +308,17 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
         num_draft_tokens=16,
         state_shape=state_shape,
         dtype=torch.float32,
-        device="cpu",
+        device="cuda",
     )
     for tensor in adapter.transition_windows:
         tensor[:, 1] = 1
 
-    k = torch.randn(1, 2, 8, 128)
-    v = torch.randn(1, 2, 16, 128)
-    g = torch.randn(2, 16)
-    beta = torch.randn(2, 16)
+    k = torch.randn(1, 2, 8, 128, device="cuda")
+    v = torch.randn(1, 2, 16, 128, device="cuda")
+    g = torch.randn(2, 16, device="cuda")
+    beta = torch.randn(2, 16, device="cuda")
 
-    prepare_prefill(
+    forward_batch = prepare_prefill(
         adapter,
         prefix_lens=[FLA_CHUNK_SIZE],
         extend_lens=[2],
@@ -321,6 +330,7 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
         g=g,
         beta=beta,
         layer_idx=0,
+        forward_batch=forward_batch,
     )
     k_cache, v_cache, g_cache, beta_cache = (
         state_input[0] for state_input in adapter.transition_windows
@@ -335,11 +345,9 @@ def test_gdn_extend_tail_cache_uses_target_request_slots():
         assert torch.all(tensor[1, 2:] == 1)
 
 
-@pytest.mark.parametrize(
-    "device",
-    ["cpu"] + (["cuda"] if torch.cuda.is_available() else []),
-)
-def test_gdn_prefill_transition_scatter_handles_mixed_chunk_boundaries(device):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_gdn_prefill_transition_scatter_handles_mixed_chunk_boundaries():
+    device = "cuda"
     adapter = create_test_adapter(
         transition_windows=tuple(
             torch.full((1, 6, 80, 2), -1.0, device=device) for _ in range(4)
@@ -348,7 +356,7 @@ def test_gdn_prefill_transition_scatter_handles_mixed_chunk_boundaries(device):
     prefix_lens = [62, 63, 126, 5, 0]
     extend_lens = [1, 3, 2, 130, 0]
     request_rows = [1, 2, 3, 4, 0]
-    prepare_prefill(
+    forward_batch = prepare_prefill(
         adapter,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
@@ -369,6 +377,7 @@ def test_gdn_prefill_transition_scatter_handles_mixed_chunk_boundaries(device):
         g=values[2],
         beta=values[3],
         layer_idx=0,
+        forward_batch=forward_batch,
     )
 
     starts = [0, 1, 4, 6, 136]
@@ -447,7 +456,7 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
         accepted_tail_lens,
         valid_mask,
         boundary_state_steps,
-    ) = adapter._verify_plan
+    ) = adapter._verify_metadata
 
     assert torch.equal(boundary_slots, torch.tensor([12, 0]))
     assert torch.equal(request_rows, torch.tensor([2, 0]))
@@ -498,7 +507,7 @@ def test_gdn_verify_exports_boundary_into_workspace():
     )
     adapter.kernel_dispatcher = dispatcher
     adapter.state_cache = state_cache
-    adapter._verify_plan = (
+    adapter._verify_metadata = (
         torch.tensor([0], device="cuda"),
         torch.tensor([1], device="cuda"),
         torch.tensor([0], device="cuda"),
@@ -658,7 +667,7 @@ def test_gdn_self_draft_state_is_request_owned_and_keeps_target_unchanged():
 
     torch.testing.assert_close(conv, original_conv)
     torch.testing.assert_close(temporal, original_temporal)
-    assert torch.all(adapter.self_draft_conv_state[0][:, [1, 3]] == -1)
+    assert torch.all(adapter.self_draft_conv[:, [1, 3]] == -1)
     assert torch.all(workspace[:, [1, 3], 0] == -2)
 
 

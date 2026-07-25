@@ -12,7 +12,7 @@ from sglang.srt.layers.sampler import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.dvr_worker import (
-    DecodeVerifyRollbackWorkerV2,
+    DecodeVerifyRollbackWorker,
 )
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
@@ -117,7 +117,7 @@ def test_pytorch_proposal_filter_matches_sampler(monkeypatch, top_ks, top_ps, mi
 
 @pytest.mark.parametrize("uses_eagle_draft", [False, True])
 def test_short_prefix_uses_one_root_verify_sentinel(uses_eagle_draft):
-    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.uses_eagle_draft = uses_eagle_draft
     worker._draft_backend = SimpleNamespace(
         target_capture_hidden_mode=(
@@ -138,7 +138,7 @@ def test_short_prefix_uses_one_root_verify_sentinel(uses_eagle_draft):
         seq_lens_sum=66,
     )
 
-    verify_input = worker._build_seed_verify_input(batch)
+    verify_input = worker._build_root_only_verify_input(batch)
 
     assert verify_input.draft_token.tolist() == [6] * 4 + [7] * 4
     assert verify_input.spec_steps == 0
@@ -147,9 +147,9 @@ def test_short_prefix_uses_one_root_verify_sentinel(uses_eagle_draft):
 
 
 def test_short_prefix_sentinel_marks_only_new_prefill_requests():
-    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.uses_eagle_draft = False
-    worker._seed_verify_slots = set()
+    worker._pending_seed_rows = set()
     worker._draft_backend = SimpleNamespace(
         target_capture_hidden_mode=dvr_worker_module.CaptureHiddenMode.NULL,
         finish_prefill=lambda _batch, _result: "next-draft",
@@ -174,11 +174,11 @@ def test_short_prefix_sentinel_marks_only_new_prefill_requests():
 
     result = worker.forward_batch_generation(batch)
 
-    assert worker._seed_verify_slots == {1}
+    assert worker._pending_seed_rows == {1}
     assert result.new_seq_lens is batch.seq_lens
     assert result.next_draft_input == "next-draft"
     worker.prepare_for_kv_cache_release(new_req)
-    assert not worker._seed_verify_slots
+    assert not worker._pending_seed_rows
 
 
 def test_draft_backends_finalize_the_common_verify_result():
@@ -204,51 +204,6 @@ def test_draft_backends_finalize_the_common_verify_result():
     assert calls == [(batch, result)]
 
 
-def test_common_target_verify_builds_and_clears_grammar_mask(monkeypatch):
-    from sglang.srt.speculative import spec_utils
-
-    calls = []
-    verify_input = SimpleNamespace(
-        retrieve_next_token=torch.tensor([[1, -1]]),
-        retrieve_next_sibling=torch.tensor([[-1, -1]]),
-        draft_token=torch.tensor([3, 4]),
-        grammar=object(),
-    )
-    sampling_info = SimpleNamespace(vocab_size=8, vocab_mask=object())
-    batch = SimpleNamespace(
-        has_grammar=True,
-        reqs=[object()],
-        sampling_info=sampling_info,
-    )
-    target_worker = SimpleNamespace(
-        forward_batch_generation=lambda **kwargs: calls.append(kwargs) or "output"
-    )
-    expected_mask = torch.tensor([[True, False]])
-    monkeypatch.setattr(
-        spec_utils,
-        "generate_token_bitmask",
-        lambda *args: expected_mask,
-    )
-
-    output, vocab_mask = dvr_worker_module.eagle_forward_target_verify(
-        verify_input,
-        batch,
-        target_worker,
-        "forward-batch",
-    )
-
-    assert output == "output"
-    assert vocab_mask is expected_mask
-    assert sampling_info.vocab_mask is None
-    assert calls == [
-        {
-            "batch": None,
-            "forward_batch": "forward-batch",
-            "is_verify": True,
-        }
-    ]
-
-
 def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     calls = []
     event = object()
@@ -258,10 +213,10 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
         "get_device_module",
         lambda _device: SimpleNamespace(current_stream=lambda: stream),
     )
-    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.device = "cuda"
     worker.uses_eagle_draft = False
-    worker._seed_verify_slots = {3}
+    worker._pending_seed_rows = {3}
     worker._target_worker = SimpleNamespace(
         model_runner=SimpleNamespace(war_fastpath_read_done_event=event)
     )
@@ -273,11 +228,11 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     worker.prepare_for_kv_cache_release(req)
 
     assert calls == [("wait", event), ("release", "done")]
-    assert not worker._seed_verify_slots
+    assert not worker._pending_seed_rows
 
 
 def test_self_draft_copies_each_graph_proposal_before_next_replay():
-    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.num_draft_tokens = 3
     worker.num_draft_steps = 2
     worker.server_args = SimpleNamespace(sampling_backend="pytorch")
@@ -324,7 +279,7 @@ def test_self_draft_copies_each_graph_proposal_before_next_replay():
 
 
 def test_self_draft_restores_batch_output_flags(monkeypatch):
-    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.num_draft_tokens = 2
     worker.topk = 1
     worker.model_runner = object()
@@ -359,7 +314,7 @@ def test_self_draft_restores_batch_output_flags(monkeypatch):
 
 
 def test_self_draft_positions_do_not_alias_sequence_lengths(monkeypatch):
-    worker = object.__new__(DecodeVerifyRollbackWorkerV2)
+    worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.num_draft_tokens = 2
     worker.topk = 1
     worker.model_runner = object()

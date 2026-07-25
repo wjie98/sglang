@@ -30,8 +30,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dvr_state_flow import (
+    DVRStateCommitPlan,
     DVRStateLifecycle,
-    DVRStateTransaction,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
@@ -326,7 +326,7 @@ class _EagleDraftBackend:
             self.worker._draft_extend_for_decode(batch, batch_result)
 
 
-class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
+class DecodeVerifyRollbackWorker(BaseSpecWorker):
     """DVR worker with pluggable self-decode or EAGLE/MTP draft execution.
 
     User-visible "spec v1" is a synchronous compatibility mode over this same
@@ -367,7 +367,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         # A one-token prefill cannot seed every draft backend. Consume one
         # target-only verify before normal draft; pool slots are overwritten on
         # every prefill, so stale request identities cannot survive slot reuse.
-        self._seed_verify_slots = set()
+        self._pending_seed_rows = set()
         self._draft_graph_buffers = {}
         max_bs = max(
             server_args.cuda_graph_config.decode.max_bs or 0,
@@ -575,11 +575,11 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
 
     def clear_cache_pool(self):
         self.state_lifecycle.clear_cache_state()
-        self._seed_verify_slots.clear()
+        self._pending_seed_rows.clear()
 
     def prepare_for_kv_cache_release(self, req) -> None:
         if req.req_pool_idx is not None:
-            self._seed_verify_slots.discard(int(req.req_pool_idx))
+            self._pending_seed_rows.discard(int(req.req_pool_idx))
         if getattr(self, "device", "cpu") != "cpu":
             rollback_done = self.war_fastpath_runner.war_fastpath_read_done_event
             if rollback_done is not None:
@@ -604,9 +604,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             decoding_rids = {req.rid for req in batch.decoding_reqs or ()}
             for req in batch.reqs:
                 request_slot = int(req.req_pool_idx)
-                self._seed_verify_slots.discard(request_slot)
+                self._pending_seed_rows.discard(request_slot)
                 if req.rid not in decoding_rids and len(req.origin_input_ids) <= 1:
-                    self._seed_verify_slots.add(request_slot)
+                    self._pending_seed_rows.add(request_slot)
             if on_publish is not None:
                 on_publish(batch_result.new_seq_lens)
             batch_result.next_draft_input = self._draft_backend.finish_prefill(
@@ -626,13 +626,13 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         needs_seed_verify = False
         for req in batch.reqs:
             request_slot = int(req.req_pool_idx)
-            if request_slot in self._seed_verify_slots:
+            if request_slot in self._pending_seed_rows:
                 needs_seed_verify = True
-                self._seed_verify_slots.discard(request_slot)
+                self._pending_seed_rows.discard(request_slot)
         with spec_stage_span("dvr_prepare"):
-            state_transaction = self.state_lifecycle.prepare_for_draft(batch)
+            state_commit_plan = self.state_lifecycle.prepare_for_draft(batch)
         if needs_seed_verify:
-            verify_input = self._build_seed_verify_input(batch)
+            verify_input = self._build_root_only_verify_input(batch)
         else:
             with self._draft_backend.context(), spec_stage_span("draft"):
                 verify_input = self._draft_backend.propose(batch)
@@ -641,7 +641,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         batch_result = self.verify(
             batch,
             verify_input,
-            state_transaction=state_transaction,
+            state_commit_plan=state_commit_plan,
             on_publish=on_publish,
         )
         final_reader = self.war_fastpath_runner
@@ -663,7 +663,9 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             final_reader.war_fastpath_read_done_event = rollback_done
         return batch_result
 
-    def _build_seed_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+    def _build_root_only_verify_input(
+        self, batch: ScheduleBatch
+    ) -> EagleVerifyInput:
         """Build a fixed-width verify input whose logical tree is only the root."""
 
         draft_input = batch.spec_info
@@ -699,7 +701,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
-        state_transaction: Optional[DVRStateTransaction] = None,
+        state_commit_plan: Optional[DVRStateCommitPlan] = None,
         on_publish=None,
     ) -> GenerationBatchResult:
         scheduler_seq_lens = batch.seq_lens
@@ -815,12 +817,12 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
         with spec_stage_span("dvr_rollback"):
-            self.state_lifecycle.rollback_after_verify(
+            self.state_lifecycle.commit_verified_state(
                 batch=batch,
-                transaction=state_transaction,
+                plan=state_commit_plan,
                 accept_lens=accept_lens,
             )
-        if state_transaction is None:
+        if state_commit_plan is None:
             commit_mamba_states_after_verify(
                 self.target_worker,
                 batch,

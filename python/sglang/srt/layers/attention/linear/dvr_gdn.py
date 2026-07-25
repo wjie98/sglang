@@ -425,49 +425,26 @@ def _scatter_prefill_transitions(
     if values.shape[1] != elements:
         raise ValueError("DVR transition value and cache element shapes do not match.")
 
-    if cache.is_cuda:
-        block_size = 256
-        _dvr_scatter_prefill_transitions_kernel[
-            (
-                request_rows.numel(),
-                triton.cdiv(chunk_size * elements, block_size),
-            )
-        ](
-            cache,
-            values,
-            request_rows,
-            prefix_lens,
-            extend_lens,
-            extend_start_loc,
-            cache.stride(0),
-            cache.stride(1),
-            values.stride(0),
-            E=elements,
-            CHUNK_SIZE=chunk_size,
-            BLOCK_SIZE=block_size,
+    block_size = 256
+    _dvr_scatter_prefill_transitions_kernel[
+        (
+            request_rows.numel(),
+            triton.cdiv(chunk_size * elements, block_size),
         )
-        return
-
-    for request_row, prefix_len, extend_len, source_start in zip(
-        request_rows.tolist(),
-        prefix_lens.tolist(),
-        extend_lens.tolist(),
-        extend_start_loc.tolist(),
-        strict=True,
-    ):
-        seq_len = prefix_len + extend_len
-        boundary = seq_len // chunk_size * chunk_size
-        write_start = max(prefix_len, boundary)
-        token_count = seq_len - write_start
-        if token_count:
-            source_start += write_start - prefix_len
-            destination_start = write_start - boundary
-            destination = cache[
-                request_row, destination_start : destination_start + token_count
-            ]
-            destination.copy_(
-                values[source_start : source_start + token_count].view_as(destination)
-            )
+    ](
+        cache,
+        values,
+        request_rows,
+        prefix_lens,
+        extend_lens,
+        extend_start_loc,
+        cache.stride(0),
+        cache.stride(1),
+        values.stride(0),
+        E=elements,
+        CHUNK_SIZE=chunk_size,
+        BLOCK_SIZE=block_size,
+    )
 
 
 def _local_gdn_dimensions(state_shape):
@@ -649,18 +626,14 @@ class DVRGDNStateAdapter:
         self.transition_windows = transition_windows
         self.verify_boundary_slots = verify_boundary_slots
         self.chunk_size = chunk_size
-        self._verify_plan: Optional[tuple[torch.Tensor, ...]] = None
-        self._prefill_plan: Optional[tuple[torch.Tensor, ...]] = None
-        self.self_draft_conv_state = (
-            tuple(
-                tensor.new_zeros(
-                    (
-                        tensor.shape[0],
-                        state_cache.intermediate_ssm.shape[1],
-                        *tensor.shape[2:],
-                    )
+        self._verify_metadata: Optional[tuple[torch.Tensor, ...]] = None
+        self.self_draft_conv = (
+            state_cache.conv[0].new_zeros(
+                (
+                    state_cache.conv[0].shape[0],
+                    state_cache.intermediate_ssm.shape[1],
+                    *state_cache.conv[0].shape[2:],
                 )
-                for tensor in state_cache.conv
             )
             if draft_reuses_target_state
             else None
@@ -782,7 +755,7 @@ class DVRGDNStateAdapter:
         from the authoritative boundary plus accepted transition rows.
         """
 
-        if self.self_draft_conv_state is None:
+        if self.self_draft_conv is None:
             return
         endpoint_slots = endpoint_slots.to(
             device=self.state_cache.temporal.device, dtype=torch.long
@@ -794,16 +767,15 @@ class DVRGDNStateAdapter:
             self.state_cache.intermediate_ssm[:, request_rows, 0] = (
                 self.state_cache.temporal[:, endpoint_slots]
             )
-            for target_conv, draft_conv in zip(
-                self.state_cache.conv, self.self_draft_conv_state, strict=True
-            ):
-                draft_conv[:, request_rows] = target_conv[:, endpoint_slots]
+            self.self_draft_conv[:, request_rows] = self.state_cache.conv[0][
+                :, endpoint_slots
+            ]
 
     def decode_state(self, *, layer_cache, forward_batch, layer_idx: int):
         """Return request-owned state for provisional DVR-self decode."""
 
         if (
-            self.self_draft_conv_state is None
+            self.self_draft_conv is None
             or not forward_batch.forward_mode.is_decode()
         ):
             return None
@@ -811,7 +783,7 @@ class DVRGDNStateAdapter:
             device=layer_cache.temporal.device, dtype=torch.long
         )
         return (
-            self.self_draft_conv_state[0][layer_idx],
+            self.self_draft_conv[layer_idx],
             layer_cache.intermediate_ssm[:, 0],
             request_rows,
         )
@@ -836,8 +808,15 @@ class DVRGDNStateAdapter:
         g: torch.Tensor,
         beta: torch.Tensor,
         layer_idx: int,
+        forward_batch,
     ):
-        if self._prefill_plan is None:
+        prefill_metadata = (
+            forward_batch.req_pool_indices,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_seq_lens,
+            forward_batch.extend_start_loc,
+        )
+        if any(tensor is None for tensor in prefill_metadata):
             raise RuntimeError("DVR GDN target EXTEND metadata was not prepared.")
 
         # q affects only the output at its own token; it does not participate in
@@ -851,7 +830,7 @@ class DVRGDNStateAdapter:
         layer_transition_windows = tuple(
             cache[layer_idx] for cache in self.transition_windows
         )
-        request_rows, prefix_lens, extend_lens, extend_start_loc = self._prefill_plan
+        request_rows, prefix_lens, extend_lens, extend_start_loc = prefill_metadata
         for cache, value in zip(
             layer_transition_windows, transition_windows, strict=True
         ):
@@ -868,26 +847,13 @@ class DVRGDNStateAdapter:
     def prepare_forward(self, *, forward_batch, forward_metadata):
         """Prepare request metadata once before all GDN layers execute."""
 
-        self._verify_plan = None
-        self._prefill_plan = None
+        self._verify_metadata = None
         if forward_batch.forward_mode.is_target_verify():
             self.prepare_target_verify(
                 forward_batch=forward_batch,
                 cache_indices=forward_metadata.mamba_cache_indices,
             )
             return None
-        if forward_batch.forward_mode.is_extend():
-            prefill_metadata = (
-                forward_batch.req_pool_indices,
-                forward_batch.extend_prefix_lens,
-                forward_batch.extend_seq_lens,
-                forward_batch.extend_start_loc,
-            )
-            if any(tensor is None for tensor in prefill_metadata):
-                raise RuntimeError(
-                    "DVR GDN target EXTEND requires GPU request and length metadata."
-                )
-            self._prefill_plan = prefill_metadata
         if not (
             forward_batch.forward_mode.is_extend()
             and forward_metadata.has_mamba_track_mask
@@ -941,7 +907,7 @@ class DVRGDNStateAdapter:
             torch.ones_like(accepted_tail_lens),
             torch.full_like(accepted_tail_lens, -1),
         )
-        self._verify_plan = (
+        self._verify_metadata = (
             boundary_slots,
             request_rows,
             verify_conv_slots,
@@ -953,9 +919,9 @@ class DVRGDNStateAdapter:
     def verify_conv_indices(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return target conv slots and request-owned intermediate rows."""
 
-        if self._verify_plan is None:
+        if self._verify_metadata is None:
             raise RuntimeError("DVR target-verify metadata was not prepared.")
-        return self._verify_plan[2], self._verify_plan[1]
+        return self._verify_metadata[2], self._verify_metadata[1]
 
     def forward_target_verify(
         self,
@@ -969,7 +935,7 @@ class DVRGDNStateAdapter:
     ) -> torch.Tensor:
         """Replay GDN state from cached transitions and candidate q/k/v/g/beta."""
 
-        if self._verify_plan is None:
+        if self._verify_metadata is None:
             raise RuntimeError("DVR target-verify metadata was not prepared.")
         if not query.is_cuda:
             raise RuntimeError("DVR GDN target verify requires CUDA tensors.")
@@ -980,7 +946,7 @@ class DVRGDNStateAdapter:
             accepted_tail_lens,
             valid_mask,
             boundary_state_steps,
-        ) = self._verify_plan
+        ) = self._verify_metadata
         batch_size = boundary_slots.shape[0]
         draft_token_num = query.shape[1] // batch_size
         candidate_inputs = (
@@ -1079,9 +1045,9 @@ class DVRGDNStateAdapter:
         )
         # Convolution state is authoritative at the accepted endpoint; unlike
         # temporal state, it is cheap and necessary to resume the next conv.
-        if self.self_draft_conv_state is not None:
+        if self.self_draft_conv is not None:
             fused_conv_window_scatter_with_mask(
-                self.self_draft_conv_state[0],
+                self.self_draft_conv,
                 self.state_cache.intermediate_conv_window[0],
                 request_rows,
                 accepted_token_counts - 1,
@@ -1126,7 +1092,7 @@ class DVRGDNStateAdapter:
                 chunk_size=self.chunk_size,
                 accepted_tail_lens=tail_lens_after,
             )
-        if self.self_draft_conv_state is not None:
+        if self.self_draft_conv is not None:
             # Reconstruct only self-draft's private endpoint. Target recurrent
             # state remains boundary-owned and target verify reads it directly.
             with profile_range("draft_state_rebuild"):

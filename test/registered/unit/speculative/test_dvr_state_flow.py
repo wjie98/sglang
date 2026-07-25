@@ -85,7 +85,9 @@ def _lifecycle_fixture(
         enable_mamba_extra_buffer=lambda: not disable_radix,
     )
     lifecycle._state_adapter = _Adapter(zeroed)
-    lifecycle.boundary_seq_lens = torch.full((8, len(slots)), -1, dtype=torch.int64)
+    lifecycle.checkpoint_seq_lens = torch.full(
+        (8, len(slots)), -1, dtype=torch.int64
+    )
     pool = _Pool(slots, copies)
     lifecycle.model_runner = SimpleNamespace(req_to_token_pool=pool)
     if next_track is None:
@@ -355,32 +357,32 @@ def test_target_extend_publishes_exact_boundary(
     lifecycle, _, batch, copies, _ = _lifecycle_fixture(
         seq_len=seq_len, last_track=last_track, prefix_len=prefix_len
     )
-    lifecycle.boundary_seq_lens[1] = torch.tensor([999, 888])
+    lifecycle.checkpoint_seq_lens[1] = torch.tensor([999, 888])
 
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
     draft_ctx = lifecycle.prepare_for_draft(batch)
 
     assert copies == []
-    assert draft_ctx.tail_lens.tolist() == [expected_tail]
+    assert draft_ctx.accepted_tail_lens.tolist() == [expected_tail]
     assert lifecycle._state_adapter.draft_initializations == [([1], [20])]
     assert lifecycle._state_adapter.verify_boundaries == [([1], [expected_boundary])]
-    assert draft_ctx.boundary_slots.tolist() == [expected_boundary]
-    assert draft_ctx.alternate_boundary_slots.tolist() == [expected_next_boundary]
+    assert draft_ctx.checkpoint_slots.tolist() == [expected_boundary]
+    assert draft_ctx.next_checkpoint_slots.tolist() == [expected_next_boundary]
 
 
 def test_target_extend_replaces_stale_request_state():
     lifecycle, _, batch, _, zeroed = _lifecycle_fixture(
         seq_len=1, last_track=None, prefix_len=0
     )
-    lifecycle.boundary_seq_lens[1] = torch.tensor([128, 192])
+    lifecycle.checkpoint_seq_lens[1] = torch.tensor([128, 192])
 
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
     draft_ctx = lifecycle.prepare_for_draft(batch)
 
     assert zeroed == [11]
-    assert draft_ctx.boundary_slots.tolist() == [11]
+    assert draft_ctx.checkpoint_slots.tolist() == [11]
 
 
 def test_target_extend_fails_without_a_boundary_source():
@@ -419,7 +421,7 @@ def test_radix_disabled_builds_tracking_from_schedule_batch_lengths():
     assert batch.mamba_track_indices.tolist() == [10]
     assert batch.mamba_track_mask.tolist() == [True]
     assert req.mamba_last_track_seqlen == 64
-    assert draft_ctx.boundary_slots.tolist() == [10]
+    assert draft_ctx.checkpoint_slots.tolist() == [10]
 
 
 def test_prepare_for_draft_uses_device_authoritative_boundary():
@@ -432,9 +434,9 @@ def test_prepare_for_draft_uses_device_authoritative_boundary():
 
     ctx = lifecycle.prepare_for_draft(batch)
 
-    assert ctx.boundary_slots.tolist() == [11]
-    assert ctx.alternate_boundary_slots.tolist() == [10]
-    assert ctx.boundary_lanes.tolist() == [1]
+    assert ctx.checkpoint_slots.tolist() == [11]
+    assert ctx.next_checkpoint_slots.tolist() == [10]
+    assert ctx.checkpoint_lanes.tolist() == [1]
 
 
 def test_prepare_for_draft_keeps_request_slots_stable_during_radix_insert():
@@ -448,11 +450,11 @@ def test_prepare_for_draft_keeps_request_slots_stable_during_radix_insert():
     ctx = lifecycle.prepare_for_draft(batch)
 
     assert torch.equal(req.mamba_ping_pong_track_buffer, before)
-    assert ctx.boundary_slots.tolist() == [10]
-    assert ctx.alternate_boundary_slots.tolist() == [11]
+    assert ctx.checkpoint_slots.tolist() == [10]
+    assert ctx.next_checkpoint_slots.tolist() == [11]
 
 
-def test_rollback_advances_only_the_next_boundary_slot():
+def test_commit_advances_only_the_next_checkpoint_slot():
     calls = []
 
     lifecycle, _, batch, *_ = _lifecycle_fixture(
@@ -468,9 +470,9 @@ def test_rollback_advances_only_the_next_boundary_slot():
 
     lifecycle._state_adapter.commit_accepted_state = commit_accepted_state
 
-    lifecycle.rollback_after_verify(
+    lifecycle.commit_verified_state(
         batch=batch,
-        transaction=ctx,
+        plan=ctx,
         accept_lens=torch.tensor([2], dtype=torch.int32),
     )
     batch.seq_lens = torch.tensor([65])
@@ -478,8 +480,8 @@ def test_rollback_advances_only_the_next_boundary_slot():
 
     assert calls[0]["tail_lens_before"].tolist() == [63]
     assert calls[0]["accepted_token_counts"].tolist() == [2]
-    assert next_ctx.boundary_slots.tolist() == [10]
-    assert next_ctx.alternate_boundary_slots.tolist() == [11]
+    assert next_ctx.checkpoint_slots.tolist() == [10]
+    assert next_ctx.next_checkpoint_slots.tolist() == [11]
 
 
 def _finished_req(**overrides):
@@ -509,9 +511,9 @@ def test_release_publishes_latest_visible_boundary():
     lifecycle._state_adapter.commit_accepted_state = lambda **_kwargs: torch.tensor(
         [True]
     )
-    lifecycle.rollback_after_verify(
+    lifecycle.commit_verified_state(
         batch=batch,
-        transaction=ctx,
+        plan=ctx,
         accept_lens=torch.tensor([64], dtype=torch.int32),
     )
     req = _finished_req()
@@ -533,7 +535,7 @@ def test_release_skips_insert_if_committed_boundary_was_lost():
     lifecycle.prepare_for_cache_release(req)
 
     assert req.skip_radix_cache_insert
-    assert lifecycle.boundary_seq_lens[req.req_pool_idx].tolist() == [-1, -1]
+    assert lifecycle.checkpoint_seq_lens[req.req_pool_idx].tolist() == [-1, -1]
 
 
 def test_prepare_for_draft_fails_without_an_exact_boundary():

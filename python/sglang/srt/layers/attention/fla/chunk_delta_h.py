@@ -379,17 +379,7 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    boundary_outputs = (
-        boundary_state,
-        boundary_state_indices,
-        boundary_state_steps,
-    )
-    write_boundary_state = all(value is not None for value in boundary_outputs)
-    if any(value is not None for value in boundary_outputs) and not write_boundary_state:
-        raise ValueError(
-            "boundary_state, boundary_state_indices, and boundary_state_steps "
-            "must be provided together."
-        )
+    write_boundary_state = boundary_state is not None
     h = k.new_empty(B, NT, H, V, K)
 
     v_new = torch.empty_like(u) if save_new_value else None

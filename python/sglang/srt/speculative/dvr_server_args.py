@@ -63,11 +63,6 @@ def handle_dvr_defaults(server_args):
     if not _is_dvr_gated_linear_state_model(server_args):
         return
 
-    if server_args.enable_unified_memory:
-        raise ValueError(
-            "DVR gated linear-state models do not support --enable-unified-memory."
-        )
-
     if server_args.page_size is None:
         server_args.page_size = FLA_CHUNK_SIZE
     elif server_args.page_size != FLA_CHUNK_SIZE:
@@ -126,8 +121,6 @@ def handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR currently does not support PDMux attention backends.")
     if server_args.disaggregation_mode != "null":
         raise ValueError("DVR currently does not support disaggregation mode.")
-    if server_args.pp_size != 1:
-        raise ValueError("DVR currently supports only pp_size == 1.")
     from sglang.srt.platforms import current_platform
 
     if current_platform.is_out_of_tree():
@@ -291,21 +284,7 @@ def handle_dvr_cuda_graph_config(server_args):
             )
             prefill_graph.backend = Backend.DISABLED
 
-    _ensure_dvr_self_draft_cuda_graph_coverage(server_args)
-
-
-def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
-    """Keep self-draft on the existing CUDA graph decode contract.
-
-    DVR self-draft must use the dedicated fast decode graph. With CUDA graph
-    padding enabled, SGLang only needs a captured max batch size; with padding
-    disabled, every exact batch size must be captured. Reuse those existing
-    semantics instead of adding a DVR-specific server argument.
-    """
-
-    if server_args.speculative_algorithm != DVR_SPECULATIVE_ALGORITHM:
-        return
-    if (
+    if server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM and (
         server_args.cuda_graph_config.decode.backend == Backend.DISABLED
         or server_args.disable_draft_cuda_graph
     ):
@@ -313,28 +292,6 @@ def _ensure_dvr_self_draft_cuda_graph_coverage(server_args):
             "DVR self-draft requires draft CUDA "
             "graphs. Remove --disable-cuda-graph/--disable-draft-cuda-graph "
             "or use a non-self-draft DVR mode."
-        )
-
-    decode_graph = server_args.cuda_graph_config.decode
-    max_running_requests = int(server_args.max_running_requests or 0)
-    graph_bs = {int(bs) for bs in (decode_graph.bs or ()) if int(bs) > 0}
-    graph_capacity = max(graph_bs, default=int(decode_graph.max_bs or 0))
-    if max_running_requests <= 0:
-        if graph_capacity > 0:
-            server_args.max_running_requests = graph_capacity
-        return
-
-    if server_args.disable_cuda_graph_padding:
-        missing_bs = set(range(1, max_running_requests + 1)) - graph_bs
-    else:
-        missing_bs = (
-            set() if graph_capacity >= max_running_requests else {max_running_requests}
-        )
-    if missing_bs:
-        raise ValueError(
-            "Configured cuda_graph_config[decode] does not cover DVR self-draft "
-            f"batch sizes {sorted(missing_bs)}. Keep max_running_requests within "
-            "the decode graph capacity."
         )
 
 

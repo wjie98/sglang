@@ -167,13 +167,6 @@ class TestDVRServerArgs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "speculative_num_draft_tokens >= 2"):
             handle_dvr_speculative_decoding(args)
 
-    def test_dvr_rejects_pipeline_parallelism(self):
-        args = _Args()
-        args.pp_size = 2
-
-        with self.assertRaisesRegex(ValueError, "pp_size == 1"):
-            handle_dvr_speculative_decoding(args)
-
     def test_dvr_self_draft_uses_existing_cuda_graph_coverage(self):
         cases = (
             (False, [1, 2, 4], 4),
@@ -190,16 +183,6 @@ class TestDVRServerArgs(unittest.TestCase):
                 self.assertEqual(args.cuda_graph_config.decode.bs, bs)
                 self.assertEqual(args.cuda_graph_config.decode.max_bs, max_bs)
 
-    def test_dvr_self_draft_caps_auto_concurrency_to_graph_capacity(self):
-        args = _Args()
-        args.max_running_requests = None
-        args.cuda_graph_config.decode.bs = [1, 2, 8]
-        args.cuda_graph_config.decode.max_bs = 8
-
-        handle_dvr_cuda_graph_config(args)
-
-        self.assertEqual(args.max_running_requests, 8)
-
     def test_dvr_chain_request_row_covers_overlap_reservation(self):
         args = _Args()
         self.assertEqual(get_req_to_token_extra_context_len(args), 32)
@@ -211,22 +194,6 @@ class TestDVRServerArgs(unittest.TestCase):
         args.speculative_eagle_topk = 1
 
         self.assertEqual(get_req_to_token_extra_context_len(args), 20)
-
-    def test_dvr_self_draft_rejects_insufficient_cuda_graph_coverage(self):
-        for padding_disabled, bs, max_bs in (
-            (False, [1, 2], 2),
-            (True, [1, 4], 4),
-            (False, None, 2),
-        ):
-            with self.subTest(padding_disabled=padding_disabled, bs=bs):
-                args = _Args()
-                args.disable_cuda_graph_padding = padding_disabled
-                args.cuda_graph_config.decode.bs = bs
-                args.cuda_graph_config.decode.max_bs = max_bs
-                with self.assertRaisesRegex(
-                    ValueError, "does not cover DVR self-draft"
-                ):
-                    handle_dvr_cuda_graph_config(args)
 
     def test_dvr_self_draft_requires_cuda_graph(self):
         for disable_draft, backend in (
@@ -292,19 +259,6 @@ class TestDVRServerArgs(unittest.TestCase):
             handle_dvr_cuda_graph_config(args)
 
         self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
-
-    def test_dvr_gdn_rejects_unified_memory(self):
-        args = _Args()
-        args.enable_unified_memory = True
-        with (
-            patch(
-                "sglang.srt.speculative.dvr_server_args."
-                "_is_dvr_gated_linear_state_model",
-                return_value=True,
-            ),
-            self.assertRaisesRegex(ValueError, "unified-memory"),
-        ):
-            handle_dvr_defaults(args)
 
     def test_dvr_eagle_defaults_to_one_mtp_draft_step(self):
         args = _Args()

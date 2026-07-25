@@ -2804,6 +2804,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     DVRTargetVerifyCudaGraphRunner,
                 )
 
+                self.enable_dvr_target_verify_cuda_graph = True
                 self.decode_cuda_graph_runner = DVRTargetVerifyCudaGraphRunner(self)
             else:
                 self.decode_cuda_graph_runner = graph_runners[self.device](self)
