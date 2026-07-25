@@ -212,7 +212,7 @@ def build_kv_cache(
         page_size=(
             page_size if not dcp_enabled() else token_to_kv_pool_allocator.page_size
         ),
-        is_eagle=spec_algorithm.uses_eagle_draft_backend(),
+        is_eagle=spec_algorithm.is_eagle() or spec_algorithm.is_dvr_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
         ),

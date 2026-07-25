@@ -466,7 +466,6 @@ def dvr_gdn_intermediate_bytes_per_request(
     *,
     checkpoint_lanes: int,
     dedup_conv_window: bool,
-    draft_reuses_target_state: bool,
 ) -> int:
     """Size DVR-only verify, rollback, and state-input buffers per request."""
 
@@ -627,7 +626,7 @@ class DVRGDNStateAdapter:
         draft_state: torch.Tensor,
         intermediate_conv_window: torch.Tensor,
         transition_windows: tuple[torch.Tensor, ...],
-        draft_reuses_target_state: bool,
+        enable_self_draft_state: bool,
         chunk_size: int = FLA_CHUNK_SIZE,
     ):
         self.kernel_dispatcher = kernel_dispatcher
@@ -636,7 +635,7 @@ class DVRGDNStateAdapter:
         self.intermediate_conv_window = intermediate_conv_window
         self.transition_windows = transition_windows
         self.chunk_size = chunk_size
-        self._verify_metadata: Optional[tuple[torch.Tensor, ...]] = None
+        self.verify_metadata: Optional[tuple[torch.Tensor, ...]] = None
         self.verify_conv = state_cache.conv[0].new_zeros(
             (
                 state_cache.conv[0].shape[0],
@@ -644,7 +643,7 @@ class DVRGDNStateAdapter:
                 *state_cache.conv[0].shape[2:],
             )
         )
-        self.self_draft_conv = self.verify_conv if draft_reuses_target_state else None
+        self.self_draft_conv = self.verify_conv if enable_self_draft_state else None
 
     @classmethod
     def for_gdn(
@@ -751,7 +750,7 @@ class DVRGDNStateAdapter:
             draft_state=draft_state,
             intermediate_conv_window=intermediate_conv_window,
             transition_windows=(k, v, gate, torch.zeros_like(gate)),
-            draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
+            enable_self_draft_state=model_runner.spec_algorithm.is_dvr_self_draft(),
         )
 
     def resolve_request_slots(self, *, batch) -> tuple[torch.Tensor, torch.Tensor]:
@@ -866,7 +865,7 @@ class DVRGDNStateAdapter:
     def prepare_forward(self, *, forward_batch, forward_metadata):
         """Prepare request metadata once before all GDN layers execute."""
 
-        self._verify_metadata = None
+        self.verify_metadata = None
         if forward_batch.forward_mode.is_target_verify():
             self.prepare_target_verify(
                 forward_batch=forward_batch,
@@ -932,7 +931,7 @@ class DVRGDNStateAdapter:
             torch.ones_like(accepted_tail_lens),
             torch.full_like(accepted_tail_lens, -1),
         )
-        self._verify_metadata = (
+        self.verify_metadata = (
             checkpoint_slots,
             request_rows,
             verify_conv_slots,
@@ -946,9 +945,9 @@ class DVRGDNStateAdapter:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return verify scratch, its rows, and intermediate-output rows."""
 
-        if self._verify_metadata is None:
+        if self.verify_metadata is None:
             raise RuntimeError("DVR target-verify metadata was not prepared.")
-        request_rows = self._verify_metadata[1]
+        request_rows = self.verify_metadata[1]
         return self.verify_conv[layer_idx], request_rows, request_rows
 
     def forward_target_verify(
@@ -963,7 +962,7 @@ class DVRGDNStateAdapter:
     ) -> torch.Tensor:
         """Replay GDN state from cached transitions and candidate q/k/v/g/beta."""
 
-        if self._verify_metadata is None:
+        if self.verify_metadata is None:
             raise RuntimeError("DVR target-verify metadata was not prepared.")
         if not query.is_cuda:
             raise RuntimeError("DVR GDN target verify requires CUDA tensors.")
@@ -974,7 +973,7 @@ class DVRGDNStateAdapter:
             accepted_tail_lens,
             valid_mask,
             boundary_state_steps,
-        ) = self._verify_metadata
+        ) = self.verify_metadata
         batch_size = checkpoint_slots.shape[0]
         draft_token_num = query.shape[1] // batch_size
         candidate_inputs = (

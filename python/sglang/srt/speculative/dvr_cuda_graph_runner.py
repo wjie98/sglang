@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dvr.gdn_backend import DVRGDNAttnBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 def _resolve_draft_flashinfer_allreduce_fusion(server_args):
     """Resolve the communication fusion ordinary decode would have selected."""
 
-    request = getattr(server_args, "_dvr_draft_flashinfer_allreduce_fusion", None)
+    request = getattr(server_args, "dvr_draft_flashinfer_allreduce_fusion", None)
     if request is None:
         return None
     requested_backend, force_disabled = request
@@ -55,8 +56,9 @@ def _resolve_dvr_backends(backend, forward_mode=ForwardMode.DECODE):
     def visit(current, *, collect_attention=True):
         nonlocal state_adapter
         if isinstance(current, HybridLinearAttnBackend):
-            candidate = getattr(current.linear_attn_backend, "dvr_state_adapter", None)
-            if candidate is not None:
+            linear_backend = current.linear_attn_backend
+            if isinstance(linear_backend, DVRGDNAttnBackend):
+                candidate = linear_backend.dvr_state_adapter
                 if state_adapter is not None and state_adapter is not candidate:
                     raise RuntimeError(
                         "DVR resolved multiple linear-state adapters in one backend."
@@ -75,21 +77,21 @@ def _resolve_dvr_backends(backend, forward_mode=ForwardMode.DECODE):
             for child in current.children:
                 visit(child, collect_attention=collect_attention)
         else:
-            candidate = getattr(current, "dvr_state_adapter", None)
-            if candidate is not None:
+            if isinstance(current, DVRGDNAttnBackend):
+                candidate = current.dvr_state_adapter
                 if state_adapter is not None and state_adapter is not candidate:
                     raise RuntimeError(
                         "DVR resolved multiple linear-state adapters in one backend."
                     )
                 state_adapter = candidate
-            if collect_attention:
+            elif collect_attention:
                 leaves.append(current)
 
     visit(backend)
     return leaves, state_adapter
 
 
-def _validate_dvr_attention_backend(
+def validate_dvr_attention_backend(
     backend, forward_mode=ForwardMode.DECODE, *, phase="draft decode"
 ):
     """Return supported full-attention leaves after wrapper resolution."""
@@ -131,7 +133,7 @@ def _fast_decode_overrides(backend, model_runner, buffer_cache):
         return plan_cache[plan_key]
 
     overrides = []
-    leaves, _ = _validate_dvr_attention_backend(backend)
+    leaves, _ = validate_dvr_attention_backend(backend)
     for leaf in leaves:
         if isinstance(leaf, FlashAttentionBackend):
             overrides.append((leaf, "num_splits", 0))
@@ -353,7 +355,7 @@ def dvr_draft_decode_context(
             # disabled. Only capture it into provisional draft graphs.
             if getattr(
                 model_runner.server_args,
-                "_dvr_enable_draft_custom_all_reduce",
+                "dvr_enable_draft_custom_all_reduce",
                 False,
             ):
                 for group in _iter_decode_custom_all_reduce_groups(model_runner):

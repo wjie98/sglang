@@ -288,7 +288,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.uses_eagle_draft_backend()
+                if (
+                    self.model_runner.spec_algorithm.is_eagle()
+                    or self.model_runner.spec_algorithm.is_dvr_eagle()
+                )
                 or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
@@ -483,7 +486,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.uses_eagle_draft_backend()
+                if (
+                    self.model_runner.spec_algorithm.is_eagle()
+                    or self.model_runner.spec_algorithm.is_dvr_eagle()
+                )
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)

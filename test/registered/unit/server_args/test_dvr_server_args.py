@@ -509,7 +509,7 @@ class TestDVRServerArgs(unittest.TestCase):
                     handle_dvr_defaults(args)
 
                 self.assertEqual(
-                    args._dvr_draft_flashinfer_allreduce_fusion,
+                    args.dvr_draft_flashinfer_allreduce_fusion,
                     (backend, force_disabled),
                 )
 

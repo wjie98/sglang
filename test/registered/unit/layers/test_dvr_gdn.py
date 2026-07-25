@@ -66,7 +66,7 @@ def create_test_adapter(
     transition_windows,
     state_cache=None,
     kernel_dispatcher=None,
-    draft_reuses_target_state=False,
+    enable_self_draft_state=False,
 ):
     if state_cache is None:
         layers, slots = transition_windows[0].shape[:2]
@@ -99,7 +99,7 @@ def create_test_adapter(
         draft_state=draft_state,
         intermediate_conv_window=intermediate_conv_window,
         transition_windows=transition_windows,
-        draft_reuses_target_state=draft_reuses_target_state,
+        enable_self_draft_state=enable_self_draft_state,
     )
 
 
@@ -350,7 +350,6 @@ def test_gdn_memory_estimate_matches_allocation():
         num_draft_tokens,
         checkpoint_lanes=checkpoint_lanes,
         dedup_conv_window=True,
-        draft_reuses_target_state=False,
     )
 
 
@@ -573,7 +572,7 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
         accepted_tail_lens,
         valid_mask,
         boundary_state_steps,
-    ) = adapter._verify_metadata
+    ) = adapter.verify_metadata
 
     assert torch.equal(checkpoint_slots, torch.tensor([7, 0]))
     assert torch.equal(request_rows, torch.tensor([2, 0]))
@@ -622,7 +621,7 @@ def test_gdn_verify_exports_boundary_into_workspace(monkeypatch):
         temporal=torch.zeros(1, 3, 16, 128, 128, device="cuda"),
     )
     adapter.state_cache = state_cache
-    adapter._verify_metadata = (
+    adapter.verify_metadata = (
         torch.tensor([0], device="cuda"),
         torch.tensor([1], device="cuda"),
         torch.tensor([0], device="cuda"),
@@ -751,7 +750,7 @@ def test_gdn_self_draft_state_is_request_owned_and_keeps_target_unchanged(
     adapter = create_test_adapter(
         state_cache=state_cache,
         transition_windows=(torch.empty(1, 4, 1),) * 4,
-        draft_reuses_target_state=True,
+        enable_self_draft_state=True,
     )
 
     def rebuild(*_args, **kwargs):

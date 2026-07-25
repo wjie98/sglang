@@ -4,21 +4,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import sglang.srt.model_executor.dvr_cuda_graph_runner as graph_module
+import sglang.srt.speculative.dvr_cuda_graph_runner as graph_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.dvr.gdn_backend import DVRGDNAttnBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.model_executor.dvr_cuda_graph_runner import (
+from sglang.srt.speculative.dvr_cuda_graph_runner import (
     DVRTargetVerifyCudaGraphRunner,
     _draft_custom_allreduce_enabled,
     _fast_decode_overrides,
     _resolve_dvr_backends,
     _resolve_draft_flashinfer_allreduce_fusion,
-    _validate_dvr_attention_backend,
+    validate_dvr_attention_backend,
     dvr_draft_decode_context,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -34,7 +35,7 @@ def test_draft_capture_is_fast_and_restores_target_state(
     backend = SimpleNamespace(enable_deterministic=True)
     server_args = SimpleNamespace(
         enable_deterministic_inference=True,
-        _dvr_enable_draft_custom_all_reduce=draft_custom_all_reduce,
+        dvr_enable_draft_custom_all_reduce=draft_custom_all_reduce,
     )
     global_server_args = SimpleNamespace(enable_deterministic_inference=True)
     model_runner = SimpleNamespace(
@@ -150,13 +151,13 @@ def test_backend_resolution_returns_attention_and_linear_state_once():
         req_to_token_pool = object()
         needs_cpu_seq_lens = False
 
-        def __init__(self, adapter=None):
-            self.dvr_state_adapter = adapter
-
     adapter = object()
+    linear_backend = object.__new__(DVRGDNAttnBackend)
+    linear_backend.dvr_state_adapter = adapter
+    linear_backend.needs_cpu_seq_lens = False
     full_attention = Backend()
     hybrid_linear = HybridLinearAttnBackend(
-        full_attention, Backend(adapter), full_attn_layers=[]
+        full_attention, linear_backend, full_attn_layers=[]
     )
     children = [Backend(), Backend()]
     tbo = TboAttnBackend(primary=hybrid_linear, children=children)
@@ -206,12 +207,17 @@ def test_backend_resolution_rejects_distinct_linear_state_adapters():
         req_to_token_pool = object()
         needs_cpu_seq_lens = False
 
-        def __init__(self, adapter=None):
-            self.dvr_state_adapter = adapter
+    def hybrid_with_adapter(adapter):
+        linear_backend = object.__new__(DVRGDNAttnBackend)
+        linear_backend.dvr_state_adapter = adapter
+        linear_backend.needs_cpu_seq_lens = False
+        return HybridLinearAttnBackend(
+            Backend(), linear_backend, full_attn_layers=[]
+        )
 
     backend = TboAttnBackend(
-        primary=Backend(object()),
-        children=[Backend(object())],
+        primary=hybrid_with_adapter(object()),
+        children=[hybrid_with_adapter(object())],
     )
 
     with pytest.raises(RuntimeError, match="multiple linear-state adapters"):
@@ -220,29 +226,29 @@ def test_backend_resolution_rejects_distinct_linear_state_adapters():
 
 def test_backend_validation_accepts_triton_and_rejects_non_fa3():
     backend = object.__new__(TritonAttnBackend)
-    leaves, adapter = _validate_dvr_attention_backend(backend)
+    leaves, adapter = validate_dvr_attention_backend(backend)
     assert leaves == [backend] and adapter is None
 
     fa4 = object.__new__(FlashAttentionBackend)
     fa4.fa_impl_ver = 4
     with pytest.raises(RuntimeError, match="requires FlashAttention 3"):
-        _validate_dvr_attention_backend(fa4)
+        validate_dvr_attention_backend(fa4)
 
 
 def test_draft_fusion_policy_preserves_user_intent_and_reuses_auto_policy(
     monkeypatch,
 ):
     server_args = SimpleNamespace(
-        _dvr_draft_flashinfer_allreduce_fusion=("trtllm", False)
+        dvr_draft_flashinfer_allreduce_fusion=("trtllm", False)
     )
     assert _resolve_draft_flashinfer_allreduce_fusion(server_args) == "trtllm"
 
-    server_args._dvr_draft_flashinfer_allreduce_fusion = (None, True)
+    server_args.dvr_draft_flashinfer_allreduce_fusion = (None, True)
     assert _resolve_draft_flashinfer_allreduce_fusion(server_args) is None
 
     import sglang.srt.arg_groups.overrides as overrides
 
-    server_args._dvr_draft_flashinfer_allreduce_fusion = (None, False)
+    server_args.dvr_draft_flashinfer_allreduce_fusion = (None, False)
     monkeypatch.setattr(
         overrides,
         "_flashinfer_allreduce_fusion_auto_enable",
@@ -257,8 +263,8 @@ def test_self_draft_preinitializes_fusion_before_custom_all_reduce(monkeypatch):
     server_args = SimpleNamespace(
         enable_deterministic_inference=True,
         flashinfer_allreduce_fusion_backend=None,
-        _dvr_enable_draft_custom_all_reduce=True,
-        _dvr_draft_flashinfer_allreduce_fusion=("trtllm", False),
+        dvr_enable_draft_custom_all_reduce=True,
+        dvr_draft_flashinfer_allreduce_fusion=("trtllm", False),
     )
     global_server_args = SimpleNamespace(
         enable_deterministic_inference=True,

@@ -128,7 +128,7 @@ class ModelRunnerKVCacheMixin:
             )
             rest_memory -= proposal_bytes / (1 << 30)
         if (
-            self.spec_algorithm.uses_eagle_draft_backend()
+            self.spec_algorithm.is_dvr_eagle()
             and self.server_args.speculative_use_rejection_sampling
             and not self.server_args.disable_overlap_schedule
         ):
@@ -190,7 +190,6 @@ class ModelRunnerKVCacheMixin:
                         current_platform.is_cpu(),
                         server_args.speculative_eagle_topk,
                     ),
-                    draft_reuses_target_state=self.spec_algorithm.is_dvr_self_draft(),
                 )
             else:
                 intermediate_per_req = (

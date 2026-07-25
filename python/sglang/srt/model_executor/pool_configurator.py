@@ -141,7 +141,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
         # reuse the target architecture's attention config.
         if (
-            mr.spec_algorithm.uses_eagle_draft_backend()
+            mr.spec_algorithm.is_eagle()
+            or mr.spec_algorithm.is_dvr_eagle()
             or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
             eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
@@ -321,7 +322,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # full-attn layers; budget into the full term.
         self._draft_full_layers_num = 0
         if (
-            mr.spec_algorithm.uses_eagle_draft_backend()
+            mr.spec_algorithm.is_eagle()
+            or mr.spec_algorithm.is_dvr_eagle()
             or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
             draft_layers = getattr(mr, "eagle_draft_num_layers", None)
