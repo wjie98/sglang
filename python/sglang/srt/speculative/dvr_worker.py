@@ -12,7 +12,6 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -40,7 +39,6 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
-    eagle_forward_target_verify,
     eagle_prepare_for_verify,
     eagle_sample,
 )
@@ -745,11 +743,10 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 )
 
         with spec_stage_span("verify"):
-            forward_output, vocab_mask = eagle_forward_target_verify(
-                spec_info,
-                batch,
-                self.target_worker,
-                verify_forward_batch,
+            forward_output = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
             )
 
         logits_output = forward_output.logits_output
@@ -760,14 +757,7 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
             )
 
         # Target acceptance semantics are independent of the draft backend.
-        # Accumulated penalties and logit bias are applied by eagle_sample;
-        # custom processors need the full verify width here.
-        if batch.sampling_info.has_custom_logit_processor:
-            apply_custom_logit_processor(
-                logits_output.next_token_logits,
-                batch.sampling_info,
-                num_tokens_in_batch=verify_tokens,
-            )
+        # Accumulated penalties and logit bias are applied by eagle_sample.
         if spec_info.spec_steps > 0 and not batch.sampling_info.is_all_greedy:
             expected_shape = (
                 len(batch.seq_lens),
@@ -799,7 +789,6 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 spec_info,
                 batch,
                 logits_output,
-                vocab_mask,
                 target_prob_filter=self.model_runner.sampler.normalize_probs,
             )
             if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:

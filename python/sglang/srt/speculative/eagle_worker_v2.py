@@ -68,7 +68,6 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
-    eagle_forward_target_verify,
     eagle_prepare_for_verify,
     eagle_sample,
     get_draft_recurrent_hidden_state_spec,
@@ -80,6 +79,7 @@ from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     draft_tp_context,
     fast_sample,
+    generate_token_bitmask,
     load_token_map,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
@@ -1592,18 +1592,42 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
+        # Prepare grammar data on CPU if needed.
+        if batch.has_grammar:
+            retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
+            draft_tokens_cpu = verify_input.draft_token.view(
+                verify_input.retrieve_next_token.shape
+            ).cpu()
+
         # Run target verify batch in the main compute stream (GPU compute).
         # Metadata init is skipped iff cuda-graph already ran load_batch —
         # eagle_prepare_for_verify marked the batch in exactly that case; the
         # non-cuda-graph path stays unmarked and gets forward_extend's init
         # (post-pad).
-        forward_batch_output, vocab_mask = eagle_forward_target_verify(
-            verify_input,
-            batch,
-            self.target_worker,
-            verify_forward_batch,
+        forward_batch_output = self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
         )
         logits_output = forward_batch_output.logits_output
+
+        # Generate vocab mask for constrained decoding.
+        vocab_mask = None
+        if batch.has_grammar:
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                verify_input,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+                # Do not reuse the mask from the preceding EXTEND.
+                batch.sampling_info.vocab_mask = None
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")

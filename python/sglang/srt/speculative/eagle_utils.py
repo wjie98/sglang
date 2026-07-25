@@ -538,47 +538,6 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
-def eagle_forward_target_verify(
-    verify_input: EagleVerifyInput,
-    batch: ScheduleBatch,
-    target_worker: TpModelWorker,
-    verify_forward_batch,
-):
-    """Run target verify and build the optional constrained-decoding mask."""
-
-    grammar_inputs = None
-    if batch.has_grammar:
-        grammar_inputs = (
-            verify_input.retrieve_next_token.cpu(),
-            verify_input.retrieve_next_sibling.cpu(),
-            verify_input.draft_token.view(verify_input.retrieve_next_token.shape).cpu(),
-        )
-
-    forward_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
-    )
-
-    vocab_mask = None
-    if grammar_inputs is not None:
-        from sglang.srt.speculative.spec_utils import generate_token_bitmask
-
-        vocab_mask = generate_token_bitmask(
-            batch.reqs,
-            verify_input,
-            *grammar_inputs,
-            batch.sampling_info.vocab_size,
-        )
-        if vocab_mask is not None:
-            assert verify_input.grammar is not None
-            vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
-            # Do not reuse the mask from the preceding EXTEND.
-            batch.sampling_info.vocab_mask = None
-
-    return forward_output, vocab_mask
-
-
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -853,12 +812,20 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     from sglang.srt.server_args import get_global_server_args
 
-    max_alloc_len = int(nxt_kv_lens_cpu.max())
-    row_width = batch.req_to_token_pool.req_to_token.shape[1]
-    assert max_alloc_len <= row_width, (
-        f"Speculative draft over-allocation ({max_alloc_len}) exceeds "
-        f"req_to_token row width ({row_width}); page_size={page_size}."
-    )
+    server_args = get_global_server_args()
+    if (
+        batch.spec_algorithm.is_dvr_self_draft()
+        or (
+            page_size > 1
+            and (server_args.speculative_eagle_topk or 1) > 1
+        )
+    ):
+        max_alloc_len = int(nxt_kv_lens_cpu.max())
+        row_width = batch.req_to_token_pool.req_to_token.shape[1]
+        assert max_alloc_len <= row_width, (
+            f"Speculative draft over-allocation ({max_alloc_len}) exceeds "
+            f"req_to_token row width ({row_width}); page_size={page_size}."
+        )
 
     # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
     # barrier has chained to the prev forward -> host stalls a full forward.

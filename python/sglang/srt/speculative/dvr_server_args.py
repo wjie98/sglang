@@ -28,6 +28,10 @@ def handle_dvr_defaults(server_args):
         return
     server_args.speculative_algorithm = algorithm
 
+    if server_args.grammar_backend not in (None, "none"):
+        raise ValueError("DVR does not support grammar-constrained decoding.")
+    server_args.grammar_backend = "none"
+
     # Resolve the supported base before deterministic-inference defaults can
     # select FlashInfer on newer GPUs. Explicit phase backends still win.
     if server_args.attention_backend is None:
@@ -128,6 +132,10 @@ def handle_dvr_speculative_decoding(server_args):
 
     if current_platform.is_out_of_tree():
         raise ValueError("DVR requires SGLang's CUDA graph runner.")
+    if server_args.enable_custom_logit_processor:
+        raise ValueError("DVR does not support custom logit processors.")
+    if server_args.enable_return_hidden_states:
+        raise ValueError("DVR does not return user-requested hidden states.")
     if (
         server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is not None

@@ -60,6 +60,9 @@ class _Args:
     enable_linear_replayssm = False
     enable_unified_memory = False
     enable_two_batch_overlap = False
+    grammar_backend = None
+    enable_custom_logit_processor = False
+    enable_return_hidden_states = False
 
     def __init__(self):
         self.cuda_graph_config = SimpleNamespace(
@@ -201,6 +204,14 @@ class TestDVRServerArgs(unittest.TestCase):
         args = _Args()
         self.assertEqual(get_req_to_token_extra_context_len(args), 32)
 
+    def test_ordinary_spec_request_row_keeps_upstream_reservation(self):
+        args = _Args()
+        args.speculative_algorithm = "EAGLE"
+        args.page_size = 64
+        args.speculative_eagle_topk = 1
+
+        self.assertEqual(get_req_to_token_extra_context_len(args), 20)
+
     def test_dvr_self_draft_rejects_insufficient_cuda_graph_coverage(self):
         for padding_disabled, bs, max_bs in (
             (False, [1, 2], 2),
@@ -336,6 +347,27 @@ class TestDVRServerArgs(unittest.TestCase):
         args.sampling_backend = "custom"
         with self.assertRaisesRegex(ValueError, "built-in flashinfer and pytorch"):
             handle_dvr_speculative_decoding(args)
+
+    def test_dvr_rejects_unsupported_output_features(self):
+        for field, message in (
+            ("enable_custom_logit_processor", "custom logit processors"),
+            ("enable_return_hidden_states", "hidden states"),
+        ):
+            with self.subTest(field=field):
+                args = _Args()
+                setattr(args, field, True)
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_dvr_speculative_decoding(args)
+
+    def test_dvr_disables_grammar_and_rejects_explicit_backend(self):
+        args = _Args()
+        handle_dvr_defaults(args)
+        self.assertEqual(args.grammar_backend, "none")
+
+        args = _Args()
+        args.grammar_backend = "xgrammar"
+        with self.assertRaisesRegex(ValueError, "grammar-constrained"):
+            handle_dvr_defaults(args)
 
     def test_dvr_preserves_disabled_radix_cache_without_enabling_radix_tracking(self):
         for strategy in ("auto", "no_buffer", "extra_buffer", "extra_buffer_lazy"):
