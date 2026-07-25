@@ -4,13 +4,14 @@ import math
 from typing import Any, Optional
 
 import torch
+from sglang.srt.layers.attention.dvr.gdn_kernels import (
+    dvr_chunk_gated_delta_rule,
+    dvr_scatter_conv_window,
+    dvr_scatter_state,
+)
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
-from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-    fused_conv_window_scatter_with_mask,
-    fused_mamba_state_scatter_with_mask,
-)
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.nvtx_utils import profile_range
 
@@ -478,12 +479,13 @@ def dvr_gdn_intermediate_bytes_per_request(
         intermediate_conv_numel * cache_params.dtype.conv.itemsize
         + math.prod(cache_params.shape.temporal) * cache_params.dtype.temporal.itemsize
     )
-    if draft_reuses_target_state:
-        total += (
-            num_layers
-            * sum(math.prod(shape) for shape in cache_params.shape.conv)
-            * cache_params.dtype.conv.itemsize
-        )
+    # Target verify uses a request-owned conv scratch so the ordinary Mamba
+    # kernel can keep its in-place contract without touching accepted state.
+    total += (
+        num_layers
+        * sum(math.prod(shape) for shape in cache_params.shape.conv)
+        * cache_params.dtype.conv.itemsize
+    )
     local_key_heads, local_value_heads, key_dim, value_dim = _local_gdn_dimensions(
         cache_params.shape
     )
@@ -627,17 +629,14 @@ class DVRGDNStateAdapter:
         self.verify_checkpoint_slots = verify_checkpoint_slots
         self.chunk_size = chunk_size
         self._verify_metadata: Optional[tuple[torch.Tensor, ...]] = None
-        self.self_draft_conv = (
-            state_cache.conv[0].new_zeros(
-                (
-                    state_cache.conv[0].shape[0],
-                    state_cache.intermediate_ssm.shape[1],
-                    *state_cache.conv[0].shape[2:],
-                )
+        self.verify_conv = state_cache.conv[0].new_zeros(
+            (
+                state_cache.conv[0].shape[0],
+                state_cache.intermediate_ssm.shape[1],
+                *state_cache.conv[0].shape[2:],
             )
-            if draft_reuses_target_state
-            else None
         )
+        self.self_draft_conv = self.verify_conv if draft_reuses_target_state else None
 
     @classmethod
     def for_gdn(
@@ -776,10 +775,7 @@ class DVRGDNStateAdapter:
     def decode_state(self, *, layer_cache, forward_batch, layer_idx: int):
         """Return request-owned state for provisional DVR-self decode."""
 
-        if (
-            self.self_draft_conv is None
-            or not forward_batch.forward_mode.is_decode()
-        ):
+        if self.self_draft_conv is None or not forward_batch.forward_mode.is_decode():
             return None
         request_rows = forward_batch.req_pool_indices.to(
             device=layer_cache.temporal.device, dtype=torch.long
@@ -894,11 +890,19 @@ class DVRGDNStateAdapter:
             cache_indices[:batch_size],
             torch.zeros_like(cache_indices[:batch_size]),
         )
+        # The stock conv kernel is intentionally in-place. Run it on this tiny
+        # request-owned copy so target verify cannot mutate accepted endpoints.
+        self.verify_conv[:, request_rows] = self.state_cache.conv[0][
+            :, verify_conv_slots
+        ]
         # TARGET_VERIFY keeps seq_lens at the accepted endpoint while its
         # speculative cache rows are appended separately.
-        accepted_tail_lens = forward_batch.seq_lens[:batch_size].to(
-            device=cache_indices.device, dtype=torch.long
-        ) % self.chunk_size
+        accepted_tail_lens = (
+            forward_batch.seq_lens[:batch_size].to(
+                device=cache_indices.device, dtype=torch.long
+            )
+            % self.chunk_size
+        )
         accepted_tail_lens = torch.where(
             valid_mask,
             accepted_tail_lens,
@@ -918,12 +922,15 @@ class DVRGDNStateAdapter:
             boundary_state_steps,
         )
 
-    def verify_conv_indices(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return target conv slots and request-owned intermediate rows."""
+    def verify_conv_state(
+        self, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return verify scratch, its rows, and intermediate-output rows."""
 
         if self._verify_metadata is None:
             raise RuntimeError("DVR target-verify metadata was not prepared.")
-        return self._verify_metadata[2], self._verify_metadata[1]
+        request_rows = self._verify_metadata[1]
+        return self.verify_conv[layer_idx], request_rows, request_rows
 
     def forward_target_verify(
         self,
@@ -995,16 +1002,14 @@ class DVRGDNStateAdapter:
                 accepted_tail_lens=accepted_tail_lens,
                 valid_mask=valid_mask,
             )
-        core_attn_out, _, _ = self.kernel_dispatcher.extend(
+        core_attn_out, _, _ = dvr_chunk_gated_delta_rule(
             q=q,
             k=k,
             v=v,
             g=cached_g,
             beta=cached_beta,
-            ssm_states=self.state_cache.temporal[layer_idx],
-            cache_indices=checkpoint_slots,
-            query_start_loc=None,
-            inplace_update=False,
+            initial_state=self.state_cache.temporal[layer_idx],
+            initial_state_indices=checkpoint_slots,
             boundary_state=self.state_cache.intermediate_ssm[layer_idx, :, 0],
             boundary_state_indices=request_rows,
             boundary_state_steps=boundary_state_steps,
@@ -1038,49 +1043,49 @@ class DVRGDNStateAdapter:
         no_commit_step = torch.full_like(tail_lens_before, -1)
         # accept_lens includes the bonus token, so every non-idle request has a
         # valid accepted step. The fused scatter already handles the empty batch.
-        fused_conv_window_scatter_with_mask(
+        dvr_scatter_conv_window(
             self.state_cache.conv[0],
             self.state_cache.intermediate_conv_window[0],
-            accepted_conv_slots,
-            accepted_token_counts - 1,
-            src_indices_raw=request_rows,
+            source_rows=request_rows,
+            destination_rows=accepted_conv_slots,
+            source_steps=accepted_token_counts - 1,
         )
         # Convolution state is authoritative at the accepted endpoint; unlike
         # temporal state, it is cheap and necessary to resume the next conv.
         if self.self_draft_conv is not None:
-            fused_conv_window_scatter_with_mask(
+            dvr_scatter_conv_window(
                 self.self_draft_conv,
                 self.state_cache.intermediate_conv_window[0],
-                request_rows,
-                accepted_token_counts - 1,
-                src_indices_raw=request_rows,
+                source_rows=request_rows,
+                destination_rows=request_rows,
+                source_steps=accepted_token_counts - 1,
             )
 
         # Commit to the pool-selected next checkpoint slot. Radix execution uses
         # two slots so finish can publish either overlap boundary; without Radix,
         # the sole request-local slot is updated in place.
         with profile_range("boundary_publish"):
-            fused_mamba_state_scatter_with_mask(
+            dvr_scatter_state(
                 self.state_cache.temporal,
                 self.state_cache.intermediate_ssm,
-                next_checkpoint_slots,
-                torch.where(
+                source_rows=request_rows,
+                destination_rows=next_checkpoint_slots,
+                source_steps=torch.where(
                     crosses_chunk_boundary,
                     torch.zeros_like(tail_lens_before),
                     no_commit_step,
                 ),
-                src_indices_raw=request_rows,
             )
-            fused_conv_window_scatter_with_mask(
+            dvr_scatter_conv_window(
                 self.state_cache.conv[0],
                 self.state_cache.intermediate_conv_window[0],
-                next_checkpoint_slots,
-                torch.where(
+                source_rows=request_rows,
+                destination_rows=next_checkpoint_slots,
+                source_steps=torch.where(
                     crosses_chunk_boundary,
                     self.chunk_size - 1 - tail_lens_before,
                     no_commit_step,
                 ),
-                src_indices_raw=request_rows,
             )
         new_tail_lens = tail_lens_after - self.chunk_size
         tail_lens_after = torch.where(

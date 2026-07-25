@@ -2,10 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk import (
-    chunk_gated_delta_rule,
-    chunk_gated_delta_rule_fwd,
-)
+from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
@@ -14,22 +11,6 @@ from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_xpu_ci(est_time=900, suite="stage-b-test-1-gpu-xpu")
-
-
-class TestChunkBoundaryOutputArgs(unittest.TestCase):
-    def test_boundary_outputs_are_all_or_none(self):
-        with self.assertRaisesRegex(ValueError, "must be provided together"):
-            chunk_gated_delta_rule_fwd(
-                None,
-                None,
-                None,
-                None,
-                None,
-                1.0,
-                None,
-                None,
-                boundary_state=object(),
-            )
 
 
 @unittest.skipIf(
@@ -87,85 +68,6 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             use_qk_l2norm_in_kernel=True,
         )
         return o, pool
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_inplace_boundary_state_keeps_activation_dtype(self):
-        for state_dtype in (torch.bfloat16, torch.float32):
-            with self.subTest(state_dtype=state_dtype):
-                q = torch.randn(1, 64, 1, 16, dtype=torch.bfloat16, device="cuda")
-                k = torch.randn_like(q)
-                v = torch.randn_like(q)
-                g = torch.nn.functional.logsigmoid(
-                    torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
-                )
-                beta = torch.sigmoid(
-                    torch.randn(1, 64, 1, dtype=torch.float32, device="cuda")
-                )
-                initial_state = torch.zeros(
-                    1, 1, 16, 16, dtype=state_dtype, device="cuda"
-                )
-
-                output, _, boundary_states = chunk_gated_delta_rule(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    initial_state=initial_state,
-                    initial_state_indices=torch.zeros(
-                        1, dtype=torch.int32, device="cuda"
-                    ),
-                    use_qk_l2norm_in_kernel=True,
-                )
-
-                self.assertEqual(output.dtype, q.dtype)
-                self.assertEqual(boundary_states.dtype, q.dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_non_inplace_verify_preserves_initial_state(self):
-        q = torch.randn(1, 80, 1, 16, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn_like(q)
-        v = torch.randn_like(q)
-        g = torch.nn.functional.logsigmoid(
-            torch.randn(1, 80, 1, dtype=torch.float32, device="cuda")
-        )
-        beta = torch.sigmoid(torch.randn(1, 80, 1, dtype=torch.float32, device="cuda"))
-        initial_state = torch.randn(2, 1, 16, 16, device="cuda")
-        original = initial_state.clone()
-        boundary_state = torch.zeros_like(initial_state)
-
-        output, _, boundary_states = chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state=initial_state,
-            initial_state_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
-            use_qk_l2norm_in_kernel=True,
-            inplace_update=False,
-            boundary_state=boundary_state,
-            boundary_state_indices=torch.tensor([0], dtype=torch.int32, device="cuda"),
-            boundary_state_steps=torch.tensor([1], dtype=torch.int32, device="cuda"),
-        )
-
-        self.assertEqual(output.shape[1], 80)
-        self.assertEqual(boundary_states.shape[1], 2)
-        self.assertEqual(boundary_states.dtype, q.dtype)
-        self.assertTrue(torch.equal(initial_state, original))
-
-        reference_state = original.clone()
-        chunk_gated_delta_rule(
-            q[:, :64],
-            k[:, :64],
-            v[:, :64],
-            g[:, :64],
-            beta[:, :64],
-            initial_state=reference_state,
-            initial_state_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
-            use_qk_l2norm_in_kernel=True,
-        )
-        self.assertTrue(torch.equal(boundary_state[0], reference_state[1]))
 
     def _check_shape(
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42

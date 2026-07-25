@@ -5,6 +5,9 @@ import pytest
 import torch
 import sglang.srt.layers.attention.linear.dvr_gdn as dvr_gdn_module
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
+from sglang.srt.layers.attention.dvr.gdn_kernels import (
+    dvr_chunk_gated_delta_rule,
+)
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.linear.dvr_gdn import (
     DVRGDNStateAdapter,
@@ -63,9 +66,10 @@ def create_test_adapter(
 ):
     if state_cache is None:
         layers, slots = transition_windows[0].shape[:2]
+        physical_slots = max(slots, 16)
         state_cache = SimpleNamespace(
-            conv=(),
-            temporal=torch.empty(layers, slots, 1),
+            conv=(torch.empty(layers, physical_slots, 1, 1),),
+            temporal=torch.empty(layers, physical_slots, 1),
             intermediate_ssm=torch.empty(layers, slots, 1, 1),
             intermediate_conv_window=(),
         )
@@ -101,6 +105,67 @@ def prepare_prefill(adapter, *, prefix_lens, extend_lens, request_rows):
         forward_metadata=SimpleNamespace(has_mamba_track_mask=False),
     )
     return forward_batch
+
+
+def test_dvr_chunk_boundary_outputs_are_all_or_none():
+    with pytest.raises(ValueError, match="must be provided together"):
+        dvr_chunk_gated_delta_rule(
+            torch.empty(1, 1, 1, 1, dtype=torch.bfloat16),
+            torch.empty(1, 1, 1, 1, dtype=torch.bfloat16),
+            torch.empty(1, 1, 1, 1, dtype=torch.bfloat16),
+            torch.empty(1, 1, 1),
+            torch.empty(1, 1, 1),
+            initial_state=torch.empty(1, 1, 1, 1),
+            initial_state_indices=torch.zeros(1, dtype=torch.int32),
+            boundary_state=torch.empty(1),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dvr_chunk_preserves_source_and_exports_fp32_boundary():
+    torch.manual_seed(7)
+    q = torch.randn(1, 80, 1, 16, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = torch.nn.functional.logsigmoid(
+        torch.randn(1, 80, 1, dtype=torch.float32, device="cuda")
+    )
+    beta = torch.sigmoid(torch.randn(1, 80, 1, dtype=torch.float32, device="cuda"))
+    source = torch.randn(2, 1, 16, 16, device="cuda")
+    original = source.clone()
+    boundary = torch.zeros_like(source)
+
+    output, _, chunk_states = dvr_chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=source,
+        initial_state_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        boundary_state=boundary,
+        boundary_state_indices=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        boundary_state_steps=torch.tensor([1], dtype=torch.int32, device="cuda"),
+    )
+
+    assert output.shape[1] == 80
+    assert chunk_states.dtype == q.dtype
+    assert torch.equal(source, original)
+
+    reference = original.clone()
+    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+
+    chunk_gated_delta_rule(
+        q[:, :64],
+        k[:, :64],
+        v[:, :64],
+        g[:, :64],
+        beta[:, :64],
+        initial_state=reference,
+        initial_state_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        use_qk_l2norm_in_kernel=True,
+    )
+    assert torch.equal(boundary[0], reference[1])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -212,6 +277,9 @@ def test_gdn_memory_estimate_matches_allocation():
     allocated_per_request += (
         adapter.verify_checkpoint_slots.numel()
         * adapter.verify_checkpoint_slots.element_size()
+    )
+    allocated_per_request += (
+        adapter.verify_conv.numel() * adapter.verify_conv.element_size()
     )
     allocated_per_request //= num_slots
     checkpoint_lanes = 2
@@ -464,13 +532,14 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
     assert torch.equal(accepted_tail_lens, torch.tensor([63, 0]))
     assert torch.equal(valid_mask, torch.tensor([True, False]))
     assert torch.equal(boundary_state_steps, torch.tensor([1, -1]))
-    conv_slots, intermediate_rows = adapter.verify_conv_indices()
-    assert torch.equal(conv_slots, torch.tensor([7, 0]))
+    conv_state, conv_slots, intermediate_rows = adapter.verify_conv_state(0)
+    assert conv_state.data_ptr() == adapter.verify_conv[0].data_ptr()
+    assert torch.equal(conv_slots, torch.tensor([2, 0]))
     assert torch.equal(intermediate_rows, torch.tensor([2, 0]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_gdn_verify_exports_boundary_into_workspace():
+def test_gdn_verify_exports_boundary_into_workspace(monkeypatch):
     state_shape = Mamba2StateShape.create(
         tp_world_size=2,
         intermediate_size=32 * 128,
@@ -499,13 +568,11 @@ def test_gdn_verify_exports_boundary_into_workspace():
             torch.empty(0, device="cuda"),
         )
 
-    dispatcher = SimpleNamespace(extend=extend)
     state_cache = SimpleNamespace(
-        conv=(),
+        conv=(torch.zeros(1, 3, 1, 1, device="cuda"),),
         temporal=torch.zeros(1, 3, 16, 128, 128, device="cuda"),
         intermediate_ssm=torch.zeros(1, 3, 1, 16, 128, 128, device="cuda"),
     )
-    adapter.kernel_dispatcher = dispatcher
     adapter.state_cache = state_cache
     adapter._verify_metadata = (
         torch.tensor([0], device="cuda"),
@@ -517,6 +584,7 @@ def test_gdn_verify_exports_boundary_into_workspace():
     )
 
     query = torch.ones(1, 2, 8, 128, device="cuda")
+    monkeypatch.setattr(dvr_gdn_module, "dvr_chunk_gated_delta_rule", extend)
     output = adapter.forward_target_verify(
         query=query,
         key=torch.zeros(1, 2, 8, 128, device="cuda"),
@@ -526,8 +594,9 @@ def test_gdn_verify_exports_boundary_into_workspace():
         layer_idx=0,
     )
     assert output.shape == (1, 2, 16, 128)
-    assert calls[0]["inplace_update"] is False
-    assert torch.equal(calls[0]["cache_indices"], torch.tensor([0], device="cuda"))
+    assert torch.equal(
+        calls[0]["initial_state_indices"], torch.tensor([0], device="cuda")
+    )
     assert torch.equal(
         calls[0]["boundary_state_indices"], torch.tensor([1], device="cuda")
     )
@@ -726,23 +795,23 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
     conv_scatters = []
     monkeypatch.setattr(
         dvr_gdn_module,
-        "fused_mamba_state_scatter_with_mask",
-        lambda _dst, _src, indices, steps, **kwargs: temporal_scatters.append(
+        "dvr_scatter_state",
+        lambda _dst, _src, **kwargs: temporal_scatters.append(
             (
-                indices.tolist(),
-                steps.tolist(),
-                kwargs.get("src_indices_raw").tolist(),
+                kwargs["destination_rows"].tolist(),
+                kwargs["source_steps"].tolist(),
+                kwargs["source_rows"].tolist(),
             )
         ),
     )
     monkeypatch.setattr(
         dvr_gdn_module,
-        "fused_conv_window_scatter_with_mask",
-        lambda _dst, _src, indices, steps, **kwargs: conv_scatters.append(
+        "dvr_scatter_conv_window",
+        lambda _dst, _src, **kwargs: conv_scatters.append(
             (
-                indices.tolist(),
-                steps.tolist(),
-                kwargs.get("src_indices_raw").tolist(),
+                kwargs["destination_rows"].tolist(),
+                kwargs["source_steps"].tolist(),
+                kwargs["source_rows"].tolist(),
             )
         ),
     )
@@ -755,10 +824,10 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
         ),
     )
     state_cache = SimpleNamespace(
-        temporal=torch.empty(1),
-        intermediate_ssm=torch.empty(1),
-        conv=(torch.empty(1),),
-        intermediate_conv_window=(torch.empty(1),),
+        temporal=torch.empty(1, 9, 1),
+        intermediate_ssm=torch.empty(1, 3, 1, 1),
+        conv=(torch.empty(1, 9, 1, 1),),
+        intermediate_conv_window=(torch.empty(1, 3, 2, 1, 1),),
     )
     adapter = create_test_adapter(
         state_cache=state_cache,

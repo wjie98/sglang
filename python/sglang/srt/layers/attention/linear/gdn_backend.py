@@ -277,9 +277,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert (
-                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
+                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            )
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
@@ -498,9 +498,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             verify_conv_slots = cache_indices[:batch_size]
             if dvr_state_adapter is not None:
                 (
+                    conv_states,
                     verify_conv_slots,
                     intermediate_state_indices,
-                ) = dvr_state_adapter.verify_conv_indices()
+                ) = dvr_state_adapter.verify_conv_state(layer_idx)
 
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
@@ -514,9 +515,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=verify_conv_slots,
                 intermediate_conv_window=intermediate_conv_window_cache,
                 intermediate_state_indices=intermediate_state_indices[:batch_size],
-                # DVR commits the accepted candidate from the intermediate
-                # window after sampling; verify must not mutate the endpoint.
-                update_conv_state=dvr_state_adapter is None,
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
@@ -596,27 +594,38 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            boundary_state_args = {}
             if self._dvr_extend_boundary_metadata is not None:
+                from sglang.srt.layers.attention.dvr.gdn_kernels import (
+                    dvr_chunk_gated_delta_rule,
+                )
+
                 boundary_state_indices, boundary_state_steps = (
                     self._dvr_extend_boundary_metadata
                 )
-                boundary_state_args = {
-                    "boundary_state": ssm_states,
-                    "boundary_state_indices": boundary_state_indices,
-                    "boundary_state_steps": boundary_state_steps,
-                }
-            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
-                query_start_loc=query_start_loc,
-                **boundary_state_args,
-            )
+                core_attn_out, last_recurrent_state, h = dvr_chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=ssm_states_contig,
+                    initial_state_indices=state_cache_indices,
+                    cu_seqlens=query_start_loc,
+                    boundary_state=ssm_states,
+                    boundary_state_indices=boundary_state_indices,
+                    boundary_state_steps=boundary_state_steps,
+                )
+            else:
+                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states_contig,
+                    cache_indices=state_cache_indices,
+                    query_start_loc=query_start_loc,
+                )
             if dvr_state_adapter is not None:
                 # Cache target-model GDN tail inputs for later DVR verify/replay.
                 dvr_state_adapter.cache_prefill_transitions(

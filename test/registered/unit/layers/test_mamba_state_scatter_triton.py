@@ -10,14 +10,12 @@ import torch
 
 try:
     from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-        fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
     )
 
     _FUSED_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
     fused_mamba_state_scatter_with_mask = None
-    fused_conv_window_scatter_with_mask = None
     _FUSED_IMPORT_ERROR = e
 
 
@@ -165,58 +163,6 @@ def _time_cuda_ms(fn, iters=50, warmup=10):
 
 
 class TestMambaStateScatterCorrectness(unittest.TestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
-    def test_conv_scatter_supports_explicit_source_rows(self):
-        physical = torch.arange(1 * 6 * 2 * 4, device="cuda", dtype=torch.float32).view(
-            1, 6, 2, 4
-        )
-        src = physical.as_strided(
-            (1, 6, 2, 2, 3),
-            (
-                physical.stride(0),
-                physical.stride(1),
-                physical.stride(3),
-                physical.stride(2),
-                physical.stride(3),
-            ),
-        )
-        dst = torch.zeros(1, 6, 2, 3, device="cuda")
-        dst_indices = torch.tensor([4, 2], device="cuda")
-        src_indices = torch.tensor([3, 5], device="cuda")
-        steps = torch.tensor([1, -1], device="cuda")
-
-        fused_conv_window_scatter_with_mask(
-            dst,
-            src,
-            dst_indices,
-            steps,
-            src_indices_raw=src_indices,
-        )
-
-        torch.testing.assert_close(dst[:, 4], src[:, 3, 1])
-        torch.testing.assert_close(dst[:, 2], torch.zeros_like(dst[:, 2]))
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
-    def test_fused_supports_explicit_source_rows(self):
-        dst = torch.zeros(1, 6, 4, device="cuda")
-        src = torch.arange(1 * 6 * 1 * 4, device="cuda", dtype=torch.float32).view(
-            1, 6, 1, 4
-        )
-        dst_indices = torch.tensor([4, 2], device="cuda")
-        src_indices = torch.tensor([3, 5], device="cuda")
-        steps = torch.tensor([0, -1], device="cuda")
-
-        fused_mamba_state_scatter_with_mask(
-            dst,
-            src,
-            dst_indices,
-            steps,
-            src_indices_raw=src_indices,
-        )
-
-        torch.testing.assert_close(dst[:, 4], src[:, 3, 0])
-        torch.testing.assert_close(dst[:, 2], torch.zeros_like(dst[:, 2]))
-
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
     def test_fused_matches_reference(self):
         """Test that fused_mamba_state_scatter_with_mask matches the reference."""
