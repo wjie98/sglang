@@ -253,11 +253,19 @@ class FlashAttentionBackend(AttentionBackend):
         self.max_num_pages = (
             self.max_context_len + self.page_size - 1
         ) // self.page_size
-        # Opt out of the seq_lens_cpu D2H only for dflash (the worker adapted to
-        # the GPU-only relay); EAGLE/MTP/standalone/non-spec keep the CPU mirror.
-        self.needs_cpu_seq_lens = not SpeculativeAlgorithm.from_string(
+        spec_algorithm = SpeculativeAlgorithm.from_string(
             model_runner.server_args.speculative_algorithm
-        ).is_dflash()
+        )
+        # Topk-1 self-DVR uses only the device-side normal-decode and target-
+        # verify page-table builders. Other EAGLE modes still have host-max
+        # draft-extend branches and therefore retain the CPU mirror.
+        gpu_only_dvr = (
+            spec_algorithm.is_dvr_self_draft()
+            and (model_runner.server_args.speculative_eagle_topk or 1) == 1
+            and not model_runner.model_config.is_local_attention_model
+            and not getattr(model_runner, "prefill_aware_swa", False)
+        )
+        self.needs_cpu_seq_lens = not (spec_algorithm.is_dflash() or gpu_only_dvr)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size

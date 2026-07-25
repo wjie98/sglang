@@ -481,6 +481,7 @@ def dvr_gdn_intermediate_bytes_per_request(
     cache_params,
     num_draft_tokens: int,
     *,
+    checkpoint_lanes: int,
     dedup_conv_window: bool,
     draft_reuses_target_state: bool,
 ) -> int:
@@ -514,9 +515,12 @@ def dvr_gdn_intermediate_bytes_per_request(
         + local_value_heads * value_dim * cache_params.dtype.conv.itemsize
         + 2 * local_value_heads * torch.float32.itemsize
     )
-    # Persistent k/v/g/beta transition windows plus the int64 boundary slot.
+    # Persistent k/v/g/beta transition windows, the selected boundary slot,
+    # and request-local checkpoint lengths mirrored by DVRStateLifecycle.
     return (
-        total + num_layers * (FLA_CHUNK_SIZE + num_draft_tokens) * values_per_token + 8
+        total
+        + num_layers * (FLA_CHUNK_SIZE + num_draft_tokens) * values_per_token
+        + (1 + checkpoint_lanes) * torch.int64.itemsize
     )
 
 
@@ -673,6 +677,10 @@ class DVRGDNStateAdapter:
         state_cache = (
             model_runner.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
+        if len(state_cache.conv) != 1:
+            raise RuntimeError(
+                "DVR GDN currently supports exactly one convolution state per layer."
+            )
         state_tensors = (state_cache.temporal, *getattr(state_cache, "conv", ()))
         if any(not tensor.is_contiguous() for tensor in state_tensors):
             raise RuntimeError(

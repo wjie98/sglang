@@ -127,6 +127,20 @@ class ModelRunnerKVCacheMixin:
                 * torch.float32.itemsize
             )
             rest_memory -= proposal_bytes / (1 << 30)
+        if (
+            self.spec_algorithm.uses_eagle_draft_backend()
+            and self.server_args.speculative_use_rejection_sampling
+            and not self.server_args.disable_overlap_schedule
+        ):
+            # FutureMap persists the next EAGLE proposal row by request. It is
+            # allocated after pool profiling, so reserve it here.
+            request_rows = (
+                self.server_args.max_running_requests // self.server_args.dp_size + 1
+            )
+            proposal_bytes = (
+                request_rows * self.model_config.vocab_size * torch.float32.itemsize
+            )
+            rest_memory -= proposal_bytes / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
@@ -170,6 +184,7 @@ class ModelRunnerKVCacheMixin:
                 intermediate_per_req = dvr_gdn_intermediate_bytes_per_request(
                     config.mamba2_cache_params,
                     draft_steps,
+                    checkpoint_lanes=(1 if server_args.disable_radix_cache else 2),
                     dedup_conv_window=conv_window_dedup_enabled(
                         _is_npu,
                         current_platform.is_cpu(),

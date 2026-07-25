@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
@@ -180,6 +181,16 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
 
         self.assertIs(result, cache)
+
+
+class TestMambaRadixCapabilities(CustomTestCase):
+    def test_int8_checkpoint_pool_does_not_preserve_request_slots(self):
+        cache = object.__new__(MambaRadixCache)
+        cache.req_to_token_pool = SimpleNamespace(mamba_ckpt_pool=None)
+        self.assertTrue(cache.preserves_mamba_request_slots())
+
+        cache.req_to_token_pool.mamba_ckpt_pool = object()
+        self.assertFalse(cache.preserves_mamba_request_slots())
 
 
 class TestDefaultRadixCacheFactory(CustomTestCase):

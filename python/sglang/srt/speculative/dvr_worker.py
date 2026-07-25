@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -401,6 +402,15 @@ class DecodeVerifyRollbackWorkerV2(BaseSpecWorker):
                 nccl_port,
                 target_worker,
             )
+            if any(
+                isinstance(module, RadixLinearAttention)
+                or callable(getattr(module, "_forward_mamba", None))
+                for module in self._draft_worker.draft_runner.model.modules()
+            ):
+                raise NotImplementedError(
+                    "DVR EAGLE requires a stateless/full-attention draft model; "
+                    "recurrent draft-model state is not managed by DVR."
+                )
             # Reuse the upstream EAGLE/MTP worker as the draft backend. DVR owns
             # target verify and rollback, not a second copy of EAGLE draft logic.
             if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():

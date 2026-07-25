@@ -138,6 +138,13 @@ def handle_dvr_speculative_decoding(server_args):
         and server_args.speculative_draft_model_path is None
     ):
         raise ValueError("DVR EAGLE requires setting --speculative-draft-model-path.")
+    if (
+        server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
+        and server_args.max_running_requests is None
+    ):
+        # Match the upstream EAGLE default so its request-indexed FutureMap
+        # buffers have a bounded capacity before memory-pool profiling.
+        server_args.max_running_requests = 48
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = (
             2

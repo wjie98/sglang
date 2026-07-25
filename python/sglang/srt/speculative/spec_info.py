@@ -134,8 +134,12 @@ class SpeculativeAlgorithm(Enum):
         return self.is_dflash()
 
     def has_draft_kv(self) -> bool:
-        """Whether the draft phase owns a separate KV chain."""
-        return not (self.is_ngram() or self.is_dvr_self_draft())
+        """Whether the draft phase writes speculative KV entries."""
+        return not self.is_ngram()
+
+    def has_separate_draft_kv_pool(self) -> bool:
+        """Whether draft KV is owned by a separate model worker."""
+        return self.has_draft_kv() and not self.is_dvr_self_draft()
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden

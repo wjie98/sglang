@@ -101,6 +101,9 @@ class CustomSpecAlgo:
         # Conservative default: the larger KV reserve.
         return True
 
+    def has_separate_draft_kv_pool(self) -> bool:
+        return self.has_draft_kv()
+
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
 

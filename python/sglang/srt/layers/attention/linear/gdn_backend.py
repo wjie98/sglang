@@ -514,6 +514,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=verify_conv_slots,
                 intermediate_conv_window=intermediate_conv_window_cache,
                 intermediate_state_indices=intermediate_state_indices[:batch_size],
+                # DVR commits the accepted candidate from the intermediate
+                # window after sampling; verify must not mutate the endpoint.
+                update_conv_state=dvr_state_adapter is None,
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,

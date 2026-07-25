@@ -177,6 +177,29 @@ def test_backend_resolution_returns_attention_and_linear_state_once():
     assert resolved_adapter is adapter
 
 
+def test_hybrid_backend_propagates_cpu_sequence_length_requirement():
+    class Backend:
+        token_to_kv_pool = object()
+        req_to_token_pool = object()
+
+        def __init__(self, needs_cpu_seq_lens):
+            self.needs_cpu_seq_lens = needs_cpu_seq_lens
+
+    model_runner = SimpleNamespace(
+        kv_cache_dtype=torch.bfloat16,
+        token_to_kv_pool=object(),
+        req_to_token_pool=object(),
+    )
+
+    hybrid = HybridAttnBackend(
+        model_runner=model_runner,
+        prefill_backend=Backend(True),
+        decode_backend=Backend(False),
+    )
+
+    assert hybrid.needs_cpu_seq_lens
+
+
 def test_backend_resolution_rejects_distinct_linear_state_adapters():
     class Backend:
         token_to_kv_pool = object()

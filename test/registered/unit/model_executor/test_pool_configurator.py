@@ -565,6 +565,47 @@ class TestEagleConfigurator(unittest.TestCase):
         )
         self.assertLessEqual(used, available)
 
+    def test_rejection_future_map_is_reserved_before_pool_sizing(self):
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            ModelRunnerKVCacheMixin,
+        )
+
+        runner = SimpleNamespace(
+            device="cuda",
+            gpu_id=0,
+            mem_fraction_static=0.9,
+            spec_algorithm=SimpleNamespace(
+                is_dvr_self_draft=lambda: False,
+                uses_eagle_draft_backend=lambda: True,
+            ),
+            server_args=SimpleNamespace(
+                speculative_use_rejection_sampling=True,
+                disable_overlap_schedule=False,
+                max_running_requests=48,
+                dp_size=1,
+            ),
+            model_config=SimpleNamespace(vocab_size=100),
+            mambaish_config=None,
+        )
+        world = SimpleNamespace(world_size=1, cpu_group=None)
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner_kv_cache_mixin."
+                "get_available_gpu_memory",
+                return_value=10.0,
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner_kv_cache_mixin."
+                "get_world_group",
+                return_value=world,
+            ),
+        ):
+            actual = ModelRunnerKVCacheMixin._profile_available_bytes(runner, 2.0)
+
+        base_bytes = int((10.0 - 2.0 * 0.1) * (1 << 30))
+        expected_reserve = (48 + 1) * 100 * 4
+        self.assertLessEqual(abs(actual - (base_bytes - expected_reserve)), 1)
+
 
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):

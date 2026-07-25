@@ -239,6 +239,16 @@ class TestDVRServerArgs(unittest.TestCase):
         self.assertFalse(args.disable_radix_cache)
         self.assertFalse(args.enable_mixed_chunk)
 
+    def test_dvr_eagle_bounds_default_request_capacity(self):
+        args = _Args()
+        args.speculative_algorithm = DVR_EAGLE_SPECULATIVE_ALGORITHM
+        args.speculative_draft_model_path = "draft"
+        args.max_running_requests = None
+
+        handle_dvr_speculative_decoding(args)
+
+        self.assertEqual(args.max_running_requests, 48)
+
     def test_dvr_gdn_disables_default_prefill_cuda_graph(self):
         args = _Args()
         with patch(

@@ -183,6 +183,27 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+def test_causal_conv1d_update_can_leave_state_unchanged():
+    device = get_device()
+    torch.manual_seed(0)
+    x = torch.randn(2, 128, 3, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(128, 4, device=device, dtype=torch.bfloat16)
+    state = torch.randn(2, 128, 3, device=device, dtype=torch.bfloat16)
+    original = state.clone()
+
+    output = causal_conv1d_update(
+        x,
+        state,
+        weight,
+        update_conv_state=False,
+    )
+    reference_state = original.clone()
+    reference = causal_conv1d_update(x, reference_state, weight)
+
+    assert torch.equal(state, original)
+    torch.testing.assert_close(output, reference)
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])

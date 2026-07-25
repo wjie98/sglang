@@ -41,8 +41,10 @@ def test_dvr_algorithm_contracts():
     assert eagle_draft.uses_eagle_draft_backend()
     assert not self_draft.need_topk()
     assert eagle_draft.need_topk()
-    assert not self_draft.has_draft_kv()
+    assert self_draft.has_draft_kv()
     assert eagle_draft.has_draft_kv()
+    assert not self_draft.has_separate_draft_kv_pool()
+    assert eagle_draft.has_separate_draft_kv_pool()
 
 
 def test_proposal_filter_matches_target_distribution():

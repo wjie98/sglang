@@ -17,8 +17,18 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 def create_gdn_adapter(
     *, num_layers, num_slots, num_draft_tokens, state_shape, dtype, device
 ):
+    conv_dim, conv_window = state_shape.conv[0]
     state_cache = SimpleNamespace(
-        conv=(),
+        conv=(
+            torch.empty(
+                num_layers,
+                num_slots,
+                conv_dim,
+                conv_window,
+                dtype=dtype,
+                device=device,
+            ),
+        ),
         temporal=torch.empty(num_layers, 1, dtype=torch.float32),
         intermediate_ssm=torch.empty(num_layers, num_slots, 1, dtype=torch.float32),
     )
@@ -196,6 +206,8 @@ def test_gdn_memory_estimate_matches_allocation():
         * adapter.verify_boundary_slots.element_size()
     )
     allocated_per_request //= num_slots
+    checkpoint_lanes = 2
+    allocated_per_request += checkpoint_lanes * torch.int64.itemsize
     allocated_per_request += num_layers * (
         math.prod(state_shape.temporal) * torch.float32.itemsize
         + sum(
@@ -207,6 +219,7 @@ def test_gdn_memory_estimate_matches_allocation():
     assert allocated_per_request == dvr_gdn_intermediate_bytes_per_request(
         params,
         num_draft_tokens,
+        checkpoint_lanes=checkpoint_lanes,
         dedup_conv_window=True,
         draft_reuses_target_state=False,
     )
@@ -223,6 +236,7 @@ def test_dvr_gdn_adapter_maps_request_and_state_slots():
         conv_kernel=4,
     )
     all_layers_state_cache = SimpleNamespace(
+        conv=(torch.zeros(1, 3, 4096, 3),),
         temporal=torch.zeros(1, 3, 16, 128, 128),
         # DVR stores only the exported chunk-boundary recurrent state here;
         # the state-input window still needs all four draft positions.

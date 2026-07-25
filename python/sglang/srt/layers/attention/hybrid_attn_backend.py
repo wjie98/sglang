@@ -24,6 +24,10 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.needs_cpu_seq_lens = (
+            prefill_backend.needs_cpu_seq_lens
+            or decode_backend.needs_cpu_seq_lens
+        )
 
     def _select_backend(self, forward_mode: ForwardMode) -> AttentionBackend:
         """
