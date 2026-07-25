@@ -89,12 +89,12 @@ verify consumes `q` only for the current candidate outputs.
 The state transition is:
 
 1. Target EXTEND establishes the latest exact boundary and caches the inputs
-   after that boundary. With Radix disabled, this is a request-local checkpoint
-   and a later request performs an ordinary full prefill.
-2. Under overlap scheduling, the request's two physical checkpoint slots stay
-   fixed. Unfinished-prefill result processing copies the latest `keep`
-   checkpoint into an independent Radix slot, so the first DVR decode can be
-   scheduled before that CPU result is consumed.
+   after that boundary in the target request's live Mamba slot. Its convolution
+   state remains at the accepted endpoint. With Radix disabled, a later request
+   performs an ordinary full prefill.
+2. A boundary produced by EXTEND or accepted verify may also be copied into an
+   ordinary Radix tracking lane. DVR records its logical length but does not
+   change the request-to-Mamba mapping or Radix ownership rules.
 3. Target EXTEND seeds one request-owned self-draft recurrent workspace and
    convolution state. Self-draft mutates only this private state; EAGLE/MTP
    advances its upstream-owned draft cache. Neither backend changes the
@@ -105,10 +105,10 @@ The state transition is:
    returned, and the exported boundary state is staged in the now-idle
    self-draft workspace.
 5. Rollback commits only accepted rows. Crossing a 64-token boundary publishes
-   the staged boundary state into the alternate checkpoint slot and compacts
-   the input window. Self-draft then rebuilds its private endpoint from the
-   newest exact boundary plus the accepted tail; EAGLE/MTP skips this target
-   recurrent-state reconstruction.
+   the staged boundary into the target live slot and, when enabled, a Radix
+   tracking lane, then compacts the input window. Self-draft rebuilds its
+   private endpoint from the newest exact boundary plus the accepted tail;
+   EAGLE/MTP skips this target recurrent-state reconstruction.
 6. Request release publishes the newest exact checkpoint no later than the
    visible committed prefix. Radix stores only that aligned prefix; a later
    request rebuilds the non-aligned suffix through ordinary EXTEND. If no such
@@ -119,8 +119,8 @@ The state transition is:
 
 At every draft boundary, `checkpoint_length + tail_length` must equal the
 committed target history. The checkpoint and cached state inputs must originate
-from that same history. An active request's physical checkpoint mapping is
-immutable from target EXTEND through draft, verify, and rollback.
+from that same history. Target verify reads only the active request's live
+boundary; ordinary Radix publication slots are never used as verify inputs.
 
 ## Compatibility contracts
 
@@ -137,9 +137,9 @@ In particular:
 - custom all-reduce may be captured for provisional draft execution but is not
   enabled for target prefill or verify;
 - Triton and FA3 draft decode retain their normal split configuration;
-- recurrent checkpoints are request-owned; unfinished Radix insertion copies
-  `keep` instead of rebinding those slots, without changing ordinary
-  Radix-disabled semantics.
+- the target live boundary is request-owned; only exact boundaries are copied
+  to Radix, while DVR leaves ordinary Radix slot allocation and rebinding
+  semantics unchanged.
 
 GDN DVR does not currently support page-major recurrent-state storage,
 ReplaySSM, streaming sessions, or int8 recurrent checkpoints. These modes

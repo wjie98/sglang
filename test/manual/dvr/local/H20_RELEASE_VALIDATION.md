@@ -40,15 +40,15 @@ coverage.
 ### 3.1 State ownership
 
 - Full-attention KV uses the ordinary request-to-token and Radix pools.
-- The target live recurrent slot contains the state used by ordinary target
-  execution. It is not a cross-request checkpoint by itself.
-- With Radix enabled, the existing Mamba extra-buffer pool provides two
-  request-owned physical checkpoint slots. DVR records which exact 64-token
-  boundary each slot contains. Unfinished Radix insertion copies `keep` into
-  its own slot and never rebinds either active request slot.
-- With Radix disabled, one request-local checkpoint is sufficient. It is
-  discarded with the request; the next request must report no Radix reuse and
-  perform an ordinary full prefill.
+- The target request's live Mamba slot owns two deliberate timestamps:
+  temporal recurrent state is the latest exact 64-token boundary, while
+  convolution state is the accepted endpoint.
+- Existing Mamba ping-pong slots remain ordinary Radix publication buffers.
+  DVR records the logical boundary in each lane but never uses those lanes as
+  target-verify inputs or changes their upstream ownership rules.
+- With Radix disabled, publication metadata is absent. The active request
+  still keeps its live boundary and private DVR state; a later request performs
+  an ordinary full prefill.
 - Each GDN layer retains at most one unclosed 64-token tail plus the current
   draft rows as `k/v/g/beta` transition inputs; candidate `q` is supplied
   directly to verify. Self-draft additionally owns one request-indexed
@@ -58,35 +58,28 @@ coverage.
 ### 3.2 Closed transition
 
 1. **Target EXTEND prepare:** clear stale logical ownership for reused request
-   slots. Radix-enabled execution uses upstream Mamba tracking; Radix-disabled
-   execution installs the request-local tracking slot.
-2. **Target EXTEND state initialization:** after deferred Mamba COW resolves a
-   warm Radix hit into the request's live slot, copy that exact boundary into
-   the request's `keep` checkpoint on the forward stream. This whole-pool copy
-   runs eagerly before a prefill CUDA Graph; it must not be captured as
-   data-dependent indexing inside each GDN layer. Target EXTEND then consumes
-   the unclosed suffix and retains only the target inputs after the last
-   64-token boundary.
-3. **Target EXTEND finish:** publish exactly one authoritative boundary from an
-   upstream tracked state, the zero state, or the copied Radix prefix. Missing
-   all three sources is a correctness error.
-4. **Overlap publication:** preserve the standard FutureMap order:
-   `get_next_batch_to_run()` may construct the next batch before the previous
-   CPU result is consumed. Result processing may copy `keep` to Radix, but it
-   cannot change either request checkpoint address.
-5. **Draft:** select the newest exact boundary from the device-side boundary
-   table. Self-draft advances only its request-owned recurrent and
-   convolution state; EAGLE/MTP advances only its upstream-owned draft state.
-6. **Target verify:** read the exact target boundary without overwriting it and
-   run deterministic GDN EXTEND over `64 + D`. The Triton chunk kernel exports
-   the state before each chunk, so `h[:, 1]` is the exact state after the first
-   64 rows. Returned outputs correspond only to the `D` logical verify rows.
-7. **Rollback/commit:** commit convolution state at the last accepted input.
-   If `tail + accepted >= 64`, write `h[:, 1]` to the alternate checkpoint and
-   compact the state-input window by 64. Rebuild the private self-draft
-   recurrent endpoint from the new boundary plus accepted tail; EAGLE/MTP keeps
-   target and draft state separate and skips this reconstruction.
-8. **Release/re-hit:** publish the newest exact checkpoint not later than the
+   rows. A GDN warm prefix must be chunk-aligned; otherwise the request
+   recomputes from the nearest ordinary compatible prefix.
+2. **Target EXTEND:** write the latest exact recurrent boundary to the target
+   live temporal slot, leave target convolution state at the accepted endpoint,
+   cache only post-boundary `k/v/g/beta`, and seed private self-draft state. If
+   EXTEND creates a new exact boundary, copy the matching temporal and
+   convolution checkpoint to an ordinary Radix tracking lane.
+3. **Draft:** self-draft advances only its private recurrent and convolution
+   state. EAGLE/MTP advances only its upstream-owned draft cache.
+4. **Target verify:** read the target live boundary without overwriting it and
+   run the dedicated deterministic DVR GDN operator over the fixed `64 + D`
+   physical window. Return only the `D` logical rows and stage the possible
+   exact `h64` in the now-idle self-draft workspace.
+5. **Rollback/commit:** commit convolution state at the last accepted input.
+   If `tail + accepted >= 64`, publish staged `h64` into the target live slot
+   and selected Radix lane, then compact the state-input window by 64. Rebuild
+   private self-draft state from the new boundary plus accepted tail;
+   EAGLE/MTP skips this target reconstruction.
+6. **Overlap publication:** all state writes are enqueued before the worker
+   returns its FutureMap. No accepted length or state metadata is read back to
+   the host. Only request release waits on the existing rollback event.
+7. **Release/re-hit:** select the newest recorded checkpoint not later than the
    visible committed prefix. Radix truncates its stored token KV to the same
    length. A new request matches that aligned state and recomputes the remaining
    suffix through ordinary EXTEND. If output trimming leaves no retained
@@ -103,11 +96,10 @@ coverage.
   committed state length.
 - The boundary and `k/v/g/beta` window come from the same accepted target
   history; rejected rows never become authoritative.
-- An active request's physical checkpoint mapping cannot change between target
-  EXTEND and cache release.
-- Warm-prefix boundary initialization uses the final physical source and
-  destination slots after COW. It executes before both eager and graphed target
-  EXTEND and covers every layer's temporal and convolution state.
+- The target live temporal slot is the only target-verify boundary source.
+  Radix lane rebinding cannot change it.
+- Every published boundary contains matching temporal and convolution state at
+  the same exact 64-token position.
 - `D <= 64`, so one verify transaction crosses at most one recurrent chunk.
 - `return_logprob=True` and `False` use the same state transition. Logprob
   materialization must not introduce another replay or commit path.
@@ -132,27 +124,16 @@ none may survive into draft/verify with released KV or Mamba state.
 
 ### 3.4 Warm-prefix prefill graph regression
 
-Boundary initialization and Radix ownership are independent contracts. Stable
-request slots remove the slot-rebinding race, but a captured per-layer copy can
-still initialize no state: the dummy prefill batch has zero prefix lengths, so
-boolean indexing captures a zero-element operation whose shape cannot become
-nonzero at replay time. Replacing the indexing with a fixed-grid kernel is also
-insufficient unless every captured input has a stable address.
-
-The implementation therefore performs one eager whole-pool copy after deferred
-COW and before dispatching either eager target EXTEND or its prefill graph. The
-copy reads the current request-to-Mamba mapping, translates both endpoints to
-physical slots, excludes rows owned by ordinary prefill tracking, and covers
-all temporal and convolution state. No DVR boundary copy remains in the GDN
-layer body.
+Warm-prefix state comes through the ordinary target EXTEND path. DVR does not
+capture a data-dependent whole-pool COW or alter Radix slot donation. The
+request's target live slot is established by normal pool mapping before DVR
+records its logical boundary and transition tail.
 
 Qualification must include cold and warm requests for prompt lengths
 `63/64/65` and `126/127/129`, mixed batches where only some rows need the copy,
 and generated-prefix re-hit. Compare temporal, convolution, and cached tail
-state directly when diagnosing a failure. Disabling prefill graphs is a useful
-control but is not an acceptable release workaround. Strict divergence at the
-second generated token is characteristic of an uninitialized warm boundary;
-`max_new_tokens=1` alone cannot validate this transition.
+state directly when diagnosing a failure. Disabling prefill graphs or Radix is
+a useful control but is not an acceptable release workaround.
 
 ### 3.5 Isolated self-draft state lifecycle
 
@@ -168,9 +149,9 @@ One self-DVR block has these state boundaries:
    steady-state DVR blocks. DVR allocates one workspace state per layer/request,
    independent of `D`, not one state per proposal token.
 2. Run all provisional recurrent decode steps only on that workspace.
-3. Run target GDN verify read-only from the exact 64-token checkpoint over the
-   fixed `64 + D` transition-input window, then reuse the same workspace for
-   the exported `h64` after draft has finished.
+3. Run the dedicated DVR GDN verify read-only from the target live 64-token
+   boundary over the fixed `64 + D` transition-input window, then reuse the
+   same workspace for exported `h64` after draft has finished.
 4. Commit accepted convolution state for both self and EAGLE.
 5. Rebuild the private self-draft recurrent state from the newest exact boundary plus
    accepted `k/v/g/beta`, with at most 63 rows. EAGLE skips this target-
@@ -221,9 +202,10 @@ that must disappear. The pre-optimization verify state-I/O trace attributed
 about 1.764 ms/block and 570 launches to per-layer metadata, five window writes,
 five full-window reads, h64 staging, and output gather. The current path resolves
 metadata once per verify, uses three pack launches per GDN layer, writes the
-selected FP32 chunk accumulator directly from the FLA producer, and directly
-gathers the logical outputs. Establish the new threshold from measurement
-rather than assuming those launches or the 64-row-bounded rebuild are free.
+selected FP32 chunk accumulator from the DVR-specific recurrent producer, and
+directly gathers the logical outputs. Establish the new threshold from
+measurement rather than assuming those launches or the 64-row-bounded rebuild
+are free.
 
 The direct producer side output is now part of the test snapshot and must be
 profiled rather than reimplemented. If state packing remains material, evaluate
@@ -568,11 +550,11 @@ advanced-index operations, and that padded graph lanes do not write dummy slot
 zero. Run BS1 and BS3 because reducing launch count may help small batches while
 state bandwidth dominates larger ones.
 
-The shared FLA producer change is limited to the optional FP32 boundary output;
-verify that ordinary calls do not execute it. Only proceed to segmented GDN
-verify if `verify_state_pack` plus unused-output compute remains material and a
-prototype preserves exact outputs and h64 for every tail length `0..63`. Only
-tune or bucket the private rebuild kernel if `draft_state_rebuild` remains a
-material fraction of the full block. This ordering keeps further optimization
-optional and prevents a machine-specific result from narrowing ordinary backend
+The boundary output belongs to the DVR-specific recurrent producer; verify that
+ordinary FLA/GDN calls never enter it. Only proceed to segmented GDN verify if
+`verify_state_pack` plus unused-output compute remains material and a prototype
+preserves exact outputs and h64 for every tail length `0..63`. Only tune or
+bucket the private rebuild kernel if `draft_state_rebuild` remains a material
+fraction of the full block. This ordering keeps further optimization optional
+and prevents a machine-specific result from narrowing ordinary backend
 behavior.

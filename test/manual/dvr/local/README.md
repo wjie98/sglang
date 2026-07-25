@@ -11,7 +11,9 @@ correctness, acceptance, or throughput:
   syntax/import checks, and DVR unit tests. Set `DVR_DIFF_BASE` when validating
   against a baseline other than `upstream/sglang-miles`.
 - `scripts/run_0p8b_self_dvr_kl.sh`: self-DVR synchronous/overlap KL and Radix
-  boundary cases, including long output and one-token prompts.
+  boundary cases, including long output and one-token prompts. Set `QUICK=1`
+  and point `MODEL_PATH` at the extracted two-layer checkpoint for a local
+  v1/v2 integration smoke without changing the full default matrix.
 - `scripts/run_35b_mtp_eagle_smoke.sh`: Qwen3.5 MTP DVR-EAGLE acceptance and KL
   in synchronous and overlap modes.
 - `scripts/run_35b_dvr_throughput.sh`: matched 35B normal, deterministic,

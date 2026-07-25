@@ -19,6 +19,13 @@ RUN_V2="${RUN_V2:-1}"
 DRAFT_TOKENS="${DRAFT_TOKENS:-16}"
 DRAFT_STEPS="${DRAFT_STEPS:-$((DRAFT_TOKENS - 1))}"
 RANDOM_SEED="${RANDOM_SEED:-2026}"
+QUICK="${QUICK:-0}"
+MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-}"
+if [[ "${QUICK}" == "1" ]]; then
+  MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-32}"
+  MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-2048}"
+fi
 BASE_URL="http://127.0.0.1:${PORT}"
 RESULT_ROOT="${RESULT_ROOT:-${DVR_REPO_ROOT}/../dvr-fixed-validation/latest-run/0p8b-self-dvr-kl}"
 SERVER_PID=""
@@ -38,7 +45,9 @@ append_run_config "${RESULT_ROOT}" \
   "linear_attn_backend=${LINEAR_ATTN_BACKEND}" \
   "disable_radix_cache=${DISABLE_RADIX_CACHE}" \
   "draft_tokens=${DRAFT_TOKENS}" "draft_steps=${DRAFT_STEPS}" \
-  "random_seed=${RANDOM_SEED}"
+  "random_seed=${RANDOM_SEED}" "quick=${QUICK}" \
+  "max_mamba_cache_size=${MAX_MAMBA_CACHE_SIZE:-auto}" \
+  "max_total_tokens=${MAX_TOTAL_TOKENS:-auto}"
 
 cleanup() {
   stop_process_group "${SERVER_PID}"
@@ -52,11 +61,18 @@ run_one_mode() {
   local client_log="${RESULT_ROOT}/results/${label}_kl.log"
   local overlap_args=()
   local radix_args=()
+  local capacity_args=()
   if [[ "${spec_v2}" == "0" ]]; then
     overlap_args=(--disable-overlap-schedule)
   fi
   if [[ "${DISABLE_RADIX_CACHE}" == "1" ]]; then
     radix_args=(--disable-radix-cache)
+  fi
+  if [[ -n "${MAX_MAMBA_CACHE_SIZE}" ]]; then
+    capacity_args+=(--max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}")
+  fi
+  if [[ -n "${MAX_TOTAL_TOKENS}" ]]; then
+    capacity_args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
   fi
 
   echo "==> Starting ${label} server on ${BASE_URL}"
@@ -82,6 +98,7 @@ run_one_mode() {
       --cuda-graph-bs 1 2 4 \
       --cuda-graph-max-bs-decode 4 \
       --max-running-requests 4 \
+      "${capacity_args[@]}" \
       "${radix_args[@]}" \
       "${overlap_args[@]}" \
       --skip-server-warmup \
@@ -93,6 +110,50 @@ run_one_mode() {
   assert_server_config \
     "${server_log}" "${ATTENTION_BACKEND}" "${PAGE_SIZE}" "${spec_v2}" "${DISABLE_RADIX_CACHE}"
   assert_dvr_graphs "${server_log}" self "${DRAFT_TOKENS}" 4
+
+  if [[ "${QUICK}" == "1" ]]; then
+    echo "==> Running ${label} extracted-model KL smoke"
+    conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
+      --base-url "${BASE_URL}" \
+      --request-modes concurrent,batch \
+      --prompt-token-lengths 1,65 \
+      --max-new 2,65 \
+      --limit-cases 8 \
+      --concurrent-workers 2 \
+      --ignore-eos \
+      2>&1 | tee "${client_log}"
+    conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
+      --base-url "${BASE_URL}" \
+      --request-modes concurrent \
+      --prompt-token-lengths 63,64 \
+      --max-new 8 \
+      --limit-cases 2 \
+      --concurrent-workers 2 \
+      --ignore-eos \
+      2>&1 | tee -a "${client_log}"
+    no_logprob_response="$(
+      curl -fsS "${BASE_URL}/generate" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "input_ids": [0],
+          "sampling_params": {
+            "max_new_tokens": 8,
+            "temperature": 0.7,
+            "ignore_eos": true
+          },
+          "return_logprob": false
+        }'
+    )"
+    conda_python -c \
+      'import json, sys; result = json.loads(sys.argv[1]); assert result["meta_info"]["completion_tokens"] == 8' \
+      "${no_logprob_response}"
+    echo "NO_LOGPROB_OK True" | tee -a "${client_log}"
+    grep -q "ALL_OK True" "${client_log}"
+    grep -q "NO_LOGPROB_OK True" "${client_log}"
+    stop_process_group "${SERVER_PID}"
+    SERVER_PID=""
+    return
+  fi
 
   echo "==> Running ${label} KL and boundary smoke"
   conda_python test/manual/dvr/local/clients/dvr_batch_kl.py \
