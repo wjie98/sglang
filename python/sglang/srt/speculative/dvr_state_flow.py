@@ -107,9 +107,9 @@ class DVRStateLifecycle:
         )
         # Columns map directly to the request's ping-pong checkpoint slots. Keep
         # both lengths: stop/reasoning trimming may publish the older visible one.
-        boundary_slots = state_adapter.verify_boundary_slots
-        self.checkpoint_seq_lens = boundary_slots.new_full(
-            (boundary_slots.numel(), track_count), -1
+        checkpoint_slots = state_adapter.verify_checkpoint_slots
+        self.checkpoint_seq_lens = checkpoint_slots.new_full(
+            (checkpoint_slots.numel(), track_count), -1
         )
 
     @property
@@ -238,9 +238,9 @@ class DVRStateLifecycle:
         next_checkpoint_slots = track_slots.gather(
             1, next_checkpoint_lanes.unsqueeze(1)
         ).squeeze(1)
-        self._state_adapter.set_verify_boundaries(
+        self._state_adapter.set_verify_checkpoints(
             request_rows=request_rows,
-            boundary_slots=checkpoint_slots,
+            checkpoint_slots=checkpoint_slots,
         )
         return DVRStateCommitPlan(
             request_rows=request_rows,
@@ -256,8 +256,8 @@ class DVRStateLifecycle:
 
         if self._state_adapter is None or batch.batch_size() == 0:
             return
-        request_rows, endpoint_slots = self._state_adapter.resolve_request_slots(
-            batch=batch
+        request_rows, accepted_conv_slots = (
+            self._state_adapter.resolve_request_slots(batch=batch)
         )
         if batch.seq_lens_cpu is None:
             raise RuntimeError(
@@ -300,20 +300,20 @@ class DVRStateLifecycle:
             boundary_tracks.append(keep_idx)
 
         if zero_indices:
-            self._state_adapter.zero_boundary_state(
+            self._state_adapter.zero_checkpoint_state(
                 indices=torch.stack(zero_indices).to(
-                    device=endpoint_slots.device, dtype=torch.long
+                    device=accepted_conv_slots.device, dtype=torch.long
                 ),
             )
         boundary_tracks = torch.tensor(
-            boundary_tracks, device=endpoint_slots.device, dtype=torch.int64
+            boundary_tracks, device=accepted_conv_slots.device, dtype=torch.int64
         )
         self.checkpoint_seq_lens[request_rows, boundary_tracks] = torch.tensor(
-            boundary_lens, device=endpoint_slots.device, dtype=torch.int64
+            boundary_lens, device=accepted_conv_slots.device, dtype=torch.int64
         )
         self._state_adapter.initialize_self_draft_state(
             request_rows=request_rows,
-            endpoint_slots=endpoint_slots,
+            accepted_conv_slots=accepted_conv_slots,
         )
 
     def commit_verified_state(
@@ -328,9 +328,9 @@ class DVRStateLifecycle:
         if accept_lens.numel() > 0:
             crosses_chunk_boundary = self._state_adapter.commit_accepted_state(
                 request_rows=plan.request_rows,
-                endpoint_slots=plan.accepted_conv_slots,
-                boundary_slots=plan.checkpoint_slots,
-                alternate_boundary_slots=plan.next_checkpoint_slots,
+                accepted_conv_slots=plan.accepted_conv_slots,
+                checkpoint_slots=plan.checkpoint_slots,
+                next_checkpoint_slots=plan.next_checkpoint_slots,
                 tail_lens_before=plan.accepted_tail_lens,
                 accepted_token_counts=accept_lens.to(torch.long),
             )

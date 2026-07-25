@@ -57,7 +57,7 @@ def create_test_adapter(
     *,
     transition_windows,
     state_cache=None,
-    verify_boundary_slots=None,
+    verify_checkpoint_slots=None,
     kernel_dispatcher=None,
     draft_reuses_target_state=False,
 ):
@@ -69,8 +69,8 @@ def create_test_adapter(
             intermediate_ssm=torch.empty(layers, slots, 1, 1),
             intermediate_conv_window=(),
         )
-    if verify_boundary_slots is None:
-        verify_boundary_slots = torch.zeros(
+    if verify_checkpoint_slots is None:
+        verify_checkpoint_slots = torch.zeros(
             transition_windows[0].shape[1],
             dtype=torch.long,
             device=transition_windows[0].device,
@@ -79,7 +79,7 @@ def create_test_adapter(
         kernel_dispatcher,
         state_cache=state_cache,
         transition_windows=transition_windows,
-        verify_boundary_slots=verify_boundary_slots,
+        verify_checkpoint_slots=verify_checkpoint_slots,
         draft_reuses_target_state=draft_reuses_target_state,
     )
 
@@ -210,8 +210,8 @@ def test_gdn_memory_estimate_matches_allocation():
         t.numel() * t.element_size() for t in adapter.transition_windows
     )
     allocated_per_request += (
-        adapter.verify_boundary_slots.numel()
-        * adapter.verify_boundary_slots.element_size()
+        adapter.verify_checkpoint_slots.numel()
+        * adapter.verify_checkpoint_slots.element_size()
     )
     allocated_per_request //= num_slots
     checkpoint_lanes = 2
@@ -277,11 +277,11 @@ def test_dvr_gdn_adapter_maps_request_and_state_slots():
         ),
     )
 
-    request_rows, endpoint_slots = adapter.resolve_request_slots(batch=batch)
+    request_rows, accepted_conv_slots = adapter.resolve_request_slots(batch=batch)
 
     assert adapter.state_cache is all_layers_state_cache
     assert request_rows.tolist() == [2]
-    assert endpoint_slots.tolist() == [0]
+    assert accepted_conv_slots.tolist() == [0]
     assert adapter.transition_windows[0].shape[2] == FLA_CHUNK_SIZE + 4
     assert adapter.transition_windows[0][0].shape == (
         3,
@@ -436,7 +436,7 @@ def test_gdn_state_input_window_compacts_only_valid_crossing_tail():
 def test_gdn_verify_uses_mamba_padding_sentinel():
     adapter = create_test_adapter(
         transition_windows=(torch.zeros(1, 3, 66, 1),),
-        verify_boundary_slots=torch.tensor([0, 11, 12]),
+        verify_checkpoint_slots=torch.tensor([0, 11, 12]),
     )
     forward_batch = SimpleNamespace(
         input_ids=torch.zeros(4, dtype=torch.long),
@@ -450,7 +450,7 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
         cache_indices=torch.tensor([7, PAD_SLOT_ID]),
     )
     (
-        boundary_slots,
+        checkpoint_slots,
         request_rows,
         verify_conv_slots,
         accepted_tail_lens,
@@ -458,7 +458,7 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
         boundary_state_steps,
     ) = adapter._verify_metadata
 
-    assert torch.equal(boundary_slots, torch.tensor([12, 0]))
+    assert torch.equal(checkpoint_slots, torch.tensor([12, 0]))
     assert torch.equal(request_rows, torch.tensor([2, 0]))
     assert torch.equal(verify_conv_slots, torch.tensor([7, 0]))
     assert torch.equal(accepted_tail_lens, torch.tensor([63, 0]))
@@ -638,7 +638,7 @@ def test_gdn_self_draft_state_is_request_owned_and_keeps_target_unchanged():
         draft_reuses_target_state=True,
     )
     adapter.initialize_self_draft_state(
-        endpoint_slots=torch.tensor([0, 2]),
+        accepted_conv_slots=torch.tensor([0, 2]),
         request_rows=torch.tensor([1, 3]),
     )
     original_conv = conv.clone()
@@ -767,9 +767,9 @@ def test_gdn_commit_alternates_boundary_slots(monkeypatch):
 
     crossed = adapter.commit_accepted_state(
         request_rows=torch.tensor([1, 2]),
-        endpoint_slots=torch.tensor([3, 4]),
-        boundary_slots=torch.tensor([5, 6]),
-        alternate_boundary_slots=torch.tensor([7, 8]),
+        accepted_conv_slots=torch.tensor([3, 4]),
+        checkpoint_slots=torch.tensor([5, 6]),
+        next_checkpoint_slots=torch.tensor([7, 8]),
         tail_lens_before=torch.tensor([63, 1]),
         accepted_token_counts=torch.tensor([2, 2]),
     )

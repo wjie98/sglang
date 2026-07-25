@@ -40,22 +40,22 @@ class _Adapter:
 
     def __init__(self, zeroed):
         self.zeroed = zeroed
-        self.verify_boundary_slots = torch.zeros(8, dtype=torch.long)
-        self.verify_boundaries = []
+        self.verify_checkpoint_slots = torch.zeros(8, dtype=torch.long)
+        self.verify_checkpoints = []
         self.draft_initializations = []
 
     @staticmethod
     def resolve_request_slots(*, batch):
         return batch.req_pool_indices.to(torch.long), torch.tensor([20])
 
-    def zero_boundary_state(self, *, indices):
+    def zero_checkpoint_state(self, *, indices):
         self.zeroed.extend(indices.tolist())
 
-    def set_verify_boundaries(self, **kwargs):
-        self.verify_boundaries.append(
+    def set_verify_checkpoints(self, **kwargs):
+        self.verify_checkpoints.append(
             (
                 kwargs["request_rows"].tolist(),
-                kwargs["boundary_slots"].tolist(),
+                kwargs["checkpoint_slots"].tolist(),
             )
         )
 
@@ -63,7 +63,7 @@ class _Adapter:
         self.draft_initializations.append(
             (
                 kwargs["request_rows"].tolist(),
-                kwargs["endpoint_slots"].tolist(),
+                kwargs["accepted_conv_slots"].tolist(),
             )
         )
 
@@ -366,7 +366,9 @@ def test_target_extend_publishes_exact_boundary(
     assert copies == []
     assert draft_ctx.accepted_tail_lens.tolist() == [expected_tail]
     assert lifecycle._state_adapter.draft_initializations == [([1], [20])]
-    assert lifecycle._state_adapter.verify_boundaries == [([1], [expected_boundary])]
+    assert lifecycle._state_adapter.verify_checkpoints == [
+        ([1], [expected_boundary])
+    ]
     assert draft_ctx.checkpoint_slots.tolist() == [expected_boundary]
     assert draft_ctx.next_checkpoint_slots.tolist() == [expected_next_boundary]
 

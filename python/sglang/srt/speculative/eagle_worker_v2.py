@@ -1592,7 +1592,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Prepare grammar data on CPU if needed.
+        # Prepare grammar data on CPU if needed
         if batch.has_grammar:
             retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
             retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
@@ -1612,9 +1612,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
-        # Generate vocab mask for constrained decoding.
+        # Generate vocab mask for constrained decoding
         vocab_mask = None
         if batch.has_grammar:
+            # Generate the logit mask for structured output.
             vocab_mask = generate_token_bitmask(
                 batch.reqs,
                 verify_input,
@@ -1623,10 +1624,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 draft_tokens_cpu,
                 batch.sampling_info.vocab_size,
             )
+
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
                 vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
-                # Do not reuse the mask from the preceding EXTEND.
+                # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
+                # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
         # Sample

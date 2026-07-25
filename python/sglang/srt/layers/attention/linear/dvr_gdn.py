@@ -617,14 +617,14 @@ class DVRGDNStateAdapter:
         *,
         state_cache: Any,
         transition_windows: tuple[torch.Tensor, ...],
-        verify_boundary_slots: torch.Tensor,
+        verify_checkpoint_slots: torch.Tensor,
         draft_reuses_target_state: bool,
         chunk_size: int = FLA_CHUNK_SIZE,
     ):
         self.kernel_dispatcher = kernel_dispatcher
         self.state_cache = state_cache
         self.transition_windows = transition_windows
-        self.verify_boundary_slots = verify_boundary_slots
+        self.verify_checkpoint_slots = verify_checkpoint_slots
         self.chunk_size = chunk_size
         self._verify_metadata: Optional[tuple[torch.Tensor, ...]] = None
         self.self_draft_conv = (
@@ -720,23 +720,25 @@ class DVRGDNStateAdapter:
             kernel_dispatcher,
             state_cache=state_cache,
             transition_windows=(k, v, gate, torch.zeros_like(gate)),
-            verify_boundary_slots=torch.zeros(
+            verify_checkpoint_slots=torch.zeros(
                 num_slots, dtype=torch.long, device=model_runner.device
             ),
             draft_reuses_target_state=model_runner.spec_algorithm.is_dvr_self_draft(),
         )
 
     def resolve_request_slots(self, *, batch) -> tuple[torch.Tensor, torch.Tensor]:
-        """Resolve request-owned rows and accepted-endpoint state rows."""
+        """Resolve request rows and accepted-endpoint convolution slots."""
 
         pool = batch.req_to_token_pool
-        endpoint_slots = pool.get_mamba_indices(batch.req_pool_indices).to(torch.long)
-        request_rows = batch.req_pool_indices.to(
-            device=endpoint_slots.device, dtype=torch.long
+        accepted_conv_slots = pool.get_mamba_indices(batch.req_pool_indices).to(
+            torch.long
         )
-        return request_rows, endpoint_slots
+        request_rows = batch.req_pool_indices.to(
+            device=accepted_conv_slots.device, dtype=torch.long
+        )
+        return request_rows, accepted_conv_slots
 
-    def zero_boundary_state(self, *, indices: torch.Tensor):
+    def zero_checkpoint_state(self, *, indices: torch.Tensor):
         indices = indices.to(device=self.state_cache.temporal.device, dtype=torch.long)
         for conv in self.state_cache.conv:
             conv[:, indices] = 0
@@ -746,7 +748,7 @@ class DVRGDNStateAdapter:
         self,
         *,
         request_rows: torch.Tensor,
-        endpoint_slots: torch.Tensor,
+        accepted_conv_slots: torch.Tensor,
     ) -> None:
         """Seed private self-draft state after target EXTEND.
 
@@ -757,7 +759,7 @@ class DVRGDNStateAdapter:
 
         if self.self_draft_conv is None:
             return
-        endpoint_slots = endpoint_slots.to(
+        accepted_conv_slots = accepted_conv_slots.to(
             device=self.state_cache.temporal.device, dtype=torch.long
         )
         request_rows = request_rows.to(
@@ -765,10 +767,10 @@ class DVRGDNStateAdapter:
         )
         with profile_range("draft_state_copy"):
             self.state_cache.intermediate_ssm[:, request_rows, 0] = (
-                self.state_cache.temporal[:, endpoint_slots]
+                self.state_cache.temporal[:, accepted_conv_slots]
             )
             self.self_draft_conv[:, request_rows] = self.state_cache.conv[0][
-                :, endpoint_slots
+                :, accepted_conv_slots
             ]
 
     def decode_state(self, *, layer_cache, forward_batch, layer_idx: int):
@@ -788,16 +790,16 @@ class DVRGDNStateAdapter:
             request_rows,
         )
 
-    def set_verify_boundaries(
-        self, *, request_rows: torch.Tensor, boundary_slots: torch.Tensor
+    def set_verify_checkpoints(
+        self, *, request_rows: torch.Tensor, checkpoint_slots: torch.Tensor
     ) -> None:
         """Bind logical request rows to the physical exact boundary for verify."""
 
         request_rows = request_rows.to(
-            device=self.verify_boundary_slots.device, dtype=torch.long
+            device=self.verify_checkpoint_slots.device, dtype=torch.long
         )
-        self.verify_boundary_slots[request_rows] = boundary_slots.to(
-            device=self.verify_boundary_slots.device, dtype=torch.long
+        self.verify_checkpoint_slots[request_rows] = checkpoint_slots.to(
+            device=self.verify_checkpoint_slots.device, dtype=torch.long
         )
 
     def cache_prefill_transitions(
@@ -883,9 +885,9 @@ class DVRGDNStateAdapter:
         request_rows = torch.where(
             valid_mask, request_rows, torch.zeros_like(request_rows)
         )
-        boundary_slots = self.verify_boundary_slots[request_rows]
-        boundary_slots = torch.where(
-            valid_mask, boundary_slots, torch.zeros_like(boundary_slots)
+        checkpoint_slots = self.verify_checkpoint_slots[request_rows]
+        checkpoint_slots = torch.where(
+            valid_mask, checkpoint_slots, torch.zeros_like(checkpoint_slots)
         )
         verify_conv_slots = torch.where(
             valid_mask,
@@ -908,7 +910,7 @@ class DVRGDNStateAdapter:
             torch.full_like(accepted_tail_lens, -1),
         )
         self._verify_metadata = (
-            boundary_slots,
+            checkpoint_slots,
             request_rows,
             verify_conv_slots,
             accepted_tail_lens,
@@ -940,14 +942,14 @@ class DVRGDNStateAdapter:
         if not query.is_cuda:
             raise RuntimeError("DVR GDN target verify requires CUDA tensors.")
         (
-            boundary_slots,
+            checkpoint_slots,
             request_rows,
             _,
             accepted_tail_lens,
             valid_mask,
             boundary_state_steps,
         ) = self._verify_metadata
-        batch_size = boundary_slots.shape[0]
+        batch_size = checkpoint_slots.shape[0]
         draft_token_num = query.shape[1] // batch_size
         candidate_inputs = (
             query.reshape(batch_size, draft_token_num, *query.shape[2:]),
@@ -1000,7 +1002,7 @@ class DVRGDNStateAdapter:
             g=cached_g,
             beta=cached_beta,
             ssm_states=self.state_cache.temporal[layer_idx],
-            cache_indices=boundary_slots,
+            cache_indices=checkpoint_slots,
             query_start_loc=None,
             inplace_update=False,
             boundary_state=self.state_cache.intermediate_ssm[layer_idx, :, 0],
@@ -1019,17 +1021,17 @@ class DVRGDNStateAdapter:
         self,
         *,
         request_rows: torch.Tensor,
-        endpoint_slots: torch.Tensor,
-        boundary_slots: torch.Tensor,
-        alternate_boundary_slots: torch.Tensor,
+        accepted_conv_slots: torch.Tensor,
+        checkpoint_slots: torch.Tensor,
+        next_checkpoint_slots: torch.Tensor,
         tail_lens_before: torch.Tensor,
         accepted_token_counts: torch.Tensor,
     ) -> torch.Tensor:
         tail_lens_before = tail_lens_before.to(
-            device=endpoint_slots.device, dtype=torch.long
+            device=accepted_conv_slots.device, dtype=torch.long
         )
         accepted_token_counts = accepted_token_counts.to(
-            device=endpoint_slots.device, dtype=torch.long
+            device=accepted_conv_slots.device, dtype=torch.long
         )
         tail_lens_after = tail_lens_before + accepted_token_counts
         crosses_chunk_boundary = tail_lens_after >= self.chunk_size
@@ -1039,7 +1041,7 @@ class DVRGDNStateAdapter:
         fused_conv_window_scatter_with_mask(
             self.state_cache.conv[0],
             self.state_cache.intermediate_conv_window[0],
-            endpoint_slots,
+            accepted_conv_slots,
             accepted_token_counts - 1,
             src_indices_raw=request_rows,
         )
@@ -1061,7 +1063,7 @@ class DVRGDNStateAdapter:
             fused_mamba_state_scatter_with_mask(
                 self.state_cache.temporal,
                 self.state_cache.intermediate_ssm,
-                alternate_boundary_slots,
+                next_checkpoint_slots,
                 torch.where(
                     crosses_chunk_boundary,
                     torch.zeros_like(tail_lens_before),
@@ -1072,7 +1074,7 @@ class DVRGDNStateAdapter:
             fused_conv_window_scatter_with_mask(
                 self.state_cache.conv[0],
                 self.state_cache.intermediate_conv_window[0],
-                alternate_boundary_slots,
+                next_checkpoint_slots,
                 torch.where(
                     crosses_chunk_boundary,
                     self.chunk_size - 1 - tail_lens_before,
@@ -1102,8 +1104,8 @@ class DVRGDNStateAdapter:
                     request_rows=request_rows,
                     boundary_slots=torch.where(
                         crosses_chunk_boundary,
-                        alternate_boundary_slots,
-                        boundary_slots,
+                        next_checkpoint_slots,
+                        checkpoint_slots,
                     ),
                     token_count=tail_lens_after,
                 )
