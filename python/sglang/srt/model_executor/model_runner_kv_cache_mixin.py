@@ -177,7 +177,7 @@ class ModelRunnerKVCacheMixin:
             draft_steps = server_args.speculative_num_draft_tokens
             state_slots_per_request = self._calculate_mamba_ratio()
             if is_dvr:
-                from sglang.srt.layers.attention.linear.dvr_gdn import (
+                from sglang.srt.layers.attention.dvr.gdn_backend import (
                     dvr_gdn_intermediate_bytes_per_request,
                 )
 

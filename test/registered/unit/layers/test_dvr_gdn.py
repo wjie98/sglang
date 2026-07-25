@@ -3,13 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import sglang.srt.layers.attention.linear.dvr_gdn as dvr_gdn_module
+import sglang.srt.layers.attention.dvr.gdn_backend as dvr_gdn_module
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
 from sglang.srt.layers.attention.dvr.gdn_kernels import (
     dvr_chunk_gated_delta_rule,
 )
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.attention.linear.dvr_gdn import (
+from sglang.srt.layers.attention.dvr.gdn_backend import (
     DVRGDNStateAdapter,
     dvr_gdn_intermediate_bytes_per_request,
 )

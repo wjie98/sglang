@@ -162,7 +162,7 @@ def test_radix_disabled_reserves_one_active_boundary_per_request():
 def test_dvr_memory_budget_includes_cuda_graph_dummy_row(monkeypatch):
     intermediate_per_row = 1 << 20
     monkeypatch.setattr(
-        "sglang.srt.layers.attention.linear.dvr_gdn."
+        "sglang.srt.layers.attention.dvr.gdn_backend."
         "dvr_gdn_intermediate_bytes_per_request",
         lambda *args, **kwargs: intermediate_per_row,
     )

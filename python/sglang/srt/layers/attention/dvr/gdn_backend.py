@@ -1,9 +1,10 @@
-"""GDN-specific DVR state allocation, replay kernels, and lifecycle adapter."""
+"""DVR GDN backend, state lifecycle, and replay kernels."""
 
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Tuple, Union
 
 import torch
+from sglang.srt.layers.attention.linear import gdn_backend as base_gdn
 from sglang.srt.layers.attention.dvr.gdn_kernels import (
     dvr_chunk_gated_delta_rule,
     dvr_scatter_conv_window,
@@ -11,11 +12,16 @@ from sglang.srt.layers.attention.dvr.gdn_kernels import (
 )
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.op import exp
+from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.nvtx_utils import profile_range
 
 __all__ = [
+    "DVRGDNAttnBackend",
     "DVRGDNStateAdapter",
     "dvr_gdn_intermediate_bytes_per_request",
 ]
@@ -1117,3 +1123,237 @@ class DVRGDNStateAdapter:
         # EAGLE/MTP owns separate draft state and skips this reconstruction.
 
         return crosses_chunk_boundary
+
+
+class DVRGDNAttnBackend(GDNAttnBackend):
+    """GDN backend whose provisional state and deterministic verify are DVR-owned."""
+
+    def __init__(self, model_runner):
+        super().__init__(model_runner)
+        self.dvr_state_adapter = DVRGDNStateAdapter.for_gdn(
+            self.kernel_dispatcher,
+            model_runner=model_runner,
+        )
+        self.dvr_extend_boundary_metadata = None
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        self.prepare_dvr_forward(forward_batch)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata_in_graph(forward_batch)
+        self.prepare_dvr_forward(forward_batch)
+
+    def prepare_dvr_forward(self, forward_batch: ForwardBatch):
+        self.dvr_extend_boundary_metadata = self.dvr_state_adapter.prepare_forward(
+            forward_batch=forward_batch,
+            forward_metadata=self.forward_metadata,
+        )
+
+    def forward_decode(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        draft_state = self.dvr_state_adapter.decode_state(
+            layer_cache=layer_cache,
+            forward_batch=forward_batch,
+            layer_idx=self.req_to_token_pool.mamba_map[layer.layer_id],
+        )
+        if draft_state is None:
+            return super().forward_decode(
+                layer, forward_batch, mixed_qkv, a, b, **kwargs
+            )
+
+        conv_states, ssm_states, cache_indices = draft_state
+        assert isinstance(mixed_qkv, torch.Tensor)
+        mixed_qkv = base_gdn.causal_conv1d_update(
+            mixed_qkv,
+            conv_states,
+            layer.conv_weights,
+            layer.bias,
+            layer.activation,
+            conv_state_indices=cache_indices,
+        )
+        if self.kernel_dispatcher.supports_packed_decode:
+            return self.kernel_dispatcher.packed_decode(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                num_v_heads=layer.num_v_heads,
+                head_v_dim=layer.head_v_dim,
+            )
+
+        query, key, value = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        batch_size = forward_batch.batch_size
+        query = query.view(1, batch_size, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, batch_size, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, batch_size, layer.num_v_heads, layer.head_v_dim)
+        return self.kernel_dispatcher.decode(
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=self.forward_metadata.query_start_loc,
+        )
+
+    def forward_extend(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        assert isinstance(mixed_qkv, torch.Tensor)
+        seq_len = mixed_qkv.shape[0]
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        metadata = self.forward_metadata
+        query_start_loc = metadata.query_start_loc
+        cache_indices = metadata.mamba_cache_indices
+        retrieve_next_token = metadata.retrieve_next_token
+        retrieve_next_sibling = metadata.retrieve_next_sibling
+        retrieve_parent_token = metadata.retrieve_parent_token
+
+        layer_idx = self.req_to_token_pool.mamba_map[layer.layer_id]
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = layer_cache.conv[0]
+        ssm_states = layer_cache.temporal
+        if is_target_verify:
+            assert isinstance(layer_cache, MambaPool.SpeculativeState)
+            intermediate_conv_window = layer_cache.intermediate_conv_window[0]
+            (
+                conv_states,
+                conv_indices,
+                intermediate_indices,
+            ) = self.dvr_state_adapter.verify_conv_state(layer_idx)
+            batch_size = seq_len // forward_batch.spec_info.draft_token_num
+            draft_tokens = forward_batch.spec_info.draft_token_num
+            mixed_qkv = (
+                base_gdn.causal_conv1d_update(
+                    mixed_qkv.view(batch_size, draft_tokens, -1).transpose(1, 2),
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=conv_indices,
+                    intermediate_conv_window=intermediate_conv_window,
+                    intermediate_state_indices=intermediate_indices,
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
+                .transpose(1, 2)
+                .reshape(seq_len, -1)
+            )
+        else:
+            mixed_qkv = mixed_qkv.transpose(0, 1)
+            if metadata.has_mamba_track_mask:
+                tracked_conv = mixed_qkv[:, metadata.track_conv_indices].transpose(0, 1)
+                conv_states[metadata.conv_states_mask_indices] = tracked_conv
+            mixed_qkv = base_gdn.causal_conv1d_fn(
+                mixed_qkv,
+                layer.conv_weights,
+                layer.bias,
+                activation=layer.activation,
+                conv_states=conv_states,
+                has_initial_state=forward_batch.extend_prefix_lens > 0,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)[:seq_len]
+
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if qkv_dim <= base_gdn.MAX_FUSED_QKV_SPLIT_DIM:
+            query, key, value = base_gdn.fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        else:
+            query, key, value = torch.split(
+                mixed_qkv,
+                [layer.q_dim, layer.k_dim, layer.v_dim],
+                dim=-1,
+            )
+            query = query.view(1, seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
+
+        g, beta = base_gdn.fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        if is_target_verify:
+            return self.dvr_state_adapter.forward_target_verify(
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                layer_idx=layer_idx,
+            )
+
+        if self.dvr_extend_boundary_metadata is None:
+            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
+        else:
+            boundary_indices, boundary_steps = self.dvr_extend_boundary_metadata
+            core_attn_out, last_recurrent_state, h = dvr_chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                boundary_state=ssm_states,
+                boundary_state_indices=boundary_indices,
+                boundary_state_steps=boundary_steps,
+            )
+        self.dvr_state_adapter.cache_prefill_transitions(
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            layer_idx=layer_idx,
+            forward_batch=forward_batch,
+        )
+        if h is not None:
+            if self.dvr_extend_boundary_metadata is None:
+                self._track_mamba_state_extend(forward_batch, h, ssm_states, metadata)
+            elif metadata.track_ssm_final_src.numel() > 0:
+                ssm_states[metadata.track_ssm_final_dst] = ssm_states[
+                    metadata.track_ssm_final_src
+                ]
+        return core_attn_out

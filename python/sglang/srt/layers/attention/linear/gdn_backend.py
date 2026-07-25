@@ -277,31 +277,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
-                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
-            )
+            assert (
+                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        self.dvr_state_adapter = None
-        if model_runner.spec_algorithm.is_dvr() and not self.is_draft_worker:
-            from sglang.srt.layers.attention.linear.dvr_gdn import (
-                DVRGDNStateAdapter,
-            )
-
-            self.dvr_state_adapter = DVRGDNStateAdapter.for_gdn(
-                self.kernel_dispatcher,
-                model_runner=model_runner,
-            )
-        self._dvr_extend_boundary_metadata = None
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        self._prepare_dvr_forward(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -311,20 +299,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
-
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        super().init_forward_metadata_in_graph(forward_batch)
-        self._prepare_dvr_forward(forward_batch)
-
-    def _prepare_dvr_forward(self, forward_batch: ForwardBatch):
-        self._dvr_extend_boundary_metadata = (
-            None
-            if self.dvr_state_adapter is None
-            else self.dvr_state_adapter.prepare_forward(
-                forward_batch=forward_batch,
-                forward_metadata=self.forward_metadata,
-            )
-        )
 
     def forward_decode(
         self,
@@ -340,16 +314,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-        using_dvr_draft_state = False
-        if self.dvr_state_adapter is not None:
-            draft_state = self.dvr_state_adapter.decode_state(
-                layer_cache=layer_cache,
-                forward_batch=forward_batch,
-                layer_idx=self.req_to_token_pool.mamba_map[layer.layer_id],
-            )
-            if draft_state is not None:
-                conv_states, ssm_states, cache_indices = draft_state
-                using_dvr_draft_state = True
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
         # per-row write cursor. All None unless --enable-linear-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
@@ -392,10 +356,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
-            if not using_dvr_draft_state:
-                self._track_mamba_state_decode(
-                    forward_batch, conv_states, ssm_states, cache_indices
-                )
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
             return core_attn_out
 
         query, key, value = torch.split(
@@ -422,10 +385,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
-        if not using_dvr_draft_state:
-            self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices
-            )
+        self._track_mamba_state_decode(
+            forward_batch, conv_states, ssm_states, cache_indices
+        )
 
         return core_attn_out
 
@@ -451,11 +413,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        dvr_state_adapter = self.dvr_state_adapter
-        layer_idx = None
-        if dvr_state_adapter is not None:
-            layer_idx = self.req_to_token_pool.mamba_map[layer.layer_id]
-
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
@@ -495,14 +452,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            verify_conv_slots = cache_indices[:batch_size]
-            if dvr_state_adapter is not None:
-                (
-                    conv_states,
-                    verify_conv_slots,
-                    intermediate_state_indices,
-                ) = dvr_state_adapter.verify_conv_state(layer_idx)
-
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
@@ -512,7 +461,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.conv_weights,
                 layer.bias,
                 layer.activation,
-                conv_state_indices=verify_conv_slots,
+                conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=intermediate_conv_window_cache,
                 intermediate_state_indices=intermediate_state_indices[:batch_size],
                 retrieve_next_token=retrieve_next_token,
@@ -565,77 +514,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            if dvr_state_adapter is None:
-                core_attn_out = self.kernel_dispatcher.target_verify(
-                    A_log=layer.A_log,
-                    dt_bias=layer.dt_bias,
-                    q=query,
-                    k=key,
-                    v=value,
-                    a=a,
-                    b=b,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    intermediate_states_buffer=intermediate_state_cache,
-                    intermediate_state_indices=intermediate_state_indices,
-                    cache_steps=forward_batch.spec_info.draft_token_num,
-                    retrieve_parent_token=retrieve_parent_token,
-                )
-            else:
-                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-                core_attn_out = dvr_state_adapter.forward_target_verify(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    layer_idx=layer_idx,
-                )
+            core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=forward_batch.spec_info.draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+            )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            if self._dvr_extend_boundary_metadata is not None:
-                from sglang.srt.layers.attention.dvr.gdn_kernels import (
-                    dvr_chunk_gated_delta_rule,
-                )
-
-                boundary_state_indices, boundary_state_steps = (
-                    self._dvr_extend_boundary_metadata
-                )
-                core_attn_out, last_recurrent_state, h = dvr_chunk_gated_delta_rule(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=ssm_states_contig,
-                    initial_state_indices=state_cache_indices,
-                    cu_seqlens=query_start_loc,
-                    boundary_state=ssm_states,
-                    boundary_state_indices=boundary_state_indices,
-                    boundary_state_steps=boundary_state_steps,
-                )
-            else:
-                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    ssm_states=ssm_states_contig,
-                    cache_indices=state_cache_indices,
-                    query_start_loc=query_start_loc,
-                )
-            if dvr_state_adapter is not None:
-                # Cache target-model GDN tail inputs for later DVR verify/replay.
-                dvr_state_adapter.cache_prefill_transitions(
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    layer_idx=layer_idx,
-                    forward_batch=forward_batch,
-                )
+            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
+                query_start_loc=query_start_loc,
+            )
 
             if is_npu() and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
@@ -650,15 +556,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states[cache_indices] = ssm_states_contig
 
             if h is not None:
-                if self._dvr_extend_boundary_metadata is None:
-                    self._track_mamba_state_extend(
-                        forward_batch, h, ssm_states, forward_metadata
-                    )
-                elif forward_metadata.track_ssm_final_src.numel() > 0:
-                    # Unaligned DVR boundaries were written directly in fp32 by
-                    # the producer. Aligned rows still use the final live state.
-                    ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                        forward_metadata.track_ssm_final_src
-                    ]
+                self._track_mamba_state_extend(
+                    forward_batch, h, ssm_states, forward_metadata
+                )
 
         return core_attn_out
