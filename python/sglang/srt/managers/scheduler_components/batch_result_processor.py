@@ -98,7 +98,6 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                self._prepare_for_kv_cache_release(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -329,7 +328,6 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        self._prepare_for_kv_cache_release(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:

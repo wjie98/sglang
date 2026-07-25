@@ -453,18 +453,12 @@ class SchedulerWeightUpdaterManager:
 
         self.tp_worker.model_runner.save_remote_model(url)
 
-        draft_runners = self.get_model_runners("draft")
-        if draft_runners:
+        if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
             assert (
                 draft_url is not None
             ), "draft_url must be provided when draft model is enabled"
-            if len(draft_runners) != 1:
-                raise NotImplementedError(
-                    "save_remote_model does not support speculative workers with "
-                    "multiple draft model runners."
-                )
-            draft_runners[0][1].save_remote_model(draft_url)
+            self.draft_worker.model_runner.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
         self.tp_worker.model_runner.save_sharded_model(

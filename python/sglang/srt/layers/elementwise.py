@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.environ import envs
 from sglang.srt.layers.triton_ops.softcap import softcap_out as fused_softcap
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
@@ -687,10 +686,7 @@ def fused_gate_sigmoid_mul_add(
         ),
     }
 
-    if (
-        num_tokens >= 1024
-        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-    ):
+    if num_tokens >= 1024:
         config["num_warps"] = min(config["num_warps"], 8)
 
     pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
