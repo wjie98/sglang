@@ -69,8 +69,10 @@ def test_draft_capture_is_fast_and_restores_target_state(
     @contextmanager
     def custom_allreduce_enabled(_group, **kwargs):
         events.append(("custom_all_reduce", True, kwargs))
-        yield True
-        events.append(("custom_all_reduce", False, kwargs))
+        try:
+            yield True
+        finally:
+            events.append(("custom_all_reduce", False, kwargs))
 
     monkeypatch.setattr(
         graph_module,
@@ -98,15 +100,18 @@ def test_draft_capture_is_fast_and_restores_target_state(
         batch_invariant_ops, "is_batch_invariant_mode_enabled", lambda: False
     )
 
-    with dvr_draft_decode_context(model_runner, {}, capture=True, self_draft=True):
-        assert not backend.enable_deterministic
-        assert not server_args.enable_deterministic_inference
-        assert not global_server_args.enable_deterministic_inference
-        assert (
-            model_runner.spec_algorithm == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
-        )
-        if draft_custom_all_reduce:
-            assert events[-1][0] == "custom_all_reduce"
+    with pytest.raises(RuntimeError, match="capture failure"):
+        with dvr_draft_decode_context(model_runner, {}, capture=True, self_draft=True):
+            assert not backend.enable_deterministic
+            assert not server_args.enable_deterministic_inference
+            assert not global_server_args.enable_deterministic_inference
+            assert (
+                model_runner.spec_algorithm
+                == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+            )
+            if draft_custom_all_reduce:
+                assert events[-1][0] == "custom_all_reduce"
+            raise RuntimeError("capture failure")
 
     assert backend.enable_deterministic
     assert server_args.enable_deterministic_inference

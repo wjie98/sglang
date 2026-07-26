@@ -6,9 +6,11 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+import sglang.srt.managers.scheduler_components.batch_result_processor as result_processor_module
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -97,15 +99,66 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
-    def test_cache_release_calls_optional_worker_lifecycle_hook(self):
-        calls = []
-        proc = _make_processor()
-        proc.model_worker.prepare_for_kv_cache_release = calls.append
-        req = SimpleNamespace(rid="done")
+    def test_prefill_release_prepares_worker_state_before_free(self):
+        events = []
+        proc = SimpleNamespace(
+            is_generation=True,
+            tree_cache=None,
+            model_worker=SimpleNamespace(
+                prepare_for_kv_cache_release=lambda _req: events.append("prepare")
+            ),
+            move_logprobs_to_cpu=lambda **_kwargs: None,
+            _validate_pp_skip_output_comm=lambda *_args: None,
+            _maybe_update_reasoning_tokens=lambda *_args: None,
+            _maybe_collect_routed_experts=lambda *_args: None,
+            _maybe_collect_indexer_topk=lambda *_args: None,
+            _maybe_collect_customized_info=lambda *_args: None,
+            output_streamer=SimpleNamespace(stream_output=lambda *_args: None),
+            metrics_reporter=SimpleNamespace(
+                report_prefill_stats=lambda **_kwargs: None
+            ),
+        )
+        finished = [False]
+        req = SimpleNamespace(
+            output_ids=[],
+            inflight_middle_chunks=0,
+            is_retracted=False,
+            return_hidden_states=False,
+            grammar=None,
+            finished=lambda: finished[0],
+            update_finish_state=lambda: finished.__setitem__(0, True),
+            time_stats=SimpleNamespace(
+                set_prefill_finished_time=lambda: None,
+                set_completion_time=lambda: None,
+            ),
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            decoding_reqs=[],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(customized_info=None, hidden_states=None),
+            next_token_ids=torch.tensor([7]),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            can_run_cuda_graph=False,
+        )
+        with patch.object(
+            result_processor_module,
+            "release_kv_cache",
+            side_effect=lambda *_args, **_kwargs: events.append("release"),
+        ):
+            SchedulerBatchResultProcessor.process_batch_result_prefill(
+                proc, batch, result
+            )
 
-        proc._prepare_for_kv_cache_release(req)
-
-        self.assertEqual(calls, [req])
+        self.assertEqual(events, ["prepare", "release"])
 
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
