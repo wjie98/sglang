@@ -6,7 +6,7 @@ if [[ -z "${MODEL_PATH:-}" ]]; then
   exit 2
 fi
 
-DVR_MODE="${DVR_MODE:-self}"
+SERVER_MODE="${SERVER_MODE:-${DVR_MODE:-self}}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -24,47 +24,62 @@ case "${ATTENTION_BACKEND}" in
     ;;
 esac
 
-case "${DVR_MODE}" in
+spec_args=()
+case "${SERVER_MODE}" in
+  normal)
+    ;;
+  deterministic)
+    spec_args+=(--enable-deterministic-inference)
+    ;;
   self)
     SPECULATIVE_ALGORITHM="DECODE_VERIFY_ROLLBACK"
     DRAFT_TOKENS="${DRAFT_TOKENS:-16}"
+    spec_args+=(
+      --speculative-algorithm "${SPECULATIVE_ALGORITHM}"
+      --speculative-num-draft-tokens "${DRAFT_TOKENS}"
+    )
     ;;
   eagle)
     SPECULATIVE_ALGORITHM="DECODE_VERIFY_ROLLBACK_EAGLE"
     DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-${MODEL_PATH}}"
     DRAFT_TOKENS="${DRAFT_TOKENS:-2}"
+    spec_args+=(
+      --speculative-algorithm "${SPECULATIVE_ALGORITHM}"
+      --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
+      --speculative-num-draft-tokens "${DRAFT_TOKENS}"
+    )
     ;;
   *)
-    echo "DVR_MODE must be self or eagle." >&2
+    echo "SERVER_MODE must be normal, deterministic, self, or eagle." >&2
     exit 2
     ;;
 esac
 
-if ((DRAFT_TOKENS < 2)); then
-  echo "DRAFT_TOKENS must be at least 2." >&2
-  exit 2
+if [[ "${SERVER_MODE}" == "self" || "${SERVER_MODE}" == "eagle" ]]; then
+  if ((DRAFT_TOKENS < 2)); then
+    echo "DRAFT_TOKENS must be at least 2." >&2
+    exit 2
+  fi
+  DRAFT_STEPS="${DRAFT_STEPS:-$((DRAFT_TOKENS - 1))}"
+  spec_args+=(
+    --speculative-num-steps "${DRAFT_STEPS}"
+    --speculative-eagle-topk 1
+  )
 fi
-DRAFT_STEPS="${DRAFT_STEPS:-$((DRAFT_TOKENS - 1))}"
 
 args=(
   --model-path "${MODEL_PATH}"
   --host "${SERVER_HOST}"
   --port "${PORT}"
   --tp-size "${TP_SIZE}"
-  --speculative-algorithm "${SPECULATIVE_ALGORITHM}"
-  --speculative-num-draft-tokens "${DRAFT_TOKENS}"
-  --speculative-num-steps "${DRAFT_STEPS}"
-  --speculative-eagle-topk 1
   --page-size "${PAGE_SIZE}"
   --attention-backend "${ATTENTION_BACKEND}"
   --linear-attn-backend "${LINEAR_ATTN_BACKEND}"
   --sampling-backend "${SAMPLING_BACKEND}"
   --random-seed "${RANDOM_SEED}"
+  "${spec_args[@]}"
 )
 
-if [[ "${DVR_MODE}" == "eagle" ]]; then
-  args+=(--speculative-draft-model-path "${DRAFT_MODEL_PATH}")
-fi
 if [[ -n "${MAX_RUNNING_REQUESTS:-}" ]]; then
   args+=(--max-running-requests "${MAX_RUNNING_REQUESTS}")
 fi
@@ -74,14 +89,42 @@ fi
 if [[ -n "${MEM_FRACTION_STATIC:-}" ]]; then
   args+=(--mem-fraction-static "${MEM_FRACTION_STATIC}")
 fi
+if [[ -n "${CONTEXT_LENGTH:-}" ]]; then
+  args+=(--context-length "${CONTEXT_LENGTH}")
+fi
+if [[ -n "${MAX_TOTAL_TOKENS:-}" ]]; then
+  args+=(--max-total-tokens "${MAX_TOTAL_TOKENS}")
+fi
+if [[ -n "${CUDA_GRAPH_BS:-}" ]]; then
+  read -r -a cuda_graph_bs <<<"${CUDA_GRAPH_BS//,/ }"
+  args+=(--cuda-graph-bs-decode "${cuda_graph_bs[@]}")
+fi
+if [[ -n "${CUDA_GRAPH_MAX_BS_DECODE:-}" ]]; then
+  args+=(--cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}")
+fi
 if [[ "${DISABLE_OVERLAP:-0}" == "1" ]]; then
   args+=(--disable-overlap-schedule)
 fi
 if [[ "${DISABLE_RADIX_CACHE:-0}" == "1" ]]; then
   args+=(--disable-radix-cache)
 fi
+if [[ "${DISABLE_CUSTOM_ALL_REDUCE:-0}" == "1" ]]; then
+  args+=(--disable-custom-all-reduce)
+fi
 
-printf 'Starting DVR mode=%s algorithm=%s model=%s tp=%s backend=%s\n' \
-  "${DVR_MODE}" "${SPECULATIVE_ALGORITHM}" "${MODEL_PATH}" "${TP_SIZE}" \
-  "${ATTENTION_BACKEND}"
-exec python -m sglang.launch_server "${args[@]}" "$@"
+cmd=(python -m sglang.launch_server "${args[@]}" "$@")
+overlap_status="enabled"
+radix_status="enabled"
+if [[ "${DISABLE_OVERLAP:-0}" == "1" ]]; then
+  overlap_status="disabled"
+fi
+if [[ "${DISABLE_RADIX_CACHE:-0}" == "1" ]]; then
+  radix_status="disabled"
+fi
+printf 'Starting mode=%s model=%s tp=%s backend=%s overlap=%s radix=%s\n' \
+  "${SERVER_MODE}" "${MODEL_PATH}" "${TP_SIZE}" "${ATTENTION_BACKEND}" \
+  "${overlap_status}" "${radix_status}"
+printf 'Command:'
+printf ' %q' "${cmd[@]}"
+printf '\n'
+exec "${cmd[@]}"
