@@ -2,9 +2,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
-import torch
-
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
+import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -15,6 +14,9 @@ from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     create_dummy_verify_input,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 def _sampling_info(top_ks, top_ps, min_ps):

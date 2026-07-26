@@ -2,12 +2,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.speculative.dvr_state_flow import DVRStateLifecycle
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class FakePool:

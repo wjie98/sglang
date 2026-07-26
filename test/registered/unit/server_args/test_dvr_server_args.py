@@ -14,6 +14,9 @@ from sglang.srt.speculative.dvr_server_args import (
     handle_dvr_cuda_graph_config,
     handle_dvr_defaults,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _Args:

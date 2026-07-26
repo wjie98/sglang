@@ -1,19 +1,22 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
 import sglang.srt.layers.attention.dvr.gdn_backend as dvr_gdn_module
+import torch
 from sglang.srt.configs.mamba_utils import Mamba2StateShape
-from sglang.srt.layers.attention.dvr.gdn_kernels import (
-    dvr_chunk_gated_delta_rule,
-)
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.dvr.gdn_backend import (
     DVRGDNStateAdapter,
     dvr_gdn_workspace_state_slots,
 )
+from sglang.srt.layers.attention.dvr.gdn_kernels import (
+    dvr_chunk_gated_delta_rule,
+)
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 def create_gdn_adapter(

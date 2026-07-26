@@ -9,9 +9,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
-import sglang.srt.managers.scheduler_components.batch_result_processor as result_processor_module
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components import (
+    batch_result_processor as result_processor_module,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )

@@ -2,11 +2,10 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-import torch
-
 import sglang.srt.speculative.dvr_cuda_graph_runner as graph_module
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+import torch
 from sglang.srt.layers.attention.dvr.gdn_backend import DVRGDNAttnBackend
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -19,12 +18,15 @@ from sglang.srt.speculative.dvr_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
     _draft_custom_allreduce_enabled,
     _fast_decode_overrides,
-    _resolve_dvr_backends,
     _resolve_draft_flashinfer_allreduce_fusion,
-    validate_dvr_attention_backend,
+    _resolve_dvr_backends,
     dvr_draft_decode_context,
+    validate_dvr_attention_backend,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 @pytest.mark.parametrize("draft_custom_all_reduce", [True, False])

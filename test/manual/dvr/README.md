@@ -74,11 +74,6 @@ curl http://127.0.0.1:30000/generate \
 
 ## Recurrent-state lifecycle
 
-The isolated self-draft state lifecycle and its H20 qualification gates are
-recorded in `local/STATE_LIFECYCLE_REDESIGN.md`. The transition below describes
-the implemented lifecycle; release qualification still requires the documented
-NVLink correctness and performance matrix.
-
 For gated linear-attention models, the ordinary token KV cache and the
 recurrent state have different lifetimes. DVR keeps the full-attention KV in
 SGLang's existing request and Radix pools. It treats only a recurrent state at
@@ -146,7 +141,6 @@ ReplaySSM, streaming sessions, or int8 recurrent checkpoints. These modes
 change the representation or lifetime of the exact state that rollback needs;
 the server rejects them instead of silently running with an incomplete state.
 
-Fast regression tests live under `test/registered/unit/`. The larger KL,
-acceptance, H20, and throughput matrices are development qualification assets
-under `test/manual/dvr/local/`; they are not intended to be included in a
-minimal upstream change.
+Fast regression tests live under `test/registered/unit/`. Release qualification
+must additionally cover long-generation KL, acceptance, and throughput on the
+target NVLink hardware.
