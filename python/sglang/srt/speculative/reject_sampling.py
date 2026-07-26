@@ -116,12 +116,23 @@ def speculative_sampling_classic_kernel(
 
         norm_sum += tl.sum(val)
 
-    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
-    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
-    target_u = coin_final * norm_sum
+    # A rejected zero-probability proposal can leave p - q with no mass. Sample
+    # from the valid target distribution instead of emitting a vocabulary sentinel.
+    residual_is_valid = (norm_sum > 0.0) & (norm_sum < float("inf"))
+    fallback_to_target = (all_drafts_accepted == 0) & ~residual_is_valid
+    sample_target = (all_drafts_accepted == 1) | fallback_to_target
+    sample_norm = norm_sum
+    if fallback_to_target:
+        sample_norm = 0.0
+        for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+            v_offsets = v_start + tl.arange(0, BLOCK_V)
+            mask = v_offsets < VOCAB_SIZE
+            p_ptr = tp_base_ptr + v_offsets * stride_tp_v
+            sample_norm += tl.sum(tl.load(p_ptr, mask=mask, other=0.0))
+
+    target_u = coin_final * sample_norm
     cum_sum = 0.0
-    final_token = VOCAB_SIZE - 1
+    final_token = 0
     found = 0
 
     for v_start in range(0, VOCAB_SIZE, BLOCK_V):
@@ -132,7 +143,7 @@ def speculative_sampling_classic_kernel(
             p_ptr = tp_base_ptr + v_offsets * stride_tp_v
             p_val = tl.load(p_ptr, mask=mask, other=0.0)
 
-            if all_drafts_accepted:
+            if sample_target:
                 val = p_val
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
