@@ -44,7 +44,6 @@ def create_gdn_adapter(
         req_to_token=torch.empty(num_slots, 1),
     )
     adapter = DVRGDNStateAdapter.for_gdn(
-        None,
         model_runner=SimpleNamespace(
             mambaish_config=SimpleNamespace(
                 mamba2_cache_params=SimpleNamespace(
@@ -66,7 +65,6 @@ def create_test_adapter(
     *,
     transition_windows,
     state_cache=None,
-    kernel_dispatcher=None,
     enable_self_draft_state=False,
 ):
     if state_cache is None:
@@ -95,7 +93,6 @@ def create_test_adapter(
         device=state_cache.conv[0].device,
     )
     return DVRGDNStateAdapter(
-        kernel_dispatcher,
         state_cache=state_cache,
         draft_state=draft_state,
         intermediate_conv_window=intermediate_conv_window,
@@ -386,7 +383,6 @@ def test_dvr_gdn_adapter_maps_request_and_state_slots():
         reqs=[SimpleNamespace(mamba_ping_pong_track_buffer=torch.tensor([0]))],
     )
     adapter = DVRGDNStateAdapter.for_gdn(
-        None,
         model_runner=SimpleNamespace(
             mambaish_config=SimpleNamespace(
                 mamba2_cache_params=SimpleNamespace(
@@ -574,24 +570,21 @@ def test_gdn_verify_uses_mamba_padding_sentinel():
         cache_indices=torch.tensor([7, PAD_SLOT_ID]),
     )
     (
-        checkpoint_slots,
+        boundary_slots,
         request_rows,
-        verify_conv_slots,
         accepted_tail_lens,
         valid_mask,
         boundary_state_steps,
     ) = adapter.verify_metadata
 
-    assert torch.equal(checkpoint_slots, torch.tensor([7, 0]))
+    assert torch.equal(boundary_slots, torch.tensor([7, 0]))
     assert torch.equal(request_rows, torch.tensor([2, 0]))
-    assert torch.equal(verify_conv_slots, torch.tensor([7, 0]))
     assert torch.equal(accepted_tail_lens, torch.tensor([63, 0]))
     assert torch.equal(valid_mask, torch.tensor([True, False]))
     assert torch.equal(boundary_state_steps, torch.tensor([1, -1]))
-    conv_state, conv_slots, intermediate_rows = adapter.verify_conv_state(0)
+    conv_state, conv_slots = adapter.verify_conv_state(0)
     assert conv_state.data_ptr() == adapter.verify_conv[0].data_ptr()
     assert torch.equal(conv_slots, torch.tensor([2, 0]))
-    assert torch.equal(intermediate_rows, torch.tensor([2, 0]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -632,7 +625,6 @@ def test_gdn_verify_exports_boundary_into_workspace(monkeypatch):
     adapter.verify_metadata = (
         torch.tensor([0], device="cuda"),
         torch.tensor([1], device="cuda"),
-        torch.tensor([0], device="cuda"),
         torch.tensor([2], device="cuda"),
         torch.tensor([True], device="cuda"),
         torch.tensor([-1], device="cuda"),

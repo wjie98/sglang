@@ -614,7 +614,6 @@ class DVRGDNStateAdapter:
 
     def __init__(
         self,
-        kernel_dispatcher: Any,
         *,
         state_cache: Any,
         draft_state: torch.Tensor,
@@ -623,7 +622,6 @@ class DVRGDNStateAdapter:
         enable_self_draft_state: bool,
         chunk_size: int = FLA_CHUNK_SIZE,
     ):
-        self.kernel_dispatcher = kernel_dispatcher
         self.state_cache = state_cache
         self.draft_state = draft_state
         self.intermediate_conv_window = intermediate_conv_window
@@ -642,7 +640,6 @@ class DVRGDNStateAdapter:
     @classmethod
     def for_gdn(
         cls,
-        kernel_dispatcher,
         *,
         model_runner: Any,
     ) -> "DVRGDNStateAdapter":
@@ -738,7 +735,6 @@ class DVRGDNStateAdapter:
         )
 
         return cls(
-            kernel_dispatcher,
             state_cache=state_cache,
             draft_state=draft_state,
             intermediate_conv_window=intermediate_conv_window,
@@ -895,16 +891,15 @@ class DVRGDNStateAdapter:
         request_rows = torch.where(
             valid_mask, request_rows, torch.zeros_like(request_rows)
         )
-        verify_conv_slots = torch.where(
+        boundary_slots = torch.where(
             valid_mask,
             cache_indices[:batch_size],
             torch.zeros_like(cache_indices[:batch_size]),
         )
-        checkpoint_slots = verify_conv_slots
         # The stock conv kernel is intentionally in-place. Run it on this tiny
         # request-owned copy so target verify cannot mutate accepted endpoints.
         self.verify_conv[:, request_rows] = self.state_cache.conv[0][
-            :, verify_conv_slots
+            :, boundary_slots
         ]
         # TARGET_VERIFY keeps seq_lens at the accepted endpoint while its
         # speculative cache rows are appended separately.
@@ -925,9 +920,8 @@ class DVRGDNStateAdapter:
             torch.full_like(accepted_tail_lens, -1),
         )
         self.verify_metadata = (
-            checkpoint_slots,
+            boundary_slots,
             request_rows,
-            verify_conv_slots,
             accepted_tail_lens,
             valid_mask,
             boundary_state_steps,
@@ -935,13 +929,13 @@ class DVRGDNStateAdapter:
 
     def verify_conv_state(
         self, layer_idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return verify scratch, its rows, and intermediate-output rows."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return request-owned verify convolution state and request rows."""
 
         if self.verify_metadata is None:
             raise RuntimeError("DVR target-verify metadata was not prepared.")
         request_rows = self.verify_metadata[1]
-        return self.verify_conv[layer_idx], request_rows, request_rows
+        return self.verify_conv[layer_idx], request_rows
 
     def forward_target_verify(
         self,
@@ -960,14 +954,13 @@ class DVRGDNStateAdapter:
         if not query.is_cuda:
             raise RuntimeError("DVR GDN target verify requires CUDA tensors.")
         (
-            checkpoint_slots,
+            boundary_slots,
             request_rows,
-            _,
             accepted_tail_lens,
             valid_mask,
             boundary_state_steps,
         ) = self.verify_metadata
-        batch_size = checkpoint_slots.shape[0]
+        batch_size = boundary_slots.shape[0]
         draft_token_num = query.shape[1] // batch_size
         candidate_inputs = (
             query.reshape(batch_size, draft_token_num, *query.shape[2:]),
@@ -1019,8 +1012,8 @@ class DVRGDNStateAdapter:
             v=v,
             g=cached_g,
             beta=cached_beta,
-            initial_state=self.state_cache.temporal[layer_idx],
-            initial_state_indices=checkpoint_slots,
+                initial_state=self.state_cache.temporal[layer_idx],
+                initial_state_indices=boundary_slots,
             boundary_state=self.draft_state[layer_idx, :, 0],
             boundary_state_indices=request_rows,
             boundary_state_steps=boundary_state_steps,
@@ -1164,7 +1157,6 @@ class DVRGDNAttnBackend(GDNAttnBackend):
     def __init__(self, model_runner):
         super().__init__(model_runner)
         self.dvr_state_adapter = DVRGDNStateAdapter.for_gdn(
-            self.kernel_dispatcher,
             model_runner=model_runner,
         )
         self.dvr_extend_boundary_metadata = None
@@ -1276,11 +1268,9 @@ class DVRGDNAttnBackend(GDNAttnBackend):
             intermediate_conv_window = self.dvr_state_adapter.intermediate_conv_window[
                 layer_idx
             ]
-            (
-                conv_states,
-                conv_indices,
-                intermediate_indices,
-            ) = self.dvr_state_adapter.verify_conv_state(layer_idx)
+            conv_states, conv_indices = self.dvr_state_adapter.verify_conv_state(
+                layer_idx
+            )
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_tokens = forward_batch.spec_info.draft_token_num
             mixed_qkv = (
@@ -1292,7 +1282,7 @@ class DVRGDNAttnBackend(GDNAttnBackend):
                     layer.activation,
                     conv_state_indices=conv_indices,
                     intermediate_conv_window=intermediate_conv_window,
-                    intermediate_state_indices=intermediate_indices,
+                    intermediate_state_indices=conv_indices,
                     retrieve_next_token=retrieve_next_token,
                     retrieve_next_sibling=retrieve_next_sibling,
                     retrieve_parent_token=retrieve_parent_token,
