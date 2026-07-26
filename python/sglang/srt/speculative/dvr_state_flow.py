@@ -101,13 +101,12 @@ class DVRStateLifecycle:
     def prepare_for_cache_release(self, req) -> None:
         if (
             self.state_adapter is None
-            or self.published_boundary_lens is None
             or req.req_pool_idx is None
         ):
             return
         request_row = int(req.req_pool_idx)
         try:
-            if req.skip_radix_cache_insert:
+            if self.published_boundary_lens is None or req.skip_radix_cache_insert:
                 return
 
             committed_len = req._cache_commit_len()
@@ -138,7 +137,8 @@ class DVRStateLifecycle:
                 req.mamba_next_track_idx = checkpoint_lane
         finally:
             self.boundary_seq_lens[request_row] = -1
-            self.published_boundary_lens[request_row].fill_(-1)
+            if self.published_boundary_lens is not None:
+                self.published_boundary_lens[request_row].fill_(-1)
 
     def prepare_for_draft(self, batch) -> Optional[DVRStateCommitPlan]:
         if self.state_adapter is None or batch.batch_size() == 0:

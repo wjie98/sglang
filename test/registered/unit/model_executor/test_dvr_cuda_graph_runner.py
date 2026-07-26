@@ -46,11 +46,22 @@ def test_draft_capture_is_fast_and_restores_target_state(
     )
 
     class FakeEnv:
-        @contextmanager
-        def override(self, value):
+        def __init__(self):
+            self.value = True
+            self.present = True
+
+        def is_set(self):
+            return self.present
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
             events.append(("deterministic_env", value))
-            yield
-            events.append(("deterministic_env", True))
+
+        def clear(self):
+            self.present = False
 
     class FakeGroup:
         pass
@@ -280,9 +291,21 @@ def test_self_draft_preinitializes_fusion_before_custom_all_reduce(monkeypatch):
     )
 
     class FakeEnv:
-        @contextmanager
-        def override(self, _value):
-            yield
+        value = True
+
+        @staticmethod
+        def is_set():
+            return True
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+        @staticmethod
+        def clear():
+            pass
 
     class FakeGroup:
         pass

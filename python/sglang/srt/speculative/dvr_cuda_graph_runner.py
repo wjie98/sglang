@@ -288,9 +288,14 @@ def dvr_draft_decode_context(
             # retain a plan resolved before capture has finished initializing them.
             buffer_cache.pop(_OVERRIDE_PLAN_CACHE, None)
             stack.callback(buffer_cache.pop, _OVERRIDE_PLAN_CACHE, None)
-            stack.enter_context(
-                envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False)
-            )
+            deterministic_env = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE
+            deterministic_env_was_set = deterministic_env.is_set()
+            deterministic_env_value = deterministic_env.get()
+            if deterministic_env_was_set:
+                stack.callback(deterministic_env.set, deterministic_env_value)
+            else:
+                stack.callback(deterministic_env.clear)
+            deterministic_env.set(False)
             _clear_moe_policy_caches()
             # Leave no fast-draft policy entry for deterministic target work.
             stack.callback(_clear_moe_policy_caches)

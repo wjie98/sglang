@@ -56,6 +56,7 @@ def create_gdn_adapter(
             server_args=SimpleNamespace(speculative_num_draft_tokens=num_draft_tokens),
             spec_algorithm=SimpleNamespace(is_dvr_self_draft=lambda: False),
             device=device,
+            dtype=dtype,
         ),
     )
     return adapter
@@ -397,6 +398,7 @@ def test_dvr_gdn_adapter_maps_request_and_state_slots():
             server_args=SimpleNamespace(speculative_num_draft_tokens=4),
             spec_algorithm=SimpleNamespace(is_dvr_self_draft=lambda: False),
             device="cpu",
+            dtype=torch.float32,
         ),
     )
 

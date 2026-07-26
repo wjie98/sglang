@@ -316,6 +316,19 @@ def test_no_radix_boundary_crossing_updates_only_live_state():
     assert lifecycle.boundary_seq_lens[1].item() == 64
 
 
+def test_no_radix_release_clears_request_lifecycle_state():
+    lifecycle, _, pool = make_lifecycle(disable_radix=True, track_slots=(10,))
+    req, batch = make_batch(seq_len=65, track_slots=(10,))
+    attach_pool(batch, pool)
+    lifecycle.prepare_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
+    assert lifecycle.boundary_seq_lens[1].item() == 64
+
+    lifecycle.prepare_for_cache_release(req)
+
+    assert lifecycle.boundary_seq_lens[1].item() == -1
+
+
 def test_radix_boundary_crossing_rotates_publication_lane():
     lifecycle, adapter, pool = make_lifecycle()
     _, batch = make_batch(seq_len=65, next_track=1)

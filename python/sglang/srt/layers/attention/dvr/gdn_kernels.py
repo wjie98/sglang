@@ -124,7 +124,7 @@ def _dvr_chunk_gated_delta_rule_fwd_kernel_h(
     stride_k = Hg * K
     stride_w = H * K
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
     h0 = initial_state + index * stride_h
     ht = initial_state + index * stride_h
     if USE_INITIAL_STATE:
@@ -417,7 +417,7 @@ def _dvr_chunk_gated_delta_rule_fwd_h(
     boundary_state: Optional[torch.Tensor] = None,
     boundary_state_indices: Optional[torch.Tensor] = None,
     boundary_state_steps: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE

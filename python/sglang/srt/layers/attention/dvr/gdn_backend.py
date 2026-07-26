@@ -673,7 +673,6 @@ class DVRGDNStateAdapter:
         local_key_heads, local_value_heads, key_dim, value_dim = _local_gdn_dimensions(
             state_shape
         )
-
         # Request row 0 is the CUDA-graph padding row. DVR workspaces use request
         # rows, not Mamba slots, so Radix may donate/rebind cache slots normally.
         num_slots = model_runner.req_to_token_pool.req_to_token.shape[0]
@@ -717,7 +716,7 @@ class DVRGDNStateAdapter:
             window_len,
             local_key_heads,
             key_dim,
-            dtype=mamba_cache_params.dtype.conv,
+            dtype=model_runner.dtype,
             device=model_runner.device,
         )
         v = torch.zeros(
@@ -726,7 +725,7 @@ class DVRGDNStateAdapter:
             window_len,
             local_value_heads,
             value_dim,
-            dtype=mamba_cache_params.dtype.conv,
+            dtype=model_runner.dtype,
             device=model_runner.device,
         )
         gate = torch.zeros(

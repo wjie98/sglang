@@ -100,7 +100,7 @@ class TestDVRServerArgs(unittest.TestCase):
             )
         )
 
-    def test_gdn_capability_uses_registered_backend(self):
+    def test_registered_linear_state_backend_requires_explicit_dvr_support(self):
         args = SimpleNamespace(
             get_model_config=lambda: SimpleNamespace(
                 hf_config=SimpleNamespace(get_text_config=lambda: object())
@@ -116,8 +116,8 @@ class TestDVRServerArgs(unittest.TestCase):
                 SimpleNamespace(backend_class_name=backend),
                 object(),
             ),
-        ):
-            self.assertTrue(_is_dvr_gated_linear_state_model(args))
+        ), self.assertRaisesRegex(ValueError, "does not yet install"):
+            _is_dvr_gated_linear_state_model(args)
 
         backend = "sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend"
         with (
@@ -300,6 +300,25 @@ class TestDVRServerArgs(unittest.TestCase):
         args = _Args()
         args.sampling_backend = "custom"
         with self.assertRaisesRegex(ValueError, "built-in flashinfer and pytorch"):
+            _handle_dvr_speculative_decoding(args)
+
+    def test_dvr_reads_declared_sampling_backend(self):
+        args = _Args()
+        args.sampling_backend = None
+        args._resolved_overrides = [("sampling", {"sampling_backend": "pytorch"})]
+
+        _handle_dvr_speculative_decoding(args)
+
+    def test_dvr_rejects_unified_memory(self):
+        args = _Args()
+        args.enable_unified_memory = True
+        with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+            _handle_dvr_speculative_decoding(args)
+
+    def test_dvr_rejects_inconsistent_chain_lengths(self):
+        args = _Args()
+        args.speculative_num_steps = 3
+        with self.assertRaisesRegex(ValueError, "num_draft_tokens =="):
             _handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_unsupported_output_features(self):

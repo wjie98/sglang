@@ -111,6 +111,9 @@ def _handle_dvr_speculative_decoding(server_args):
     if server_args.speculative_algorithm not in DVR_SPECULATIVE_ALGORITHMS:
         return
 
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    view = resolved_view(server_args)
     if not server_args.device.startswith("cuda"):
         raise ValueError("DVR currently only supports CUDA device.")
     if is_hip():
@@ -129,6 +132,8 @@ def _handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR does not support custom logit processors.")
     if server_args.enable_return_hidden_states:
         raise ValueError("DVR does not return user-requested hidden states.")
+    if view.enable_unified_memory:
+        raise ValueError("DVR does not support --enable-unified-memory.")
     if (
         server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is not None
@@ -178,14 +183,8 @@ def _handle_dvr_speculative_decoding(server_args):
             "--enable-int8-mamba-checkpoint."
         )
     for phase, backend in (
-        (
-            "prefill",
-            server_args.prefill_attention_backend or server_args.attention_backend,
-        ),
-        (
-            "decode",
-            server_args.decode_attention_backend or server_args.attention_backend,
-        ),
+        ("prefill", view.prefill_attention_backend or view.attention_backend),
+        ("decode", view.decode_attention_backend or view.attention_backend),
     ):
         if backend not in _DVR_FULL_ATTENTION_BACKENDS:
             raise ValueError(
@@ -193,7 +192,7 @@ def _handle_dvr_speculative_decoding(server_args):
                 f"backends, got effective {phase} backend {backend}."
             )
     linear_prefill_backend = (
-        server_args.linear_attn_prefill_backend or server_args.linear_attn_backend
+        view.linear_attn_prefill_backend or view.linear_attn_backend
     )
     if uses_gated_linear_state and linear_prefill_backend != "triton":
         raise ValueError(
@@ -207,11 +206,10 @@ def _handle_dvr_speculative_decoding(server_args):
         server_args.speculative_num_draft_tokens
         != server_args.speculative_num_steps + 1
     ):
-        logger.warning(
-            "speculative_num_draft_tokens is adjusted to "
-            "speculative_num_steps + 1 for DVR chain mode."
+        raise ValueError(
+            "DVR chain mode requires speculative_num_draft_tokens == "
+            "speculative_num_steps + 1."
         )
-        server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
 
     if server_args.speculative_num_draft_tokens < 2:
         raise ValueError(
@@ -231,7 +229,7 @@ def _handle_dvr_speculative_decoding(server_args):
         server_args.speculative_eagle_topk = 1
     elif server_args.speculative_eagle_topk != 1:
         raise ValueError("DVR currently supports only chain mode with topk == 1.")
-    if server_args.sampling_backend not in ("flashinfer", "pytorch"):
+    if view.sampling_backend not in ("flashinfer", "pytorch"):
         raise ValueError(
             "DVR supports only the built-in flashinfer and pytorch sampling "
             "backends because target verification must reproduce the sampler's "
@@ -303,11 +301,9 @@ def _is_dvr_gated_linear_state_model(server_args):
     registered = get_linear_attn_config(hf_config)
     if registered is not None:
         backend = registered[0].backend_class_name
-        if backend.endswith(".gdn_backend.GDNAttnBackend"):
-            return True
         raise ValueError(
-            "DVR does not support the registered linear-state backend "
-            f"{backend!r}."
+            "DVR does not yet install its state adapter for registered "
+            f"linear-state backend {backend!r}."
         )
 
     # Qwen3.5/InternS2 text configs inherit Qwen3NextConfig; JetVLM unwraps
