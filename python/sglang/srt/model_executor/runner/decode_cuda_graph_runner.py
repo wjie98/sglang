@@ -181,10 +181,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
-    record_war_fastpath_event = True
-    initialize_attention_backend_state = True
-    global_num_tokens_are_expanded = False
-    force_decode_capture = False
+    owns_attention_graph_state = True
 
     def __init__(
         self,
@@ -246,28 +243,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # --- capture mode + tokens-per-bs ------------------------------
-        self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
-        self.num_tokens_per_bs = (
-            1
-            if self.force_decode_capture
-            else model_runner.decode_num_tokens_per_bs(
-                num_draft_tokens=self.speculative_num_draft_tokens
-            )
+        self.capture_forward_mode, self.num_tokens_per_bs = (
+            self._resolve_capture_layout()
         )
-        if (
-            model_runner.spec_algorithm.is_speculative()
-            and not self.force_decode_capture
-        ):
-            if self.model_runner.is_draft_worker:
-                # Draft workers can use TARGET_VERIFY mode.
-                if (
-                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
-                ):
-                    raise RuntimeError("This should not happen")
-            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-        elif self.is_dllm:
-            self.capture_forward_mode = ForwardMode.DLLM_EXTEND
 
         # --- bucket sizes ---------------------------------------------
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -283,7 +262,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        if self.initialize_attention_backend_state:
+        if self.owns_attention_graph_state:
             self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -405,6 +384,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def _resolve_capture_layout(self):
+        num_tokens_per_bs = self.model_runner.decode_num_tokens_per_bs(
+            num_draft_tokens=self.speculative_num_draft_tokens
+        )
+        if self.model_runner.spec_algorithm.is_speculative():
+            if self.model_runner.is_draft_worker:
+                # Draft workers can use TARGET_VERIFY mode.
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
+                    raise RuntimeError("This should not happen")
+            return ForwardMode.TARGET_VERIFY, num_tokens_per_bs
+        if self.is_dllm:
+            return ForwardMode.DLLM_EXTEND, num_tokens_per_bs
+        return ForwardMode.DECODE, num_tokens_per_bs
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(
             size=bs,
@@ -428,8 +423,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.global_num_tokens_are_expanded
-                or self.model_runner.spec_algorithm.is_eagle()
+                if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
                 else max(forward_batch.global_num_tokens_cpu)
@@ -968,8 +962,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
-                if self.global_num_tokens_are_expanded
-                or self.model_runner.spec_algorithm.is_eagle()
+                if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
                 else max_num_tokens
@@ -1048,15 +1041,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            # Publish a read-done event for the WAR barrier: a cuda-graph forward
-            # finishes its shared req_to_token / SWA reads at this pre-replay
-            # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
-            if self.record_war_fastpath_event and (
+            # A provisional DVR self-draft decode is followed by target verify
+            # and rollback, so its worker publishes the final WAR fence instead.
+            if (
                 forward_batch.forward_mode.is_decode()
-                or (
-                    forward_batch.forward_mode.is_target_verify()
-                    and self.model_runner.spec_algorithm.is_dflash()
-                )
+                and not self.model_runner.spec_algorithm.is_dvr_self_draft()
+            ) or (
+                forward_batch.forward_mode.is_target_verify()
+                and self.model_runner.spec_algorithm.is_dflash()
             ):
                 read_done = self.device_module.Event()
                 read_done.record()

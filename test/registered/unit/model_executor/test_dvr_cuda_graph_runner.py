@@ -13,8 +13,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.dvr_cuda_graph_runner import (
-    DVRTargetVerifyCudaGraphRunner,
+    DVRDraftDecodeCudaGraphRunner,
     _draft_custom_allreduce_enabled,
     _fast_decode_overrides,
     _resolve_dvr_backends,
@@ -22,7 +24,6 @@ from sglang.srt.speculative.dvr_cuda_graph_runner import (
     validate_dvr_attention_backend,
     dvr_draft_decode_context,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -361,29 +362,59 @@ def test_draft_custom_allreduce_context_restores_target_policy():
         assert communicator.disabled
 
 
-def test_mlp_tp_gather_uses_runner_layout_for_speculative_batch_size():
-    runner = object.__new__(DVRTargetVerifyCudaGraphRunner)
-    runner.require_mlp_tp_gather = True
-    runner.num_tokens_per_bs = 16
-    runner.enable_pdmux = False
-    runner.disable_padding = False
-    runner.max_bs = 2
-    runner.require_mlp_sync = False
-    runner.is_encoder_decoder = False
-    runner.capture_hidden_mode = CaptureHiddenMode.NULL
-    runner.enable_two_batch_overlap = False
+def test_dvr_draft_graph_uses_plain_decode_layout_and_shared_state():
+    runner = object.__new__(DVRDraftDecodeCudaGraphRunner)
+
+    assert runner._resolve_capture_layout() == (ForwardMode.DECODE, 1)
+    assert not runner.owns_attention_graph_state
+
+
+@pytest.mark.parametrize(
+    ("forward_mode", "dvr_self_draft", "dflash", "records_event"),
+    [
+        (ForwardMode.DECODE, False, False, True),
+        (ForwardMode.DECODE, True, False, False),
+        (ForwardMode.TARGET_VERIFY, False, True, True),
+        (ForwardMode.TARGET_VERIFY, True, False, False),
+    ],
+)
+def test_cuda_graph_war_event_skips_provisional_self_draft(
+    forward_mode, dvr_self_draft, dflash, records_event
+):
+    events = []
+
+    class Event:
+        def record(self):
+            events.append("record")
+
+    class Backend:
+        @contextmanager
+        def replay_session(self):
+            yield
+
+        def replay(self, _key, _forward_batch):
+            return PPProxyTensors({})
+
+    runner = object.__new__(DecodeCudaGraphRunner)
     runner.model_runner = SimpleNamespace(
-        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
+        device_timer=None,
+        spec_algorithm=SimpleNamespace(
+            is_dvr_self_draft=lambda: dvr_self_draft,
+            is_dflash=lambda: dflash,
+        ),
+        war_fastpath_read_done_event=None,
     )
-    forward_batch = SimpleNamespace(
-        replace_embeds=None,
-        global_num_tokens_cpu=[32],
-        batch_size=2,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-        spec_info=None,
-    )
+    runner.device_module = SimpleNamespace(Event=Event)
+    runner.backend = Backend()
+    runner.bs = 1
 
-    assert runner.can_run_graph(forward_batch)
+    def load_batch(_forward_batch, _pp_proxy_tensors):
+        runner._replay_graph_key = 1
 
-    runner.global_num_tokens_are_expanded = False
-    assert not runner.can_run_graph(forward_batch)
+    runner.load_batch = load_batch
+    runner.execute(SimpleNamespace(forward_mode=forward_mode))
+
+    assert bool(events) is records_event
+    assert (
+        runner.model_runner.war_fastpath_read_done_event is not None
+    ) is records_event

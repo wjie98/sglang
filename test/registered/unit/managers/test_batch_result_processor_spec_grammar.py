@@ -97,6 +97,16 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
+    def test_cache_release_calls_optional_worker_lifecycle_hook(self):
+        calls = []
+        proc = _make_processor()
+        proc.model_worker.prepare_for_kv_cache_release = calls.append
+        req = SimpleNamespace(rid="done")
+
+        proc._prepare_for_kv_cache_release(req)
+
+        self.assertEqual(calls, [req])
+
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()

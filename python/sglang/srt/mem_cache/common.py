@@ -257,19 +257,11 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     """
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
-    if server_args.speculative_algorithm is not None:
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        spec_algo = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
-        needs_decode_reserve = spec_algo.is_dvr_self_draft() or (
-            server_args.page_size > 1
-            and (server_args.speculative_eagle_topk or 1) > 1
-        )
-    else:
-        needs_decode_reserve = False
-    if needs_decode_reserve:
+    if (
+        server_args.speculative_algorithm is not None
+        and server_args.page_size > 1
+        and (server_args.speculative_eagle_topk or 1) > 1
+    ):
         extra = max(extra, get_alloc_reserve_per_decode(server_args))
     return extra
 

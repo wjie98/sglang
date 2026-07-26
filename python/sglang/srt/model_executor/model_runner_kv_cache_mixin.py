@@ -47,7 +47,6 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
-    conv_window_dedup_enabled,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -118,10 +117,14 @@ class ModelRunnerKVCacheMixin:
         )
         if self.spec_algorithm.is_dvr_self_draft():
             # Exact rejection sampling retains one proposal distribution per
-            # draft edge. Reserve it before sizing the KV/state pools.
-            graph_max_bs = self.server_args.cuda_graph_config.decode.max_bs or 1
+            # draft edge. Reserve the worker's full fixed chain capacity.
+            proposal_batch_capacity = max(
+                self.server_args.cuda_graph_config.decode.max_bs or 0,
+                self.server_args.max_running_requests or 0,
+                1,
+            )
             proposal_bytes = (
-                graph_max_bs
+                proposal_batch_capacity
                 * self.server_args.speculative_num_steps
                 * self.model_config.vocab_size
                 * torch.float32.itemsize
@@ -170,30 +173,31 @@ class ModelRunnerKVCacheMixin:
         assert config is not None
 
         has_spec_dec = not self.spec_algorithm.is_none()
-        is_dvr = self.spec_algorithm.is_dvr()
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
-            draft_steps = server_args.speculative_num_draft_tokens
-            state_slots_per_request = self._calculate_mamba_ratio()
-            if is_dvr:
+            intermediate_state_slots = server_args.speculative_num_draft_tokens
+            if self.spec_algorithm.is_dvr():
                 from sglang.srt.layers.attention.dvr.gdn_backend import (
-                    dvr_gdn_intermediate_bytes_per_request,
+                    dvr_gdn_workspace_state_slots,
                 )
 
-                intermediate_per_req = dvr_gdn_intermediate_bytes_per_request(
-                    config.mamba2_cache_params,
-                    draft_steps,
-                    checkpoint_lanes=(1 if server_args.disable_radix_cache else 2),
-                    dedup_conv_window=conv_window_dedup_enabled(
-                        _is_npu,
-                        current_platform.is_cpu(),
-                        server_args.speculative_eagle_topk,
-                    ),
+                num_local_layers = sum(
+                    self.start_layer <= layer_id < self.end_layer
+                    for layer_id in config.mamba2_cache_params.layers
                 )
-            else:
-                intermediate_per_req = (
-                    config.mamba2_cache_params.mamba_cache_per_req * draft_steps
+                intermediate_state_slots = dvr_gdn_workspace_state_slots(
+                    config.mamba2_cache_params,
+                    server_args.speculative_num_draft_tokens,
+                    num_layers=num_local_layers,
+                )
+                # DVR workspaces are request-indexed and include row 0 for
+                # CUDA-graph padding. Reserve that row once; the upstream
+                # formulas below account for all active request rows.
+                total_rest_memory -= (
+                    intermediate_state_slots
+                    * config.mamba2_cache_params.mamba_cache_per_req
+                    / (1 << 30)
                 )
 
         if server_args.max_mamba_cache_size is not None:
@@ -203,13 +207,16 @@ class ModelRunnerKVCacheMixin:
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
+                ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests
                     // (self.dp_size if server_args.enable_dp_attention else 1),
-                    server_args.max_mamba_cache_size // state_slots_per_request,
+                    server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = intermediate_per_req * (
-                    capped_reqs + (1 if is_dvr else 0)
+                intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * capped_reqs
+                    * intermediate_state_slots
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -217,16 +224,15 @@ class ModelRunnerKVCacheMixin:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
-            request_capacity = server_args.max_running_requests // (
+            server_args.max_mamba_cache_size = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
-            )
-            server_args.max_mamba_cache_size = request_capacity * (
-                state_slots_per_request if is_dvr else 1
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
-                intermediate_size = intermediate_per_req * (
-                    request_capacity + (1 if is_dvr else 0)
+                intermediate_size = (
+                    config.mamba2_cache_params.mamba_cache_per_req
+                    * server_args.max_mamba_cache_size
+                    * intermediate_state_slots
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -237,7 +243,8 @@ class ModelRunnerKVCacheMixin:
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
             # The mamba budget (from the ratio split) must cover both:
             #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: one buffer set per active request.
+            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
+            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
             mamba_budget = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
@@ -246,31 +253,20 @@ class ModelRunnerKVCacheMixin:
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
             if has_spec_dec:
-                if is_dvr:
-                    # DVR's request-indexed workspaces include row 0 for padded
-                    # CUDA-graph requests in addition to active request rows.
-                    mamba_budget_bytes -= intermediate_per_req
-                    server_args.max_mamba_cache_size = int(
-                        mamba_budget_bytes
-                        // (per_req + intermediate_per_req / state_slots_per_request)
-                    )
-                else:
-                    # Preserve the upstream arithmetic, including operation
-                    # order, for every non-DVR speculative worker.
-                    server_args.max_mamba_cache_size = int(
-                        mamba_budget_bytes
-                        // (per_req * (1 + draft_steps / state_slots_per_request))
-                    )
+                ratio = self._calculate_mamba_ratio()
+                D = intermediate_state_slots
+                # Joint solve: main_state + intermediate = mamba_budget
+                server_args.max_mamba_cache_size = int(
+                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
                     server_args.max_running_requests
                     // (self.dp_size if server_args.enable_dp_attention else 1),
-                    server_args.max_mamba_cache_size // state_slots_per_request,
+                    server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = intermediate_per_req * (
-                    capped_reqs + (1 if is_dvr else 0)
-                )
+                intermediate_size = per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)

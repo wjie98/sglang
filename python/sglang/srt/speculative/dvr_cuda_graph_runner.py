@@ -382,12 +382,10 @@ def dvr_draft_decode_context(
 class DVRDraftDecodeCudaGraphRunner(DecodeCudaGraphRunner):
     """Ordinary decode graph used only for provisional self-draft tokens."""
 
-    force_decode_capture = True
-    # Target verify remains the final shared-pool reader. Publishing an event
-    # after every provisional decode step allocates and records 15 events that
-    # the DVR worker must discard before returning to Scheduler.
-    record_war_fastpath_event = False
-    initialize_attention_backend_state = False
+    owns_attention_graph_state = False
+
+    def _resolve_capture_layout(self):
+        return ForwardMode.DECODE, 1
 
 
 class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
@@ -398,8 +396,6 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     those rules on the graph runner instead of attaching execution hooks to the
     spec_info data object.
     """
-
-    global_num_tokens_are_expanded = True
 
     def get_spec_info(self, num_tokens: int):
         from sglang.srt.speculative.spec_info import create_dummy_verify_input

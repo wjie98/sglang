@@ -107,7 +107,7 @@ def handle_dvr_defaults(server_args):
         server_args.mamba_ssm_dtype = "float32"
 
 
-def handle_dvr_speculative_decoding(server_args):
+def _handle_dvr_speculative_decoding(server_args):
     if server_args.speculative_algorithm not in DVR_SPECULATIVE_ALGORITHMS:
         return
 

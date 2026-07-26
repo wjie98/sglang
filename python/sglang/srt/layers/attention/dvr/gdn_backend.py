@@ -22,7 +22,7 @@ from sglang.srt.utils.nvtx_utils import profile_range
 __all__ = [
     "DVRGDNAttnBackend",
     "DVRGDNStateAdapter",
-    "dvr_gdn_intermediate_bytes_per_request",
+    "dvr_gdn_workspace_state_slots",
 ]
 
 if not is_cpu():
@@ -460,25 +460,18 @@ def _local_gdn_dimensions(state_shape):
     return local_key_heads, local_value_heads, key_dim, value_dim
 
 
-def dvr_gdn_intermediate_bytes_per_request(
+def dvr_gdn_workspace_state_slots(
     cache_params,
     num_draft_tokens: int,
     *,
-    checkpoint_lanes: int,
-    dedup_conv_window: bool,
+    num_layers: int,
 ) -> int:
-    """Size DVR-only verify, rollback, and state-input buffers per request."""
+    """Conservatively express DVR workspace as whole Mamba-state slots."""
 
     intermediate_conv_numel = sum(
-        conv_dim
-        * (
-            num_draft_tokens + window_size - 1
-            if dedup_conv_window
-            else num_draft_tokens * window_size
-        )
+        conv_dim * (num_draft_tokens + window_size - 1)
         for conv_dim, window_size in cache_params.shape.conv
     )
-    num_layers = len(cache_params.layers)
     total = num_layers * (
         intermediate_conv_numel * cache_params.dtype.conv.itemsize
         + math.prod(cache_params.shape.temporal) * cache_params.dtype.temporal.itemsize
@@ -498,13 +491,14 @@ def dvr_gdn_intermediate_bytes_per_request(
         + local_value_heads * value_dim * cache_params.dtype.conv.itemsize
         + 2 * local_value_heads * torch.float32.itemsize
     )
-    # Persistent k/v/g/beta transition windows, the selected boundary slot,
-    # and request-local checkpoint lengths mirrored by DVRStateLifecycle.
-    return (
+    workspace_bytes = (
         total
         + num_layers * (FLA_CHUNK_SIZE + num_draft_tokens) * values_per_token
-        + (1 + checkpoint_lanes) * torch.int64.itemsize
+        # Cover request-local boundary metadata without coupling pool sizing to
+        # the selected Radix strategy.
+        + 3 * torch.int64.itemsize
     )
+    return max(1, math.ceil(workspace_bytes / cache_params.mamba_cache_per_req))
 
 
 def _compact_gdn_transition_windows(

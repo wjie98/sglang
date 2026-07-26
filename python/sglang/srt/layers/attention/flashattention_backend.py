@@ -256,16 +256,11 @@ class FlashAttentionBackend(AttentionBackend):
         spec_algorithm = SpeculativeAlgorithm.from_string(
             model_runner.server_args.speculative_algorithm
         )
-        # Topk-1 self-DVR uses only the device-side normal-decode and target-
-        # verify page-table builders. Other EAGLE modes still have host-max
-        # draft-extend branches and therefore retain the CPU mirror.
-        gpu_only_dvr = (
-            spec_algorithm.is_dvr_self_draft()
-            and (model_runner.server_args.speculative_eagle_topk or 1) == 1
-            and not model_runner.model_config.is_local_attention_model
-            and not getattr(model_runner, "prefill_aware_swa", False)
+        # DFlash and self-DVR relay sequence lengths on device. EAGLE-based
+        # draft-extend still has host-max paths and keeps the CPU mirror.
+        self.needs_cpu_seq_lens = not (
+            spec_algorithm.is_dflash() or spec_algorithm.is_dvr_self_draft()
         )
-        self.needs_cpu_seq_lens = not (spec_algorithm.is_dflash() or gpu_only_dvr)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size

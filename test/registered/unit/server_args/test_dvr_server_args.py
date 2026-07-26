@@ -9,10 +9,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dvr_server_args import (
     DVR_EAGLE_SPECULATIVE_ALGORITHM,
     DVR_SPECULATIVE_ALGORITHM,
+    _handle_dvr_speculative_decoding,
     _is_dvr_gated_linear_state_model,
     handle_dvr_cuda_graph_config,
     handle_dvr_defaults,
-    handle_dvr_speculative_decoding,
 )
 
 
@@ -159,13 +159,13 @@ class TestDVRServerArgs(unittest.TestCase):
             ),
             self.assertRaisesRegex(ValueError, "two-batch overlap"),
         ):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_zero_step_chain_mode(self):
         args = _Args()
         args.speculative_num_draft_tokens = 1
         with self.assertRaisesRegex(ValueError, "speculative_num_draft_tokens >= 2"):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
     def test_dvr_self_draft_uses_existing_cuda_graph_coverage(self):
         cases = (
@@ -183,9 +183,9 @@ class TestDVRServerArgs(unittest.TestCase):
                 self.assertEqual(args.cuda_graph_config.decode.bs, bs)
                 self.assertEqual(args.cuda_graph_config.decode.max_bs, max_bs)
 
-    def test_dvr_chain_request_row_covers_overlap_reservation(self):
+    def test_dvr_chain_request_row_uses_standard_spec_headroom(self):
         args = _Args()
-        self.assertEqual(get_req_to_token_extra_context_len(args), 32)
+        self.assertEqual(get_req_to_token_extra_context_len(args), 20)
 
     def test_ordinary_spec_request_row_keeps_upstream_reservation(self):
         args = _Args()
@@ -212,7 +212,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.speculative_algorithm = DVR_EAGLE_SPECULATIVE_ALGORITHM
         args.speculative_draft_model_path = "draft"
 
-        handle_dvr_speculative_decoding(args)
+        _handle_dvr_speculative_decoding(args)
 
         self.assertFalse(args.disable_radix_cache)
         self.assertFalse(args.enable_mixed_chunk)
@@ -223,7 +223,7 @@ class TestDVRServerArgs(unittest.TestCase):
         args.speculative_draft_model_path = "draft"
         args.max_running_requests = None
 
-        handle_dvr_speculative_decoding(args)
+        _handle_dvr_speculative_decoding(args)
 
         self.assertEqual(args.max_running_requests, 48)
 
@@ -266,14 +266,14 @@ class TestDVRServerArgs(unittest.TestCase):
         args.speculative_draft_model_path = "draft"
         args.speculative_num_draft_tokens = None
 
-        handle_dvr_speculative_decoding(args)
+        _handle_dvr_speculative_decoding(args)
 
         self.assertEqual(args.speculative_num_draft_tokens, 2)
         self.assertEqual(args.speculative_num_steps, 1)
 
     def test_dvr_rejection_sampling_is_always_enabled(self):
         args = _Args()
-        handle_dvr_speculative_decoding(args)
+        _handle_dvr_speculative_decoding(args)
         self.assertTrue(args.speculative_use_rejection_sampling)
 
     def test_dvr_rejection_sampling_rejects_ignored_acceptance_thresholds(self):
@@ -281,26 +281,26 @@ class TestDVRServerArgs(unittest.TestCase):
         args.speculative_accept_threshold_single = 0.9
 
         with self.assertRaisesRegex(ValueError, "thresholds must remain 1.0"):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejection_sampling_rejects_tree_and_multi_layer_eagle(self):
         args = _Args()
         args.speculative_eagle_topk = 2
         with self.assertRaisesRegex(ValueError, "chain mode with topk == 1"):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
         args = _Args()
         args.speculative_algorithm = DVR_EAGLE_SPECULATIVE_ALGORITHM
         args.speculative_draft_model_path = "draft"
         args.enable_multi_layer_eagle = True
         with self.assertRaisesRegex(NotImplementedError, "multi-layer EAGLE"):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_custom_sampler(self):
         args = _Args()
         args.sampling_backend = "custom"
         with self.assertRaisesRegex(ValueError, "built-in flashinfer and pytorch"):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_unsupported_output_features(self):
         for field, message in (
@@ -311,7 +311,7 @@ class TestDVRServerArgs(unittest.TestCase):
                 args = _Args()
                 setattr(args, field, True)
                 with self.assertRaisesRegex(ValueError, message):
-                    handle_dvr_speculative_decoding(args)
+                    _handle_dvr_speculative_decoding(args)
 
     def test_dvr_disables_grammar_and_rejects_explicit_backend(self):
         args = _Args()
@@ -378,7 +378,7 @@ class TestDVRServerArgs(unittest.TestCase):
                     return_value=True,
                 ):
                     with self.assertRaisesRegex(ValueError, message):
-                        handle_dvr_speculative_decoding(args)
+                        _handle_dvr_speculative_decoding(args)
 
     def test_dvr_gdn_radix_requires_non_lazy_extra_buffer(self):
         for strategy in ("no_buffer", "extra_buffer_lazy"):
@@ -402,14 +402,14 @@ class TestDVRServerArgs(unittest.TestCase):
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "linear-attn-prefill-backend"):
-                handle_dvr_speculative_decoding(args)
+                _handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_unsupported_full_attention_backend(self):
         args = _Args()
         args.attention_backend = "flashinfer"
 
         with self.assertRaisesRegex(ValueError, "only Triton and FA3"):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
     def test_dvr_defaults_unspecified_attention_backend_to_triton(self):
         args = _Args()
@@ -425,18 +425,18 @@ class TestDVRServerArgs(unittest.TestCase):
         args.prefill_attention_backend = "triton"
         args.decode_attention_backend = "fa3"
 
-        handle_dvr_speculative_decoding(args)
+        _handle_dvr_speculative_decoding(args)
 
         args.decode_attention_backend = "flashinfer"
         with self.assertRaisesRegex(ValueError, "effective decode backend"):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
     def test_dvr_rejects_pdmux_attention(self):
         args = _Args()
         args.enable_pdmux = True
 
         with self.assertRaisesRegex(ValueError, "PDMux"):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
     def test_dvr_gdn_rejects_streaming_session(self):
         args = _Args()
@@ -447,7 +447,7 @@ class TestDVRServerArgs(unittest.TestCase):
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "streaming sessions"):
-                handle_dvr_speculative_decoding(args)
+                _handle_dvr_speculative_decoding(args)
 
     def test_dvr_gdn_rejects_int8_recurrent_checkpoints(self):
         args = _Args()
@@ -458,7 +458,7 @@ class TestDVRServerArgs(unittest.TestCase):
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "exact recurrent checkpoints"):
-                handle_dvr_speculative_decoding(args)
+                _handle_dvr_speculative_decoding(args)
 
     def test_plain_transformer_dvr_ignores_gdn_only_options(self):
         args = _Args()
@@ -471,7 +471,7 @@ class TestDVRServerArgs(unittest.TestCase):
             "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=False,
         ):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
         self.assertTrue(args.enable_mixed_chunk)
 
@@ -481,7 +481,7 @@ class TestDVRServerArgs(unittest.TestCase):
             "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
             return_value=True,
         ):
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
         self.assertFalse(args.enable_mixed_chunk)
 
@@ -536,7 +536,7 @@ class TestDVRServerArgs(unittest.TestCase):
             return_value=False,
         ):
             handle_dvr_defaults(args)
-            handle_dvr_speculative_decoding(args)
+            _handle_dvr_speculative_decoding(args)
 
         self.assertEqual(args.page_size, 32)
         self.assertEqual(args.speculative_num_draft_tokens, 65)

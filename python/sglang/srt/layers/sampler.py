@@ -259,58 +259,6 @@ class Sampler(nn.Module):
                 raise ValueError(f"Invalid sampling backend: {backend}")
         return batch_next_token_ids
 
-    @staticmethod
-    def normalize_probs(
-        probs: torch.Tensor,
-        sampling_info: SamplingBatchInfo,
-        repeat: int = 1,
-    ) -> torch.Tensor:
-        """Return the normalized distribution used by the configured sampler."""
-
-        top_ks = sampling_info.top_ks
-        top_ps = sampling_info.top_ps
-        min_ps = sampling_info.min_ps
-        if repeat != 1:
-            top_ks = torch.repeat_interleave(top_ks, repeat, dim=0)
-            top_ps = torch.repeat_interleave(top_ps, repeat, dim=0)
-            min_ps = torch.repeat_interleave(min_ps, repeat, dim=0)
-
-        backend = get_flags().sampling_backend
-        if backend == "flashinfer" and probs.is_cuda:
-            if sampling_info.need_min_p_sampling:
-                probs = top_k_renorm_prob(probs, top_ks)
-                probs = top_p_renorm_prob(probs, top_ps)
-                threshold = probs.amax(dim=-1, keepdim=True) * min_ps.unsqueeze(1)
-                probs = torch.where(probs >= threshold, probs, 0.0)
-                return probs / probs.sum(dim=-1, keepdim=True)
-
-            # Sequential renormalization has the same support and normalized
-            # weights as FlashInfer's joint top-k/top-p sampler.
-            if sampling_info.need_top_p_sampling:
-                probs = top_p_renorm_prob(probs, top_ps)
-            if sampling_info.need_top_k_sampling:
-                probs = top_k_renorm_prob(probs, top_ks)
-            return probs
-
-        if backend == "pytorch" or not probs.is_cuda:
-            if not (
-                sampling_info.need_top_k_sampling
-                or sampling_info.need_top_p_sampling
-                or sampling_info.need_min_p_sampling
-            ):
-                return probs
-            filtered, indices = _filter_probs_torch(
-                probs,
-                top_ks,
-                top_ps,
-                min_ps,
-                sampling_info.need_min_p_sampling,
-            )
-            filtered.div_(filtered.sum(dim=-1, keepdim=True))
-            return torch.zeros_like(probs).scatter_(-1, indices, filtered)
-
-        raise ValueError(f"Cannot normalize probabilities for backend: {backend}")
-
     def _sample_from_logprobs(
         self,
         logprobs: torch.Tensor,
@@ -541,14 +489,21 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     When sampling_seed is not None, deterministic inference will be enabled, it will sample
     with the sampling_seed of each request.
     """
-    probs_sort, probs_idx = _filter_probs_torch(
-        probs, top_ks, top_ps, min_ps, need_min_p_sampling
-    )
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[
+        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
         assert (
             sampling_seed is None
         ), "With sampling seed, multinomial_with_seed will provide wrong results"
+        min_p_thresholds = probs_sort[:, 0] * min_ps
+        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
@@ -566,26 +521,6 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
-
-
-def _filter_probs_torch(
-    probs: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
-    min_ps: torch.Tensor,
-    need_min_p_sampling: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    if need_min_p_sampling:
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
-    return probs_sort, probs_idx
 
 
 def top_k_top_p_min_p_sampling_from_logits_ascend(

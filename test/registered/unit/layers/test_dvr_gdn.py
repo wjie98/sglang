@@ -10,7 +10,7 @@ from sglang.srt.layers.attention.dvr.gdn_kernels import (
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.dvr.gdn_backend import (
     DVRGDNStateAdapter,
-    dvr_gdn_intermediate_bytes_per_request,
+    dvr_gdn_workspace_state_slots,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -305,7 +305,8 @@ def test_gdn_extend_requires_forward_metadata():
         )
 
 
-def test_gdn_memory_estimate_matches_allocation():
+@pytest.mark.parametrize("num_draft_tokens", [2, 16, 64])
+def test_gdn_memory_reserve_covers_allocation(num_draft_tokens):
     state_shape = Mamba2StateShape.create(
         tp_world_size=4,
         intermediate_size=32 * 128,
@@ -317,7 +318,6 @@ def test_gdn_memory_estimate_matches_allocation():
     )
     num_layers = 3
     num_slots = 5
-    num_draft_tokens = 16
     adapter = create_gdn_adapter(
         num_layers=num_layers,
         num_slots=num_slots,
@@ -326,12 +326,6 @@ def test_gdn_memory_estimate_matches_allocation():
         dtype=torch.bfloat16,
         device="cpu",
     )
-    params = SimpleNamespace(
-        layers=tuple(range(num_layers)),
-        shape=state_shape,
-        dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
-    )
-
     allocated_per_request = sum(
         t.numel() * t.element_size() for t in adapter.transition_windows
     )
@@ -345,12 +339,24 @@ def test_gdn_memory_estimate_matches_allocation():
     allocated_per_request //= num_slots
     checkpoint_lanes = 2
     allocated_per_request += (1 + checkpoint_lanes) * torch.int64.itemsize
-    assert allocated_per_request == dvr_gdn_intermediate_bytes_per_request(
+    state_bytes_per_request = (
+        adapter.state_cache.temporal.numel()
+        * adapter.state_cache.temporal.element_size()
+        + sum(t.numel() * t.element_size() for t in adapter.state_cache.conv)
+    ) // num_slots
+    params = SimpleNamespace(
+        layers=tuple(range(num_layers)),
+        shape=state_shape,
+        dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
+        mamba_cache_per_req=state_bytes_per_request,
+    )
+    workspace_state_slots = dvr_gdn_workspace_state_slots(
         params,
         num_draft_tokens,
-        checkpoint_lanes=checkpoint_lanes,
-        dedup_conv_window=True,
+        num_layers=num_layers,
     )
+    assert workspace_state_slots * state_bytes_per_request >= allocated_per_request
+    assert (workspace_state_slots - 1) * state_bytes_per_request < allocated_per_request
 
 
 def test_dvr_gdn_adapter_maps_request_and_state_slots():

@@ -168,6 +168,7 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def need_topk(self) -> bool:
+        """Whether FutureMap must relay draft topk_p/topk_index, even for topk=1."""
         return self.is_eagle() or self.is_dvr_eagle() or self.is_standalone()
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
@@ -184,10 +185,10 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dvr():
             from sglang.srt.speculative.dvr_server_args import (
-                handle_dvr_speculative_decoding,
+                _handle_dvr_speculative_decoding,
             )
 
-            handle_dvr_speculative_decoding(server_args)
+            _handle_dvr_speculative_decoding(server_args)
         elif self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_frozen_kv_mtp():

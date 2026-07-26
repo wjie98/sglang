@@ -6,10 +6,7 @@ import torch
 
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import (
-    Sampler,
-    top_k_top_p_min_p_sampling_from_probs_torch,
-)
+from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative.dvr_worker import (
     DecodeVerifyRollbackWorker,
@@ -43,30 +40,30 @@ def test_dvr_algorithm_contracts():
     assert eagle_draft.has_draft_kv()
 
 
-def test_proposal_filter_matches_target_distribution():
-    proposal = Sampler.normalize_probs(
+def test_dvr_sampling_probs_match_target_distribution():
+    proposal = dvr_worker_module.dvr_sampling_probs(
         torch.tensor([[0.6, 0.3, 0.1]]),
         _sampling_info([3], [1.0], [0.5]),
     )
     torch.testing.assert_close(proposal, torch.tensor([[2 / 3, 1 / 3, 0.0]]))
 
-    joint = Sampler.normalize_probs(
+    joint = dvr_worker_module.dvr_sampling_probs(
         torch.tensor([[0.6, 0.25, 0.15]]),
         _sampling_info([2], [0.7], [0.0]),
     )
     torch.testing.assert_close(joint, torch.tensor([[12 / 17, 5 / 17, 0.0]]))
 
 
-def test_proposal_filter_handles_mixed_and_repeated_sampling_rows():
+def test_dvr_sampling_probs_handle_mixed_and_repeated_rows():
     probs = torch.tensor([[0.6, 0.3, 0.1], [0.6, 0.3, 0.1]])
-    filtered = Sampler.normalize_probs(
+    filtered = dvr_worker_module.dvr_sampling_probs(
         probs,
         _sampling_info([1, 3], [1.0, 1.0], [0.0, 0.0]),
     )
     torch.testing.assert_close(filtered[0], torch.tensor([1.0, 0.0, 0.0]))
     torch.testing.assert_close(filtered[1], probs[1])
 
-    repeated = Sampler.normalize_probs(
+    repeated = dvr_worker_module.dvr_sampling_probs(
         torch.tensor([[0.6, 0.4]] * 4),
         _sampling_info([1, 2], [1.0, 1.0], [0.0, 0.0]),
         repeat=2,
@@ -83,7 +80,9 @@ def test_proposal_filter_handles_mixed_and_repeated_sampling_rows():
         ([3, 2], [0.8, 0.7], [0.15, 0.35]),
     ],
 )
-def test_pytorch_proposal_filter_matches_sampler(monkeypatch, top_ks, top_ps, min_ps):
+def test_pytorch_dvr_sampling_probs_match_sampler(
+    monkeypatch, top_ks, top_ps, min_ps
+):
     probs = torch.tensor([[0.40, 0.30, 0.20, 0.10], [0.50, 0.25, 0.15, 0.10]])
     sampling_info = _sampling_info(top_ks, top_ps, min_ps)
     captured = None
@@ -107,7 +106,7 @@ def test_pytorch_proposal_filter_matches_sampler(monkeypatch, top_ks, top_ps, mi
     sorted_indices = probs.argsort(dim=-1, descending=True)
     expected = torch.zeros_like(probs).scatter_(-1, sorted_indices, captured)
     expected /= expected.sum(dim=-1, keepdim=True)
-    actual = Sampler.normalize_probs(probs, sampling_info)
+    actual = dvr_worker_module.dvr_sampling_probs(probs, sampling_info)
     torch.testing.assert_close(actual, expected)
 
 
@@ -240,7 +239,6 @@ def test_self_draft_copies_each_graph_proposal_before_next_replay():
     worker.model_runner = SimpleNamespace(
         sampler=SimpleNamespace(
             use_log_softmax_logprob=False,
-            normalize_probs=Sampler.normalize_probs,
         ),
         sample=lambda output, _batch: output.next_token_logits.argmax(dim=-1),
     )

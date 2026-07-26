@@ -13,11 +13,8 @@ DVR_PY_FILES=(
   python/sglang/srt/layers/attention/dvr/gdn_backend.py
   python/sglang/srt/layers/attention/dvr/gdn_kernels.py
   python/sglang/srt/layers/attention/flashattention_backend.py
-  python/sglang/srt/layers/moe/token_dispatcher/flashinfer.py
-  python/sglang/srt/layers/sampler.py
   python/sglang/srt/managers/scheduler_components/batch_result_processor.py
   python/sglang/srt/managers/tokenizer_manager.py
-  python/sglang/srt/mem_cache/common.py
   python/sglang/srt/mem_cache/kv_cache_builder.py
   python/sglang/srt/model_executor/model_runner.py
   python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
@@ -38,6 +35,7 @@ DVR_PY_FILES=(
   test/manual/dvr/local/clients/dvr_eagle_acceptance.py
   test/manual/dvr/local/clients/dvr_radix_lifecycle.py
   test/registered/unit/layers/test_dvr_gdn.py
+  test/registered/unit/managers/test_batch_result_processor_spec_grammar.py
   test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py
   test/registered/unit/model_executor/test_pool_configurator.py
   test/registered/unit/server_args/test_dvr_server_args.py
@@ -54,6 +52,7 @@ conda_python -m py_compile "${DVR_PY_FILES[@]}"
 conda_python -m pytest \
   test/registered/unit/speculative/test_dvr_worker.py \
   test/registered/unit/speculative/test_dvr_state_flow.py \
+  test/registered/unit/managers/test_batch_result_processor_spec_grammar.py \
   test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py \
   test/registered/unit/server_args/test_dvr_server_args.py \
   test/registered/unit/layers/test_dvr_gdn.py \

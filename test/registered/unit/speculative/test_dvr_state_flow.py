@@ -127,6 +127,8 @@ def test_no_radix_uses_only_the_live_mamba_slot():
         mambaish_config=SimpleNamespace(mamba2_cache_params=params),
         spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
         dp_size=1,
+        start_layer=0,
+        end_layer=1,
     )
     runner._calculate_mamba_ratio = lambda: (
         ModelRunnerKVCacheMixin._calculate_mamba_ratio(runner)
@@ -139,11 +141,17 @@ def test_no_radix_uses_only_the_live_mamba_slot():
 
 
 def test_dvr_memory_budget_includes_cuda_graph_dummy_row(monkeypatch):
-    intermediate_per_row = 1 << 20
+    workspace_state_slots = 2
+    helper_args = {}
+
+    def state_slots(*args, **kwargs):
+        helper_args.update(kwargs)
+        return workspace_state_slots
+
     monkeypatch.setattr(
         "sglang.srt.layers.attention.dvr.gdn_backend."
-        "dvr_gdn_intermediate_bytes_per_request",
-        lambda *args, **kwargs: intermediate_per_row,
+        "dvr_gdn_workspace_state_slots",
+        state_slots,
     )
     server_args = SimpleNamespace(
         speculative_num_draft_tokens=16,
@@ -157,10 +165,15 @@ def test_dvr_memory_budget_includes_cuda_graph_dummy_row(monkeypatch):
     runner = SimpleNamespace(
         server_args=server_args,
         mambaish_config=SimpleNamespace(
-            mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1024)
+            mamba2_cache_params=SimpleNamespace(
+                mamba_cache_per_req=1024,
+                layers=(0, 1, 2, 3),
+            )
         ),
         spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
         dp_size=1,
+        start_layer=1,
+        end_layer=3,
         _calculate_mamba_ratio=lambda: 3,
     )
 
@@ -168,8 +181,54 @@ def test_dvr_memory_budget_includes_cuda_graph_dummy_row(monkeypatch):
         runner, total_rest_memory=1.0
     )
 
-    expected_bytes = 3 * intermediate_per_row + 8 * 1024
+    expected_bytes = (2 + 1) * workspace_state_slots * 1024 + 8 * 1024
+    assert helper_args == {"num_layers": 2}
     assert remaining == pytest.approx(1.0 - expected_bytes / (1 << 30))
+
+
+@pytest.mark.parametrize(
+    ("graph_max_bs", "max_running_requests", "expected_capacity"),
+    [(4, 48, 48), (64, 48, 64)],
+)
+def test_self_dvr_proposal_budget_matches_chain_capacity(
+    monkeypatch, graph_max_bs, max_running_requests, expected_capacity
+):
+    available_gb = 2
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.model_runner_kv_cache_mixin."
+        "get_available_gpu_memory",
+        lambda *args, **kwargs: available_gb,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.model_runner_kv_cache_mixin.get_world_group",
+        lambda: SimpleNamespace(world_size=1, cpu_group=None),
+    )
+    num_draft_steps = 3
+    vocab_size = 10
+    runner = SimpleNamespace(
+        device="cuda",
+        gpu_id=0,
+        mem_fraction_static=1.0,
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+        server_args=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(max_bs=graph_max_bs)
+            ),
+            max_running_requests=max_running_requests,
+            speculative_num_steps=num_draft_steps,
+        ),
+        model_config=SimpleNamespace(vocab_size=vocab_size),
+        mambaish_config=None,
+    )
+
+    available_bytes = ModelRunnerKVCacheMixin._profile_available_bytes(
+        runner, pre_model_load_memory=available_gb
+    )
+
+    proposal_bytes = (
+        expected_capacity * num_draft_steps * vocab_size * torch.float32.itemsize
+    )
+    assert available_bytes == available_gb * (1 << 30) - proposal_bytes
 
 
 def test_radix_uses_upstream_ping_pong_capacity():
