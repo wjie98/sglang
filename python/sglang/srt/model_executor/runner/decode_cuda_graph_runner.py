@@ -1041,14 +1041,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            # A provisional DVR self-draft decode is followed by target verify
-            # and rollback, so its worker publishes the final WAR fence instead.
+            # A provisional DVR self-draft decode is followed by target verify,
+            # whose load_batch is the transaction's final shared-pool reader.
             if (
                 forward_batch.forward_mode.is_decode()
                 and not self.model_runner.spec_algorithm.is_dvr_self_draft()
             ) or (
                 forward_batch.forward_mode.is_target_verify()
-                and self.model_runner.spec_algorithm.is_dflash()
+                and (
+                    self.model_runner.spec_algorithm.is_dflash()
+                    or self.model_runner.spec_algorithm.is_dvr_self_draft()
+                )
             ):
                 read_done = self.device_module.Event()
                 read_done.record()

@@ -124,17 +124,19 @@ def test_dvr_draft_sample_returns_the_distribution_it_samples(monkeypatch):
     )
     sampled = None
 
-    def sample(proposal, num_samples):
+    def sample(proposal, seeds, positions):
         nonlocal sampled
-        assert num_samples == 1
+        assert seeds.tolist() == [2026]
+        assert positions.tolist() == [7]
         sampled = proposal
-        token_ids = torch.tensor([[1]])
-        return proposal.gather(1, token_ids), token_ids
+        return torch.tensor([1])
 
-    monkeypatch.setattr(dvr_worker_module, "fast_sample", sample)
+    monkeypatch.setattr(dvr_worker_module, "sample_from_probs_with_seed", sample)
     logits = torch.tensor([[2.0, 1.0, 0.0]])
 
-    token_ids, proposal = dvr_worker_module.dvr_draft_sample(logits, sampling_info)
+    token_ids, proposal = dvr_worker_module.dvr_draft_sample(
+        logits, sampling_info, torch.tensor([7])
+    )
 
     expected_probs = torch.softmax(torch.tensor([[2.0, 1.5, -0.5]]) / 2.0, dim=-1)
     expected = dvr_worker_module.dvr_sampling_probs(expected_probs, sampling_info)
@@ -151,12 +153,12 @@ def test_dvr_draft_sample_greedy_applies_logits_bias(monkeypatch):
     )
     monkeypatch.setattr(
         dvr_worker_module,
-        "fast_sample",
+        "sample_from_probs_with_seed",
         lambda *_args, **_kwargs: pytest.fail("greedy draft must not sample"),
     )
 
     token_ids, proposal = dvr_worker_module.dvr_draft_sample(
-        torch.tensor([[1.0, 0.0]]), sampling_info
+        torch.tensor([[1.0, 0.0]]), sampling_info, torch.tensor([3])
     )
 
     assert token_ids.tolist() == [1]
@@ -254,7 +256,8 @@ def test_draft_backends_finalize_the_common_verify_result():
 
 def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     calls = []
-    event = object()
+    read_done = object()
+    state_done = object()
     stream = SimpleNamespace(wait_event=lambda value: calls.append(("wait", value)))
     monkeypatch.setattr(
         torch,
@@ -266,8 +269,9 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     worker.uses_eagle_draft = False
     worker.pending_seed_rows = {3}
     worker.target_model_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(war_fastpath_read_done_event=event)
+        model_runner=SimpleNamespace(war_fastpath_read_done_event=read_done)
     )
+    worker.state_commit_done_event = state_done
     worker.state_lifecycle = SimpleNamespace(
         prepare_for_cache_release=lambda req: calls.append(("release", req.rid))
     )
@@ -275,7 +279,11 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
 
     worker.prepare_for_kv_cache_release(req)
 
-    assert calls == [("wait", event), ("release", "done")]
+    assert calls == [
+        ("wait", read_done),
+        ("wait", state_done),
+        ("release", "done"),
+    ]
     assert not worker.pending_seed_rows
 
 
@@ -287,12 +295,13 @@ def test_self_draft_copies_each_graph_proposal_before_next_replay(monkeypatch):
     backend.proposal_prob_buffer = torch.empty((1, 2, 3))
 
     sampling_info = _sampling_info([3], [1.0], [0.0])
-    sampled_tokens = iter((torch.tensor([[0]]), torch.tensor([[2]])))
+    sampling_info.sampling_seed = torch.tensor([2026])
+    sampled_tokens = iter((torch.tensor([0]), torch.tensor([2])))
 
-    def sample(proposal, num_samples):
-        assert num_samples == 1
-        token_ids = next(sampled_tokens)
-        return proposal.gather(1, token_ids), token_ids
+    def sample(_proposal, seeds, positions):
+        assert seeds.tolist() == [2026]
+        assert positions.shape == (1,)
+        return next(sampled_tokens)
 
     worker.model_runner = SimpleNamespace(
         maybe_update_ngram_token_table=lambda _token_ids, _batch: None,
@@ -310,7 +319,7 @@ def test_self_draft_copies_each_graph_proposal_before_next_replay(monkeypatch):
         return LogitsProcessorOutput(next_token_logits=static_logits)
 
     backend.decode_forward = draft_forward
-    monkeypatch.setattr(dvr_worker_module, "fast_sample", sample)
+    monkeypatch.setattr(dvr_worker_module, "sample_from_probs_with_seed", sample)
     forward_batch = SimpleNamespace(
         spec_info=dvr_worker_module.EagleDraftInput(bonus_tokens=torch.tensor([1])),
         out_cache_loc=torch.arange(3),

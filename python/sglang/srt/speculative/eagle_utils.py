@@ -699,17 +699,27 @@ def eagle_sample(
                 "distribution; the current speculative algorithm/draft worker "
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
-        # coins for rejection sampling
-        coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-        # coins for final sampling
-        coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+        sampling_seed = (
+            sampling_info.sampling_seed if use_rejection_sampling else None
+        )
+        if sampling_seed is None:
+            # Ordinary unseeded EAGLE keeps its existing global-RNG behavior.
+            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
+        else:
+            # The chain kernel derives request-local coins from seed and the
+            # actual target row position, independent of batching and streams.
+            coins = None
+            coins_for_final_sampling = None
 
         sampling_fn = (
             chain_speculative_sampling_triton
             if use_rejection_sampling
             else tree_speculative_sampling_target_only
         )
-        sampling_fn(
+        sampling_kwargs = dict(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
             accept_token_num=num_correct_drafts,  # mutable
@@ -726,6 +736,12 @@ def eagle_sample(
             threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
             deterministic=True,
         )
+        if use_rejection_sampling:
+            sampling_kwargs.update(
+                sampling_seed=sampling_seed,
+                positions=verify_input.positions,
+            )
+        sampling_fn(**sampling_kwargs)
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point

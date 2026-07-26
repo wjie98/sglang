@@ -3,6 +3,7 @@ import torch
 
 from sglang.srt.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
+    sample_from_probs_with_seed,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -86,3 +87,191 @@ def test_all_accepted_path_still_samples_final_target_row():
     assert accept_token_num.item() == 1
     assert accept_index.tolist() == [[0, 1]]
     assert predicts.tolist() == [2, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_equal_target_and_draft_distributions_accept_full_dvr16_chain():
+    batch_size = 3
+    num_draft_tokens = 15
+    num_slots = num_draft_tokens + 1
+    vocab_size = 32
+    device = "cuda"
+
+    generator = torch.Generator().manual_seed(2026)
+    draft_probs = torch.rand(
+        batch_size, num_draft_tokens, vocab_size, generator=generator
+    )
+    draft_probs /= draft_probs.sum(dim=-1, keepdim=True)
+    draft_probs = draft_probs.to(device)
+    draft_tokens = draft_probs.argmax(dim=-1)
+
+    bonus_tokens = torch.tensor([3, 11, 29], device=device)
+    bonus_probs = torch.zeros(
+        batch_size, vocab_size, dtype=torch.float32, device=device
+    )
+    bonus_probs.scatter_(1, bonus_tokens.unsqueeze(1), 1.0)
+    target_probs = torch.cat((draft_probs, bonus_probs.unsqueeze(1)), dim=1)
+
+    candidates = torch.cat(
+        (
+            torch.zeros(batch_size, 1, dtype=torch.int64, device=device),
+            draft_tokens,
+        ),
+        dim=1,
+    )
+    retrieve_index = torch.arange(
+        batch_size * num_slots, dtype=torch.int32, device=device
+    ).view(batch_size, num_slots)
+    predicts = torch.full(
+        (batch_size * num_slots,), -1, dtype=torch.int32, device=device
+    )
+    accept_index = torch.full(
+        (batch_size, num_slots), -1, dtype=torch.int32, device=device
+    )
+    accepted_draft_tokens = torch.empty(
+        batch_size, dtype=torch.int32, device=device
+    )
+    almost_one = torch.nextafter(
+        torch.tensor(1.0, device=device), torch.tensor(0.0, device=device)
+    )
+    rejection_coins = torch.stack(
+        (
+            torch.zeros(num_slots, device=device),
+            torch.full((num_slots,), 0.5, device=device),
+            almost_one.expand(num_slots),
+        )
+    )
+
+    chain_speculative_sampling_triton(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accepted_draft_tokens,
+        candidates=candidates,
+        retrive_index=retrieve_index,
+        retrive_next_token=None,
+        retrive_next_sibling=None,
+        uniform_samples=rejection_coins,
+        uniform_samples_for_final_sampling=torch.tensor(
+            [0.0, 0.5, 0.99], dtype=torch.float32, device=device
+        ),
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+
+    assert accepted_draft_tokens.tolist() == [num_draft_tokens] * batch_size
+    assert (accepted_draft_tokens + 1).tolist() == [num_slots] * batch_size
+    assert torch.equal(accept_index, retrieve_index)
+    expected = torch.cat((draft_tokens, bonus_tokens.unsqueeze(1)), dim=1)
+    assert torch.equal(predicts.view(batch_size, num_slots), expected.to(torch.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_seeded_proposal_sampling_is_repeatable_and_batch_order_independent():
+    probs = torch.tensor(
+        [
+            [0.05, 0.15, 0.30, 0.50],
+            [0.60, 0.25, 0.10, 0.05],
+            [0.20, 0.10, 0.40, 0.30],
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    seeds = torch.tensor([2026, 2030, 99], dtype=torch.int64, device="cuda")
+    positions = torch.tensor([64, 127, 511], dtype=torch.int64, device="cuda")
+
+    expected = sample_from_probs_with_seed(probs, seeds, positions)
+    repeated = sample_from_probs_with_seed(probs, seeds, positions)
+    permutation = torch.tensor([2, 0, 1], device="cuda")
+    permuted = sample_from_probs_with_seed(
+        probs[permutation], seeds[permutation], positions[permutation]
+    )
+
+    assert torch.equal(expected, repeated)
+    assert torch.equal(permuted, expected[permutation])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_seeded_chain_rejection_is_repeatable_and_batch_order_independent():
+    batch_size = 3
+    num_slots = 4
+    vocab_size = 5
+    device = "cuda"
+    draft_probs = torch.tensor(
+        [
+            [[0.60, 0.20, 0.10, 0.05, 0.05]] * (num_slots - 1),
+            [[0.05, 0.10, 0.15, 0.30, 0.40]] * (num_slots - 1),
+            [[0.20, 0.20, 0.20, 0.20, 0.20]] * (num_slots - 1),
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    target_probs = torch.tensor(
+        [
+            [[0.10, 0.20, 0.30, 0.25, 0.15]] * num_slots,
+            [[0.30, 0.25, 0.20, 0.15, 0.10]] * num_slots,
+            [[0.05, 0.15, 0.50, 0.20, 0.10]] * num_slots,
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    candidates = torch.cat(
+        (
+            torch.zeros(batch_size, 1, dtype=torch.int64, device=device),
+            draft_probs.argmax(dim=-1),
+        ),
+        dim=1,
+    )
+    seeds = torch.tensor([2026, 2030, 99], dtype=torch.int64, device=device)
+    positions = torch.tensor(
+        [[64, 65, 66, 67], [127, 128, 129, 130], [511, 512, 513, 514]],
+        dtype=torch.int64,
+        device=device,
+    )
+
+    def run(order):
+        ordered_target = target_probs[order]
+        ordered_draft = draft_probs[order]
+        ordered_candidates = candidates[order]
+        retrieve_index = torch.arange(
+            batch_size * num_slots, dtype=torch.int32, device=device
+        ).view(batch_size, num_slots)
+        predicts = torch.full(
+            (batch_size * num_slots,), -1, dtype=torch.int32, device=device
+        )
+        accept_index = torch.full(
+            (batch_size, num_slots), -1, dtype=torch.int32, device=device
+        )
+        accept_lens = torch.empty(batch_size, dtype=torch.int32, device=device)
+        chain_speculative_sampling_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_lens,
+            candidates=ordered_candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=None,
+            retrive_next_sibling=None,
+            uniform_samples=None,
+            uniform_samples_for_final_sampling=None,
+            target_probs=ordered_target,
+            draft_probs=ordered_draft,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+            sampling_seed=seeds[order],
+            positions=positions[order],
+        )
+        return predicts.view(batch_size, num_slots), accept_lens
+
+    identity = torch.arange(batch_size, device=device)
+    permutation = torch.tensor([2, 0, 1], device=device)
+    expected_predicts, expected_lens = run(identity)
+    repeated_predicts, repeated_lens = run(identity)
+    permuted_predicts, permuted_lens = run(permutation)
+
+    assert torch.equal(expected_predicts, repeated_predicts)
+    assert torch.equal(expected_lens, repeated_lens)
+    assert torch.equal(permuted_predicts, expected_predicts[permutation])
+    assert torch.equal(permuted_lens, expected_lens[permutation])

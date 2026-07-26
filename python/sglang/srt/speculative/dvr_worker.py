@@ -44,9 +44,9 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_sample,
 )
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.reject_sampling import sample_from_probs_with_seed
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
-    fast_sample,
     record_stream_each,
     record_stream_for_v2_verify,
     spec_stage_span,
@@ -114,7 +114,9 @@ def dvr_sampling_probs(
     raise ValueError(f"Unsupported DVR sampling backend: {backend}")
 
 
-def dvr_draft_sample(logits: torch.Tensor, sampling_info):
+def dvr_draft_sample(
+    logits: torch.Tensor, sampling_info, positions: torch.Tensor
+):
     """Sample a provisional token and return the exact proposal distribution.
 
     Target rejection corrects this proposal to the requested distribution, so
@@ -128,8 +130,10 @@ def dvr_draft_sample(logits: torch.Tensor, sampling_info):
 
     probs = torch.softmax(logits / sampling_info.temperatures, dim=-1)
     proposal = dvr_sampling_probs(probs, sampling_info)
-    _, token_ids = fast_sample(proposal, num_samples=1)
-    return token_ids.view(-1), proposal
+    token_ids = sample_from_probs_with_seed(
+        proposal, sampling_info.sampling_seed, positions
+    )
+    return token_ids, proposal
 
 
 class SelfDraftBackend:
@@ -286,6 +290,7 @@ class SelfDraftBackend:
                 next_token_ids, proposal = dvr_draft_sample(
                     logits_output.next_token_logits,
                     forward_batch.sampling_info,
+                    forward_batch.positions,
                 )
                 owner.model_runner.maybe_update_ngram_token_table(
                     next_token_ids, forward_batch
@@ -431,6 +436,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             server_args=server_args,
             model_runner=self.model_runner,
         )
+        self.state_commit_done_event = None
         # A one-token prefill cannot seed every draft backend. Consume one
         # target-only verify before normal draft; pool slots are overwritten on
         # every prefill, so stale request identities cannot survive slot reuse.
@@ -648,14 +654,18 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         if req.req_pool_idx is not None:
             self.pending_seed_rows.discard(int(req.req_pool_idx))
         if getattr(self, "device", "cpu") != "cpu":
-            rollback_done = self.war_fastpath_runner.war_fastpath_read_done_event
-            if rollback_done is not None:
-                # Overlap may already have launched one extra DVR round. Order
-                # checkpoint selection and slot donation after that round without
-                # synchronizing the host or changing the steady-state schedule.
-                torch.get_device_module(self.device).current_stream().wait_event(
-                    rollback_done
-                )
+            current_stream = torch.get_device_module(self.device).current_stream()
+            read_done = self.war_fastpath_runner.war_fastpath_read_done_event
+            if read_done is not None:
+                current_stream.wait_event(read_done)
+            if (
+                self.state_commit_done_event is not None
+                and self.state_commit_done_event is not read_done
+            ):
+                # Overlap may have launched one extra DVR round before the prior
+                # result finishes. Its request-owned state must be committed
+                # before Radix donation reuses the physical slots.
+                current_stream.wait_event(self.state_commit_done_event)
         self.state_lifecycle.prepare_for_cache_release(req)
 
     def forward_batch_generation(
@@ -690,6 +700,12 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
                 f"batch_size={batch.batch_size()}, "
                 f"capacity={self.chain_retrieve_index.shape[0]}."
             )
+        final_reader = self.war_fastpath_runner
+        # Ignore a synchronous or previous-iteration event. The final shared
+        # reader in this transaction publishes a fresh event: target verify for
+        # self draft, and draft-extend for EAGLE.
+        final_reader.war_fastpath_read_done_event = None
+        self.state_commit_done_event = None
         needs_seed_verify = False
         for req in batch.reqs:
             request_slot = int(req.req_pool_idx)
@@ -711,23 +727,17 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             state_commit_plan=state_commit_plan,
             on_publish=on_publish,
         )
-        final_reader = self.war_fastpath_runner
-        # Discard a draft-phase or synchronous previous-iteration event. Only
-        # the final rollback reader may release scheduler result writes.
-        final_reader.war_fastpath_read_done_event = None
         # Self prepares its next chain input; EAGLE catches its private cache up
         # to the same accepted target endpoint.
         self.draft_backend.finish_verify(batch, batch_result)
 
-        # Publish one fence for the complete rollback transaction. The EAGLE
-        # graph records this as soon as draft-extend snapshots shared pools;
-        # self-draft (and an eager EAGLE miss) records it here after its final
-        # shared-pool reader has been enqueued.
-        rollback_done = final_reader.war_fastpath_read_done_event
-        if rollback_done is None:
-            rollback_done = torch.get_device_module(self.device).Event()
-            rollback_done.record()
-            final_reader.war_fastpath_read_done_event = rollback_done
+        # Graph paths publish at their last shared-pool snapshot. Eager misses
+        # use the conservative end-of-transaction fence.
+        read_done = final_reader.war_fastpath_read_done_event
+        if read_done is None:
+            read_done = torch.get_device_module(self.device).Event()
+            read_done.record()
+            final_reader.war_fastpath_read_done_event = read_done
         return batch_result
 
     def build_root_only_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -889,6 +899,9 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
                 plan=state_commit_plan,
                 accept_lens=accept_lens,
             )
+        if state_commit_plan is not None:
+            self.state_commit_done_event = torch.get_device_module(self.device).Event()
+            self.state_commit_done_event.record()
         if state_commit_plan is None:
             commit_mamba_states_after_verify(
                 self.target_worker,

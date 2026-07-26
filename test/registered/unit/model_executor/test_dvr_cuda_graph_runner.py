@@ -405,7 +405,7 @@ def test_dvr_draft_graph_uses_plain_decode_layout_and_shared_state():
         (ForwardMode.DECODE, False, False, True),
         (ForwardMode.DECODE, True, False, False),
         (ForwardMode.TARGET_VERIFY, False, True, True),
-        (ForwardMode.TARGET_VERIFY, True, False, False),
+        (ForwardMode.TARGET_VERIFY, True, False, True),
     ],
 )
 def test_cuda_graph_war_event_skips_provisional_self_draft(
