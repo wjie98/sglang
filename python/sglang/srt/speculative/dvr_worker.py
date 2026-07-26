@@ -46,11 +46,16 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
+    fast_sample,
     record_stream_each,
     record_stream_for_v2_verify,
     spec_stage_span,
 )
-from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
+from sglang.srt.utils.async_probe import (
+    maybe_detect_inf,
+    maybe_detect_nan,
+    sanitize_nan_logits,
+)
 from sglang.srt.utils.common import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
@@ -107,6 +112,24 @@ def dvr_sampling_probs(
         return torch.zeros_like(probs).scatter_(-1, indices, filtered)
 
     raise ValueError(f"Unsupported DVR sampling backend: {backend}")
+
+
+def dvr_draft_sample(logits: torch.Tensor, sampling_info):
+    """Sample a provisional token and return the exact proposal distribution.
+
+    Target rejection corrects this proposal to the requested distribution, so
+    provisional tokens must not enter the full-vocabulary deterministic target
+    sampler.
+    """
+    sampling_info.apply_logits_bias(logits)
+    sanitize_nan_logits(logits, "dvr draft logits")
+    if sampling_info.is_all_greedy:
+        return torch.argmax(logits, dim=-1), None
+
+    probs = torch.softmax(logits / sampling_info.temperatures, dim=-1)
+    proposal = dvr_sampling_probs(probs, sampling_info)
+    _, token_ids = fast_sample(proposal, num_samples=1)
+    return token_ids.view(-1), proposal
 
 
 class SelfDraftBackend:
@@ -260,21 +283,14 @@ class SelfDraftBackend:
                     else origin_seq_lens_sum + (step + 1) * forward_batch.batch_size
                 )
                 logits_output = self.decode_forward(forward_batch)
-                maybe_detect_nan(
-                    logits_output.next_token_logits, f"dvr draft step {step}"
+                next_token_ids, proposal = dvr_draft_sample(
+                    logits_output.next_token_logits,
+                    forward_batch.sampling_info,
                 )
-                next_token_ids = owner.model_runner.sample(logits_output, forward_batch)
-                if not forward_batch.sampling_info.is_all_greedy:
-                    sampling_probs = logits_output.next_token_logits
-                    sampling_info = forward_batch.sampling_info
-                    if (
-                        owner.model_runner.sampler.use_log_softmax_logprob
-                        and not sampling_info.need_top_p_sampling
-                        and not sampling_info.need_top_k_sampling
-                        and not sampling_info.need_min_p_sampling
-                    ):
-                        sampling_probs = torch.softmax(sampling_probs, dim=-1)
-                    proposal = dvr_sampling_probs(sampling_probs, sampling_info)
+                owner.model_runner.maybe_update_ngram_token_table(
+                    next_token_ids, forward_batch
+                )
+                if proposal is not None:
                     if self.proposal_prob_buffer is None:
                         self.proposal_prob_buffer = torch.empty(
                             (

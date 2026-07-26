@@ -24,9 +24,12 @@ def _sampling_info(top_ks, top_ps, min_ps):
         top_ks=torch.tensor(top_ks),
         top_ps=torch.tensor(top_ps),
         min_ps=torch.tensor(min_ps),
+        temperatures=torch.ones((len(top_ks), 1)),
         need_top_k_sampling=any(value != 0 for value in top_ks),
         need_top_p_sampling=any(value != 1.0 for value in top_ps),
         need_min_p_sampling=any(value != 0.0 for value in min_ps),
+        is_all_greedy=False,
+        apply_logits_bias=lambda _logits: None,
     )
 
 
@@ -110,6 +113,54 @@ def test_pytorch_dvr_sampling_probs_match_sampler(
     expected /= expected.sum(dim=-1, keepdim=True)
     actual = dvr_worker_module.dvr_sampling_probs(probs, sampling_info)
     torch.testing.assert_close(actual, expected)
+
+
+def test_dvr_draft_sample_returns_the_distribution_it_samples(monkeypatch):
+    sampling_info = _sampling_info([2], [0.8], [0.0])
+    sampling_info.temperatures.fill_(2.0)
+    sampling_info.sampling_seed = torch.tensor([2026])
+    sampling_info.apply_logits_bias = lambda logits: logits.add_(
+        torch.tensor([[0.0, 0.5, -0.5]])
+    )
+    sampled = None
+
+    def sample(proposal, num_samples):
+        nonlocal sampled
+        assert num_samples == 1
+        sampled = proposal
+        token_ids = torch.tensor([[1]])
+        return proposal.gather(1, token_ids), token_ids
+
+    monkeypatch.setattr(dvr_worker_module, "fast_sample", sample)
+    logits = torch.tensor([[2.0, 1.0, 0.0]])
+
+    token_ids, proposal = dvr_worker_module.dvr_draft_sample(logits, sampling_info)
+
+    expected_probs = torch.softmax(torch.tensor([[2.0, 1.5, -0.5]]) / 2.0, dim=-1)
+    expected = dvr_worker_module.dvr_sampling_probs(expected_probs, sampling_info)
+    torch.testing.assert_close(proposal, expected)
+    assert sampled is proposal
+    assert token_ids.tolist() == [1]
+
+
+def test_dvr_draft_sample_greedy_applies_logits_bias(monkeypatch):
+    sampling_info = _sampling_info([1], [1.0], [0.0])
+    sampling_info.is_all_greedy = True
+    sampling_info.apply_logits_bias = lambda logits: logits.add_(
+        torch.tensor([[0.0, 2.0]])
+    )
+    monkeypatch.setattr(
+        dvr_worker_module,
+        "fast_sample",
+        lambda *_args, **_kwargs: pytest.fail("greedy draft must not sample"),
+    )
+
+    token_ids, proposal = dvr_worker_module.dvr_draft_sample(
+        torch.tensor([[1.0, 0.0]]), sampling_info
+    )
+
+    assert token_ids.tolist() == [1]
+    assert proposal is None
 
 
 @pytest.mark.parametrize("uses_eagle_draft", [False, True])
@@ -228,27 +279,29 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     assert not worker.pending_seed_rows
 
 
-def test_self_draft_copies_each_graph_proposal_before_next_replay():
+def test_self_draft_copies_each_graph_proposal_before_next_replay(monkeypatch):
     worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.num_draft_tokens = 3
     worker.num_draft_steps = 2
-    worker.server_args = SimpleNamespace(sampling_backend="pytorch")
     backend = dvr_worker_module.SelfDraftBackend(worker)
     backend.proposal_prob_buffer = torch.empty((1, 2, 3))
 
     sampling_info = _sampling_info([3], [1.0], [0.0])
-    sampling_info.is_all_greedy = False
+    sampled_tokens = iter((torch.tensor([[0]]), torch.tensor([[2]])))
+
+    def sample(proposal, num_samples):
+        assert num_samples == 1
+        token_ids = next(sampled_tokens)
+        return proposal.gather(1, token_ids), token_ids
+
     worker.model_runner = SimpleNamespace(
-        sampler=SimpleNamespace(
-            use_log_softmax_logprob=False,
-        ),
-        sample=lambda output, _batch: output.next_token_logits.argmax(dim=-1),
+        maybe_update_ngram_token_table=lambda _token_ids, _batch: None,
     )
     static_logits = torch.empty((1, 3))
     per_step = iter(
         (
-            torch.tensor([[0.6, 0.3, 0.1]]),
-            torch.tensor([[0.1, 0.2, 0.7]]),
+            torch.tensor([[0.6, 0.3, 0.1]]).log(),
+            torch.tensor([[0.1, 0.2, 0.7]]).log(),
         )
     )
 
@@ -257,6 +310,7 @@ def test_self_draft_copies_each_graph_proposal_before_next_replay():
         return LogitsProcessorOutput(next_token_logits=static_logits)
 
     backend.decode_forward = draft_forward
+    monkeypatch.setattr(dvr_worker_module, "fast_sample", sample)
     forward_batch = SimpleNamespace(
         spec_info=dvr_worker_module.EagleDraftInput(bonus_tokens=torch.tensor([1])),
         out_cache_loc=torch.arange(3),
