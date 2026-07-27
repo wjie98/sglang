@@ -26,7 +26,7 @@ Two draft backends are available:
 For GDN models, `page_size` must equal the FLA chunk size (64). This keeps
 Radix prefix boundaries identical to the recurrent checkpoints used by verify.
 FlashInfer is supported as a sampling backend, but not as DVR's full-attention
-backend.
+backend. Grammar-constrained decoding is not supported by DVR.
 
 ## Start a server
 
@@ -97,15 +97,27 @@ curl http://127.0.0.1:30000/generate \
     "text": "Explain deterministic speculative decoding.",
     "sampling_params": {
       "max_new_tokens": 128,
-      "temperature": 0
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "sampling_seed": 2026
     },
     "return_logprob": true
   }'
 ```
 
+Formal correctness, acceptance, profiling, and throughput qualification must
+use explicit non-greedy parameters. Qwen3.5 uses
+`temperature=1.0, top_p=0.95, top_k=20`; Qwen3-Next uses
+`temperature=0.7, top_p=0.8, top_k=20`. Keep a fixed per-request
+`sampling_seed` across matched runs. Greedy sampling is permitted only for
+setup such as DeepGEMM precompilation or for a separately labelled diagnostic;
+it underestimates proposal and rejection-sampling cost and may hide acceptance
+regressions.
+
 For stochastic RL logprob qualification, set
 `SGLANG_RETURN_ORIGINAL_LOGPROB=True` before server startup when the oracle
-expects logprobs before temperature scaling. Greedy requests are unaffected.
+expects logprobs before temperature scaling.
 
 ## Recurrent-state lifecycle
 
@@ -187,7 +199,8 @@ target NVLink hardware.
 Start a fresh server for each row. Keep model revision, visible GPUs, TP size,
 attention backend, page size, context and token capacity, CUDA graph batch
 sizes, Radix policy, custom all-reduce policy, dataset, output length,
-concurrency, and random seed identical.
+concurrency, and random seed identical. Also keep the explicit
+model-recommended temperature, top-p, top-k, and request seeds identical.
 
 Pair scheduling modes as follows:
 
