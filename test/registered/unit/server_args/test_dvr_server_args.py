@@ -517,24 +517,6 @@ class TestDVRServerArgs(unittest.TestCase):
 
         self.assertTrue(args.enable_deterministic_inference)
 
-    def test_dvr_preserves_draft_allreduce_fusion_request(self):
-        for backend, force_disabled in (("trtllm", False), (None, True)):
-            with self.subTest(backend=backend, force_disabled=force_disabled):
-                args = _Args()
-                args.flashinfer_allreduce_fusion_backend = backend
-                args.enforce_disable_flashinfer_allreduce_fusion = force_disabled
-                with patch(
-                    "sglang.srt.speculative.dvr_server_args."
-                    "_is_dvr_gated_linear_state_model",
-                    return_value=False,
-                ):
-                    handle_dvr_defaults(args)
-
-                self.assertEqual(
-                    args.dvr_draft_flashinfer_allreduce_fusion,
-                    (backend, force_disabled),
-                )
-
     def test_dvr_defaults_normalize_algorithm_before_generic_spec_handling(self):
         args = _Args()
         args.speculative_algorithm = DVR_SPECULATIVE_ALGORITHM.lower()

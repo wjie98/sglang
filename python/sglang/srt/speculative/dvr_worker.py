@@ -150,7 +150,6 @@ class SelfDraftBackend:
         return dvr_draft_decode_context(
             self.owner.model_runner,
             self.owner.draft_graph_buffers,
-            self_draft=True,
         )
 
     def idle_input(self):
@@ -558,7 +557,6 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
                 self.model_runner,
                 self.draft_graph_buffers,
                 capture=True,
-                self_draft=True,
             ):
                 draft_backend.graph_runner = DVRDraftDecodeCudaGraphRunner(
                     self.model_runner
