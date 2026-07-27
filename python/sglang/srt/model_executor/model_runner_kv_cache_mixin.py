@@ -348,9 +348,13 @@ class ModelRunnerKVCacheMixin:
 
         additional_ratio = 0
         if self.server_args.enable_mamba_extra_buffer():
-            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
-            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not self.server_args.disable_overlap_schedule:
+            # DVR also retains two lanes in sync mode because one verify may
+            # publish a boundary beyond the user-visible finish.
+            needs_two_track_lanes = (
+                not self.server_args.disable_overlap_schedule
+                or self.spec_algorithm.is_dvr()
+            )
+            if needs_two_track_lanes:
                 if self.server_args.enable_mamba_extra_buffer_lazy():
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
                 else:
@@ -651,7 +655,12 @@ class ModelRunnerKVCacheMixin:
                         None if is_dvr else max_spec_draft_tokens
                     ),
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
-                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                    # A final verify may cross one boundary past the visible
+                    # finish. Keep the preceding checkpoint in the other lane
+                    # even on DVR's synchronous compatibility path.
+                    enable_overlap_schedule=(
+                        not self.server_args.disable_overlap_schedule or is_dvr
+                    ),
                     start_layer=self.start_layer,
                     enable_linear_replayssm=self.server_args.enable_linear_replayssm,
                     linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,

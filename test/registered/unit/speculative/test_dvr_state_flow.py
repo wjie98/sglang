@@ -233,16 +233,29 @@ def test_self_dvr_proposal_budget_matches_chain_capacity(
     assert available_bytes == available_gb * (1 << 30) - proposal_bytes
 
 
-def test_radix_uses_upstream_ping_pong_capacity():
+@pytest.mark.parametrize(
+    ("spec_algorithm", "disable_overlap", "expected_ratio"),
+    [
+        (SpeculativeAlgorithm.NONE, True, 4),
+        (SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK, True, 5),
+        (SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK, False, 5),
+    ],
+)
+def test_radix_ping_pong_capacity(
+    spec_algorithm, disable_overlap, expected_ratio
+):
     server_args = SimpleNamespace(
         disable_radix_cache=False,
-        disable_overlap_schedule=False,
+        disable_overlap_schedule=disable_overlap,
         enable_mamba_extra_buffer=lambda: True,
         enable_mamba_extra_buffer_lazy=lambda: False,
     )
-    runner = SimpleNamespace(server_args=server_args)
+    runner = SimpleNamespace(
+        server_args=server_args,
+        spec_algorithm=spec_algorithm,
+    )
 
-    assert ModelRunnerKVCacheMixin._calculate_mamba_ratio(runner) == 5
+    assert ModelRunnerKVCacheMixin._calculate_mamba_ratio(runner) == expected_ratio
 
 
 @pytest.mark.parametrize(
