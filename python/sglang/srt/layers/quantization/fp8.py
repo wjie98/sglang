@@ -416,6 +416,12 @@ class Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+        # Resolve this once while the server's deterministic contract is active.
+        # DVR temporarily relaxes that contract only while capturing provisional
+        # draft graphs; the target and self-draft FP8 GEMMs must still agree.
+        self.use_fixed_w8a8_triton = (
+            _is_cuda and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        )
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
@@ -919,6 +925,7 @@ class Fp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+            use_fixed_w8a8_triton=self.use_fixed_w8a8_triton,
         )
 
 

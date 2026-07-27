@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
@@ -105,6 +106,10 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quantization_config: W8A8Fp8Config):
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.quantization_config = quantization_config
+        self.use_fixed_w8a8_triton = (
+            torch.cuda.is_available()
+            and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight
@@ -191,6 +196,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            use_fixed_w8a8_triton=self.use_fixed_w8a8_triton,
         )
 
 

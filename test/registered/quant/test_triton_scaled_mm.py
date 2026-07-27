@@ -1,9 +1,12 @@
 import unittest
 from typing import Optional
+from unittest.mock import patch
 
 import torch
 import torch.testing
 
+import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_kernel import triton_scaled_mm
 from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -134,6 +137,76 @@ class TestScaledMM(CustomTestCase):
         )
 
         torch.testing.assert_close(output, reference, rtol=0.15, atol=0.1)
+
+    def test_fixed_w8a8_dispatch_uses_explicit_tile(self):
+        input = torch.ones((3, 4), dtype=torch.bfloat16, device=self._device)
+        weight = torch.ones((4, 5), dtype=torch.bfloat16, device=self._device)
+        weight_scale = torch.ones((5, 1), dtype=torch.float32, device=self._device)
+        qinput = torch.ones((3, 4), dtype=torch.int8, device=self._device)
+        input_scale = torch.ones((3, 1), dtype=torch.float32, device=self._device)
+        captured = {}
+
+        def fixed_scaled_mm(*args, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros((3, 5), dtype=torch.bfloat16, device=self._device)
+
+        with (
+            patch.object(
+                fp8_utils,
+                "sglang_per_token_quant_fp8",
+                return_value=(qinput, input_scale),
+            ),
+            patch.object(fp8_utils, "triton_scaled_mm", side_effect=fixed_scaled_mm),
+        ):
+            output = fp8_utils.apply_fp8_linear(
+                input,
+                weight,
+                weight_scale,
+                cutlass_fp8_supported=True,
+                use_fixed_w8a8_triton=True,
+            )
+
+        self.assertEqual(output.shape, (3, 5))
+        self.assertEqual(
+            captured,
+            {
+                "block_size_m": 64,
+                "block_size_n": 64,
+                "block_size_k": 256,
+                "use_heuristic": False,
+            },
+        )
+
+    def test_fp8_method_captures_deterministic_policy(self):
+        config = type(
+            "Config",
+            (),
+            {
+                "weight_block_size": None,
+                "use_mxfp8": False,
+                "is_checkpoint_fp8_serialized": True,
+            },
+        )()
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.fp8.cutlass_fp8_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp8."
+                "dispatch_w8a8_block_fp8_linear",
+                return_value=None,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp8.envs."
+                "SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get",
+                return_value=True,
+            ),
+        ):
+            method = Fp8LinearMethod(config)
+
+        self.assertTrue(method.use_fixed_w8a8_triton)
 
 
 if __name__ == "__main__":
