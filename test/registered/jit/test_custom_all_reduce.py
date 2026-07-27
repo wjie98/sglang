@@ -165,6 +165,7 @@ def _init_comm_once() -> CustomAllReduceV2:
     comm = CustomAllReduceV2(cpu_group, device, max_size, max_size)
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+    assert comm.full_nvlink
     register_comm_cleanup(comm)
     return comm
 

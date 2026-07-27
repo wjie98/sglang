@@ -47,7 +47,10 @@ class CustomAllReduceV2:
     ) -> None:
         _maybe_init_config()
         self.disabled = True
-        if not can_use_custom_all_reduce_v2(group=group, device=device):
+        self.full_nvlink = can_use_custom_all_reduce_v2(
+            group=group, device=device
+        )
+        if not self.full_nvlink:
             return
 
         self.group = group
