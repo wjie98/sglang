@@ -162,7 +162,7 @@ deterministic settings to leak into provisional draft capture.
 In particular:
 
 - target prefill and verify remain deterministic;
-- draft graph capture restores environment, backend, server-argument, MoE, and
+- draft graph capture restores environment, backend, batch-invariant, MoE, and
   collective state when it exits;
 - custom all-reduce may be captured for provisional draft execution but is not
   enabled for target prefill or verify;
@@ -266,9 +266,10 @@ resolved server configuration contains
 normal-decode optimization.
 
 Deterministic dynamic channelwise W8A8 FP8 linear layers automatically use a
-fixed Triton tile. The policy is resolved when the quantized linear method is
-constructed, so DVR's temporary draft-capture context cannot switch the draft
-back to a shape-dependent CUTLASS GEMM. Leave
+fixed Triton tile. The generic FP8 dispatch reads the immutable deterministic
+server contract, while DVR only relaxes runtime batch-invariant operators for
+draft capture. Target and self-draft therefore keep the same FP8 reduction
+path. Leave
 `USE_TRITON_W8A8_FP8_KERNEL` unset for formal comparisons: setting it also
 changes the ordinary non-deterministic baseline.
 

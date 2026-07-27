@@ -1658,7 +1658,6 @@ def apply_fp8_linear(
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
-    use_fixed_w8a8_triton: bool = False,
 ) -> torch.Tensor:
     # Note: we pad the input because torch._scaled_mm is more performant
     # for matrices with batch dimension > 16.
@@ -1736,15 +1735,18 @@ def apply_fp8_linear(
                     )
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+        use_batch_invariant_w8a8 = (
+            get_global_server_args().enable_deterministic_inference
+        )
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
         if (
             not cutlass_compatible_b
             or use_triton_w8a8_fp8_kernel
-            or use_fixed_w8a8_triton
+            or use_batch_invariant_w8a8
         ):
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
-            if use_fixed_w8a8_triton:
+            if use_batch_invariant_w8a8:
                 # Keep the K reduction and output tiling independent of the
                 # runtime token count so decode and prefill produce identical
                 # channelwise W8A8 results.

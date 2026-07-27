@@ -17,7 +17,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var
 
 _OVERRIDE_PLAN_CACHE = object()
@@ -242,9 +241,9 @@ def dvr_draft_decode_context(
 ):
     """Temporarily switch a DVR draft runner into performance-first decode mode.
 
-    Global determinism changes only while a draft graph is captured. Runtime
-    replay temporarily switches attention metadata but leaves ordinary target,
-    sampler, and MoE policy untouched.
+    Runtime determinism changes only while a draft graph is captured. The
+    immutable server policy remains available to operators such as FP8 GEMMs
+    that must stay numerically aligned with target execution.
     """
 
     with ExitStack() as stack:
@@ -271,16 +270,12 @@ def dvr_draft_decode_context(
                 stack.callback(deterministic_env.set, deterministic_env_value)
             else:
                 stack.callback(deterministic_env.clear)
+            # Keep ServerArgs immutable. This environment switch and the
+            # batch-invariant mode below select only runtime draft fast paths.
             deterministic_env.set(False)
             _clear_moe_policy_caches()
             # Leave no fast-draft policy entry for deterministic target work.
             stack.callback(_clear_moe_policy_caches)
-            global_server_args = get_global_server_args()
-            for server_args in (
-                model_runner.server_args,
-                global_server_args,
-            ):
-                patch_attr(server_args, "enable_deterministic_inference", False)
 
         backends = tuple(
             backend

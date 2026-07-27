@@ -40,10 +40,6 @@ def test_draft_capture_is_fast_and_restores_target_state(
         dvr_enable_draft_custom_all_reduce=draft_custom_all_reduce,
         flashinfer_allreduce_fusion_backend=None,
     )
-    global_server_args = SimpleNamespace(
-        enable_deterministic_inference=True,
-        flashinfer_allreduce_fusion_backend=None,
-    )
     model_runner = SimpleNamespace(
         attn_backend=backend,
         server_args=server_args,
@@ -84,9 +80,6 @@ def test_draft_capture_is_fast_and_restores_target_state(
         "envs",
         SimpleNamespace(SGLANG_ENABLE_DETERMINISTIC_INFERENCE=FakeEnv()),
     )
-    monkeypatch.setattr(
-        graph_module, "get_global_server_args", lambda: global_server_args
-    )
     monkeypatch.setattr(graph_module, "_clear_moe_policy_caches", lambda: None)
     monkeypatch.setattr(
         graph_module,
@@ -101,28 +94,49 @@ def test_draft_capture_is_fast_and_restores_target_state(
     )
     import sglang.srt.batch_invariant_ops as batch_invariant_ops
 
+    batch_invariant_state = {"enabled": True}
     monkeypatch.setattr(
-        batch_invariant_ops, "is_batch_invariant_mode_enabled", lambda: False
+        batch_invariant_ops,
+        "is_batch_invariant_mode_enabled",
+        lambda: batch_invariant_state["enabled"],
+    )
+
+    def disable_batch_invariant_mode():
+        batch_invariant_state["enabled"] = False
+        events.append(("batch_invariant", False))
+
+    def enable_batch_invariant_mode():
+        batch_invariant_state["enabled"] = True
+        events.append(("batch_invariant", True))
+
+    monkeypatch.setattr(
+        batch_invariant_ops,
+        "disable_batch_invariant_mode",
+        disable_batch_invariant_mode,
+    )
+    monkeypatch.setattr(
+        batch_invariant_ops,
+        "enable_batch_invariant_mode",
+        enable_batch_invariant_mode,
     )
 
     with pytest.raises(RuntimeError, match="capture failure"):
         with dvr_draft_decode_context(model_runner, {}, capture=True):
             assert not backend.enable_deterministic
-            assert not server_args.enable_deterministic_inference
-            assert not global_server_args.enable_deterministic_inference
+            assert server_args.enable_deterministic_inference
+            assert not batch_invariant_state["enabled"]
             assert server_args.flashinfer_allreduce_fusion_backend is None
-            assert global_server_args.flashinfer_allreduce_fusion_backend is None
             assert (
                 model_runner.spec_algorithm
                 == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
             )
             if draft_custom_all_reduce:
-                assert events[-1][0] == "custom_all_reduce"
+                assert any(event[0:2] == ("custom_all_reduce", True) for event in events)
             raise RuntimeError("capture failure")
 
     assert backend.enable_deterministic
     assert server_args.enable_deterministic_inference
-    assert global_server_args.enable_deterministic_inference
+    assert batch_invariant_state["enabled"]
     assert model_runner.spec_algorithm == SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK
     assert events[-1][0:2] == ("deterministic_env", True)
     assert (("custom_all_reduce", False) in [event[:2] for event in events]) == (
