@@ -108,6 +108,33 @@ class TestScaledMM(CustomTestCase):
                     triton_out_row_scale, ref_out, rtol=rtol, atol=atol
                 )
 
+    def test_explicit_tile(self):
+        torch.manual_seed(42)
+        input, weight = self._make_inputs(17, 64, 96, torch.int8)
+        scale_a = 0.1 + 0.05 * torch.rand(
+            (17, 1), dtype=torch.float32, device=self._device
+        )
+        scale_b = 0.1 + 0.05 * torch.rand(
+            (96, 1), dtype=torch.float32, device=self._device
+        )
+
+        output = triton_scaled_mm(
+            input,
+            weight,
+            scale_a,
+            scale_b,
+            torch.float16,
+            block_size_m=64,
+            block_size_n=64,
+            block_size_k=32,
+            use_heuristic=False,
+        )
+        reference = torch_scaled_mm(
+            input, weight, scale_a, scale_b, torch.float16
+        )
+
+        torch.testing.assert_close(output, reference, rtol=0.15, atol=0.1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
