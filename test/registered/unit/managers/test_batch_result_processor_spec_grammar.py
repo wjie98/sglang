@@ -125,6 +125,7 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
             inflight_middle_chunks=0,
             is_retracted=False,
             return_hidden_states=False,
+            return_sampling_mask=False,
             grammar=None,
             finished=lambda: finished[0],
             update_finish_state=lambda: finished.__setitem__(0, True),

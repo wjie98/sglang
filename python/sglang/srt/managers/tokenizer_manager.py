@@ -146,6 +146,8 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
     "output_token_ids_logprobs",
+    "output_token_sampling_mask",
+    "output_token_sampling_logprobs",
 )
 
 
@@ -162,6 +164,12 @@ class ReqState:
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
+
+    # An abort matched this rid while the request was still tokenizer-held
+    # (parked at the pause gate / model-update lock / tokenization). The
+    # scheduler never saw the rid, so the dispatch path must resolve the
+    # request as aborted instead of sending it.
+    abort_before_dispatch: bool = False
 
     # For streaming output
     last_output_offset: int = 0
@@ -204,6 +212,8 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_token_sampling_mask: List = dataclasses.field(default_factory=list)
+    output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -1156,6 +1166,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logprob_start_len=obj.logprob_start_len,
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
+                return_sampling_mask=obj.return_sampling_mask,
                 stream=obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -1328,10 +1339,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    def _abort_instead_of_dispatch(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> bool:
+        """Resolve a request whose rid an abort matched while it was still
+        tokenizer-held (see abort_request): the scheduler never saw the rid, so
+        it must be finished here instead of dispatched. Returns True if the
+        request was aborted."""
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if (
+            state is None
+            or not state.abort_before_dispatch
+            or is_health_check_generate_req(tokenized_obj)
+        ):
+            return False
+        self._handle_abort_req(
+            AbortReq(
+                rid=tokenized_obj.rid,
+                abort_message="Aborted by AbortReq before dispatch to scheduler",
+            )
+        )
+        return True
+
     def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        if self._abort_instead_of_dispatch(tokenized_obj):
+            return
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         time_stats = tokenized_obj.time_stats
@@ -1347,6 +1383,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ],
     ):
         """Send a batch of tokenized requests as a single batched request to the scheduler."""
+        tokenized_objs = [
+            tokenized_obj
+            for tokenized_obj in tokenized_objs
+            if not self._abort_instead_of_dispatch(tokenized_obj)
+        ]
+        if not tokenized_objs:
+            return
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
         for tokenized_obj in tokenized_objs:
@@ -1674,18 +1717,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     except StopAsyncIteration:
                         pass
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, prefix: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
-        if (
-            not abort_all
-            and self.server_args.tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
-        ):
-            return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        if not abort_all and self.server_args.tokenizer_worker_num == 1:
+            if prefix:
+                if not any(r.startswith(rid) for r in self.rid_to_state):
+                    return
+            elif rid not in self.rid_to_state:
+                return
+        # A matching request can still be tokenizer-held: rid_to_state is
+        # populated in _init_req_state, several awaits (pause gate,
+        # model_update_lock, tokenization) before the scheduler learns the rid
+        # in _send_one_request. The scheduler-side abort cannot match those, so
+        # flag them here; the dispatch path resolves flagged requests as
+        # aborted instead of sending them. Already-dispatched requests are
+        # unaffected (the flag is only read at dispatch).
+        for tracked_rid, state in self.rid_to_state.items():
+            if abort_all or (
+                tracked_rid.startswith(rid) if prefix else tracked_rid == rid
+            ):
+                state.abort_before_dispatch = True
+        req = AbortReq(rid=rid, abort_all=abort_all, prefix=prefix)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
@@ -1910,6 +1967,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj,
                     i,
                 )
+            if (
+                isinstance(state.obj, GenerateReqInput)
+                and state.obj.return_sampling_mask
+            ):
+                output_sampling_mask = recv_obj.output_token_sampling_mask
+                if output_sampling_mask is not None:
+                    state.output_token_sampling_mask.extend(output_sampling_mask[i])
+                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
+                    if output_sampling_logprobs is not None:
+                        state.output_token_sampling_logprobs.extend(
+                            output_sampling_logprobs[i]
+                        )
+                    meta_info["output_token_sampling_mask"] = (
+                        state.output_token_sampling_mask
+                    )
+                    meta_info["output_token_sampling_logprobs"] = (
+                        state.output_token_sampling_logprobs
+                    )
+                    meta_info["output_token_sampling_mask_length"] = len(
+                        state.output_token_sampling_mask
+                    )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(

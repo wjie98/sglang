@@ -2364,11 +2364,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return result
 
     def load_lora_adapter_from_tensors(
-        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+        self,
+        lora_ref: LoRARef,
+        tensors,
+        config_dict,
+        added_tokens_config=None,
+        upsert: bool = False,
     ):
         logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
         result = self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            upsert=upsert,
         )
         logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
         return result
@@ -2382,6 +2391,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         config_dict,
         group_name,
         added_tokens_config=None,
+        upsert: bool = False,
     ):
         """Load a new lora adapter whose weights are broadcast over the
         `_model_update_group` process group (no CUDA IPC).
@@ -2417,7 +2427,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return LoRAUpdateOutput(success=False, error_message=error_msg)
 
         result = self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref, tensors, config_dict, added_tokens_config
+            lora_ref,
+            tensors,
+            config_dict,
+            added_tokens_config,
+            upsert=upsert,
         )
         logger.info(f"LoRA adapter loading from distributed completes: {lora_ref}.")
         return result
