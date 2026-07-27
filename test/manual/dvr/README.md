@@ -255,6 +255,33 @@ If server startup enters an exhaustive DeepGEMM precompile session during CUDA
 graph capture, the cache is incomplete and that performance result is invalid.
 Diagnostic runs with DeepGEMM disabled must be labelled separately.
 
+### Collective and FP8 determinism checks
+
+Self-DVR intentionally leaves FlashInfer all-reduce fusion disabled in draft
+graphs. Unlike custom all-reduce, this fusion can change the tensor-parallel
+reduction path relative to the deterministic target and sharply reduce
+acceptance. Custom all-reduce may remain enabled for draft capture. Confirm the
+resolved server configuration contains
+`flashinfer_allreduce_fusion_backend=None`; do not restore the fusion as a
+normal-decode optimization.
+
+Deterministic dynamic channelwise W8A8 FP8 linear layers automatically use a
+fixed Triton tile. The policy is resolved when the quantized linear method is
+constructed, so DVR's temporary draft-capture context cannot switch the draft
+back to a shape-dependent CUTLASS GEMM. Leave
+`USE_TRITON_W8A8_FP8_KERNEL` unset for formal comparisons: setting it also
+changes the ordinary non-deterministic baseline.
+
+On H20, qualify the two numerical boundaries separately:
+
+- Qwen3-Next-80B TP acceptance with custom all-reduce enabled and disabled.
+  Both rows must keep FlashInfer all-reduce fusion disabled and produce the
+  same acceptance and target output.
+- Qwen3.5 FP8 target replay at matrix token counts
+  `1,2,16,32,63,64,65,80,128`. Compare rows representing the same token across
+  matrix sizes and require bitwise-equal BF16 outputs before running the full
+  397B KL matrix.
+
 ### Correctness matrix
 
 Run both `return_logprob=false` and `true`. At minimum cover:
