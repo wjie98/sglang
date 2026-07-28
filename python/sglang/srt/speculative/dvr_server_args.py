@@ -124,8 +124,11 @@ def handle_dvr_defaults(server_args):
 
 
 def _handle_dvr_speculative_decoding(server_args):
-    if server_args.speculative_algorithm not in DVR_SPECULATIVE_ALGORITHMS:
+    algorithm = server_args.speculative_algorithm
+    if algorithm not in DVR_SPECULATIVE_ALGORITHMS:
         return
+    is_self_draft = algorithm == DVR_SPECULATIVE_ALGORITHM
+    is_eagle_draft = algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
 
     from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -159,12 +162,9 @@ def _handle_dvr_speculative_decoding(server_args):
             "DVR exact rejection sampling requires target-vocabulary proposal "
             "distributions and does not support --speculative-token-map."
         )
-    if (
-        server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
-        and server_args.speculative_draft_model_path is not None
-    ):
+    if is_self_draft and server_args.speculative_draft_model_path is not None:
         raise ValueError("DVR self draft does not use a draft model path.")
-    if server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM:
+    if is_self_draft:
         if any(
             value is not None
             for value in (
@@ -187,24 +187,14 @@ def _handle_dvr_speculative_decoding(server_args):
                 "DVR self draft does not use --speculative-attention-mode; keep "
                 "its default value 'prefill'."
             )
-    if (
-        server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
-        and server_args.speculative_draft_model_path is None
-    ):
+    if is_eagle_draft and server_args.speculative_draft_model_path is None:
         raise ValueError("DVR EAGLE requires setting --speculative-draft-model-path.")
-    if (
-        server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
-        and server_args.max_running_requests is None
-    ):
+    if is_eagle_draft and server_args.max_running_requests is None:
         # Match the upstream EAGLE default so its request-indexed FutureMap
         # buffers have a bounded capacity before memory-pool profiling.
         server_args.max_running_requests = 48
     if server_args.speculative_num_draft_tokens is None:
-        server_args.speculative_num_draft_tokens = (
-            2
-            if server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
-            else 16
-        )
+        server_args.speculative_num_draft_tokens = 2 if is_eagle_draft else 16
 
     uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
     if uses_gated_linear_state and server_args.enable_two_batch_overlap:
@@ -299,7 +289,6 @@ def _handle_dvr_speculative_decoding(server_args):
         raise NotImplementedError(
             "DVR rejection sampling does not support multi-layer EAGLE."
         )
-
     if server_args.enable_mixed_chunk:
         logger.warning("Mixed chunked prefill is disabled for DVR.")
         server_args.enable_mixed_chunk = False
