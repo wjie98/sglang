@@ -31,6 +31,45 @@ class TestBatchInvariantOps(CustomTestCase):
     def tearDownClass(cls):
         batch_invariant_ops._ENABLE_MM_COMPARISON_TEST = False
 
+    def test_mode_context_restores_nested_transitions(self):
+        initial_enabled = batch_invariant_ops.is_batch_invariant_mode_enabled()
+        initial_bmm = torch.bmm
+
+        with set_batch_invariant_mode(not initial_enabled):
+            self.assertEqual(
+                batch_invariant_ops.is_batch_invariant_mode_enabled(),
+                not initial_enabled,
+            )
+            with set_batch_invariant_mode(initial_enabled):
+                self.assertEqual(
+                    batch_invariant_ops.is_batch_invariant_mode_enabled(),
+                    initial_enabled,
+                )
+            self.assertEqual(
+                batch_invariant_ops.is_batch_invariant_mode_enabled(),
+                not initial_enabled,
+            )
+
+        self.assertEqual(
+            batch_invariant_ops.is_batch_invariant_mode_enabled(),
+            initial_enabled,
+        )
+        self.assertIs(torch.bmm, initial_bmm)
+
+    def test_mode_context_restores_after_exception(self):
+        initial_enabled = batch_invariant_ops.is_batch_invariant_mode_enabled()
+        initial_bmm = torch.bmm
+
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            with set_batch_invariant_mode(not initial_enabled):
+                raise RuntimeError("capture failed")
+
+        self.assertEqual(
+            batch_invariant_ops.is_batch_invariant_mode_enabled(),
+            initial_enabled,
+        )
+        self.assertIs(torch.bmm, initial_bmm)
+
     def _test_batch_invariance(self, M, K, N, dtype):
         """
         Test that matrix operations produce identical results for:

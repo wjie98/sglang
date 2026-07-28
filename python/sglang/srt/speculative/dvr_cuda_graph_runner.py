@@ -213,12 +213,11 @@ def dvr_draft_decode_context(
     capture: bool = False,
     extra_attn_backends=(),
 ):
-    """Temporarily switch a DVR draft runner into performance-first decode mode.
+    """Select the performance-first policy for provisional DVR draft work.
 
-    Runtime determinism changes only while a draft graph is captured. Operators
-    that key their policy on active batch-invariant mode may therefore capture
-    their ordinary decode fast path, while the immutable server policy remains
-    available to operators whose target and draft geometry must stay aligned.
+    Backend-local attention metadata follows the draft policy during capture
+    and replay. Process-wide operator and collective policy changes only during
+    serialized graph capture; target ServerArgs remain immutable.
     """
 
     with ExitStack() as stack:
@@ -275,15 +274,9 @@ def dvr_draft_decode_context(
             ):
                 for group in _iter_decode_custom_all_reduce_groups(model_runner):
                     stack.enter_context(_draft_custom_allreduce_enabled(group))
-            from sglang.srt.batch_invariant_ops import (
-                disable_batch_invariant_mode,
-                enable_batch_invariant_mode,
-                is_batch_invariant_mode_enabled,
-            )
+            from sglang.srt.batch_invariant_ops import set_batch_invariant_mode
 
-            if is_batch_invariant_mode_enabled():
-                disable_batch_invariant_mode()
-                stack.callback(enable_batch_invariant_mode)
+            stack.enter_context(set_batch_invariant_mode(False))
 
         yield
 
@@ -300,10 +293,11 @@ class DVRDraftDecodeCudaGraphRunner(DecodeCudaGraphRunner):
 class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     """Target-verify graph runner for DVR self-draft and DVR-EAGLE.
 
-    DVR target verify uses the standard EAGLE verifier shape, but the graph
-    metadata must follow DVR's causal verifier and GDN state-input windows. Keep
-    those rules on the graph runner instead of attaching execution hooks to the
-    spec_info data object.
+    TARGET_VERIFY is an EXTEND forward and therefore uses target prefill
+    kernels. DecodeCudaGraphRunner is reused only for its fixed number of tokens
+    per request and speculative metadata plumbing. DVR adds the causal verifier
+    and GDN state-input metadata here rather than changing prefill graph
+    semantics or attaching execution hooks to the spec_info data object.
     """
 
     def get_spec_info(self, num_tokens: int):

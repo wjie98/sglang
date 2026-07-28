@@ -1042,16 +1042,32 @@ def disable_batch_invariant_mode():
 
 @contextlib.contextmanager
 def set_batch_invariant_mode(enabled: bool = True):
-    global _batch_invariant_MODE, _batch_invariant_LIB
-    old_data = (_batch_invariant_MODE, _batch_invariant_LIB)
+    """Temporarily select the process-wide batch-invariant operator set.
+
+    This context is intended for serialized initialization and CUDA graph
+    capture. Request execution must not switch the process-wide dispatcher.
+    """
+
+    previous_enabled = is_batch_invariant_mode_enabled()
+    if previous_enabled == enabled:
+        yield
+        return
+
+    previous_enable_bmm = _original_torch_bmm is not None
     if enabled:
         enable_batch_invariant_mode()
     else:
         disable_batch_invariant_mode()
-    yield
-    if _batch_invariant_LIB is not None:
-        _batch_invariant_LIB._destroy()
-    _batch_invariant_MODE, _batch_invariant_LIB = old_data
+
+    try:
+        yield
+    finally:
+        # A destroyed torch.library.Library cannot be restored by assigning its
+        # Python object. Re-register the previous mode and restore torch.bmm.
+        if is_batch_invariant_mode_enabled():
+            disable_batch_invariant_mode()
+        if previous_enabled:
+            enable_batch_invariant_mode(enable_bmm=previous_enable_bmm)
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])

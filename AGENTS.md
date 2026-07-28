@@ -1,5 +1,22 @@
 # DVR development notes
 
+## Execution policy
+
+- Treat forward semantics, numerical policy, and CUDA graph layout as separate
+  concerns. `TARGET_VERIFY` is an EXTEND forward executed in a fixed-token,
+  per-request graph; inheriting decode graph infrastructure does not make it a
+  decode kernel.
+- Resolved `ServerArgs` define the immutable authoritative target policy.
+  Target prefill and target verify always inherit it.
+- Provisional draft work is the only DVR exception. Process-wide operator,
+  environment, and collective state may change only during serialized draft
+  graph capture. Runtime replay may select backend-local metadata, but must not
+  mutate `ServerArgs`, deterministic environment state, or the process-wide
+  batch-invariant dispatcher.
+- Sampling determinism is independent of model kernel policy. Draft and
+  rejection random numbers must remain request-seed and absolute-position
+  based even when provisional model kernels use the normal fast path.
+
 ## Fixed validation sampling
 
 - Use the fixed DVR validation scripts. Do not replace them with one-off

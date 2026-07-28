@@ -18,6 +18,30 @@ Two draft backends are available:
 - `DECODE_VERIFY_ROLLBACK`: the target model drafts from its committed state.
 - `DECODE_VERIFY_ROLLBACK_EAGLE`: an EAGLE or MTP model produces draft tokens.
 
+## Execution phases and numerical policy
+
+DVR keeps forward semantics, numerical policy, and CUDA graph layout separate:
+
+| Phase | Forward mode | Numerical policy | Graph layout |
+| --- | --- | --- | --- |
+| Target prefill | `EXTEND` | Authoritative deterministic target | Dynamic prefill tokens |
+| Self draft | `DECODE` | Provisional normal fast path | One token per request |
+| Target verify | `TARGET_VERIFY` | Authoritative deterministic target | Fixed draft tokens per request |
+| Rollback/commit | No model forward | Commit target-selected state | GPU state transition |
+
+`TARGET_VERIFY` is classified as EXTEND and attention dispatches it through
+`forward_extend`. Its runner reuses decode CUDA graph infrastructure only
+because speculative verification has a fixed number of tokens per request and
+requires fixed-address speculative metadata. It does not use decode attention
+mathematics.
+
+The resolved server configuration is the immutable target contract. DVR does
+not switch target prefill or verify into a private numerical mode. The sole
+exception is provisional draft graph capture, which temporarily selects normal
+fast model and collective kernels. Runtime graph replay must not mutate the
+process-wide deterministic dispatcher or server configuration. Deterministic
+request sampling remains enabled independently of this model-kernel choice.
+
 ## Supported configuration
 
 - CUDA execution with pipeline parallel size one.
@@ -521,6 +545,7 @@ Run the stable unit suite from the repository root:
 
 ```bash
 PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/batch_invariant_ops/test_batch_invariant_ops.py \
   test/registered/unit/layers/test_dvr_gdn.py \
   test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py \
   test/registered/unit/server_args/test_dvr_server_args.py \

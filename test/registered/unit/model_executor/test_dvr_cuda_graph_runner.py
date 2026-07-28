@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.dvr_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
+    DVRTargetVerifyCudaGraphRunner,
     _draft_custom_allreduce_enabled,
     _fast_decode_overrides,
     _resolve_dvr_backends,
@@ -100,23 +101,19 @@ def test_draft_capture_is_fast_and_restores_target_state(
         lambda: batch_invariant_state["enabled"],
     )
 
-    def disable_batch_invariant_mode():
-        batch_invariant_state["enabled"] = False
-        events.append(("batch_invariant", False))
-
-    def enable_batch_invariant_mode():
-        batch_invariant_state["enabled"] = True
-        events.append(("batch_invariant", True))
+    @contextmanager
+    def set_batch_invariant_mode(enabled):
+        previous = batch_invariant_state["enabled"]
+        batch_invariant_state["enabled"] = enabled
+        events.append(("batch_invariant", enabled))
+        try:
+            yield
+        finally:
+            batch_invariant_state["enabled"] = previous
+            events.append(("batch_invariant", previous))
 
     monkeypatch.setattr(
-        batch_invariant_ops,
-        "disable_batch_invariant_mode",
-        disable_batch_invariant_mode,
-    )
-    monkeypatch.setattr(
-        batch_invariant_ops,
-        "enable_batch_invariant_mode",
-        enable_batch_invariant_mode,
+        batch_invariant_ops, "set_batch_invariant_mode", set_batch_invariant_mode
     )
 
     with pytest.raises(RuntimeError, match="capture failure"):
@@ -141,6 +138,46 @@ def test_draft_capture_is_fast_and_restores_target_state(
     assert (("custom_all_reduce", False) in [event[:2] for event in events]) == (
         draft_custom_all_reduce
     )
+
+
+def test_draft_replay_changes_only_backend_local_metadata(monkeypatch):
+    backend = SimpleNamespace(enable_deterministic=True)
+    model_runner = SimpleNamespace(
+        attn_backend=backend,
+        server_args=SimpleNamespace(
+            enable_deterministic_inference=True,
+            dvr_enable_draft_custom_all_reduce=True,
+        ),
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK,
+    )
+
+    monkeypatch.setattr(
+        graph_module,
+        "_fast_decode_overrides",
+        lambda *_args, **_kwargs: [(backend, "enable_deterministic", False)],
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "_iter_decode_custom_all_reduce_groups",
+        lambda _: pytest.fail("replay must not change collective policy"),
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "envs",
+        SimpleNamespace(
+            SGLANG_ENABLE_DETERMINISTIC_INFERENCE=SimpleNamespace(
+                is_set=lambda: pytest.fail(
+                    "replay must not change deterministic environment state"
+                )
+            )
+        ),
+    )
+
+    with dvr_draft_decode_context(model_runner, {}):
+        assert not backend.enable_deterministic
+        assert model_runner.server_args.enable_deterministic_inference
+
+    assert backend.enable_deterministic
 
 
 def test_triton_fast_decode_override_contract(monkeypatch):
@@ -298,6 +335,20 @@ def test_dvr_draft_graph_uses_plain_decode_layout_and_shared_state():
 
     assert runner._resolve_capture_layout() == (ForwardMode.DECODE, 1)
     assert not runner.owns_attention_graph_state
+
+
+def test_dvr_target_verify_uses_fixed_shape_extend_semantics():
+    runner = object.__new__(DVRTargetVerifyCudaGraphRunner)
+    runner.speculative_num_draft_tokens = 16
+    runner.model_runner = SimpleNamespace(
+        is_draft_worker=False,
+        decode_num_tokens_per_bs=lambda *, num_draft_tokens: num_draft_tokens,
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: True),
+    )
+
+    assert runner._resolve_capture_layout() == (ForwardMode.TARGET_VERIFY, 16)
+    assert ForwardMode.TARGET_VERIFY.is_extend()
+    assert not ForwardMode.TARGET_VERIFY.is_decode()
 
 
 @pytest.mark.parametrize(
