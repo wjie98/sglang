@@ -453,10 +453,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_draft_num_layers = None
         if (
             (
-                (
-                    self.spec_algorithm.is_eagle()
-                    or self.spec_algorithm.is_dvr_eagle()
-                )
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_dvr_eagle()
                 or self.spec_algorithm.is_standalone()
             )
             and not self.is_draft_worker
@@ -2824,7 +2822,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     DVRTargetVerifyCudaGraphRunner,
                 )
 
-                self.enable_dvr_target_verify_cuda_graph = True
                 self.decode_cuda_graph_runner = DVRTargetVerifyCudaGraphRunner(self)
             else:
                 self.decode_cuda_graph_runner = graph_runners[self.device](self)
@@ -2867,10 +2864,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
         # (restored from #25795), so it does NOT need this skip.
         if (
-            (
-                self.spec_algorithm.is_eagle()
-                or self.spec_algorithm.is_dvr_eagle()
-            )
+            (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dvr_eagle())
             and not self.is_draft_worker
             and not self.server_args.enable_return_hidden_states
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
