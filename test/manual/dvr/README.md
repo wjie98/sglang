@@ -26,7 +26,9 @@ Two draft backends are available:
 For GDN models, `page_size` must equal the FLA chunk size (64). This keeps
 Radix prefix boundaries identical to the recurrent checkpoints used by verify.
 FlashInfer is supported as a sampling backend, but not as DVR's full-attention
-backend. Grammar-constrained decoding is not supported by DVR.
+backend. Grammar-constrained decoding and dynamic token penalties
+(`frequency_penalty`, `presence_penalty`, `repetition_penalty`, and
+`min_new_tokens`) are not supported by DVR. Static `logit_bias` is supported.
 
 ## Start a server
 

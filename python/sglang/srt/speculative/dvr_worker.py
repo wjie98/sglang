@@ -709,6 +709,19 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             )
             return batch_result
 
+        sampling_info = batch.sampling_info
+        penalizer = sampling_info.penalizer_orchestrator
+        if (
+            sampling_info.acc_additive_penalties is not None
+            or sampling_info.acc_scaling_penalties is not None
+            or (penalizer is not None and penalizer.is_required)
+        ):
+            raise ValueError(
+                "DVR exact sampling does not support dynamic token penalties "
+                "(frequency_penalty, presence_penalty, repetition_penalty, or "
+                "min_new_tokens)."
+            )
+
         # DVR decode has one shared core: draft -> target verify -> rollback.
         if batch.spec_info is None:
             batch.spec_info = self.draft_backend.idle_input()

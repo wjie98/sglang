@@ -229,6 +229,35 @@ def test_short_prefix_sentinel_marks_only_new_prefill_requests():
     assert not worker.pending_seed_rows
 
 
+@pytest.mark.parametrize(
+    ("additive_penalties", "scaling_penalties", "orchestrator_required"),
+    [
+        (torch.zeros(1, 2), None, False),
+        (None, torch.ones(1, 2), False),
+        (None, None, True),
+    ],
+)
+def test_dvr_rejects_dynamic_token_penalties(
+    additive_penalties, scaling_penalties, orchestrator_required
+):
+    worker = object.__new__(DecodeVerifyRollbackWorker)
+    worker.uses_eagle_draft = False
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        is_extend_in_batch=False,
+        sampling_info=SimpleNamespace(
+            acc_additive_penalties=additive_penalties,
+            acc_scaling_penalties=scaling_penalties,
+            penalizer_orchestrator=SimpleNamespace(
+                is_required=orchestrator_required
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="dynamic token penalties"):
+        worker.forward_batch_generation(batch)
+
+
 def test_draft_backends_finalize_the_common_verify_result():
     bonus_tokens = torch.tensor([3, 5])
     result = SimpleNamespace(
