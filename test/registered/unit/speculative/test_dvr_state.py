@@ -5,7 +5,7 @@ import torch
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
-from sglang.srt.speculative.dvr_state_flow import DVRStateLifecycle
+from sglang.srt.speculative.dvr_state import DVRStateLifecycle
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -269,11 +269,11 @@ def test_target_extend_records_live_boundary(seq_len, expected_boundary, expecte
 
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
-    plan = lifecycle.prepare_for_draft(batch)
+    plan = lifecycle.prepare_rollback(batch)
 
-    assert lifecycle.boundary_seq_lens[1].item() == expected_boundary
-    assert plan.live_boundary_slots.tolist() == [20]
-    assert plan.accepted_tail_lens.tolist() == [expected_tail]
+    assert lifecycle.target_boundary_lens[1].item() == expected_boundary
+    assert plan.target_cache_slots.tolist() == [20]
+    assert plan.tail_lens.tolist() == [expected_tail]
     assert adapter.initialized[-1]["accepted_tail_lens"] == [expected_tail]
     assert adapter.zeroed == ([20] if expected_boundary == 0 else [])
 
@@ -285,7 +285,7 @@ def test_new_prefill_boundary_is_copied_to_radix_tracking_slot():
 
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
-    plan = lifecycle.prepare_for_draft(batch)
+    plan = lifecycle.prepare_rollback(batch)
 
     assert adapter.published == [
         {
@@ -294,9 +294,9 @@ def test_new_prefill_boundary_is_copied_to_radix_tracking_slot():
             "publish_mask": [True],
         }
     ]
-    assert lifecycle.published_boundary_lens[1].tolist() == [64, -1]
-    assert plan.publish_boundary_slots.tolist() == [11]
-    assert plan.publish_boundary_lanes.tolist() == [1]
+    assert lifecycle.radix_boundary_lens[1].tolist() == [64, -1]
+    assert plan.radix_checkpoint_slots.tolist() == [11]
+    assert plan.radix_checkpoint_lanes.tolist() == [1]
 
 
 def test_warm_partial_extend_needs_no_new_radix_checkpoint():
@@ -306,12 +306,12 @@ def test_warm_partial_extend_needs_no_new_radix_checkpoint():
 
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
-    plan = lifecycle.prepare_for_draft(batch)
+    plan = lifecycle.prepare_rollback(batch)
 
     assert adapter.published[-1]["publish_mask"] == [False]
-    assert lifecycle.published_boundary_lens[1].tolist() == [-1, -1]
-    assert plan.live_boundary_slots.tolist() == [20]
-    assert plan.publish_boundary_slots.tolist() == [10]
+    assert lifecycle.radix_boundary_lens[1].tolist() == [-1, -1]
+    assert plan.target_cache_slots.tolist() == [20]
+    assert plan.radix_checkpoint_slots.tolist() == [10]
 
 
 def test_no_radix_boundary_crossing_updates_only_live_state():
@@ -320,15 +320,15 @@ def test_no_radix_boundary_crossing_updates_only_live_state():
     attach_pool(batch, pool)
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
-    plan = lifecycle.prepare_for_draft(batch)
+    plan = lifecycle.prepare_rollback(batch)
     adapter.crosses_boundary = torch.tensor([True])
 
-    lifecycle.commit_verified_state(
+    lifecycle.rollback(
         batch=batch, plan=plan, accept_lens=torch.tensor([2])
     )
 
     assert adapter.commits[-1]["publish_boundary_slots"] is None
-    assert lifecycle.boundary_seq_lens[1].item() == 64
+    assert lifecycle.target_boundary_lens[1].item() == 64
 
 
 def test_no_radix_release_clears_request_lifecycle_state():
@@ -337,11 +337,11 @@ def test_no_radix_release_clears_request_lifecycle_state():
     attach_pool(batch, pool)
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
-    assert lifecycle.boundary_seq_lens[1].item() == 64
+    assert lifecycle.target_boundary_lens[1].item() == 64
 
     lifecycle.prepare_for_cache_release(req)
 
-    assert lifecycle.boundary_seq_lens[1].item() == -1
+    assert lifecycle.target_boundary_lens[1].item() == -1
 
 
 def test_radix_boundary_crossing_rotates_publication_lane():
@@ -350,26 +350,26 @@ def test_radix_boundary_crossing_rotates_publication_lane():
     attach_pool(batch, pool)
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
-    plan = lifecycle.prepare_for_draft(batch)
+    plan = lifecycle.prepare_rollback(batch)
     adapter.crosses_boundary = torch.tensor([True])
 
-    lifecycle.commit_verified_state(
+    lifecycle.rollback(
         batch=batch, plan=plan, accept_lens=torch.tensor([63])
     )
 
     assert adapter.commits[-1]["accepted_conv_slots"].tolist() == [20]
     assert adapter.commits[-1]["publish_boundary_slots"].tolist() == [11]
-    assert lifecycle.boundary_seq_lens[1].item() == 128
-    assert lifecycle.published_boundary_lens[1].tolist() == [64, 128]
+    assert lifecycle.target_boundary_lens[1].item() == 128
+    assert lifecycle.radix_boundary_lens[1].tolist() == [64, 128]
 
 
-def test_prepare_for_draft_rejects_stale_live_boundary():
+def test_prepare_rollback_rejects_stale_target_boundary():
     lifecycle, _, pool = make_lifecycle()
     _, batch = make_batch(seq_len=65)
     attach_pool(batch, pool)
 
     with pytest.raises(RuntimeError, match="latest exact recurrent boundary"):
-        lifecycle.prepare_for_draft(batch)
+        lifecycle.prepare_rollback(batch)
 
 
 def test_target_extend_requires_host_sequence_lengths():
@@ -388,9 +388,9 @@ def test_release_selects_latest_visible_radix_boundary():
     attach_pool(batch, pool)
     lifecycle.prepare_target_extend(batch)
     lifecycle.finish_target_extend(batch)
-    plan = lifecycle.prepare_for_draft(batch)
+    plan = lifecycle.prepare_rollback(batch)
     adapter.crosses_boundary = torch.tensor([True])
-    lifecycle.commit_verified_state(
+    lifecycle.rollback(
         batch=batch, plan=plan, accept_lens=torch.tensor([63])
     )
     req.kv_committed_len = 128
@@ -401,5 +401,5 @@ def test_release_selects_latest_visible_radix_boundary():
 
     assert req.mamba_last_track_seqlen == 128
     assert req.mamba_next_track_idx == 0
-    assert lifecycle.boundary_seq_lens[1].item() == -1
-    assert lifecycle.published_boundary_lens[1].tolist() == [-1, -1]
+    assert lifecycle.target_boundary_lens[1].item() == -1
+    assert lifecycle.radix_boundary_lens[1].tolist() == [-1, -1]

@@ -42,8 +42,8 @@ from sglang.srt.speculative.dvr_sampling import (
     dvr_sample_from_probs,
     dvr_sampling_probs,
 )
-from sglang.srt.speculative.dvr_state_flow import (
-    DVRStateCommitPlan,
+from sglang.srt.speculative.dvr_state import (
+    DVRRollbackPlan,
     DVRStateLifecycle,
 )
 from sglang.srt.speculative.eagle_info import (
@@ -671,7 +671,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
                 needs_seed_verify = True
                 self.pending_seed_rows.discard(request_slot)
         with spec_stage_span("dvr_prepare"):
-            state_commit_plan = self.state_lifecycle.prepare_for_draft(batch)
+            rollback_plan = self.state_lifecycle.prepare_rollback(batch)
         if needs_seed_verify:
             verify_input = self.build_root_only_verify_input(batch)
         else:
@@ -682,7 +682,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         batch_result = self.verify(
             batch,
             verify_input,
-            state_commit_plan=state_commit_plan,
+            rollback_plan=rollback_plan,
             on_publish=on_publish,
         )
         # Self prepares its next chain input; EAGLE catches its private cache up
@@ -841,7 +841,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         spec_info: EagleVerifyInput,
-        state_commit_plan: Optional[DVRStateCommitPlan] = None,
+        rollback_plan: Optional[DVRRollbackPlan] = None,
         on_publish=None,
     ) -> GenerationBatchResult:
         scheduler_seq_lens = batch.seq_lens
@@ -927,19 +927,19 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
         with spec_stage_span("dvr_rollback"):
-            self.state_lifecycle.commit_verified_state(
+            self.state_lifecycle.rollback(
                 batch=batch,
-                plan=state_commit_plan,
+                plan=rollback_plan,
                 accept_lens=accept_lens,
             )
-        if state_commit_plan is not None:
+        if rollback_plan is not None:
             self.state_commit_done_event = torch.get_device_module(self.device).Event()
             self.state_commit_done_event.record()
             if not self.uses_eagle_draft:
                 self.war_fastpath_runner.war_fastpath_read_done_event = (
                     self.state_commit_done_event
                 )
-        if state_commit_plan is None:
+        if rollback_plan is None:
             commit_mamba_states_after_verify(
                 self.target_worker,
                 batch,

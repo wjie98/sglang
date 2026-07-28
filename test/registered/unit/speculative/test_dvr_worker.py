@@ -431,7 +431,7 @@ def test_self_verify_fences_state_commit_before_overlap_publish(monkeypatch):
         ),
     )
     worker.state_lifecycle = SimpleNamespace(
-        commit_verified_state=lambda **_kwargs: calls.append("commit")
+        rollback=lambda **_kwargs: calls.append("commit")
     )
     worker.sample_verified_tokens = lambda *_args: (
         torch.tensor([7, 8], dtype=torch.int32),
@@ -456,7 +456,7 @@ def test_self_verify_fences_state_commit_before_overlap_publish(monkeypatch):
     worker.verify(
         batch,
         spec_info,
-        state_commit_plan=object(),
+        rollback_plan=object(),
         on_publish=lambda _seq_lens: calls.append("publish"),
     )
 

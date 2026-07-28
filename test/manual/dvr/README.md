@@ -482,7 +482,7 @@ PYTHONPATH=python python -m pytest -q \
   test/registered/unit/layers/test_dvr_gdn.py \
   test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py \
   test/registered/unit/server_args/test_dvr_server_args.py \
-  test/registered/unit/speculative/test_dvr_state_flow.py \
+  test/registered/unit/speculative/test_dvr_state.py \
   test/registered/unit/speculative/test_dvr_worker.py \
   test/registered/unit/speculative/test_dvr_sampling.py \
   test/registered/unit/managers/test_batch_result_processor_spec_grammar.py \
