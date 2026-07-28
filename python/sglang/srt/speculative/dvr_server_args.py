@@ -12,20 +12,11 @@ logger = logging.getLogger(__name__)
 
 DVR_SPECULATIVE_ALGORITHM = "DECODE_VERIFY_ROLLBACK"
 DVR_EAGLE_SPECULATIVE_ALGORITHM = "DECODE_VERIFY_ROLLBACK_EAGLE"
-DVR_SPECULATIVE_ALGORITHMS = {
-    DVR_SPECULATIVE_ALGORITHM,
-    DVR_EAGLE_SPECULATIVE_ALGORITHM,
-}
 _DVR_FULL_ATTENTION_BACKENDS = {"triton", "fa3"}
 
 
 def handle_dvr_defaults(server_args):
-    algorithm = server_args.speculative_algorithm
-    if algorithm is None:
-        return
-    algorithm = algorithm.upper()
-    if algorithm not in DVR_SPECULATIVE_ALGORITHMS:
-        return
+    algorithm = server_args.speculative_algorithm.upper()
     server_args.speculative_algorithm = algorithm
 
     # These generic speculative options are handled before DVR's algorithm
@@ -125,8 +116,6 @@ def handle_dvr_defaults(server_args):
 
 def _handle_dvr_speculative_decoding(server_args):
     algorithm = server_args.speculative_algorithm
-    if algorithm not in DVR_SPECULATIVE_ALGORITHMS:
-        return
     is_self_draft = algorithm == DVR_SPECULATIVE_ALGORITHM
     is_eagle_draft = algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
 
@@ -162,9 +151,9 @@ def _handle_dvr_speculative_decoding(server_args):
             "DVR exact rejection sampling requires target-vocabulary proposal "
             "distributions and does not support --speculative-token-map."
         )
-    if is_self_draft and server_args.speculative_draft_model_path is not None:
-        raise ValueError("DVR self draft does not use a draft model path.")
     if is_self_draft:
+        if server_args.speculative_draft_model_path is not None:
+            raise ValueError("DVR self draft does not use a draft model path.")
         if any(
             value is not None
             for value in (
@@ -187,12 +176,15 @@ def _handle_dvr_speculative_decoding(server_args):
                 "DVR self draft does not use --speculative-attention-mode; keep "
                 "its default value 'prefill'."
             )
-    if is_eagle_draft and server_args.speculative_draft_model_path is None:
-        raise ValueError("DVR EAGLE requires setting --speculative-draft-model-path.")
-    if is_eagle_draft and server_args.max_running_requests is None:
-        # Match the upstream EAGLE default so its request-indexed FutureMap
-        # buffers have a bounded capacity before memory-pool profiling.
-        server_args.max_running_requests = 48
+    if is_eagle_draft:
+        if server_args.speculative_draft_model_path is None:
+            raise ValueError(
+                "DVR EAGLE requires setting --speculative-draft-model-path."
+            )
+        if server_args.max_running_requests is None:
+            # Match upstream EAGLE so request-indexed FutureMap storage is
+            # bounded before memory-pool profiling.
+            server_args.max_running_requests = 48
     if server_args.speculative_num_draft_tokens is None:
         server_args.speculative_num_draft_tokens = 2 if is_eagle_draft else 16
 
@@ -296,9 +288,6 @@ def _handle_dvr_speculative_decoding(server_args):
 
 def handle_dvr_cuda_graph_config(server_args):
     """Apply DVR constraints after the generic CUDA graph config is resolved."""
-
-    if server_args.speculative_algorithm not in DVR_SPECULATIVE_ALGORITHMS:
-        return
 
     if _is_dvr_gated_linear_state_model(server_args):
         prefill_graph = server_args.cuda_graph_config.prefill

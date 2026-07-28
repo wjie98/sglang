@@ -5,6 +5,7 @@ import torch
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
+from sglang.srt.speculative.dvr_sampling import dvr_proposal_buffer_bytes
 from sglang.srt.speculative.dvr_state import DVRStateLifecycle
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -233,6 +234,28 @@ def test_self_dvr_proposal_budget_matches_chain_capacity(
     assert available_bytes == available_gb * (1 << 30) - proposal_bytes
 
 
+@pytest.mark.parametrize("disable_overlap", [False, True])
+def test_eagle_dvr_proposal_budget_is_request_local(disable_overlap):
+    max_running_requests = 48
+    dp_size = 2
+    vocab_size = 10
+    runner = SimpleNamespace(
+        spec_algorithm=SpeculativeAlgorithm.DECODE_VERIFY_ROLLBACK_EAGLE,
+        server_args=SimpleNamespace(
+            speculative_use_rejection_sampling=True,
+            disable_overlap_schedule=disable_overlap,
+            max_running_requests=max_running_requests,
+            dp_size=dp_size,
+        ),
+        model_config=SimpleNamespace(vocab_size=vocab_size),
+    )
+
+    proposal_bytes = dvr_proposal_buffer_bytes(runner)
+
+    expected_rows = 0 if disable_overlap else max_running_requests // dp_size + 1
+    assert proposal_bytes == expected_rows * vocab_size * torch.float32.itemsize
+
+
 @pytest.mark.parametrize(
     ("spec_algorithm", "disable_overlap", "expected_ratio"),
     [
@@ -372,14 +395,15 @@ def test_prepare_rollback_rejects_stale_target_boundary():
         lifecycle.prepare_rollback(batch)
 
 
-def test_target_extend_requires_host_sequence_lengths():
+def test_target_extend_does_not_require_host_sequence_lengths():
     lifecycle, _, pool = make_lifecycle()
     _, batch = make_batch(seq_len=65)
     attach_pool(batch, pool)
     batch.seq_lens_cpu = None
 
-    with pytest.raises(RuntimeError, match="requires seq_lens_cpu"):
-        lifecycle.finish_target_extend(batch)
+    lifecycle.finish_target_extend(batch)
+
+    assert lifecycle.target_boundary_lens[1].item() == 64
 
 
 def test_release_selects_latest_visible_radix_boundary():

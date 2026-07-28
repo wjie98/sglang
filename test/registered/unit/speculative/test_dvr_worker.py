@@ -198,7 +198,7 @@ def test_short_prefix_uses_one_root_verify_sentinel(uses_eagle_draft):
 def test_short_prefix_sentinel_marks_only_new_prefill_requests():
     worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.uses_eagle_draft = False
-    worker.pending_seed_rows = set()
+    worker.seed_verify_slots = set()
     worker.draft_backend = SimpleNamespace(
         target_capture_hidden_mode=dvr_worker_module.CaptureHiddenMode.NULL,
         finish_prefill=lambda _batch, _result: "next-draft",
@@ -223,11 +223,11 @@ def test_short_prefix_sentinel_marks_only_new_prefill_requests():
 
     result = worker.forward_batch_generation(batch)
 
-    assert worker.pending_seed_rows == {1}
+    assert worker.seed_verify_slots == {1}
     assert result.new_seq_lens is batch.seq_lens
     assert result.next_draft_input == "next-draft"
     worker.prepare_for_kv_cache_release(new_req)
-    assert not worker.pending_seed_rows
+    assert not worker.seed_verify_slots
 
 
 @pytest.mark.parametrize(
@@ -361,7 +361,7 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.device = "cuda"
     worker.uses_eagle_draft = False
-    worker.pending_seed_rows = {3}
+    worker.seed_verify_slots = {3}
     worker.target_model_worker = SimpleNamespace(
         model_runner=SimpleNamespace(war_fastpath_read_done_event=read_done)
     )
@@ -378,7 +378,7 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
         ("wait", state_done),
         ("release", "done"),
     ]
-    assert not worker.pending_seed_rows
+    assert not worker.seed_verify_slots
 
 
 def test_self_verify_fences_state_commit_before_overlap_publish(monkeypatch):

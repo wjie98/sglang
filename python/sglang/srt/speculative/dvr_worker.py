@@ -374,7 +374,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         # A one-token prefill cannot seed every draft backend. Consume one
         # target-only verify before normal draft; pool slots are overwritten on
         # every prefill, so stale request identities cannot survive slot reuse.
-        self.pending_seed_rows = set()
+        self.seed_verify_slots = set()
         self.draft_graph_buffers = {}
         max_bs = max(
             server_args.cuda_graph_config.decode.max_bs or 0,
@@ -589,11 +589,11 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
 
     def clear_cache_pool(self):
         self.state_lifecycle.clear_cache_state()
-        self.pending_seed_rows.clear()
+        self.seed_verify_slots.clear()
 
     def prepare_for_kv_cache_release(self, req) -> None:
         if req.req_pool_idx is not None:
-            self.pending_seed_rows.discard(int(req.req_pool_idx))
+            self.seed_verify_slots.discard(int(req.req_pool_idx))
         if getattr(self, "device", "cpu") != "cpu":
             current_stream = torch.get_device_module(self.device).current_stream()
             read_done = self.war_fastpath_runner.war_fastpath_read_done_event
@@ -622,9 +622,9 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             decoding_rids = {req.rid for req in batch.decoding_reqs or ()}
             for req in batch.reqs:
                 request_slot = int(req.req_pool_idx)
-                self.pending_seed_rows.discard(request_slot)
+                self.seed_verify_slots.discard(request_slot)
                 if req.rid not in decoding_rids and len(req.origin_input_ids) <= 1:
-                    self.pending_seed_rows.add(request_slot)
+                    self.seed_verify_slots.add(request_slot)
             if on_publish is not None:
                 on_publish(batch_result.new_seq_lens)
             batch_result.next_draft_input = self.draft_backend.finish_prefill(
@@ -663,9 +663,9 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         needs_seed_verify = False
         for req in batch.reqs:
             request_slot = int(req.req_pool_idx)
-            if request_slot in self.pending_seed_rows:
+            if request_slot in self.seed_verify_slots:
                 needs_seed_verify = True
-                self.pending_seed_rows.discard(request_slot)
+                self.seed_verify_slots.discard(request_slot)
         with spec_stage_span("dvr_prepare"):
             rollback_plan = self.state_lifecycle.prepare_rollback(batch)
         if needs_seed_verify:

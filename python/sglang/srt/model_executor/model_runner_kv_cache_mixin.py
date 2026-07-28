@@ -115,35 +115,15 @@ class ModelRunnerKVCacheMixin:
         rest_memory = available_gpu_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
-        if self.spec_algorithm.is_dvr_self_draft():
-            # Exact rejection sampling retains one proposal distribution per
-            # draft edge. Reserve the worker's full fixed chain capacity.
-            proposal_batch_capacity = max(
-                self.server_args.cuda_graph_config.decode.max_bs or 0,
-                self.server_args.max_running_requests or 0,
-                1,
-            )
-            proposal_bytes = (
-                proposal_batch_capacity
-                * self.server_args.speculative_num_steps
-                * self.model_config.vocab_size
-                * torch.float32.itemsize
-            )
-            rest_memory -= proposal_bytes / (1 << 30)
         if (
-            self.spec_algorithm.is_dvr_eagle()
-            and self.server_args.speculative_use_rejection_sampling
-            and not self.server_args.disable_overlap_schedule
+            self.spec_algorithm.is_dvr_self_draft()
+            or self.spec_algorithm.is_dvr_eagle()
         ):
-            # FutureMap persists the next EAGLE proposal row by request. It is
-            # allocated after pool profiling, so reserve it here.
-            request_rows = (
-                self.server_args.max_running_requests // self.server_args.dp_size + 1
+            from sglang.srt.speculative.dvr_sampling import (
+                dvr_proposal_buffer_bytes,
             )
-            proposal_bytes = (
-                request_rows * self.model_config.vocab_size * torch.float32.itemsize
-            )
-            rest_memory -= proposal_bytes / (1 << 30)
+
+            rest_memory -= dvr_proposal_buffer_bytes(self) / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 

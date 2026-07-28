@@ -196,21 +196,11 @@ class DVRStateLifecycle:
         request_rows, target_cache_slots = self.state_adapter.resolve_request_slots(
             batch=batch
         )
-        if batch.seq_lens_cpu is None:
-            raise RuntimeError(
-                "DVR linear-state target EXTEND requires seq_lens_cpu; "
-                "mixed chunk scheduling must remain disabled for this model."
-            )
-
-        seq_lens = torch.tensor(
-            [int(value) for value in batch.seq_lens_cpu.tolist()],
-            device=target_cache_slots.device,
-            dtype=torch.int64,
+        seq_lens = batch.seq_lens.to(
+            device=target_cache_slots.device, dtype=torch.int64
         )
         prefix_lens = torch.tensor(
-            [int(value) for value in batch.prefix_lens],
-            device=target_cache_slots.device,
-            dtype=torch.int64,
+            batch.prefix_lens, device=target_cache_slots.device, dtype=torch.int64
         )
         boundary_lens = seq_lens // self.chunk_size * self.chunk_size
         zero_mask = boundary_lens == 0

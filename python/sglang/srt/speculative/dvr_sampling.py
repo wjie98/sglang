@@ -14,6 +14,28 @@ DVR_FINAL_RNG_DOMAIN = 0xB8F1A2C7
 DVR_SAMPLING_BLOCK_SIZE = 4096
 
 
+def dvr_proposal_buffer_bytes(model_runner) -> int:
+    """Return proposal storage allocated after KV-pool memory profiling."""
+
+    server_args = model_runner.server_args
+    if model_runner.spec_algorithm.is_dvr_self_draft():
+        request_rows = max(
+            server_args.cuda_graph_config.decode.max_bs or 0,
+            server_args.max_running_requests or 0,
+            1,
+        )
+        proposal_rows = request_rows * server_args.speculative_num_steps
+    elif (
+        model_runner.spec_algorithm.is_dvr_eagle()
+        and server_args.speculative_use_rejection_sampling
+        and not server_args.disable_overlap_schedule
+    ):
+        proposal_rows = server_args.max_running_requests // server_args.dp_size + 1
+    else:
+        return 0
+    return proposal_rows * model_runner.model_config.vocab_size * torch.float32.itemsize
+
+
 def dvr_sampling_probs(
     probs: torch.Tensor,
     sampling_info,
