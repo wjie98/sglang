@@ -252,6 +252,72 @@ def test_draft_backends_finalize_the_common_verify_result():
     assert calls == [(batch, result)]
 
 
+@pytest.mark.parametrize("uses_eagle_draft", [False, True])
+def test_weight_update_recaptures_the_complete_dvr_draft_graph_set(
+    uses_eagle_draft,
+):
+    calls = []
+    worker = object.__new__(DecodeVerifyRollbackWorker)
+    worker.uses_eagle_draft = uses_eagle_draft
+    worker.draft_graph_buffers = {"stale": object()}
+    worker.init_cuda_graphs = lambda: calls.append(("recapture",))
+    worker.draft_backend = SimpleNamespace(graph_runner=object())
+
+    def update_draft_weights(model_path, load_format, **kwargs):
+        calls.append(("load", model_path, load_format, kwargs))
+        return True, "loaded"
+
+    worker.draft_model_worker = SimpleNamespace(
+        draft_runner=SimpleNamespace(
+            update_weights_from_disk=update_draft_weights,
+        )
+    )
+    request = SimpleNamespace(
+        model_path="updated-model",
+        load_format="auto",
+        recapture_cuda_graph=True,
+    )
+
+    success, _ = worker.update_weights_from_disk(request)
+
+    assert success
+    if uses_eagle_draft:
+        assert calls == [
+            (
+                "load",
+                "updated-model",
+                "auto",
+                {"recapture_cuda_graph": False},
+            ),
+            ("recapture",),
+        ]
+        assert worker.draft_backend.graph_runner is not None
+    else:
+        assert calls == [("recapture",)]
+        assert worker.draft_backend.graph_runner is None
+    assert not worker.draft_graph_buffers
+
+
+def test_weight_update_keeps_dvr_graphs_when_recapture_is_disabled():
+    worker = object.__new__(DecodeVerifyRollbackWorker)
+    worker.uses_eagle_draft = False
+    worker.draft_graph_buffers = {"current": object()}
+    graph_runner = object()
+    worker.draft_backend = SimpleNamespace(graph_runner=graph_runner)
+    worker.init_cuda_graphs = lambda: pytest.fail("unexpected graph recapture")
+    request = SimpleNamespace(
+        model_path="updated-model",
+        load_format="auto",
+        recapture_cuda_graph=False,
+    )
+
+    success, _ = worker.update_weights_from_disk(request)
+
+    assert success
+    assert worker.draft_backend.graph_runner is graph_runner
+    assert "current" in worker.draft_graph_buffers
+
+
 def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     calls = []
     read_done = object()

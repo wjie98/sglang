@@ -630,17 +630,28 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         return []
 
     def update_weights_from_disk(self, recv_req):
-        if not self.uses_eagle_draft:
-            # The scheduler has already updated the target model. Self-draft
-            # shares those weights and must not load them a second time.
-            return True, "Succeeded to update model weights."
-        success, message = self.draft_worker.draft_runner.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
-        )
-        if not success:
-            return success, message
+        # The scheduler has already updated the target model. Self-draft shares
+        # those weights, while EAGLE still needs its separate draft weights.
+        if self.uses_eagle_draft:
+            success, message = (
+                self.draft_worker.draft_runner.update_weights_from_disk(
+                    recv_req.model_path,
+                    recv_req.load_format,
+                    recapture_cuda_graph=False,
+                )
+            )
+            if not success:
+                return success, message
+
+        if recv_req.recapture_cuda_graph:
+            # DVR owns additional graph runners beyond ModelRunner's decode
+            # graph. Rebuild the complete draft graph set after both target and
+            # draft weights have been updated.
+            self.draft_graph_buffers.clear()
+            if not self.uses_eagle_draft:
+                self.draft_backend.graph_runner = None
+            self.init_cuda_graphs()
+
         return True, "Succeeded to update model weights."
 
     def update_weights_from_ipc(self, recv_req):
