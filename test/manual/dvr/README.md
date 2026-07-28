@@ -31,6 +31,12 @@ backend. Grammar-constrained decoding and dynamic token penalties
 `min_new_tokens`) are not supported by DVR. Requests using them are rejected
 rather than approximated. Static `logit_bias` is supported.
 
+DVR also rejects adaptive or decoupled speculative execution, multi-layer
+EAGLE, reduced-vocabulary token maps, and EAGLE3/DFLASH draft-window options.
+Self-draft reuses the target model and decode backend, so draft-model revision,
+load-format, quantization, and draft-attention overrides are invalid in that
+mode. Mixed chunked prefill is disabled automatically for both DVR algorithms.
+
 ## Start a server
 
 The launcher uses the current Python environment. Set `PYTHONPATH` explicitly

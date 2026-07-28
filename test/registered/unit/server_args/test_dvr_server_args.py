@@ -25,9 +25,19 @@ class _Args:
     enable_dp_attention = False
     enable_pdmux = False
     disaggregation_mode = "null"
+    decoupled_spec_role = "null"
     pp_size = 1
     speculative_adaptive = False
+    speculative_adaptive_config = None
     speculative_draft_model_path = None
+    speculative_draft_model_revision = None
+    speculative_draft_load_format = None
+    speculative_draft_model_quantization = None
+    speculative_draft_attention_backend = None
+    speculative_draft_window_size = None
+    speculative_attention_mode = "prefill"
+    speculative_token_map = None
+    speculative_skip_dp_mlp_sync = False
     speculative_num_draft_tokens = 16
     max_speculative_num_draft_tokens = 16
     speculative_num_steps = None
@@ -170,6 +180,69 @@ class TestDVRServerArgs(unittest.TestCase):
         args.speculative_num_draft_tokens = 1
         with self.assertRaisesRegex(ValueError, "speculative_num_draft_tokens >= 2"):
             _handle_dvr_speculative_decoding(args)
+
+    def test_dvr_algorithm_marker_fills_canonical_self_draft_defaults(self):
+        args = _Args()
+        args.speculative_num_draft_tokens = None
+        args.speculative_num_steps = None
+        args.speculative_eagle_topk = None
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
+            return_value=False,
+        ):
+            handle_dvr_defaults(args)
+            _handle_dvr_speculative_decoding(args)
+
+        self.assertTrue(args.enable_deterministic_inference)
+        self.assertEqual(args.grammar_backend, "none")
+        self.assertEqual(args.attention_backend, "triton")
+        self.assertEqual(args.speculative_num_draft_tokens, 16)
+        self.assertEqual(args.speculative_num_steps, 15)
+        self.assertEqual(args.speculative_eagle_topk, 1)
+        self.assertTrue(args.speculative_use_rejection_sampling)
+        self.assertFalse(args.enable_mixed_chunk)
+
+    def test_dvr_rejects_generic_spec_modes_with_different_execution_semantics(self):
+        for field, value, message in (
+            ("speculative_adaptive", True, "fixed verify chain"),
+            ("speculative_skip_dp_mlp_sync", True, "skip-dp-mlp-sync"),
+            ("speculative_draft_window_size", 64, "draft-window-size"),
+        ):
+            with self.subTest(field=field):
+                args = _Args()
+                setattr(args, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_dvr_defaults(args)
+
+    def test_dvr_rejects_decoupled_and_reduced_vocab_execution(self):
+        for field, value, message in (
+            ("decoupled_spec_role", "verifier", "decoupled speculative"),
+            ("speculative_token_map", "tokens.json", "target-vocabulary"),
+        ):
+            with self.subTest(field=field):
+                args = _Args()
+                setattr(args, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    _handle_dvr_speculative_decoding(args)
+
+    def test_dvr_self_draft_rejects_unused_draft_worker_options(self):
+        for field, value, message in (
+            ("speculative_draft_model_revision", "main", "draft-model revision"),
+            ("speculative_draft_load_format", "dummy", "draft-model revision"),
+            ("speculative_draft_model_quantization", "fp8", "draft-model revision"),
+            (
+                "speculative_draft_attention_backend",
+                "triton",
+                "draft-attention-backend",
+            ),
+            ("speculative_attention_mode", "decode", "attention-mode"),
+        ):
+            with self.subTest(field=field):
+                args = _Args()
+                setattr(args, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    _handle_dvr_speculative_decoding(args)
 
     def test_dvr_self_draft_uses_existing_cuda_graph_coverage(self):
         cases = (
@@ -496,13 +569,13 @@ class TestDVRServerArgs(unittest.TestCase):
         ):
             _handle_dvr_speculative_decoding(args)
 
-        self.assertTrue(args.enable_mixed_chunk)
+        self.assertFalse(args.enable_mixed_chunk)
 
-    def test_dvr_gdn_disables_mixed_chunk(self):
+    def test_all_dvr_modes_disable_mixed_chunk(self):
         args = _Args()
         with patch(
             "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
-            return_value=True,
+            return_value=False,
         ):
             _handle_dvr_speculative_decoding(args)
 
@@ -536,6 +609,25 @@ class TestDVRServerArgs(unittest.TestCase):
             handle_dvr_defaults(args)
 
         self.assertEqual(args.speculative_algorithm, DVR_SPECULATIVE_ALGORITHM)
+
+    def test_dvr_gdn_fills_complete_state_defaults(self):
+        args = _Args()
+        args.page_size = None
+        args.mamba_track_interval = 256
+        args.mamba_ssm_dtype = "bfloat16"
+
+        with patch(
+            "sglang.srt.speculative.dvr_server_args._is_dvr_gated_linear_state_model",
+            return_value=True,
+        ):
+            handle_dvr_defaults(args)
+
+        self.assertTrue(args.enable_deterministic_inference)
+        self.assertEqual(args.grammar_backend, "none")
+        self.assertEqual(args.page_size, 64)
+        self.assertEqual(args.mamba_radix_cache_strategy, "extra_buffer")
+        self.assertEqual(args.mamba_track_interval, 64)
+        self.assertEqual(args.mamba_ssm_dtype, "float32")
 
     def test_non_gdn_dvr_does_not_inherit_fla_limits(self):
         args = _Args()

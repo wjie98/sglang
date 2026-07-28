@@ -28,6 +28,23 @@ def handle_dvr_defaults(server_args):
         return
     server_args.speculative_algorithm = algorithm
 
+    # These generic speculative options are handled before DVR's algorithm
+    # hook. Reject them here instead of letting upstream silently disable them
+    # or fail with an unrelated assertion.
+    if server_args.speculative_adaptive:
+        raise ValueError(
+            "DVR uses a fixed verify chain and does not support adaptive spec."
+        )
+    if server_args.speculative_skip_dp_mlp_sync:
+        raise ValueError(
+            "DVR does not support --speculative-skip-dp-mlp-sync or DP attention."
+        )
+    if server_args.speculative_draft_window_size is not None:
+        raise ValueError(
+            "DVR does not support --speculative-draft-window-size; it is an "
+            "EAGLE3/DFLASH draft-cache option."
+        )
+
     if server_args.grammar_backend not in (None, "none"):
         raise ValueError("DVR does not support grammar-constrained decoding.")
     server_args.grammar_backend = "none"
@@ -117,6 +134,8 @@ def _handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR currently only supports CUDA device.")
     if is_hip():
         raise ValueError("DVR currently supports NVIDIA CUDA, not ROCm/HIP.")
+    if server_args.pp_size != 1:
+        raise ValueError("DVR currently requires pipeline parallel size one.")
     if server_args.enable_dp_attention:
         raise ValueError("DVR currently does not support DP attention.")
     if server_args.enable_pdmux:
@@ -133,11 +152,41 @@ def _handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR does not return user-requested hidden states.")
     if view.enable_unified_memory:
         raise ValueError("DVR does not support --enable-unified-memory.")
+    if server_args.decoupled_spec_role != "null":
+        raise ValueError("DVR does not support decoupled speculative execution.")
+    if server_args.speculative_token_map is not None:
+        raise ValueError(
+            "DVR exact rejection sampling requires target-vocabulary proposal "
+            "distributions and does not support --speculative-token-map."
+        )
     if (
         server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is not None
     ):
         raise ValueError("DVR self draft does not use a draft model path.")
+    if server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM:
+        if any(
+            value is not None
+            for value in (
+                server_args.speculative_draft_model_revision,
+                server_args.speculative_draft_load_format,
+                server_args.speculative_draft_model_quantization,
+            )
+        ):
+            raise ValueError(
+                "DVR self draft does not use draft-model revision, load-format, "
+                "or quantization options."
+            )
+        if server_args.speculative_draft_attention_backend is not None:
+            raise ValueError(
+                "DVR self draft reuses the target decode backend and does not use "
+                "--speculative-draft-attention-backend."
+            )
+        if server_args.speculative_attention_mode != "prefill":
+            raise ValueError(
+                "DVR self draft does not use --speculative-attention-mode; keep "
+                "its default value 'prefill'."
+            )
     if (
         server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
         and server_args.speculative_draft_model_path is None
@@ -246,19 +295,13 @@ def _handle_dvr_speculative_decoding(server_args):
             "DVR rejection sampling does not use speculative acceptance "
             "thresholds; both thresholds must remain 1.0."
         )
-    if (
-        server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
-        and server_args.enable_multi_layer_eagle
-    ):
+    if server_args.enable_multi_layer_eagle:
         raise NotImplementedError(
-            "DVR EAGLE rejection sampling does not support multi-layer EAGLE."
+            "DVR rejection sampling does not support multi-layer EAGLE."
         )
 
-    if uses_gated_linear_state or (
-        server_args.speculative_algorithm == DVR_EAGLE_SPECULATIVE_ALGORITHM
-    ):
-        # GDN boundary publication and the reused EAGLE draft backend both
-        # require an unambiguous prefill/decode phase boundary.
+    if server_args.enable_mixed_chunk:
+        logger.warning("Mixed chunked prefill is disabled for DVR.")
         server_args.enable_mixed_chunk = False
 
 
