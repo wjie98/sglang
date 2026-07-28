@@ -56,8 +56,8 @@ class DVRStateLifecycle:
                 f"{self.server_args.mamba_cache_chunk_size}."
             )
 
-        request_capacity = state_adapter.draft_state.shape[1]
-        device = state_adapter.draft_state.device
+        request_capacity = state_adapter.recurrent_workspace.shape[1]
+        device = state_adapter.recurrent_workspace.device
         self.target_boundary_lens = torch.full(
             (request_capacity,), -1, dtype=torch.int64, device=device
         )
@@ -246,8 +246,8 @@ class DVRStateLifecycle:
 
         self.state_adapter.initialize_self_draft_state(
             request_rows=request_rows,
-            accepted_conv_slots=target_cache_slots,
-            accepted_tail_lens=seq_lens.remainder(self.chunk_size),
+            target_cache_slots=target_cache_slots,
+            tail_lens=seq_lens.remainder(self.chunk_size),
         )
 
     def rollback(
@@ -262,8 +262,8 @@ class DVRStateLifecycle:
 
         crosses_boundary = self.state_adapter.commit_accepted_state(
             request_rows=plan.request_rows,
-            accepted_conv_slots=plan.target_cache_slots,
-            publish_boundary_slots=plan.radix_checkpoint_slots,
+            target_cache_slots=plan.target_cache_slots,
+            radix_checkpoint_slots=plan.radix_checkpoint_slots,
             tail_lens_before=plan.tail_lens,
             accepted_token_counts=accept_lens.to(torch.long),
         )

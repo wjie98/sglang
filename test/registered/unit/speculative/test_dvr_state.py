@@ -32,7 +32,7 @@ class FakeAdapter:
     chunk_size = 64
 
     def __init__(self):
-        self.draft_state = torch.empty(1, 8, 1)
+        self.recurrent_workspace = torch.empty(1, 8, 1)
         self.zeroed = []
         self.published = []
         self.initialized = []
@@ -274,7 +274,7 @@ def test_target_extend_records_live_boundary(seq_len, expected_boundary, expecte
     assert lifecycle.target_boundary_lens[1].item() == expected_boundary
     assert plan.target_cache_slots.tolist() == [20]
     assert plan.tail_lens.tolist() == [expected_tail]
-    assert adapter.initialized[-1]["accepted_tail_lens"] == [expected_tail]
+    assert adapter.initialized[-1]["tail_lens"] == [expected_tail]
     assert adapter.zeroed == ([20] if expected_boundary == 0 else [])
 
 
@@ -327,7 +327,7 @@ def test_no_radix_boundary_crossing_updates_only_live_state():
         batch=batch, plan=plan, accept_lens=torch.tensor([2])
     )
 
-    assert adapter.commits[-1]["publish_boundary_slots"] is None
+    assert adapter.commits[-1]["radix_checkpoint_slots"] is None
     assert lifecycle.target_boundary_lens[1].item() == 64
 
 
@@ -357,8 +357,8 @@ def test_radix_boundary_crossing_rotates_publication_lane():
         batch=batch, plan=plan, accept_lens=torch.tensor([63])
     )
 
-    assert adapter.commits[-1]["accepted_conv_slots"].tolist() == [20]
-    assert adapter.commits[-1]["publish_boundary_slots"].tolist() == [11]
+    assert adapter.commits[-1]["target_cache_slots"].tolist() == [20]
+    assert adapter.commits[-1]["radix_checkpoint_slots"].tolist() == [11]
     assert lifecycle.target_boundary_lens[1].item() == 128
     assert lifecycle.radix_boundary_lens[1].tolist() == [64, 128]
 

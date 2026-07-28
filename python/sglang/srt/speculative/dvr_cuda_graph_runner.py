@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dvr.gdn_backend import DVRGDNAttnBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -31,15 +30,16 @@ def _resolve_dvr_backends(backend, forward_mode=ForwardMode.DECODE):
 
     def visit(current, *, collect_attention=True):
         nonlocal state_adapter
+        candidate = getattr(current, "dvr_state_adapter", None)
+        if candidate is not None:
+            if state_adapter is not None and state_adapter is not candidate:
+                raise RuntimeError(
+                    "DVR resolved multiple linear-state adapters in one backend."
+                )
+            state_adapter = candidate
+
         if isinstance(current, HybridLinearAttnBackend):
-            linear_backend = current.linear_attn_backend
-            if isinstance(linear_backend, DVRGDNAttnBackend):
-                candidate = linear_backend.dvr_state_adapter
-                if state_adapter is not None and state_adapter is not candidate:
-                    raise RuntimeError(
-                        "DVR resolved multiple linear-state adapters in one backend."
-                    )
-                state_adapter = candidate
+            visit(current.linear_attn_backend, collect_attention=False)
             visit(current.full_attn_backend, collect_attention=collect_attention)
         elif isinstance(current, HybridAttnBackend):
             selected = current._select_backend(forward_mode)
@@ -52,16 +52,8 @@ def _resolve_dvr_backends(backend, forward_mode=ForwardMode.DECODE):
             visit(current.primary, collect_attention=collect_attention)
             for child in current.children:
                 visit(child, collect_attention=collect_attention)
-        else:
-            if isinstance(current, DVRGDNAttnBackend):
-                candidate = current.dvr_state_adapter
-                if state_adapter is not None and state_adapter is not candidate:
-                    raise RuntimeError(
-                        "DVR resolved multiple linear-state adapters in one backend."
-                    )
-                state_adapter = candidate
-            elif collect_attention:
-                leaves.append(current)
+        elif collect_attention and candidate is None:
+            leaves.append(current)
 
     visit(backend)
     return leaves, state_adapter
