@@ -20,9 +20,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
-from sglang.srt.sampling.penaltylib.repetition_penalty import (
-    apply_scaling_penalties,
-)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -822,12 +819,6 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         logits = logits_output.next_token_logits.view(batch_size, num_tokens, -1)
         sanitize_nan_logits(logits, "verify: target model logits")
 
-        if sampling_info.acc_additive_penalties is not None:
-            logits.add_(sampling_info.acc_additive_penalties[:, None, :])
-        if sampling_info.acc_scaling_penalties is not None:
-            apply_scaling_penalties(
-                logits, sampling_info.acc_scaling_penalties[:, None, :]
-            )
         if sampling_info.logit_bias is not None:
             logits.add_(sampling_info.logit_bias[:, None, :])
 
