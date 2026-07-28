@@ -324,15 +324,28 @@ def handle_dvr_cuda_graph_config(server_args):
             )
             prefill_graph.backend = Backend.DISABLED
 
-    if server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM and (
-        server_args.cuda_graph_config.decode.backend == Backend.DISABLED
-        or server_args.disable_draft_cuda_graph
-    ):
-        raise ValueError(
-            "DVR self-draft requires draft CUDA "
-            "graphs. Remove --disable-cuda-graph/--disable-draft-cuda-graph "
-            "or use a non-self-draft DVR mode."
-        )
+    if server_args.speculative_algorithm == DVR_SPECULATIVE_ALGORITHM:
+        decode_graph = server_args.cuda_graph_config.decode
+        if (
+            decode_graph.backend == Backend.DISABLED
+            or server_args.disable_draft_cuda_graph
+        ):
+            raise ValueError(
+                "DVR self-draft requires draft CUDA "
+                "graphs. Remove --disable-cuda-graph/--disable-draft-cuda-graph "
+                "or use a non-self-draft DVR mode."
+            )
+        if server_args.max_running_requests is None:
+            server_args.max_running_requests = decode_graph.max_bs
+        elif (
+            decode_graph.max_bs is not None
+            and server_args.max_running_requests > decode_graph.max_bs
+        ):
+            raise ValueError(
+                "DVR self-draft has no eager fallback, so "
+                "--max-running-requests must not exceed the decode CUDA graph "
+                f"max_bs ({decode_graph.max_bs})."
+            )
 
 
 def _is_dvr_gated_linear_state_model(server_args):

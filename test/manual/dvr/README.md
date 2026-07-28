@@ -36,6 +36,8 @@ EAGLE, reduced-vocabulary token maps, and EAGLE3/DFLASH draft-window options.
 Self-draft reuses the target model and decode backend, so draft-model revision,
 load-format, quantization, and draft-attention overrides are invalid in that
 mode. Mixed chunked prefill is disabled automatically for both DVR algorithms.
+Self-draft has no eager fallback: when `max_running_requests` is unset it uses
+the decode CUDA graph `max_bs`, and an explicitly larger value is rejected.
 
 ## Start a server
 

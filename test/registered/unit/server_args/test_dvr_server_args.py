@@ -284,6 +284,17 @@ class TestDVRServerArgs(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "requires draft CUDA graphs"):
                     handle_dvr_cuda_graph_config(args)
 
+    def test_dvr_self_draft_bounds_request_capacity_to_graph_coverage(self):
+        args = _Args()
+        args.max_running_requests = None
+        handle_dvr_cuda_graph_config(args)
+        self.assertEqual(args.max_running_requests, 4)
+
+        args = _Args()
+        args.max_running_requests = 5
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            handle_dvr_cuda_graph_config(args)
+
     def test_dvr_eagle_keeps_radix_cache(self):
         args = _Args()
         args.speculative_algorithm = DVR_EAGLE_SPECULATIVE_ALGORITHM
