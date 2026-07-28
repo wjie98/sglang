@@ -100,6 +100,36 @@ def test_deterministic_non_fp8_uses_upstream_default(monkeypatch):
     }
 
 
+def test_nondeterministic_fp8_uses_upstream_default(monkeypatch):
+    monkeypatch.setattr(
+        config_module,
+        "get_global_server_args",
+        lambda: type("Args", (), {"enable_deterministic_inference": False})(),
+    )
+    monkeypatch.setattr(
+        config_module, "_use_low_smem_fp8_default", lambda: False
+    )
+    monkeypatch.setattr(config_module, "_is_hip", False)
+
+    assert config_module.get_default_config(
+        M=16,
+        E=512,
+        N=512,
+        K=4096,
+        topk=10,
+        dtype="fp8_w8a8",
+        is_marlin=False,
+        block_shape=None,
+    ) == {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 4,
+    }
+
+
 def test_swap_ab_cache_tracks_active_invariant_mode(monkeypatch):
     invariant = {"enabled": True}
     monkeypatch.setattr(kernel_module, "_is_cuda", True)

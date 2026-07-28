@@ -1736,9 +1736,8 @@ def apply_fp8_linear(
                     )
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-        use_batch_invariant_w8a8 = is_batch_invariant_mode_enabled()
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-        if use_batch_invariant_w8a8:
+        if is_batch_invariant_mode_enabled():
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             # Keep the K reduction and output tiling independent of the
