@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from sglang.srt.speculative.dvr_reject_sampling import (
+from sglang.srt.speculative.dvr_sampling import (
     dvr_chain_rejection_sample,
     dvr_sample_from_probs,
 )

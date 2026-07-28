@@ -484,7 +484,7 @@ PYTHONPATH=python python -m pytest -q \
   test/registered/unit/server_args/test_dvr_server_args.py \
   test/registered/unit/speculative/test_dvr_state_flow.py \
   test/registered/unit/speculative/test_dvr_worker.py \
-  test/registered/unit/speculative/test_dvr_reject_sampling.py \
+  test/registered/unit/speculative/test_dvr_sampling.py \
   test/registered/unit/managers/test_batch_result_processor_spec_grammar.py \
   test/registered/unit/model_executor/test_pool_configurator.py \
   test/registered/unit/layers/moe/test_fused_moe_triton_config.py

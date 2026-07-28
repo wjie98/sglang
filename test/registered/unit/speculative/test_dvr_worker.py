@@ -2,6 +2,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import sglang.srt.speculative.dvr_sampling as dvr_sampling_module
 import sglang.srt.speculative.dvr_worker as dvr_worker_module
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -46,13 +47,13 @@ def test_dvr_algorithm_contracts():
 
 
 def test_dvr_sampling_probs_match_target_distribution():
-    proposal = dvr_worker_module.dvr_sampling_probs(
+    proposal = dvr_sampling_module.dvr_sampling_probs(
         torch.tensor([[0.6, 0.3, 0.1]]),
         _sampling_info([3], [1.0], [0.5]),
     )
     torch.testing.assert_close(proposal, torch.tensor([[2 / 3, 1 / 3, 0.0]]))
 
-    joint = dvr_worker_module.dvr_sampling_probs(
+    joint = dvr_sampling_module.dvr_sampling_probs(
         torch.tensor([[0.6, 0.25, 0.15]]),
         _sampling_info([2], [0.7], [0.0]),
     )
@@ -61,14 +62,14 @@ def test_dvr_sampling_probs_match_target_distribution():
 
 def test_dvr_sampling_probs_handle_mixed_and_repeated_rows():
     probs = torch.tensor([[0.6, 0.3, 0.1], [0.6, 0.3, 0.1]])
-    filtered = dvr_worker_module.dvr_sampling_probs(
+    filtered = dvr_sampling_module.dvr_sampling_probs(
         probs,
         _sampling_info([1, 3], [1.0, 1.0], [0.0, 0.0]),
     )
     torch.testing.assert_close(filtered[0], torch.tensor([1.0, 0.0, 0.0]))
     torch.testing.assert_close(filtered[1], probs[1])
 
-    repeated = dvr_worker_module.dvr_sampling_probs(
+    repeated = dvr_sampling_module.dvr_sampling_probs(
         torch.tensor([[0.6, 0.4]] * 4),
         _sampling_info([1, 2], [1.0, 1.0], [0.0, 0.0]),
         repeat=2,
@@ -109,7 +110,7 @@ def test_pytorch_dvr_sampling_probs_match_sampler(monkeypatch, top_ks, top_ps, m
     sorted_indices = probs.argsort(dim=-1, descending=True)
     expected = torch.zeros_like(probs).scatter_(-1, sorted_indices, captured)
     expected /= expected.sum(dim=-1, keepdim=True)
-    actual = dvr_worker_module.dvr_sampling_probs(probs, sampling_info)
+    actual = dvr_sampling_module.dvr_sampling_probs(probs, sampling_info)
     torch.testing.assert_close(actual, expected)
 
 
@@ -129,15 +130,15 @@ def test_dvr_draft_sample_returns_the_distribution_it_samples(monkeypatch):
         sampled = proposal
         return torch.tensor([1])
 
-    monkeypatch.setattr(dvr_worker_module, "dvr_sample_from_probs", sample)
+    monkeypatch.setattr(dvr_sampling_module, "dvr_sample_from_probs", sample)
     logits = torch.tensor([[2.0, 1.0, 0.0]])
 
-    token_ids, proposal = dvr_worker_module.dvr_draft_sample(
+    token_ids, proposal = dvr_sampling_module.dvr_draft_sample(
         logits, sampling_info, torch.tensor([7])
     )
 
     expected_probs = torch.softmax(torch.tensor([[2.0, 1.5, -0.5]]) / 2.0, dim=-1)
-    expected = dvr_worker_module.dvr_sampling_probs(expected_probs, sampling_info)
+    expected = dvr_sampling_module.dvr_sampling_probs(expected_probs, sampling_info)
     torch.testing.assert_close(proposal, expected)
     assert sampled is proposal
     assert token_ids.tolist() == [1]
@@ -150,12 +151,12 @@ def test_dvr_draft_sample_greedy_applies_logits_bias(monkeypatch):
         torch.tensor([[0.0, 2.0]])
     )
     monkeypatch.setattr(
-        dvr_worker_module,
+        dvr_sampling_module,
         "dvr_sample_from_probs",
         lambda *_args, **_kwargs: pytest.fail("greedy draft must not sample"),
     )
 
-    token_ids, proposal = dvr_worker_module.dvr_draft_sample(
+    token_ids, proposal = dvr_sampling_module.dvr_draft_sample(
         torch.tensor([[1.0, 0.0]]), sampling_info, torch.tensor([3])
     )
 
@@ -495,7 +496,7 @@ def test_self_draft_copies_each_graph_proposal_before_next_replay(monkeypatch):
         return LogitsProcessorOutput(next_token_logits=static_logits)
 
     backend.decode_forward = draft_forward
-    monkeypatch.setattr(dvr_worker_module, "dvr_sample_from_probs", sample)
+    monkeypatch.setattr(dvr_sampling_module, "dvr_sample_from_probs", sample)
     forward_batch = SimpleNamespace(
         spec_info=dvr_worker_module.EagleDraftInput(bonus_tokens=torch.tensor([1])),
         out_cache_loc=torch.arange(3),

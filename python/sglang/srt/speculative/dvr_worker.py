@@ -34,12 +34,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dvr_reject_sampling import (
+from sglang.srt.speculative.dvr_sampling import (
     dvr_chain_rejection_sample,
+    dvr_draft_sample,
     dvr_sample_from_probs,
+    dvr_sampling_probs,
 )
 from sglang.srt.speculative.dvr_state_flow import (
     DVRStateCommitPlan,
@@ -69,77 +70,6 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
-
-
-def dvr_sampling_probs(
-    probs: torch.Tensor,
-    sampling_info,
-    repeat: int = 1,
-) -> torch.Tensor:
-    """Build sampler-equivalent proposal or target probabilities for DVR."""
-    top_ks = sampling_info.top_ks
-    top_ps = sampling_info.top_ps
-    min_ps = sampling_info.min_ps
-    if repeat != 1:
-        top_ks = torch.repeat_interleave(top_ks, repeat, dim=0)
-        top_ps = torch.repeat_interleave(top_ps, repeat, dim=0)
-        min_ps = torch.repeat_interleave(min_ps, repeat, dim=0)
-
-    backend = get_flags().sampling_backend
-    if backend == "flashinfer" and probs.is_cuda:
-        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
-
-        if sampling_info.need_min_p_sampling:
-            probs = top_k_renorm_prob(probs, top_ks)
-            probs = top_p_renorm_prob(probs, top_ps)
-            threshold = probs.amax(dim=-1, keepdim=True) * min_ps.unsqueeze(1)
-            probs = torch.where(probs >= threshold, probs, 0.0)
-            return probs / probs.sum(dim=-1, keepdim=True)
-        if sampling_info.need_top_p_sampling:
-            probs = top_p_renorm_prob(probs, top_ps)
-        if sampling_info.need_top_k_sampling:
-            probs = top_k_renorm_prob(probs, top_ks)
-        return probs
-
-    if backend == "pytorch" or not probs.is_cuda:
-        if not (
-            sampling_info.need_top_k_sampling
-            or sampling_info.need_top_p_sampling
-            or sampling_info.need_min_p_sampling
-        ):
-            return probs
-        filtered, indices = probs.sort(dim=-1, descending=True)
-        cumulative = torch.cumsum(filtered, dim=-1)
-        filtered[
-            torch.arange(probs.shape[-1], device=probs.device).view(1, -1)
-            >= top_ks.view(-1, 1)
-        ] = 0.0
-        filtered[(cumulative - filtered) > top_ps.view(-1, 1)] = 0.0
-        if sampling_info.need_min_p_sampling:
-            threshold = filtered[:, :1] * min_ps.unsqueeze(1)
-            filtered[filtered < threshold] = 0.0
-        filtered.div_(filtered.sum(dim=-1, keepdim=True))
-        return torch.zeros_like(probs).scatter_(-1, indices, filtered)
-
-    raise ValueError(f"Unsupported DVR sampling backend: {backend}")
-
-
-def dvr_draft_sample(logits: torch.Tensor, sampling_info, positions: torch.Tensor):
-    """Sample a provisional token and return the exact proposal distribution.
-
-    Target rejection corrects this proposal to the requested distribution, so
-    provisional tokens must not enter the full-vocabulary deterministic target
-    sampler.
-    """
-    sampling_info.apply_logits_bias(logits)
-    sanitize_nan_logits(logits, "dvr draft logits")
-    if sampling_info.is_all_greedy:
-        return torch.argmax(logits, dim=-1), None
-
-    probs = torch.softmax(logits / sampling_info.temperatures, dim=-1)
-    proposal = dvr_sampling_probs(probs, sampling_info)
-    token_ids = dvr_sample_from_probs(proposal, sampling_info.sampling_seed, positions)
-    return token_ids, proposal
 
 
 class SelfDraftBackend:
