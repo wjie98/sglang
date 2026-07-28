@@ -362,7 +362,6 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         self.uses_eagle_draft = self.model_runner.spec_algorithm.is_dvr_eagle()
         device_module = torch.get_device_module(self.device)
         self.verify_plan_stream = None
-        self.verify_plan_stream_ctx = nullcontext()
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
@@ -371,7 +370,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             server_args=server_args,
             model_runner=self.model_runner,
         )
-        self.state_commit_done_event = None
+        self.rollback_done_event = None
         # A one-token prefill cannot seed every draft backend. Consume one
         # target-only verify before normal draft; pool slots are overwritten on
         # every prefill, so stale request identities cannot survive slot reuse.
@@ -425,9 +424,6 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             # target verify and rollback, not a second copy of EAGLE draft logic.
             if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
                 self.verify_plan_stream = device_module.Stream()
-                self.verify_plan_stream_ctx = device_module.stream(
-                    self.verify_plan_stream
-                )
             self.draft_backend = EagleDraftBackend(self, self.draft_worker)
             log_prefix = "DVR EAGLE"
         else:
@@ -604,13 +600,13 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             if read_done is not None:
                 current_stream.wait_event(read_done)
             if (
-                self.state_commit_done_event is not None
-                and self.state_commit_done_event is not read_done
+                self.rollback_done_event is not None
+                and self.rollback_done_event is not read_done
             ):
                 # Overlap may have launched one extra DVR round before the prior
                 # result finishes. Its request-owned state must be committed
                 # before Radix donation reuses the physical slots.
-                current_stream.wait_event(self.state_commit_done_event)
+                current_stream.wait_event(self.rollback_done_event)
         self.state_lifecycle.prepare_for_cache_release(req)
 
     def forward_batch_generation(
@@ -663,7 +659,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
         # reader in this transaction publishes a fresh event: target verify for
         # self draft, and draft-extend for EAGLE.
         final_reader.war_fastpath_read_done_event = None
-        self.state_commit_done_event = None
+        self.rollback_done_event = None
         needs_seed_verify = False
         for req in batch.reqs:
             request_slot = int(req.req_pool_idx)
@@ -862,7 +858,13 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             # ForwardBatch.init_new consumes this one-shot host-length mirror.
             batch.seq_lens_cpu_cache = spec_info.seq_lens_cpu
 
-        with self.verify_plan_stream_ctx, spec_stage_span("verify_prepare"):
+        device_module = torch.get_device_module(self.device)
+        verify_plan_context = (
+            device_module.stream(self.verify_plan_stream)
+            if self.verify_plan_stream is not None
+            else nullcontext()
+        )
+        with verify_plan_context, spec_stage_span("verify_prepare"):
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 spec_info,
                 self.req_to_token_pool,
@@ -870,7 +872,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
                 self.target_worker,
             )
 
-        current_stream = torch.get_device_module(self.device).current_stream()
+        current_stream = device_module.current_stream()
         if self.uses_eagle_draft:
             record_stream_each((batch.input_ids, batch.out_cache_loc), current_stream)
         if self.verify_plan_stream is not None:
@@ -933,11 +935,11 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
                 accept_lens=accept_lens,
             )
         if rollback_plan is not None:
-            self.state_commit_done_event = torch.get_device_module(self.device).Event()
-            self.state_commit_done_event.record()
+            self.rollback_done_event = device_module.Event()
+            self.rollback_done_event.record()
             if not self.uses_eagle_draft:
                 self.war_fastpath_runner.war_fastpath_read_done_event = (
-                    self.state_commit_done_event
+                    self.rollback_done_event
                 )
         if rollback_plan is None:
             commit_mamba_states_after_verify(

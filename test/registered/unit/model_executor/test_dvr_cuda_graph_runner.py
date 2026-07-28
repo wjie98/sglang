@@ -280,9 +280,7 @@ def test_draft_custom_allreduce_context_restores_target_policy():
     )
     group = SimpleNamespace(ca_comm=communicator, world_size=2)
 
-    with _draft_custom_allreduce_enabled(
-        group, create_if_missing=False, require_full_nvlink=True
-    ) as enabled:
+    with _draft_custom_allreduce_enabled(group) as enabled:
         assert enabled
         assert not communicator.disabled
 
@@ -290,9 +288,7 @@ def test_draft_custom_allreduce_context_restores_target_policy():
     assert communicator.original_disabled
 
     communicator.full_nvlink = False
-    with _draft_custom_allreduce_enabled(
-        group, create_if_missing=False, require_full_nvlink=True
-    ) as enabled:
+    with _draft_custom_allreduce_enabled(group) as enabled:
         assert not enabled
         assert communicator.disabled
 

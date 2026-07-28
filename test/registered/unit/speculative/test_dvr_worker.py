@@ -365,7 +365,7 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     worker.target_model_worker = SimpleNamespace(
         model_runner=SimpleNamespace(war_fastpath_read_done_event=read_done)
     )
-    worker.state_commit_done_event = state_done
+    worker.rollback_done_event = state_done
     worker.state_lifecycle = SimpleNamespace(
         prepare_for_cache_release=lambda req: calls.append(("release", req.rid))
     )
@@ -419,7 +419,6 @@ def test_self_verify_fences_state_commit_before_overlap_publish(monkeypatch):
     worker.uses_eagle_draft = False
     worker.device = "cpu"
     worker.num_draft_tokens = 2
-    worker.verify_plan_stream_ctx = nullcontext()
     worker.verify_plan_stream = None
     worker.req_to_token_pool = object()
     worker.target_model_worker = SimpleNamespace(
@@ -461,7 +460,7 @@ def test_self_verify_fences_state_commit_before_overlap_publish(monkeypatch):
     )
 
     assert calls == ["fill_bonus", "commit", "record_commit", "publish"]
-    assert runner.war_fastpath_read_done_event is worker.state_commit_done_event
+    assert runner.war_fastpath_read_done_event is worker.rollback_done_event
 
 
 def test_self_draft_copies_each_graph_proposal_before_next_replay(monkeypatch):
