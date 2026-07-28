@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 
-from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-    if is_batch_invariant_mode_enabled():
+    if get_global_server_args().enable_deterministic_inference:
         logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
@@ -170,12 +170,10 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
-    if is_batch_invariant_mode_enabled():
-        # Use one M-independent reduction policy per dtype. The smaller M tile
-        # avoids wasting most rows on deterministic decode and short verify.
+    if get_global_server_args().enable_deterministic_inference:
         if dtype == "fp8_w8a8" and block_shape is None:
             if _use_low_smem_fp8_default():
-                return {
+                config = {
                     "BLOCK_SIZE_M": 32,
                     "BLOCK_SIZE_N": 64,
                     "BLOCK_SIZE_K": 256,
@@ -183,27 +181,22 @@ def get_default_config(
                     "num_warps": 4,
                     "num_stages": 4,
                 }
-            return {
-                "BLOCK_SIZE_M": 16,
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 16,
+                    "BLOCK_SIZE_N": 64,
+                    "BLOCK_SIZE_K": 128,
+                    "GROUP_SIZE_M": 1,
+                    "num_warps": 4,
+                    "num_stages": 2 if _is_hip else 4,
+                }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
                 "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 4,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
             }
-        if dtype is None and block_shape is None:
-            return {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-            }
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-        }
         return config
     if dtype == "fp8_w8a8":
         if block_shape is None:

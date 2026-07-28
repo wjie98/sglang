@@ -85,9 +85,7 @@ def test_dvr_sampling_probs_handle_mixed_and_repeated_rows():
         ([3, 2], [0.8, 0.7], [0.15, 0.35]),
     ],
 )
-def test_pytorch_dvr_sampling_probs_match_sampler(
-    monkeypatch, top_ks, top_ps, min_ps
-):
+def test_pytorch_dvr_sampling_probs_match_sampler(monkeypatch, top_ks, top_ps, min_ps):
     probs = torch.tensor([[0.40, 0.30, 0.20, 0.10], [0.50, 0.25, 0.15, 0.10]])
     sampling_info = _sampling_info(top_ks, top_ps, min_ps)
     captured = None
@@ -131,7 +129,7 @@ def test_dvr_draft_sample_returns_the_distribution_it_samples(monkeypatch):
         sampled = proposal
         return torch.tensor([1])
 
-    monkeypatch.setattr(dvr_worker_module, "sample_from_probs_with_seed", sample)
+    monkeypatch.setattr(dvr_worker_module, "dvr_sample_from_probs", sample)
     logits = torch.tensor([[2.0, 1.0, 0.0]])
 
     token_ids, proposal = dvr_worker_module.dvr_draft_sample(
@@ -153,7 +151,7 @@ def test_dvr_draft_sample_greedy_applies_logits_bias(monkeypatch):
     )
     monkeypatch.setattr(
         dvr_worker_module,
-        "sample_from_probs_with_seed",
+        "dvr_sample_from_probs",
         lambda *_args, **_kwargs: pytest.fail("greedy draft must not sample"),
     )
 
@@ -319,7 +317,7 @@ def test_self_draft_copies_each_graph_proposal_before_next_replay(monkeypatch):
         return LogitsProcessorOutput(next_token_logits=static_logits)
 
     backend.decode_forward = draft_forward
-    monkeypatch.setattr(dvr_worker_module, "sample_from_probs_with_seed", sample)
+    monkeypatch.setattr(dvr_worker_module, "dvr_sample_from_probs", sample)
     forward_batch = SimpleNamespace(
         spec_info=dvr_worker_module.EagleDraftInput(bonus_tokens=torch.tensor([1])),
         out_cache_loc=torch.arange(3),

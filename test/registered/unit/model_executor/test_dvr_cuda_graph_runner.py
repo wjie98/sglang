@@ -80,7 +80,6 @@ def test_draft_capture_is_fast_and_restores_target_state(
         "envs",
         SimpleNamespace(SGLANG_ENABLE_DETERMINISTIC_INFERENCE=FakeEnv()),
     )
-    monkeypatch.setattr(graph_module, "_clear_moe_policy_caches", lambda: None)
     monkeypatch.setattr(
         graph_module,
         "_fast_decode_overrides",

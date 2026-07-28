@@ -5,7 +5,14 @@ from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
+
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -13,6 +20,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    apply_scaling_penalties,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -30,6 +40,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dvr_reject_sampling import (
+    dvr_chain_rejection_sample,
+    dvr_sample_from_probs,
+)
 from sglang.srt.speculative.dvr_state_flow import (
     DVRStateCommitPlan,
     DVRStateLifecycle,
@@ -41,10 +55,9 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
     eagle_prepare_for_verify,
-    eagle_sample,
+    verify_tree_greedy_func,
 )
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-from sglang.srt.speculative.reject_sampling import sample_from_probs_with_seed
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     record_stream_each,
@@ -114,9 +127,7 @@ def dvr_sampling_probs(
     raise ValueError(f"Unsupported DVR sampling backend: {backend}")
 
 
-def dvr_draft_sample(
-    logits: torch.Tensor, sampling_info, positions: torch.Tensor
-):
+def dvr_draft_sample(logits: torch.Tensor, sampling_info, positions: torch.Tensor):
     """Sample a provisional token and return the exact proposal distribution.
 
     Target rejection corrects this proposal to the requested distribution, so
@@ -130,9 +141,7 @@ def dvr_draft_sample(
 
     probs = torch.softmax(logits / sampling_info.temperatures, dim=-1)
     proposal = dvr_sampling_probs(probs, sampling_info)
-    token_ids = sample_from_probs_with_seed(
-        proposal, sampling_info.sampling_seed, positions
-    )
+    token_ids = dvr_sample_from_probs(proposal, sampling_info.sampling_seed, positions)
     return token_ids, proposal
 
 
@@ -770,6 +779,119 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             seq_lens_cpu=batch.seq_lens_cpu,
         )
 
+    def sample_verified_tokens(
+        self,
+        verify_input: EagleVerifyInput,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+    ):
+        """Sample the target distribution and verify one top-k=1 DVR chain."""
+
+        device = batch.device
+        if batch.forward_mode.is_idle():
+            empty = torch.empty(0, dtype=torch.int32, device=device)
+            return empty, empty, empty
+
+        sampling_info = batch.sampling_info
+        batch_size = len(batch.seq_lens)
+        num_tokens = verify_input.draft_token_num
+        logits = logits_output.next_token_logits.view(batch_size, num_tokens, -1)
+        sanitize_nan_logits(logits, "verify: target model logits")
+
+        if sampling_info.acc_additive_penalties is not None:
+            logits.add_(sampling_info.acc_additive_penalties[:, None, :])
+        if sampling_info.acc_scaling_penalties is not None:
+            apply_scaling_penalties(
+                logits, sampling_info.acc_scaling_penalties[:, None, :]
+            )
+        if sampling_info.logit_bias is not None:
+            logits.add_(sampling_info.logit_bias[:, None, :])
+
+        candidates = verify_input.draft_token.view(batch_size, num_tokens)
+        predict = torch.zeros(batch_size * num_tokens, dtype=torch.int32, device=device)
+        accept_index = torch.full(
+            (batch_size, verify_input.max_tree_depth),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        num_correct_drafts = torch.empty(batch_size, dtype=torch.int32, device=device)
+
+        if sampling_info.is_all_greedy:
+            target_predict = torch.argmax(logits, dim=-1)
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=num_correct_drafts,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
+        else:
+            target_probs = F.softmax(
+                logits / sampling_info.temperatures[:, None, :], dim=-1
+            )
+            target_probs = dvr_sampling_probs(
+                target_probs.flatten(0, 1), sampling_info, num_tokens
+            ).view_as(logits)
+            maybe_detect_nan(target_probs, "dvr verify: filtered target probabilities")
+
+            positions = verify_input.positions.view(batch_size, num_tokens)
+            if verify_input.spec_steps == 0:
+                root_indices = verify_input.retrieve_index[:, 0]
+                root_tokens = dvr_sample_from_probs(
+                    target_probs[:, 0],
+                    sampling_info.sampling_seed,
+                    positions[:, 0],
+                )
+                predict[root_indices.to(torch.long)] = root_tokens.to(torch.int32)
+                accept_index[:, 0] = root_indices
+                num_correct_drafts.zero_()
+            else:
+                expected_shape = (
+                    batch_size,
+                    num_tokens - 1,
+                    target_probs.shape[-1],
+                )
+                if (
+                    verify_input.draft_probs is None
+                    or tuple(verify_input.draft_probs.shape) != expected_shape
+                ):
+                    actual_shape = (
+                        None
+                        if verify_input.draft_probs is None
+                        else tuple(verify_input.draft_probs.shape)
+                    )
+                    raise ValueError(
+                        "DVR rejection sampling requires one target-vocabulary "
+                        f"proposal row per draft edge; got {actual_shape}, "
+                        f"expected {expected_shape}."
+                    )
+                dvr_chain_rejection_sample(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=num_correct_drafts,
+                    candidates=candidates,
+                    retrieve_index=verify_input.retrieve_index,
+                    target_probs=target_probs,
+                    draft_probs=verify_input.draft_probs,
+                    sampling_seed=sampling_info.sampling_seed,
+                    positions=positions,
+                )
+
+        tp_group = (
+            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
+
+        return predict, num_correct_drafts + 1, accept_index
+
     def verify(
         self,
         batch: ScheduleBatch,
@@ -831,28 +953,6 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
                 "draft step."
             )
 
-        # Target acceptance semantics are independent of the draft backend.
-        # Accumulated penalties and logit bias are applied by eagle_sample.
-        if spec_info.spec_steps > 0 and not batch.sampling_info.is_all_greedy:
-            expected_shape = (
-                len(batch.seq_lens),
-                verify_tokens - 1,
-                logits_output.next_token_logits.shape[-1],
-            )
-            if (
-                spec_info.draft_probs is None
-                or tuple(spec_info.draft_probs.shape) != expected_shape
-            ):
-                actual_shape = (
-                    None
-                    if spec_info.draft_probs is None
-                    else tuple(spec_info.draft_probs.shape)
-                )
-                raise ValueError(
-                    "DVR rejection sampling requires one target-vocabulary "
-                    "proposal row per draft edge; got "
-                    f"{actual_shape}, expected {expected_shape}."
-                )
         with spec_stage_span("verify_sample"):
             maybe_detect_nan(
                 logits_output.next_token_logits, "verify: target model logits"
@@ -860,13 +960,8 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, "verify: target model logits"
             )
-            predict, accept_lens, accept_index = eagle_sample(
-                spec_info,
-                batch,
-                logits_output,
-                # draft_probs already contains q; rejection sampling also needs
-                # target p to match the configured target sampler exactly.
-                target_prob_filter=dvr_sampling_probs,
+            predict, accept_lens, accept_index = self.sample_verified_tokens(
+                spec_info, batch, logits_output
             )
             if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
                 accept_tokens = predict[accept_index]

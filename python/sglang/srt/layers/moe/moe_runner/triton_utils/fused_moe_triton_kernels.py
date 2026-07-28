@@ -57,12 +57,24 @@ def support_tensor_descriptor():
 
 
 # swap_ab benefits SM90 GPUs (H20, H100, H200, etc.) for certain block shapes.
-@functools.lru_cache(maxsize=8)
 def should_enable_swap_ab(
     BLOCK_SIZE_M: int,
     BLOCK_SIZE_N: int,
 ) -> bool:
-    if not _is_cuda or is_batch_invariant_mode_enabled():
+    return _should_enable_swap_ab(
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        is_batch_invariant_mode_enabled(),
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def _should_enable_swap_ab(
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+    batch_invariant: bool,
+) -> bool:
+    if not _is_cuda or batch_invariant:
         return False
 
     return is_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64

@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
 
@@ -138,7 +137,7 @@ class TestScaledMM(CustomTestCase):
 
         torch.testing.assert_close(output, reference, rtol=0.15, atol=0.1)
 
-    def test_w8a8_dispatch_follows_deterministic_contract(self):
+    def test_w8a8_dispatch_follows_active_invariant_mode(self):
         input = torch.ones((3, 4), dtype=torch.bfloat16, device=self._device)
         weight = torch.ones((4, 5), dtype=torch.bfloat16, device=self._device)
         weight_scale = torch.ones((5, 1), dtype=torch.float32, device=self._device)
@@ -151,7 +150,7 @@ class TestScaledMM(CustomTestCase):
             "block_size_k": 256,
             "use_heuristic": False,
         }
-        for deterministic, expected_kwargs in ((False, {}), (True, fixed_tile)):
+        for invariant_mode, expected_kwargs in ((False, {}), (True, fixed_tile)):
             captured = {}
 
             def scaled_mm(*args, **kwargs):
@@ -167,10 +166,8 @@ class TestScaledMM(CustomTestCase):
                 patch.object(fp8_utils, "triton_scaled_mm", side_effect=scaled_mm),
                 patch.object(
                     fp8_utils,
-                    "get_global_server_args",
-                    return_value=SimpleNamespace(
-                        enable_deterministic_inference=deterministic
-                    ),
+                    "is_batch_invariant_mode_enabled",
+                    return_value=invariant_mode,
                 ),
             ):
                 output = fp8_utils.apply_fp8_linear(

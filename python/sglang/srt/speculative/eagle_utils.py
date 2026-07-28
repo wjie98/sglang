@@ -543,15 +543,10 @@ def eagle_sample(
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
-    *,
-    target_prob_filter=None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
-
-    ``target_prob_filter`` lets specialized workers reproduce their target
-    sampler distribution without changing ordinary EAGLE sampling semantics.
     """
     import torch.nn.functional as F
 
@@ -652,7 +647,6 @@ def eagle_sample(
 
         use_rejection_sampling = (
             get_global_server_args().speculative_use_rejection_sampling
-            and verify_input.spec_steps > 0
         )
 
         # Apply temperature and get target probs
@@ -664,33 +658,29 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if target_prob_filter is None:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
-            )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        else:
-            target_probs = target_prob_filter(
-                target_probs, sampling_info, verify_input.draft_token_num
-            )
+        target_probs = top_k_renorm_prob(
+            target_probs,
+            torch.repeat_interleave(
+                sampling_info.top_ks, verify_input.draft_token_num, dim=0
+            ),
+        )  # (bs * num_draft_tokens, vocab_size)
+        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        target_probs = top_p_renorm_prob(
+            target_probs,
+            torch.repeat_interleave(
+                sampling_info.top_ps, verify_input.draft_token_num, dim=0
+            ),
+        )
+        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
             if use_rejection_sampling
             else torch.zeros_like(target_probs)
         )
-        # Defense-in-depth behind the startup allowlist: validate the actual
-        # kernel inputs before entering the Triton rejection sampler.
+        # Defense-in-depth behind the spec_hook startup allowlist: validate the
+        # actual kernel inputs (catches draft_probs plumbing regressions or a
+        # startup guard bypassed by a worker subclass) before the Triton kernel.
         if use_rejection_sampling and (
             draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
         ):
@@ -699,27 +689,18 @@ def eagle_sample(
                 "distribution; the current speculative algorithm/draft worker "
                 "does not produce one (draft_probs missing or vocab-mismatched)."
             )
-        sampling_seed = (
-            sampling_info.sampling_seed if use_rejection_sampling else None
-        )
-        if sampling_seed is None:
-            # Ordinary unseeded EAGLE keeps its existing global-RNG behavior.
-            coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device=device
-            )
-        else:
-            # The chain kernel derives request-local coins from seed and the
-            # actual target row position, independent of batching and streams.
-            coins = None
-            coins_for_final_sampling = None
+
+        # coins for rejection sampling
+        coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+        # coins for final sampling
+        coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
 
         sampling_fn = (
             chain_speculative_sampling_triton
             if use_rejection_sampling
             else tree_speculative_sampling_target_only
         )
-        sampling_kwargs = dict(
+        sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
             accept_token_num=num_correct_drafts,  # mutable
@@ -736,12 +717,6 @@ def eagle_sample(
             threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
             deterministic=True,
         )
-        if use_rejection_sampling:
-            sampling_kwargs.update(
-                sampling_seed=sampling_seed,
-                positions=verify_input.positions,
-            )
-        sampling_fn(**sampling_kwargs)
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point

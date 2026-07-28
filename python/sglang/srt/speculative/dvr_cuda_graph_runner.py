@@ -161,20 +161,6 @@ def _fast_decode_overrides(backend, model_runner, buffer_cache):
     return overrides
 
 
-def _clear_moe_policy_caches():
-    # These upstream caches read global determinism state without keying on it.
-    # Draft graph capture is the only DVR phase that changes that state.
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
-        get_moe_configs,
-    )
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-        should_enable_swap_ab,
-    )
-
-    get_moe_configs.cache_clear()
-    should_enable_swap_ab.cache_clear()
-
-
 def _iter_decode_custom_all_reduce_groups(model_runner):
     candidate_groups = [getattr(model_runner, "tp_group", None)]
     for get_group in (get_moe_ep_group, get_moe_tp_group):
@@ -241,9 +227,10 @@ def dvr_draft_decode_context(
 ):
     """Temporarily switch a DVR draft runner into performance-first decode mode.
 
-    Runtime determinism changes only while a draft graph is captured. The
-    immutable server policy remains available to operators such as FP8 GEMMs
-    that must stay numerically aligned with target execution.
+    Runtime determinism changes only while a draft graph is captured. Operators
+    that key their policy on active batch-invariant mode may therefore capture
+    their ordinary decode fast path, while the immutable server policy remains
+    available to operators whose target and draft geometry must stay aligned.
     """
 
     with ExitStack() as stack:
@@ -273,9 +260,6 @@ def dvr_draft_decode_context(
             # Keep ServerArgs immutable. This environment switch and the
             # batch-invariant mode below select only runtime draft fast paths.
             deterministic_env.set(False)
-            _clear_moe_policy_caches()
-            # Leave no fast-draft policy entry for deterministic target work.
-            stack.callback(_clear_moe_policy_caches)
 
         backends = tuple(
             backend
