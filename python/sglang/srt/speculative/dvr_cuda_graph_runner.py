@@ -324,8 +324,6 @@ class DVRTargetVerifyCudaGraphRunner(DecodeCudaGraphRunner):
     spec_info data object.
     """
 
-    is_dvr_target_verify_graph = True
-
     def get_spec_info(self, num_tokens: int):
         from sglang.srt.speculative.spec_info import create_dummy_verify_input
 

@@ -42,6 +42,7 @@ class _Args:
     disable_radix_cache = False
     disable_custom_all_reduce = False
     enable_deterministic_inference = False
+    enable_prefill_only_deterministic_inference = False
     flashinfer_allreduce_fusion_backend = None
     enforce_disable_flashinfer_allreduce_fusion = False
     mamba_radix_cache_strategy = "auto"
@@ -516,6 +517,13 @@ class TestDVRServerArgs(unittest.TestCase):
             handle_dvr_defaults(args)
 
         self.assertTrue(args.enable_deterministic_inference)
+
+    def test_dvr_rejects_prefill_only_deterministic_mode(self):
+        args = _Args()
+        args.enable_prefill_only_deterministic_inference = True
+
+        with self.assertRaisesRegex(ValueError, "target prefill and verify"):
+            handle_dvr_defaults(args)
 
     def test_dvr_defaults_normalize_algorithm_before_generic_spec_handling(self):
         args = _Args()

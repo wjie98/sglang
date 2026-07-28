@@ -16,7 +16,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.dvr_cuda_graph_runner import (
     DVRDraftDecodeCudaGraphRunner,
-    DVRTargetVerifyCudaGraphRunner,
     _draft_custom_allreduce_enabled,
     _fast_decode_overrides,
     _resolve_dvr_backends,
@@ -303,12 +302,6 @@ def test_dvr_draft_graph_uses_plain_decode_layout_and_shared_state():
 
     assert runner._resolve_capture_layout() == (ForwardMode.DECODE, 1)
     assert not runner.owns_attention_graph_state
-    assert not runner.is_dvr_target_verify_graph
-
-
-def test_only_dvr_target_graph_preserves_deterministic_capture():
-    assert not DecodeCudaGraphRunner.is_dvr_target_verify_graph
-    assert DVRTargetVerifyCudaGraphRunner.is_dvr_target_verify_graph
 
 
 @pytest.mark.parametrize(

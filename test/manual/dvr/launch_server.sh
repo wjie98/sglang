@@ -35,6 +35,7 @@ case "${SERVER_MODE}" in
     SPECULATIVE_ALGORITHM="DECODE_VERIFY_ROLLBACK"
     DRAFT_TOKENS="${DRAFT_TOKENS:-16}"
     spec_args+=(
+      --enable-deterministic-inference
       --speculative-algorithm "${SPECULATIVE_ALGORITHM}"
       --speculative-num-draft-tokens "${DRAFT_TOKENS}"
     )
@@ -44,6 +45,7 @@ case "${SERVER_MODE}" in
     DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-${MODEL_PATH}}"
     DRAFT_TOKENS="${DRAFT_TOKENS:-2}"
     spec_args+=(
+      --enable-deterministic-inference
       --speculative-algorithm "${SPECULATIVE_ALGORITHM}"
       --speculative-draft-model-path "${DRAFT_MODEL_PATH}"
       --speculative-num-draft-tokens "${DRAFT_TOKENS}"

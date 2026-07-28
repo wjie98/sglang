@@ -91,6 +91,13 @@ the server configuration can be attached to a test report.
 Current SGLang uses the same DVR worker and V2 result schema in both modes; the
 synchronous mode only disables scheduler overlap.
 
+The launcher passes `--enable-deterministic-inference` explicitly for both DVR
+modes. This selects SGLang's ordinary deterministic target kernels; DVR then
+restores normal fast decode settings only while capturing and replaying
+provisional draft work. Do not combine DVR with
+`--enable-prefill-only-deterministic-inference`: target verify is deterministic
+as well as prefill.
+
 ## Request example
 
 ```bash

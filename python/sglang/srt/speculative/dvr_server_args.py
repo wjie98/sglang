@@ -44,6 +44,14 @@ def handle_dvr_defaults(server_args):
         not server_args.disable_custom_all_reduce
     )
 
+    if server_args.enable_prefill_only_deterministic_inference:
+        raise ValueError(
+            "DVR makes target prefill and verify deterministic; use "
+            "--enable-deterministic-inference instead of "
+            "--enable-prefill-only-deterministic-inference. DVR restores the "
+            "normal fast path only inside provisional draft execution."
+        )
+
     # DVR only permits provisional draft decode to be non-deterministic. Target
     # prefill and verify define the output contract and must use the ordinary
     # deterministic-inference configuration from server initialization onward.
