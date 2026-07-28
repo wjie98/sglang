@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -1737,25 +1736,7 @@ def apply_fp8_linear(
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-        if is_batch_invariant_mode_enabled():
-            # Massage the input to be 2D
-            qinput = qinput.view(-1, qinput.shape[-1])
-            # Keep the K reduction and output tiling independent of the
-            # runtime token count so decode and prefill produce identical
-            # channelwise W8A8 results.
-            output = triton_scaled_mm(
-                qinput,
-                weight,
-                x_scale,
-                weight_scale,
-                input.dtype,
-                bias,
-                block_size_m=64,
-                block_size_n=64,
-                block_size_k=256,
-                use_heuristic=False,
-            )
-        elif not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
+        if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(

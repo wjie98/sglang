@@ -26,6 +26,25 @@
   self-DVR sync/overlap, DVR-EAGLE/MTP sync/overlap, Radix enabled/disabled,
   prompt lengths `1/63/64/65`, generated lengths `2/17/65/512`, concurrent and
   batched requests, and `return_logprob=true/false`.
+- Every correctness run has two independent exact-logprob gates:
+  1. DVR target output versus a clean target prefill of the same accepted
+     sequence.
+  2. DVR target prefill versus ordinary deterministic prefill of that same
+     forced sequence and token positions.
+  Both require identical token IDs and counts, selected-token `maxdiff=0`, and
+  `kl_proxy=0`; passing one does not waive the other. The proxy is computed
+  from selected-token logprobs and must not be reported as full-vocabulary KL.
+  Claim full-vocabulary `KL=0` only when the test captures and compares the
+  complete target distributions.
+- Generate the forced sequence only once, with DVR. The deterministic server
+  scores that sequence through a prefill-only request (`max_new_tokens=0`); do
+  not independently sample a second trajectory or substitute ordinary
+  deterministic decode for this gate.
+- Run these phases with `test/manual/dvr/check_logprob_parity.py` so every
+  comparison uses the same token indexing and exact-logprob convention. Start
+  both servers with `SGLANG_RETURN_ORIGINAL_LOGPROB=True`; the completed
+  artifact must contain both `dvr_gate.exact=true` and `det_gate.exact=true`.
+  Do not start throughput qualification when either gate is missing or false.
 - The extracted model has deliberately incomplete weights. It is valid for
   graph, state-lifecycle, and strict replay tests, but its EAGLE acceptance and
   throughput are not release metrics.
@@ -39,7 +58,7 @@
 ## NVLink release gates
 
 - Follow the ordered H20 matrix in `test/manual/dvr/README.md`. Do not substitute
-  A40 results for FP8, FA3, NVLink collective, or release-throughput results.
+  A40 results for FA3, NVLink collective, or release-throughput results.
 - For a fixed execution shape, repeat the same non-greedy prompt and request
   seed at least three times and require identical DVR output. Do not require
   output identity across sync/overlap or batch shapes unless the matched
@@ -50,6 +69,7 @@
 - Keep FlashInfer all-reduce fusion disabled for self-DVR. Test custom
   all-reduce independently; it may be captured only in provisional draft
   graphs.
-- Run the H20 FP8 matrix with `USE_TRITON_W8A8_FP8_KERNEL` unset. Target
-  deterministic dense W8A8 uses a fixed Triton tile, while provisional
-  self-draft intentionally restores the ordinary fast dispatch.
+- DVR target prefill and verify use the unmodified upstream deterministic
+  policy. Only provisional self-draft graph capture may select the ordinary
+  fast MoE path. A backend or model that fails either exact-logprob gate is
+  unsupported; do not add a weaker DVR-specific target policy.

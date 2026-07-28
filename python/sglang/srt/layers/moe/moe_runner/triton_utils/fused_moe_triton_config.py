@@ -194,32 +194,12 @@ def get_default_config(
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
     if is_batch_invariant_mode_enabled():
-        if dtype == "fp8_w8a8" and block_shape is None:
-            if _use_low_smem_fp8_default():
-                config = {
-                    "BLOCK_SIZE_M": 32,
-                    "BLOCK_SIZE_N": 64,
-                    "BLOCK_SIZE_K": 256,
-                    "GROUP_SIZE_M": 1,
-                    "num_warps": 4,
-                    "num_stages": 4,
-                }
-            else:
-                config = {
-                    "BLOCK_SIZE_M": 16,
-                    "BLOCK_SIZE_N": 64,
-                    "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": 1,
-                    "num_warps": 4,
-                    "num_stages": 2 if _is_hip else 4,
-                }
-        else:
-            config = {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_M": 8,
-            }
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+        }
         return config
     if dtype == "fp8_w8a8":
         if block_shape is None:

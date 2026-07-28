@@ -1,5 +1,4 @@
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -14,73 +13,8 @@ from sglang.srt.layers.moe.moe_runner.triton_utils import (
 )
 
 
-@pytest.mark.parametrize(
-    ("low_smem", "is_hip", "expected"),
-    [
-        (
-            False,
-            False,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 4,
-            },
-        ),
-        (
-            True,
-            False,
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 256,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 4,
-            },
-        ),
-        (
-            False,
-            True,
-            {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 2,
-            },
-        ),
-    ],
-)
-def test_batch_invariant_fp8_moe_configs(monkeypatch, low_smem, is_hip, expected):
-    monkeypatch.setattr(
-        config_module,
-        "is_batch_invariant_mode_enabled",
-        lambda: True,
-    )
-    monkeypatch.setattr(config_module, "_use_low_smem_fp8_default", lambda: low_smem)
-    monkeypatch.setattr(config_module, "_is_hip", is_hip)
-
-    for num_tokens in (16, 80):
-        assert (
-            config_module.get_default_config(
-                M=num_tokens,
-                E=512,
-                N=512,
-                K=4096,
-                topk=10,
-                dtype="fp8_w8a8",
-                is_marlin=False,
-                block_shape=None,
-            )
-            == expected
-        )
-
-
-def test_batch_invariant_non_fp8_uses_upstream_default(monkeypatch):
+@pytest.mark.parametrize("num_tokens", [16, 80])
+def test_batch_invariant_moe_uses_upstream_default(monkeypatch, num_tokens):
     monkeypatch.setattr(
         config_module,
         "is_batch_invariant_mode_enabled",
@@ -88,7 +22,7 @@ def test_batch_invariant_non_fp8_uses_upstream_default(monkeypatch):
     )
 
     assert config_module.get_default_config(
-        M=16,
+        M=num_tokens,
         E=512,
         N=512,
         K=4096,
@@ -104,47 +38,31 @@ def test_batch_invariant_non_fp8_uses_upstream_default(monkeypatch):
     }
 
 
-def test_nondeterministic_fp8_uses_upstream_default(monkeypatch):
-    monkeypatch.setattr(
-        config_module,
-        "get_global_server_args",
-        lambda: SimpleNamespace(enable_deterministic_inference=True),
-        raising=False,
-    )
+def test_self_draft_moe_uses_upstream_fast_default(monkeypatch):
     monkeypatch.setattr(
         config_module,
         "is_batch_invariant_mode_enabled",
         lambda: False,
     )
-    monkeypatch.setattr(config_module, "_use_low_smem_fp8_default", lambda: False)
-    monkeypatch.setattr(config_module, "_is_hip", False)
-
     assert config_module.get_default_config(
         M=16,
         E=512,
         N=512,
         K=4096,
         topk=10,
-        dtype="fp8_w8a8",
+        dtype=None,
         is_marlin=False,
         block_shape=None,
     ) == {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 64,
         "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        "num_stages": 4,
     }
 
 
 def test_short_moe_sum_reduce_tracks_active_invariant_mode(monkeypatch):
     invariant = {"enabled": False}
-    monkeypatch.setattr(
-        fused_moe_module,
-        "get_global_server_args",
-        lambda: SimpleNamespace(enable_deterministic_inference=True),
-    )
     monkeypatch.setattr(
         fused_moe_module,
         "is_batch_invariant_mode_enabled",
@@ -160,12 +78,6 @@ def test_short_moe_sum_reduce_tracks_active_invariant_mode(monkeypatch):
 
 def test_moe_config_cache_tracks_active_invariant_mode(monkeypatch, tmp_path):
     invariant = {"enabled": True}
-    monkeypatch.setattr(
-        config_module,
-        "get_global_server_args",
-        lambda: SimpleNamespace(enable_deterministic_inference=True),
-        raising=False,
-    )
     monkeypatch.setattr(
         config_module,
         "is_batch_invariant_mode_enabled",

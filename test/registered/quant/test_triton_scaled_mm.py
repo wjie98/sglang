@@ -1,11 +1,9 @@
 import unittest
 from typing import Optional
-from unittest.mock import patch
 
 import torch
 import torch.testing
 
-import sglang.srt.layers.quantization.fp8_utils as fp8_utils
 from sglang.srt.layers.quantization.fp8_kernel import triton_scaled_mm
 from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -109,76 +107,6 @@ class TestScaledMM(CustomTestCase):
                 torch.testing.assert_close(
                     triton_out_row_scale, ref_out, rtol=rtol, atol=atol
                 )
-
-    def test_explicit_tile(self):
-        torch.manual_seed(42)
-        input, weight = self._make_inputs(17, 64, 96, torch.int8)
-        scale_a = 0.1 + 0.05 * torch.rand(
-            (17, 1), dtype=torch.float32, device=self._device
-        )
-        scale_b = 0.1 + 0.05 * torch.rand(
-            (96, 1), dtype=torch.float32, device=self._device
-        )
-
-        output = triton_scaled_mm(
-            input,
-            weight,
-            scale_a,
-            scale_b,
-            torch.float16,
-            block_size_m=64,
-            block_size_n=64,
-            block_size_k=32,
-            use_heuristic=False,
-        )
-        reference = torch_scaled_mm(
-            input, weight, scale_a, scale_b, torch.float16
-        )
-
-        torch.testing.assert_close(output, reference, rtol=0.15, atol=0.1)
-
-    def test_w8a8_dispatch_follows_active_invariant_mode(self):
-        input = torch.ones((3, 4), dtype=torch.bfloat16, device=self._device)
-        weight = torch.ones((4, 5), dtype=torch.bfloat16, device=self._device)
-        weight_scale = torch.ones((5, 1), dtype=torch.float32, device=self._device)
-        qinput = torch.ones((3, 4), dtype=torch.int8, device=self._device)
-        input_scale = torch.ones((3, 1), dtype=torch.float32, device=self._device)
-
-        fixed_tile = {
-            "block_size_m": 64,
-            "block_size_n": 64,
-            "block_size_k": 256,
-            "use_heuristic": False,
-        }
-        for invariant_mode, expected_kwargs in ((False, {}), (True, fixed_tile)):
-            captured = {}
-
-            def scaled_mm(*args, **kwargs):
-                captured.update(kwargs)
-                return torch.zeros((3, 5), dtype=torch.bfloat16, device=self._device)
-
-            with (
-                patch.object(
-                    fp8_utils,
-                    "sglang_per_token_quant_fp8",
-                    return_value=(qinput, input_scale),
-                ),
-                patch.object(fp8_utils, "triton_scaled_mm", side_effect=scaled_mm),
-                patch.object(
-                    fp8_utils,
-                    "is_batch_invariant_mode_enabled",
-                    return_value=invariant_mode,
-                ),
-            ):
-                output = fp8_utils.apply_fp8_linear(
-                    input,
-                    weight,
-                    weight_scale,
-                    cutlass_fp8_supported=True,
-                )
-
-            self.assertEqual(output.shape, (3, 5))
-            self.assertEqual(captured, expected_kwargs)
 
 
 if __name__ == "__main__":

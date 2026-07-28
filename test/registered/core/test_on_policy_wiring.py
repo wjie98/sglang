@@ -566,6 +566,22 @@ class TestOnPolicyHelpers(unittest.TestCase):
             self.assertTrue(server_args.enable_deterministic_inference)
             self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
 
+    def test_cuda_graph_patch_noop_when_dvr_verify(self):
+        server_args = SimpleNamespace(
+            enable_prefill_only_deterministic_inference=True,
+            enable_deterministic_inference=True,
+            enable_flashinfer_allreduce_fusion=False,
+            rl_on_policy_target="fsdp_tp",
+            disable_custom_all_reduce=True,
+        )
+        with patch_prefill_only_deterministic_inference_for_cuda_graph(
+            server_args,
+            dvr_target_verify_cuda_graph=True,
+        ) as patched:
+            self.assertFalse(patched)
+            self.assertTrue(server_args.enable_deterministic_inference)
+            self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
+
     def test_tp_invariant_ops_import_is_available(self):
         import sglang.srt.tp_invariant_ops as tp_invariant_ops
 
