@@ -28,7 +28,8 @@ Radix prefix boundaries identical to the recurrent checkpoints used by verify.
 FlashInfer is supported as a sampling backend, but not as DVR's full-attention
 backend. Grammar-constrained decoding and dynamic token penalties
 (`frequency_penalty`, `presence_penalty`, `repetition_penalty`, and
-`min_new_tokens`) are not supported by DVR. Static `logit_bias` is supported.
+`min_new_tokens`) are not supported by DVR. Requests using them are rejected
+rather than approximated. Static `logit_bias` is supported.
 
 ## Start a server
 
@@ -121,6 +122,12 @@ For stochastic RL logprob qualification, set
 `SGLANG_RETURN_ORIGINAL_LOGPROB=True` before server startup when the oracle
 expects logprobs before temperature scaling.
 
+Within one fixed execution shape, repeat the same prompt and `sampling_seed` at
+least three times and require identical DVR output. This catches accidental use
+of process-global RNG in draft or rejection sampling. Output identity across
+sync/overlap or different batch shapes is not a DVR requirement unless the
+matched ordinary deterministic path also guarantees it.
+
 ## Recurrent-state lifecycle
 
 For gated linear-attention models, the ordinary token KV cache and the
@@ -178,6 +185,8 @@ In particular:
 - target prefill and verify remain deterministic;
 - draft graph capture restores environment, backend, batch-invariant, MoE, and
   collective state when it exits;
+- weight updates requested with `recapture_cuda_graph=true` rebuild the complete
+  DVR graph set only after target and draft weights are updated;
 - custom all-reduce may be captured for provisional draft execution but is not
   enabled for target prefill or verify;
 - Triton and FA3 draft decode retain their normal split configuration;
@@ -195,6 +204,45 @@ must additionally cover long-generation KL, acceptance, and throughput on the
 target NVLink hardware.
 
 ## NVLink qualification
+
+### Qualification order
+
+Use a clean process for every server row and record `git rev-parse HEAD` before
+testing. Run the gates in this order so an early correctness failure does not
+contaminate later throughput results:
+
+1. Qwen3.5-35B self-DVR with Triton and FA3: boundary prompts, 512/1024-token
+   strict replay, `return_logprob=false/true`, Radix enabled, and one
+   Radix-disabled diagnostic.
+2. Qwen3.5-35B MTP/EAGLE: sync and overlap correctness, repeated-seed output,
+   acceptance, and throughput. Start with the model-recommended draft length;
+   report any additional draft-length sweep separately.
+3. Qwen3-Next-80B self-DVR: Triton/FA3, custom-all-reduce on/off, ShareGPT and
+   long-input throughput. FlashInfer all-reduce fusion must remain disabled in
+   both rows.
+4. FP8 Qwen3.5 models: run the matrix-size deterministic replay gate below
+   before long-generation KL or throughput.
+5. Only after all correctness gates pass, run the matched normal,
+   deterministic, self-DVR, and DVR-EAGLE throughput rows.
+
+For RL weight-update qualification, run one self-DVR row and one same-checkpoint
+MTP row after:
+
+```bash
+curl http://127.0.0.1:30000/update_weights_from_disk \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"model_path\": \"${MODEL_PATH}\",
+    \"recapture_cuda_graph\": true,
+    \"flush_cache\": true
+  }"
+```
+
+After the endpoint returns success, repeat prompt length 65 with output lengths
+65 and 512. Logs must show complete draft and target-verify graph capture, and
+the measured requests must not fall back to eager execution. This gate covers
+self-draft and MTP stored in the same checkpoint; independently versioned
+EAGLE checkpoints require a separately matched update procedure.
 
 ### Keep the comparison matched
 
@@ -281,12 +329,14 @@ resolved server configuration contains
 normal-decode optimization.
 
 Deterministic dynamic channelwise W8A8 FP8 linear layers automatically use a
-fixed Triton tile. The generic FP8 dispatch reads the immutable deterministic
-server contract, while DVR only relaxes runtime batch-invariant operators for
-draft capture. Target and self-draft therefore keep the same FP8 reduction
-path. Leave
-`USE_TRITON_W8A8_FP8_KERNEL` unset for formal comparisons: setting it also
-changes the ordinary non-deterministic baseline.
+fixed Triton tile. Target prefill and verify run with active batch-invariant
+mode and therefore take that fixed path. Provisional self-draft graph capture
+temporarily disables active batch-invariant mode and restores the ordinary fast
+dense-FP8 dispatch; this is intentional and its numerical effect is measured by
+acceptance. Deterministic FP8 MoE defaults still use the immutable server
+configuration so their fixed geometry does not silently change during draft
+capture. Leave `USE_TRITON_W8A8_FP8_KERNEL` unset for formal comparisons:
+setting it also changes the ordinary non-deterministic baseline.
 
 On H20, qualify the two numerical boundaries separately:
 
@@ -297,6 +347,10 @@ On H20, qualify the two numerical boundaries separately:
   `1,2,16,32,63,64,65,80,128`. Compare rows representing the same token across
   matrix sizes and require bitwise-equal BF16 outputs before running the full
   397B KL matrix.
+
+An A40 can exercise the dispatch-policy unit tests, but it cannot compile the
+H20 `float8_e4m3fn` Triton path. A local A40 failure at FP8 kernel compilation
+is a hardware limitation, not a substitute for this H20 gate.
 
 ### Correctness matrix
 
@@ -310,6 +364,7 @@ Run both `return_logprob=false` and `true`. At minimum cover:
 - self-DVR with 16 draft tokens in synchronous and overlap scheduling;
 - Qwen3.5 MTP/EAGLE in synchronous and overlap scheduling;
 - Triton and FA3 full-attention backends on supported hardware.
+- one ordinary non-DVR overlap request in both logprob return modes.
 
 Strict KL testing first decodes a sequence, concatenates the accepted generated
 tokens to the prompt, and reruns target prefill to score the same positions.
@@ -394,9 +449,32 @@ Before accepting a result, retain the expanded launcher command and verify:
 - all measured decode batch sizes were captured without eager fallback;
 - target prefill and verify are deterministic while self-draft uses normal fast
   decode settings;
+- an RL weight update with graph recapture rebuilt all DVR-owned graph runners
+  before the first post-update request;
 - custom all-reduce and communication fusion, when eligible, are confined to
   provisional self-draft capture rather than target prefill or verify;
 - `max_running_requests` was not silently reduced;
 - the requested Radix policy was active;
 - no unexpected DeepGEMM precompile, illegal memory access, device assertion,
   or CUDA graph replay fallback occurred.
+
+### Local pre-push gate
+
+Run the stable unit suite from the repository root:
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/registered/unit/layers/test_dvr_gdn.py \
+  test/registered/unit/model_executor/test_dvr_cuda_graph_runner.py \
+  test/registered/unit/server_args/test_dvr_server_args.py \
+  test/registered/unit/speculative/test_dvr_state_flow.py \
+  test/registered/unit/speculative/test_dvr_worker.py \
+  test/registered/unit/speculative/test_dvr_reject_sampling.py \
+  test/registered/unit/managers/test_batch_result_processor_spec_grammar.py \
+  test/registered/unit/model_executor/test_pool_configurator.py \
+  test/registered/unit/layers/moe/test_fused_moe_triton_config.py
+```
+
+Also run `git diff --check` and `py_compile` for every changed Python file. The
+manual extracted-model matrix is specified in `AGENTS.md`; it is a functional
+gate, not a release performance benchmark.
