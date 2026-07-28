@@ -86,6 +86,10 @@
 - Keep FlashInfer all-reduce fusion disabled for self-DVR. Test custom
   all-reduce independently; it may be captured only in provisional draft
   graphs.
+- FlashInfer full attention is qualified only with Radix disabled, matching the
+  upstream deterministic-inference support matrix. Its provisional draft graph
+  must restore ordinary tensor-core and split-KV policy without changing target
+  prefill or verify.
 - DVR target prefill and verify use the unmodified upstream deterministic
   policy. Only provisional self-draft graph capture may select the ordinary
   fast MoE path. A backend or model that fails either exact-logprob gate is

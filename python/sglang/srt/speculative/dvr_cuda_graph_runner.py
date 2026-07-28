@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 
 _OVERRIDE_PLAN_CACHE = object()
@@ -52,6 +53,11 @@ def _resolve_dvr_backends(backend, forward_mode=ForwardMode.DECODE):
             visit(current.primary, collect_attention=collect_attention)
             for child in current.children:
                 visit(child, collect_attention=collect_attention)
+        elif hasattr(current, "attn_backends"):
+            # Upstream multi-step draft wrappers expose their per-step backend
+            # instances here. Validate and tune the actual attention leaves.
+            for child in current.attn_backends:
+                visit(child, collect_attention=collect_attention)
         elif collect_attention and candidate is None:
             leaves.append(current)
 
@@ -67,6 +73,9 @@ def validate_dvr_attention_backend(
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
+    from sglang.srt.layers.attention.flashinfer_backend import (
+        FlashInferAttnBackend,
+    )
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
     leaves, state_adapter = _resolve_dvr_backends(backend, forward_mode)
@@ -80,19 +89,24 @@ def validate_dvr_attention_backend(
                 f"DVR {phase} requires FlashAttention 3, got "
                 f"fa_impl_ver={leaf.fa_impl_ver}."
             )
-        if not isinstance(leaf, TritonAttnBackend):
+        if not isinstance(leaf, TritonAttnBackend | FlashInferAttnBackend):
             raise RuntimeError(
-                f"DVR {phase} supports only Triton or FA3 full-attention "
+                f"DVR {phase} supports only Triton, FA3, or FlashInfer "
+                "full-attention "
                 f"backends, got {type(leaf).__name__}."
             )
     return leaves, state_adapter
 
 
 def _fast_decode_overrides(backend, model_runner, buffer_cache):
-    """Return fast-decode state for the DVR-supported Triton and FA3 leaves."""
+    """Return ordinary decode state for each DVR-supported attention leaf."""
 
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
+    )
+    from sglang.srt.layers.attention.flashinfer_backend import (
+        FlashInferAttnBackend,
+        should_use_tensor_core,
     )
 
     plan_cache = buffer_cache.setdefault(_OVERRIDE_PLAN_CACHE, {})
@@ -103,6 +117,25 @@ def _fast_decode_overrides(backend, model_runner, buffer_cache):
     overrides = []
     leaves, _ = validate_dvr_attention_backend(backend)
     for leaf in leaves:
+        if isinstance(leaf, FlashInferAttnBackend):
+            attn_tp_size = get_parallel().attn_tp_size
+            use_tensor_cores = should_use_tensor_core(
+                kv_cache_dtype=model_runner.kv_cache_dtype,
+                num_attention_heads=(
+                    model_runner.model_config.num_attention_heads // attn_tp_size
+                ),
+                num_kv_heads=model_runner.model_config.get_num_kv_heads(attn_tp_size),
+            )
+            overrides.extend(
+                (
+                    (leaf, "enable_deterministic", False),
+                    (leaf, "decode_use_tensor_cores", use_tensor_cores),
+                    (leaf, "prefill_split_tile_size", None),
+                    (leaf, "decode_split_tile_size", None),
+                    (leaf, "disable_cuda_graph_kv_split", False),
+                )
+            )
+            continue
         if isinstance(leaf, FlashAttentionBackend):
             overrides.append((leaf, "num_splits", 0))
             continue

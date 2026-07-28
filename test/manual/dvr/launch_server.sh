@@ -17,9 +17,9 @@ SAMPLING_BACKEND="${SAMPLING_BACKEND:-pytorch}"
 RANDOM_SEED="${RANDOM_SEED:-2026}"
 
 case "${ATTENTION_BACKEND}" in
-  triton|fa3) ;;
+  triton|fa3|flashinfer) ;;
   *)
-    echo "ATTENTION_BACKEND must be triton or fa3." >&2
+    echo "ATTENTION_BACKEND must be triton, fa3, or flashinfer." >&2
     exit 2
     ;;
 esac
@@ -56,6 +56,13 @@ case "${SERVER_MODE}" in
     exit 2
     ;;
 esac
+
+if [[ "${ATTENTION_BACKEND}" == "flashinfer" && "${SERVER_MODE}" != "normal" ]]; then
+  if [[ "${DISABLE_RADIX_CACHE:-0}" != "1" ]]; then
+    echo "Disabling Radix cache for deterministic FlashInfer attention." >&2
+    DISABLE_RADIX_CACHE=1
+  fi
+fi
 
 if [[ "${SERVER_MODE}" == "self" || "${SERVER_MODE}" == "eagle" ]]; then
   if ((DRAFT_TOKENS < 2)); then

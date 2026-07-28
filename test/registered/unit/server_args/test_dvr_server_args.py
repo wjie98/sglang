@@ -511,11 +511,34 @@ class TestDVRServerArgs(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "linear-attn-prefill-backend"):
                 _handle_dvr_speculative_decoding(args)
 
-    def test_dvr_rejects_unsupported_full_attention_backend(self):
+    def test_dvr_accepts_flashinfer_with_radix_disabled(self):
+        args = _Args()
+        args.attention_backend = "flashinfer"
+        args.disable_radix_cache = True
+
+        _handle_dvr_speculative_decoding(args)
+
+    def test_dvr_flashinfer_defaults_disable_radix_cache(self):
         args = _Args()
         args.attention_backend = "flashinfer"
 
-        with self.assertRaisesRegex(ValueError, "only Triton and FA3"):
+        handle_dvr_defaults(args)
+
+        self.assertTrue(args.disable_radix_cache)
+
+    def test_dvr_flashinfer_phase_validation_also_disables_radix(self):
+        args = _Args()
+        args.attention_backend = "flashinfer"
+
+        _handle_dvr_speculative_decoding(args)
+
+        self.assertTrue(args.disable_radix_cache)
+
+    def test_dvr_rejects_unsupported_full_attention_backend(self):
+        args = _Args()
+        args.attention_backend = "fa4"
+
+        with self.assertRaisesRegex(ValueError, "Triton, FA3, and FlashInfer"):
             _handle_dvr_speculative_decoding(args)
 
     def test_dvr_defaults_unspecified_attention_backend_to_triton(self):
@@ -534,7 +557,7 @@ class TestDVRServerArgs(unittest.TestCase):
 
         _handle_dvr_speculative_decoding(args)
 
-        args.decode_attention_backend = "flashinfer"
+        args.decode_attention_backend = "fa4"
         with self.assertRaisesRegex(ValueError, "effective decode backend"):
             _handle_dvr_speculative_decoding(args)
 
