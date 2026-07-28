@@ -351,6 +351,89 @@ def test_cache_release_waits_for_pending_dvr_rollback(monkeypatch):
     assert not worker.pending_seed_rows
 
 
+def test_self_verify_fences_state_commit_before_overlap_publish(monkeypatch):
+    calls = []
+
+    class Event:
+        def record(self):
+            calls.append("record_commit")
+
+    class FillBonusTokens:
+        def __getitem__(self, _grid):
+            def run(tokens, _accept_lens, output, _width):
+                calls.append("fill_bonus")
+                output.copy_(tokens.reshape(-1)[: output.shape[0]])
+
+            return run
+
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda _device: SimpleNamespace(
+            Event=Event, current_stream=lambda: SimpleNamespace()
+        ),
+    )
+    monkeypatch.setattr(
+        dvr_worker_module,
+        "eagle_prepare_for_verify",
+        lambda *_args, **_kwargs: (SimpleNamespace(), False),
+    )
+    monkeypatch.setattr(dvr_worker_module, "fill_bonus_tokens", FillBonusTokens())
+
+    runner = SimpleNamespace(war_fastpath_read_done_event=None)
+    logits_output = SimpleNamespace(
+        next_token_logits=torch.tensor([[1.0, 0.0]]),
+        hidden_states=None,
+    )
+    worker = object.__new__(DecodeVerifyRollbackWorker)
+    worker.uses_eagle_draft = False
+    worker.device = "cpu"
+    worker.num_draft_tokens = 2
+    worker.verify_plan_stream_ctx = nullcontext()
+    worker.verify_plan_stream = None
+    worker.req_to_token_pool = object()
+    worker.target_model_worker = SimpleNamespace(
+        model_runner=runner,
+        forward_batch_generation=lambda **_kwargs: SimpleNamespace(
+            logits_output=logits_output,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+        ),
+    )
+    worker.state_lifecycle = SimpleNamespace(
+        commit_verified_state=lambda **_kwargs: calls.append("commit")
+    )
+    worker.sample_verified_tokens = lambda *_args: (
+        torch.tensor([7, 8], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+    )
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([64], dtype=torch.int32),
+        seq_lens_cpu_cache=None,
+        forward_mode=ForwardMode.DECODE,
+        return_logprob=False,
+    )
+    spec_info = SimpleNamespace(
+        is_verify_input=lambda: True,
+        draft_token_num=2,
+        num_tokens_per_req=None,
+        custom_mask=object(),
+        seq_lens_cpu=torch.tensor([64], dtype=torch.int32),
+        spec_steps=1,
+    )
+
+    worker.verify(
+        batch,
+        spec_info,
+        state_commit_plan=object(),
+        on_publish=lambda _seq_lens: calls.append("publish"),
+    )
+
+    assert calls == ["fill_bonus", "commit", "record_commit", "publish"]
+    assert runner.war_fastpath_read_done_event is worker.state_commit_done_event
+
+
 def test_self_draft_copies_each_graph_proposal_before_next_replay(monkeypatch):
     worker = object.__new__(DecodeVerifyRollbackWorker)
     worker.num_draft_tokens = 3
