@@ -77,12 +77,10 @@
 - Follow the ordered H20 matrix in `test/manual/dvr/README.md`. Do not substitute
   A40 results for FA3, NVLink collective, or release-throughput results.
 - For a fixed execution shape, repeat the same non-greedy prompt and request
-  seed at least three times and run both exact-logprob gates on every output.
-  Record output hashes as a diagnostic, but do not require trajectory identity:
-  the intentionally non-deterministic draft kernel can change the proposal and
-  therefore the rejection-sampling coupling without changing the target
-  distribution. Unit tests must still prove that sampling RNG is request-seed
-  and absolute-position based for a fixed proposal.
+  seed at least three times and require identical DVR output. Run both
+  exact-logprob gates on every output. Do not require output identity across
+  sync/overlap or batch shapes unless the matched ordinary deterministic path
+  provides that contract.
 - Compare DVR overlap with normal overlap and deterministic overlap. Report
   absolute throughput, accepted length, acceptance-normalized efficiency, and
   DVR/deterministic speedup.
@@ -90,8 +88,7 @@
   all-reduce independently; it may be captured only in provisional draft
   graphs.
 - DVR full-attention phases support only Triton and FlashAttention 3.
-  FlashInfer remains an independent sampling backend, not an attention backend;
-  do not introduce a decode-only phase split to bypass this contract.
+  Do not introduce a decode-only phase split to bypass this contract.
 - DVR target prefill and verify use the unmodified upstream deterministic
   policy. Only provisional self-draft graph capture may select the ordinary
   fast MoE path. A backend or model that fails either exact-logprob gate is

@@ -56,20 +56,17 @@ request sampling remains enabled independently of this model-kernel choice.
 
 For GDN models, `page_size` must equal the FLA chunk size (64). This keeps
 Radix prefix boundaries identical to the recurrent checkpoints used by verify.
-FlashInfer remains independently supported as a sampling backend, but DVR does
-not support it as a full-attention backend. Grammar-constrained decoding and
-dynamic token penalties
+Grammar-constrained decoding and dynamic token penalties
 (`frequency_penalty`, `presence_penalty`, `repetition_penalty`, and
 `min_new_tokens`) are not supported by DVR. Requests using them are rejected
 rather than approximated. Static `logit_bias` is supported.
 
 DVR also rejects adaptive or decoupled speculative execution, multi-layer
-EAGLE, reduced-vocabulary token maps, and EAGLE3/DFLASH draft-window options.
-Self-draft reuses the target model and decode backend, so draft-model revision,
-load-format, quantization, and draft-attention overrides are invalid in that
-mode. Mixed chunked prefill is disabled automatically for both DVR algorithms.
-Self-draft has no eager fallback: when `max_running_requests` is unset it uses
-the decode CUDA graph `max_bs`, and an explicitly larger value is rejected.
+EAGLE, and reduced-vocabulary token maps. Self-draft reuses the target model and
+therefore rejects a separate draft-model path. Generic speculative argument
+handling owns unrelated draft-window and mixed-chunk validation. Self-draft has
+no eager fallback: when `max_running_requests` is unset it uses the decode CUDA
+graph `max_bs`, and an explicitly larger value is rejected.
 
 ## Start a server
 
@@ -172,12 +169,11 @@ For stochastic RL logprob qualification, set
 expects logprobs before temperature scaling.
 
 Within one fixed execution shape, repeat the same prompt and `sampling_seed` at
-least three times and run both exact-logprob gates on every output. Record
-trajectory hashes as a diagnostic, but do not require them to match: the fast
-draft kernel is intentionally non-deterministic, so its proposal can change the
-rejection-sampling coupling while preserving the target distribution. The DVR
-sampling unit tests separately require request-seed and absolute-position based
-RNG for a fixed proposal.
+least three times and require identical DVR output. Run both exact-logprob gates
+on every output. This catches accidental use of process-global RNG in draft or
+rejection sampling. Output identity across sync/overlap or different batch
+shapes is not a DVR requirement unless the matched ordinary deterministic path
+also guarantees it.
 
 ## Recurrent-state lifecycle
 

@@ -19,31 +19,15 @@ def handle_dvr_defaults(server_args):
     algorithm = server_args.speculative_algorithm.upper()
     server_args.speculative_algorithm = algorithm
 
-    # These generic speculative options are handled before DVR's algorithm
-    # hook. Reject them here instead of letting upstream silently disable them
-    # or fail with an unrelated assertion.
+    # Adaptive spec mutates the fixed chain before DVR's algorithm hook runs.
     if server_args.speculative_adaptive:
         raise ValueError(
             "DVR uses a fixed verify chain and does not support adaptive spec."
-        )
-    if server_args.speculative_skip_dp_mlp_sync:
-        raise ValueError(
-            "DVR does not support --speculative-skip-dp-mlp-sync or DP attention."
-        )
-    if server_args.speculative_draft_window_size is not None:
-        raise ValueError(
-            "DVR does not support --speculative-draft-window-size; it is an "
-            "EAGLE3/DFLASH draft-cache option."
         )
 
     if server_args.grammar_backend not in (None, "none"):
         raise ValueError("DVR does not support grammar-constrained decoding.")
     server_args.grammar_backend = "none"
-
-    # Resolve the supported base before deterministic-inference defaults can
-    # select FlashInfer on newer GPUs. Explicit phase backends still win.
-    if server_args.attention_backend is None:
-        server_args.attention_backend = "triton"
 
     # Deterministic target prefill/verify disables custom all-reduce later in
     # ServerArgs. Preserve the user's original choice for provisional draft
@@ -77,22 +61,6 @@ def handle_dvr_defaults(server_args):
             "DVR gated linear-state models require page_size == "
             f"FLA_CHUNK_SIZE == {FLA_CHUNK_SIZE}, got {server_args.page_size}."
         )
-
-    # With Radix disabled, ChunkCache retains the ordinary full-prefill behavior;
-    # DVR's request-local checkpoint does not depend on this cache strategy.
-    if not server_args.disable_radix_cache:
-        if server_args.mamba_radix_cache_strategy == "auto":
-            logger.warning(
-                "DVR for gated linear-state models requires mamba extra_buffer "
-                "state tracking. Setting --mamba-radix-cache-strategy extra_buffer."
-            )
-            server_args.mamba_radix_cache_strategy = "extra_buffer"
-        elif server_args.mamba_radix_cache_strategy != "extra_buffer":
-            raise ValueError(
-                "DVR gated linear-state Radix caching requires "
-                "--mamba-radix-cache-strategy extra_buffer; no_buffer and "
-                "extra_buffer_lazy cannot preserve the overlap checkpoint."
-            )
 
     if server_args.mamba_track_interval != FLA_CHUNK_SIZE:
         logger.warning(
@@ -128,7 +96,7 @@ def _handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR currently supports NVIDIA CUDA, not ROCm/HIP.")
     if server_args.pp_size != 1:
         raise ValueError("DVR currently requires pipeline parallel size one.")
-    if server_args.enable_dp_attention:
+    if view.enable_dp_attention:
         raise ValueError("DVR currently does not support DP attention.")
     if server_args.enable_pdmux:
         raise ValueError("DVR currently does not support PDMux attention backends.")
@@ -142,8 +110,6 @@ def _handle_dvr_speculative_decoding(server_args):
         raise ValueError("DVR does not support custom logit processors.")
     if server_args.enable_return_hidden_states:
         raise ValueError("DVR does not return user-requested hidden states.")
-    if view.enable_unified_memory:
-        raise ValueError("DVR does not support --enable-unified-memory.")
     if server_args.decoupled_spec_role != "null":
         raise ValueError("DVR does not support decoupled speculative execution.")
     if server_args.speculative_token_map is not None:
@@ -154,27 +120,9 @@ def _handle_dvr_speculative_decoding(server_args):
     if is_self_draft:
         if server_args.speculative_draft_model_path is not None:
             raise ValueError("DVR self draft does not use a draft model path.")
-        if any(
-            value is not None
-            for value in (
-                server_args.speculative_draft_model_revision,
-                server_args.speculative_draft_load_format,
-                server_args.speculative_draft_model_quantization,
-            )
-        ):
-            raise ValueError(
-                "DVR self draft does not use draft-model revision, load-format, "
-                "or quantization options."
-            )
-        if server_args.speculative_draft_attention_backend is not None:
-            raise ValueError(
-                "DVR self draft reuses the target decode backend and does not use "
-                "--speculative-draft-attention-backend."
-            )
         if server_args.speculative_attention_mode != "prefill":
             raise ValueError(
-                "DVR self draft does not use --speculative-attention-mode; keep "
-                "its default value 'prefill'."
+                "DVR target verify requires --speculative-attention-mode prefill."
             )
     if is_eagle_draft:
         if server_args.speculative_draft_model_path is None:
@@ -189,6 +137,15 @@ def _handle_dvr_speculative_decoding(server_args):
         server_args.speculative_num_draft_tokens = 2 if is_eagle_draft else 16
 
     uses_gated_linear_state = _is_dvr_gated_linear_state_model(server_args)
+    if (
+        uses_gated_linear_state
+        and not view.disable_radix_cache
+        and view.mamba_radix_cache_strategy != "extra_buffer"
+    ):
+        raise ValueError(
+            "DVR gated linear-state Radix caching requires the resolved "
+            "--mamba-radix-cache-strategy extra_buffer."
+        )
     if uses_gated_linear_state and server_args.enable_two_batch_overlap:
         raise ValueError(
             "DVR gated linear-state models do not support two-batch overlap."
@@ -259,13 +216,6 @@ def _handle_dvr_speculative_decoding(server_args):
         server_args.speculative_eagle_topk = 1
     elif server_args.speculative_eagle_topk != 1:
         raise ValueError("DVR currently supports only chain mode with topk == 1.")
-    if view.sampling_backend not in ("flashinfer", "pytorch"):
-        raise ValueError(
-            "DVR supports only the built-in flashinfer and pytorch sampling "
-            "backends because target verification must reproduce the sampler's "
-            "request distribution."
-        )
-
     # DVR uses exact rejection sampling. The one-root short-prompt sentinel is
     # the only target-only iteration and selects that locally in the worker.
     server_args.speculative_use_rejection_sampling = True
@@ -277,13 +227,10 @@ def _handle_dvr_speculative_decoding(server_args):
             "DVR rejection sampling does not use speculative acceptance "
             "thresholds; both thresholds must remain 1.0."
         )
-    if server_args.enable_multi_layer_eagle:
+    if is_eagle_draft and view.enable_multi_layer_eagle:
         raise NotImplementedError(
             "DVR rejection sampling does not support multi-layer EAGLE."
         )
-    if server_args.enable_mixed_chunk:
-        logger.warning("Mixed chunked prefill is disabled for DVR.")
-        server_args.enable_mixed_chunk = False
 
 
 def handle_dvr_cuda_graph_config(server_args):
