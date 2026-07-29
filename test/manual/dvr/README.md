@@ -45,7 +45,7 @@ request sampling remains enabled independently of this model-kernel choice.
 ## Supported configuration
 
 - CUDA execution with pipeline parallel size one.
-- Triton, FlashAttention 3, or FlashInfer for full-attention layers.
+- Triton or FlashAttention 3 for all full-attention phases.
 - Triton linear-attention prefill for models with GDN layers.
 - Chain proposals (`speculative_eagle_topk=1`) and exact rejection sampling.
 - Radix cache enabled or disabled. Disabling Radix keeps ordinary full-prefill
@@ -56,9 +56,9 @@ request sampling remains enabled independently of this model-kernel choice.
 
 For GDN models, `page_size` must equal the FLA chunk size (64). This keeps
 Radix prefix boundaries identical to the recurrent checkpoints used by verify.
-FlashInfer full attention follows the upstream deterministic-inference support
-matrix and therefore requires Radix cache to be disabled. FlashInfer remains
-independently supported as a sampling backend. Grammar-constrained decoding and dynamic token penalties
+FlashInfer remains independently supported as a sampling backend, but DVR does
+not support it as a full-attention backend. Grammar-constrained decoding and
+dynamic token penalties
 (`frequency_penalty`, `presence_penalty`, `repetition_penalty`, and
 `min_new_tokens`) are not supported by DVR. Requests using them are rejected
 rather than approximated. Static `logit_bias` is supported.
@@ -172,10 +172,12 @@ For stochastic RL logprob qualification, set
 expects logprobs before temperature scaling.
 
 Within one fixed execution shape, repeat the same prompt and `sampling_seed` at
-least three times and require identical DVR output. This catches accidental use
-of process-global RNG in draft or rejection sampling. Output identity across
-sync/overlap or different batch shapes is not a DVR requirement unless the
-matched ordinary deterministic path also guarantees it.
+least three times and run both exact-logprob gates on every output. Record
+trajectory hashes as a diagnostic, but do not require them to match: the fast
+draft kernel is intentionally non-deterministic, so its proposal can change the
+rejection-sampling coupling while preserving the target distribution. The DVR
+sampling unit tests separately require request-seed and absolute-position based
+RNG for a fixed proposal.
 
 ## Recurrent-state lifecycle
 
@@ -240,8 +242,7 @@ In particular:
   DVR graph set only after target and draft weights are updated;
 - custom all-reduce may be captured for provisional draft execution but is not
   enabled for target prefill or verify;
-- Triton, FA3, and FlashInfer draft decode retain their normal split
-  configuration and tensor-core policy;
+- Triton and FA3 draft decode retain their normal split configuration;
 - the target live boundary is request-owned; only exact boundaries are copied
   to Radix, while DVR leaves ordinary Radix slot allocation and rebinding
   semantics unchanged.
@@ -265,8 +266,7 @@ contaminate later throughput results:
 
 1. Qwen3.5-35B self-DVR with Triton and FA3: both exact-logprob gates, boundary
    prompts, 512/1024-token generation, `return_logprob=false/true`, Radix
-   enabled, and one Radix-disabled diagnostic. Run FlashInfer as a separate
-   radix-disabled row.
+   enabled, and one Radix-disabled diagnostic.
 2. Qwen3.5-35B MTP/EAGLE: sync and overlap correctness, repeated-seed output,
    acceptance, and throughput. Start with the model-recommended draft length;
    report any additional draft-length sweep separately.
@@ -407,8 +407,7 @@ Run both `return_logprob=false` and `true`. At minimum cover:
   `DISABLE_RADIX_CACHE=1` control;
 - self-DVR with 16 draft tokens in synchronous and overlap scheduling;
 - Qwen3.5 MTP/EAGLE in synchronous and overlap scheduling;
-- Triton and FA3 full-attention backends with Radix enabled, plus FlashInfer
-  with Radix disabled on supported hardware.
+- Triton and FA3 full-attention backends with Radix enabled;
 - one ordinary non-DVR overlap request in both logprob return modes.
 
 Every row has two separate strict checks:
@@ -529,8 +528,7 @@ a material unhidden gap. Triton does not require this CPU mirror.
 
 Before accepting a result, retain the expanded launcher command and verify:
 
-- the effective full-attention backend is Triton, FA3, or FlashInfer; every
-  FlashInfer deterministic/DVR row must report Radix disabled;
+- every full-attention phase resolves to Triton or FA3;
 - GDN prefill/verify uses the Triton linear-attention backend;
 - all measured decode batch sizes were captured without eager fallback;
 - target prefill and verify are deterministic while self-draft uses normal fast

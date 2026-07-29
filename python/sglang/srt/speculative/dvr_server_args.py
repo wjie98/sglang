@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 DVR_SPECULATIVE_ALGORITHM = "DECODE_VERIFY_ROLLBACK"
 DVR_EAGLE_SPECULATIVE_ALGORITHM = "DECODE_VERIFY_ROLLBACK_EAGLE"
-_DVR_FULL_ATTENTION_BACKENDS = {"triton", "fa3", "flashinfer"}
+_DVR_FULL_ATTENTION_BACKENDS = {"triton", "fa3"}
 
 
 def handle_dvr_defaults(server_args):
@@ -44,23 +44,6 @@ def handle_dvr_defaults(server_args):
     # select FlashInfer on newer GPUs. Explicit phase backends still win.
     if server_args.attention_backend is None:
         server_args.attention_backend = "triton"
-
-    effective_attention_backends = (
-        server_args.prefill_attention_backend or server_args.attention_backend,
-        server_args.decode_attention_backend or server_args.attention_backend,
-    )
-    if (
-        "flashinfer" in effective_attention_backends
-        and not server_args.disable_radix_cache
-    ):
-        # The generic deterministic handler emits this warning for the base
-        # backend. Phase-specific FlashInfer needs the same early default.
-        if server_args.attention_backend != "flashinfer":
-            logger.warning(
-                "Radix cache is disabled because deterministic FlashInfer "
-                "attention does not support it."
-            )
-        server_args.disable_radix_cache = True
 
     # Deterministic target prefill/verify disables custom all-reduce later in
     # ServerArgs. Preserve the user's original choice for provisional draft
@@ -229,26 +212,15 @@ def _handle_dvr_speculative_decoding(server_args):
             "DVR requires exact recurrent checkpoints and does not support "
             "--enable-int8-mamba-checkpoint."
         )
-    effective_attention_backends = (
+    for phase, backend in (
         ("prefill", view.prefill_attention_backend or view.attention_backend),
         ("decode", view.decode_attention_backend or view.attention_backend),
-    )
-    for phase, backend in effective_attention_backends:
+    ):
         if backend not in _DVR_FULL_ATTENTION_BACKENDS:
             raise ValueError(
-                "DVR currently supports only Triton, FA3, and FlashInfer "
-                "full-attention "
+                "DVR currently supports only Triton and FA3 full-attention "
                 f"backends, got effective {phase} backend {backend}."
             )
-    if (
-        any(backend == "flashinfer" for _, backend in effective_attention_backends)
-        and not server_args.disable_radix_cache
-    ):
-        logger.warning(
-            "Radix cache is disabled because deterministic FlashInfer attention "
-            "does not support it."
-        )
-        server_args.disable_radix_cache = True
     linear_prefill_backend = (
         view.linear_attn_prefill_backend or view.linear_attn_backend
     )

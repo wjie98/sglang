@@ -6,7 +6,6 @@ import sglang.srt.speculative.dvr_cuda_graph_runner as graph_module
 import torch
 from sglang.srt.layers.attention.dvr.gdn_backend import DVRGDNAttnBackend
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -241,51 +240,6 @@ def test_fa3_fast_decode_override_contract():
     assert backend.num_splits == 1
 
 
-def test_flashinfer_fast_decode_override_contract(monkeypatch):
-    monkeypatch.setenv("SGLANG_FLASHINFER_USE_TENSOR_CORE", "false")
-    monkeypatch.setattr(
-        graph_module, "get_parallel", lambda: SimpleNamespace(attn_tp_size=2)
-    )
-    model_runner = SimpleNamespace(
-        server_args=SimpleNamespace(),
-        kv_cache_dtype=torch.bfloat16,
-        model_config=SimpleNamespace(
-            num_attention_heads=16,
-            get_num_kv_heads=lambda tp_size: 8 // tp_size,
-        ),
-    )
-    backend = object.__new__(FlashInferAttnBackend)
-    backend.enable_deterministic = True
-    backend.decode_use_tensor_cores = True
-    backend.prefill_split_tile_size = 4096
-    backend.decode_split_tile_size = 2048
-    backend.disable_cuda_graph_kv_split = True
-
-    with dvr_draft_decode_context(
-        SimpleNamespace(
-            attn_backend=backend,
-            server_args=SimpleNamespace(
-                enable_deterministic_inference=True,
-                dvr_enable_draft_custom_all_reduce=False,
-            ),
-            model_config=model_runner.model_config,
-            kv_cache_dtype=model_runner.kv_cache_dtype,
-        ),
-        {},
-    ):
-        assert not backend.enable_deterministic
-        assert not backend.decode_use_tensor_cores
-        assert backend.prefill_split_tile_size is None
-        assert backend.decode_split_tile_size is None
-        assert not backend.disable_cuda_graph_kv_split
-
-    assert backend.enable_deterministic
-    assert backend.decode_use_tensor_cores
-    assert backend.prefill_split_tile_size == 4096
-    assert backend.decode_split_tile_size == 2048
-    assert backend.disable_cuda_graph_kv_split
-
-
 def test_backend_resolution_returns_attention_and_linear_state_once():
     class Backend:
         token_to_kv_pool = object()
@@ -321,12 +275,13 @@ def test_backend_resolution_returns_attention_and_linear_state_once():
 
 def test_backend_resolution_flattens_upstream_multi_step_wrappers():
     triton = object.__new__(TritonAttnBackend)
-    flashinfer = object.__new__(FlashInferAttnBackend)
-    wrapper = SimpleNamespace(attn_backends=[triton, flashinfer])
+    fa3 = object.__new__(FlashAttentionBackend)
+    fa3.fa_impl_ver = 3
+    wrapper = SimpleNamespace(attn_backends=[triton, fa3])
 
     leaves, adapter = _resolve_dvr_backends(wrapper)
 
-    assert leaves == [triton, flashinfer]
+    assert leaves == [triton, fa3]
     assert adapter is None
 
 
@@ -377,10 +332,9 @@ def test_backend_resolution_rejects_distinct_linear_state_adapters():
 
 
 def test_backend_validation_accepts_supported_attention_backends():
-    for backend in (
-        object.__new__(TritonAttnBackend),
-        object.__new__(FlashInferAttnBackend),
-    ):
+    fa3 = object.__new__(FlashAttentionBackend)
+    fa3.fa_impl_ver = 3
+    for backend in (object.__new__(TritonAttnBackend), fa3):
         leaves, adapter = validate_dvr_attention_backend(backend)
         assert leaves == [backend] and adapter is None
 
