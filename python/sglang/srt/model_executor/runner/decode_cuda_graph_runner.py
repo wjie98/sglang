@@ -704,6 +704,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with patch_prefill_only_deterministic_inference_for_cuda_graph(
             self.model_runner.server_args,
             attn_backend=getattr(self.model_runner, "attn_backend", None),
+            dvr_target_verify_cuda_graph=getattr(
+                self.model_runner, "enable_dvr_target_verify_cuda_graph", False
+            ),
         ):
             with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
                 if not self.enable_pdmux:

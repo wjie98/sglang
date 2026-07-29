@@ -126,9 +126,11 @@ def patch_prefill_only_deterministic_inference_for_cuda_graph(
     server_args: Any,
     *,
     attn_backend: Optional[Any] = None,
+    dvr_target_verify_cuda_graph: bool = False,
 ) -> Iterator[bool]:
-    enabled = getattr(
-        server_args, "enable_prefill_only_deterministic_inference", False
+    enabled = (
+        getattr(server_args, "enable_prefill_only_deterministic_inference", False)
+        and not dvr_target_verify_cuda_graph
     )
     if not enabled:
         yield False
