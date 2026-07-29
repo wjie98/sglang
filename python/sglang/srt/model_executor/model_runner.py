@@ -2477,6 +2477,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             | JetNemotronConfig
             | JetVLMConfig,
         ):
+            if not config.mamba2_cache_params.layers:
+                return None
             return config
         return None
 
