@@ -5,6 +5,8 @@
 import argparse
 import json
 import math
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -30,9 +32,20 @@ def post_json(
 
 
 def flush_cache(base_url: str) -> None:
-    result = post_json(base_url, "/flush_cache")
-    if isinstance(result, str) and "Cache flushed" not in result:
-        raise RuntimeError(f"Cache flush failed: {result}")
+    # Overlap serving may return the completed response just before scheduler
+    # bookkeeping releases the request. Wait for that bounded handoff instead
+    # of racing the replay phase against the still-active batch.
+    for attempt in range(100):
+        try:
+            result = post_json(base_url, "/flush_cache")
+        except urllib.error.HTTPError as error:
+            if error.code == 400 and attempt < 99:
+                time.sleep(0.1)
+                continue
+            raise
+        if isinstance(result, str) and "Cache flushed" not in result:
+            raise RuntimeError(f"Cache flush failed: {result}")
+        return
 
 
 def token_logprobs(response: dict[str, Any], field: str) -> list[tuple[float, int]]:
