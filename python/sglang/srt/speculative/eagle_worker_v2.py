@@ -202,6 +202,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+    def sample_rejection_proposal(
+        self,
+        probs: torch.Tensor,
+        sampling_info,
+        positions: torch.Tensor,
+        *,
+        position_offset: int = 0,
+    ):
+        """Sample an EAGLE proposal; specialized workers may provide seeded RNG."""
+
+        del sampling_info, positions, position_offset
+        return fast_sample(probs, num_samples=1)
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -699,7 +712,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.sampling_info,
                     self.server_args.speculative_use_rejection_sampling,
                 )
-                topk_p, topk_index = fast_sample(probs, num_samples=1)
+                topk_p, topk_index = self.sample_rejection_proposal(
+                    probs,
+                    forward_batch.sampling_info,
+                    forward_batch.positions,
+                    position_offset=1,
+                )
                 draft_probs_list.append(probs)
             elif self.topk == 1 and not _is_hip:
                 topk_index = torch.argmax(
@@ -858,7 +876,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             use_rejection_sampling,
         )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+            topk_p, topk_index = self.sample_rejection_proposal(
+                probs,
+                batch.sampling_info,
+                batch.seq_lens,
+            )
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
@@ -1002,7 +1024,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info,
                 self.server_args.speculative_use_rejection_sampling,
             )
-            ret_topk_p, ret_topk_index = fast_sample(probs, num_samples=1)
+            ret_topk_p, ret_topk_index = self.sample_rejection_proposal(
+                probs,
+                batch.sampling_info,
+                batch_result.new_seq_lens,
+            )
             ret_draft_probs = probs
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts

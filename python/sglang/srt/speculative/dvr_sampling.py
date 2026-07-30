@@ -127,6 +127,7 @@ def dvr_sample_from_probs_kernel(
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
     RNG_DOMAIN: tl.constexpr,
+    POSITION_OFFSET: tl.constexpr,
 ):
     request_id = tl.program_id(0)
     probs = Probs + request_id * stride_probs_b
@@ -137,7 +138,7 @@ def dvr_sample_from_probs_kernel(
         norm += tl.sum(tl.load(probs + offsets, mask=offsets < VOCAB_SIZE, other=0.0))
 
     seed = tl.load(Seeds + request_id)
-    position = tl.load(Positions + request_id)
+    position = tl.load(Positions + request_id) + POSITION_OFFSET
     target = dvr_stateless_uniform(seed, position, RNG_DOMAIN) * norm
     cumulative = 0.0
     sampled_token = 0
@@ -169,7 +170,7 @@ def dvr_sample_from_probs_kernel(
     )
 
 
-def dvr_sample_from_probs(probs, seeds, positions):
+def dvr_sample_from_probs(probs, seeds, positions, *, position_offset=0):
     """Sample rows reproducibly without global RNG state or FP64 Gumbel noise."""
 
     if not probs.is_cuda:
@@ -198,6 +199,7 @@ def dvr_sample_from_probs(probs, seeds, positions):
         VOCAB_SIZE=probs.shape[1],
         BLOCK_V=DVR_SAMPLING_BLOCK_SIZE,
         RNG_DOMAIN=DVR_PROPOSAL_RNG_DOMAIN,
+        POSITION_OFFSET=position_offset,
     )
     return output
 

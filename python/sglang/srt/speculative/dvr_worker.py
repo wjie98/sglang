@@ -283,6 +283,58 @@ class SelfDraftBackend:
         )
 
 
+class DVREagleDraftWorker(EagleDraftWorker):
+    """EAGLE draft execution with request-seeded proposal sampling."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        max_bs = max(
+            self.server_args.cuda_graph_config.decode.max_bs or 0,
+            self.server_args.max_running_requests or 0,
+            1,
+        )
+        self.proposal_sampling_seeds = torch.zeros(
+            max_bs, dtype=torch.int64, device=self.device
+        )
+
+    def set_sampling_seeds(self, seeds: torch.Tensor):
+        if seeds is None:
+            raise RuntimeError("DVR EAGLE requires one sampling seed per request.")
+        seeds = seeds.reshape(-1)
+        if seeds.shape[0] > self.proposal_sampling_seeds.shape[0]:
+            raise RuntimeError(
+                "DVR EAGLE sampling batch exceeds its graph seed buffer: "
+                f"batch_size={seeds.shape[0]}, "
+                f"capacity={self.proposal_sampling_seeds.shape[0]}."
+            )
+        self.proposal_sampling_seeds[: seeds.shape[0]].copy_(seeds)
+
+    def sample_rejection_proposal(
+        self,
+        probs: torch.Tensor,
+        sampling_info,
+        positions: torch.Tensor,
+        *,
+        position_offset: int = 0,
+    ):
+        if probs.shape[0] == 0:
+            return probs[:, :1], torch.empty(
+                (0, 1), dtype=torch.int64, device=probs.device
+            )
+        seeds = sampling_info.sampling_seed
+        if seeds is None:
+            # EAGLE draft graphs use a static SamplingBatchInfo. The DVR backend
+            # refreshes this fixed-address buffer before each graph replay.
+            seeds = self.proposal_sampling_seeds[: probs.shape[0]]
+        token_ids = dvr_sample_from_probs(
+            probs,
+            seeds,
+            positions,
+            position_offset=position_offset,
+        ).unsqueeze(1)
+        return probs.gather(1, token_ids), token_ids
+
+
 class EagleDraftBackend:
     """Upstream EAGLE/MTP draft operations around the DVR target transaction."""
 
@@ -326,6 +378,7 @@ class EagleDraftBackend:
             )
 
     def propose(self, batch):
+        self.worker.set_sampling_seeds(batch.sampling_info.sampling_seed)
         return self.worker.draft(batch)
 
     def finish_verify(self, batch, batch_result):
@@ -400,7 +453,7 @@ class DecodeVerifyRollbackWorker(BaseSpecWorker):
             server_args.context_length = (
                 target_worker.model_runner.model_config.context_len
             )
-            self.draft_model_worker = EagleDraftWorker(
+            self.draft_model_worker = DVREagleDraftWorker(
                 server_args,
                 gpu_id,
                 tp_rank,

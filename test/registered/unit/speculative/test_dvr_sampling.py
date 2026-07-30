@@ -178,6 +178,9 @@ def test_seeded_proposal_is_repeatable_and_batch_order_independent():
 
     assert torch.equal(expected, repeated)
     assert torch.equal(permuted, expected[permutation])
+    shifted = dvr_sample_from_probs(probs, seeds, positions, position_offset=1)
+    explicit_shift = dvr_sample_from_probs(probs, seeds, positions + 1)
+    assert torch.equal(shifted, explicit_shift)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

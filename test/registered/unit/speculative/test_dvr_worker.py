@@ -282,6 +282,51 @@ def test_draft_backends_finalize_the_common_verify_result():
     assert calls == [(batch, result)]
 
 
+def test_dvr_eagle_proposal_sampling_uses_request_seed_and_position(monkeypatch):
+    worker = object.__new__(dvr_worker_module.DVREagleDraftWorker)
+    worker.proposal_sampling_seeds = torch.tensor([2026, 2030])
+    captured = {}
+
+    def sample(probs, seeds, positions, *, position_offset):
+        captured.update(
+            probs=probs,
+            seeds=seeds.clone(),
+            positions=positions.clone(),
+            position_offset=position_offset,
+        )
+        return torch.tensor([1, 0])
+
+    monkeypatch.setattr(dvr_worker_module, "dvr_sample_from_probs", sample)
+    probs = torch.tensor([[0.25, 0.75], [0.60, 0.40]])
+    topk_p, topk_index = worker.sample_rejection_proposal(
+        probs,
+        SimpleNamespace(sampling_seed=None),
+        torch.tensor([64, 127]),
+        position_offset=1,
+    )
+
+    assert captured["probs"] is probs
+    assert captured["seeds"].tolist() == [2026, 2030]
+    assert captured["positions"].tolist() == [64, 127]
+    assert captured["position_offset"] == 1
+    assert topk_index.tolist() == [[1], [0]]
+    torch.testing.assert_close(topk_p, torch.tensor([[0.75], [0.60]]))
+
+
+def test_dvr_eagle_refreshes_graph_sampling_seeds_before_draft():
+    calls = []
+    seeds = torch.tensor([2026, 2030])
+    worker = SimpleNamespace(
+        set_sampling_seeds=lambda value: calls.append(("seed", value)),
+        draft=lambda batch: calls.append(("draft", batch)) or "verify-input",
+    )
+    backend = dvr_worker_module.EagleDraftBackend(SimpleNamespace(), worker)
+    batch = SimpleNamespace(sampling_info=SimpleNamespace(sampling_seed=seeds))
+
+    assert backend.propose(batch) == "verify-input"
+    assert calls == [("seed", seeds), ("draft", batch)]
+
+
 @pytest.mark.parametrize("uses_eagle_draft", [False, True])
 def test_weight_update_recaptures_the_complete_dvr_draft_graph_set(
     uses_eagle_draft,
