@@ -298,7 +298,7 @@ def test_dvr_eagle_proposal_sampling_uses_request_seed_and_position(monkeypatch)
 
     monkeypatch.setattr(dvr_worker_module, "dvr_sample_from_probs", sample)
     probs = torch.tensor([[0.25, 0.75], [0.60, 0.40]])
-    topk_p, topk_index = worker.sample_rejection_proposal(
+    topk_p, topk_index = worker.sample_dvr_rejection_proposal(
         probs,
         SimpleNamespace(sampling_seed=None),
         torch.tensor([64, 127]),

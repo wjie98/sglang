@@ -309,7 +309,7 @@ class DVREagleDraftWorker(EagleDraftWorker):
             )
         self.proposal_sampling_seeds[: seeds.shape[0]].copy_(seeds)
 
-    def sample_rejection_proposal(
+    def sample_dvr_rejection_proposal(
         self,
         probs: torch.Tensor,
         sampling_info,
